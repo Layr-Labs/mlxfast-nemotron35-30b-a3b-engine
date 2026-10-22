@@ -24,9 +24,12 @@ The profile prints on stdout. The rules:
 The evaluator-only paths come from the environment, not from arguments, so
 that every caller denies the same set: MLXFAST_QWEN38_GOLDEN_DIR,
 MLXFAST_CORRECTNESS_GOLDEN_PATH, MLXFAST_PRIVATE_DIR,
-MLXFAST_BASELINE_WORKSPACE, MLXFAST_BASELINE_CALIBRATION, BENCHD_BIN_DIR, the
-build cache root (MLXFAST_BUILD_CACHE_DIR, else ~/.cache/mlxfast-engine-build)
-and the runner registration files two levels above RUNNER_WORKSPACE. The reference workspace is not denied when --tree is
+MLXFAST_BASELINE_WORKSPACE, MLXFAST_BASELINE_CALIBRATION, BENCHD_BIN_DIR,
+BENCHD_PRIVATE_AUDIT_PATH, the stable resident log root
+(MLXFAST_RESIDENT_LOG_ROOT, falling back to RESIDENT_UP_LOG_DIR), the build
+cache root (MLXFAST_BUILD_CACHE_DIR, else
+~/.cache/mlxfast-engine-build) and the runner registration files two levels
+above RUNNER_WORKSPACE. The reference workspace is not denied when --tree is
 inside it, because then the confined program is that workspace's own.
 
 With --official, the four paths that an official run must name
@@ -53,6 +56,7 @@ OFFICIAL_REQUIRED = (
 OTHER_EVALUATOR_PATHS = (
     "MLXFAST_CORRECTNESS_GOLDEN_PATH",
     "MLXFAST_PRIVATE_DIR",
+    "BENCHD_PRIVATE_AUDIT_PATH",
 )
 RUNNER_REGISTRATION_FILES = (".credentials", ".credentials_rsaparams", ".runner")
 
@@ -87,6 +91,7 @@ def inside(path, root):
 
 def evaluator_paths(env, tree):
     paths = [env.get(name, "") for name in OFFICIAL_REQUIRED + OTHER_EVALUATOR_PATHS]
+    paths.append(env.get("MLXFAST_RESIDENT_LOG_ROOT") or env.get("RESIDENT_UP_LOG_DIR", ""))
     home = env.get("HOME") or os.path.expanduser("~")
     paths.append(env.get("MLXFAST_BUILD_CACHE_DIR") or os.path.join(home, ".cache/mlxfast-engine-build"))
     baseline = env.get("MLXFAST_BASELINE_WORKSPACE", "")

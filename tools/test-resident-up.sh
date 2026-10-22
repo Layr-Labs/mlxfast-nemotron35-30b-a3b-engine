@@ -18,24 +18,27 @@
 #   6. a resident that dies before it is healthy fails the window, with its log
 #   7. a resident that never binds fails on the health timeout
 #   8. a resident that ignores SIGTERM is killed with the process group
+#   9. the resident gets only the documented environment allowlist, including
+#      model/runtime controls but excluding evaluator paths and ranked flags
 #
 # And the PER-LEG form benchd drives (--boot / --stop), against a synthetic
 # tree:
-#   9.  --boot writes the socket path as the first line of --socket-out, a
+#   10. --boot writes the socket path as the first line of --socket-out, a
 #       <socket>.pid sidecar and a <socket>.ready marker, exits 0, and leaves
 #       the resident RUNNING
-#   10. --spec serial is authoritative over a tree whose mtp-head.manifest.json
+#   11. --spec serial is authoritative over a tree whose mtp-head.manifest.json
 #       declares a draft depth
-#   11. the boot loads THAT TREE'S own weights, not an inherited path
-#   12. a second --boot while a resident is up refuses box-wide, across trees
-#   13. --stop ends the resident and removes all three files; a second --stop is
+#   12. the boot loads THAT TREE'S own weights, not an inherited path
+#   13. a second --boot while a resident is up refuses box-wide, across trees
+#   14. --stop ends the resident and removes all three files; a second --stop is
 #       a no-op; the next leg boots afterwards
-#   14. every flag without a value, every missing required flag, and every
+#   15. a failed private-temp cleanup makes --stop fail and keeps its sidecar
+#   16. every flag without a value, every missing required flag, and every
 #       spec/draft-length mismatch refuses BY NAME
-#   15. under the real sandbox-exec, with the default RESIDENT_UP_LOG_DIR
-#       (<tree>/.build/resident): --stop, and a boot that fails, leave no
-#       tmp.* directory in the tree. Another account cannot list such a
-#       directory, so ranked preflight 7a stops the next run. macOS only.
+#   17. RESIDENT_UP_LOG_DIR outside MLXFAST_RESIDENT_LOG_ROOT refuses by name
+#   18. under the real sandbox-exec, private TMPDIR is outside
+#       RESIDENT_UP_LOG_DIR; --stop and a failed boot remove it. macOS only.
+#       A failed wrapper cleanup returns non-zero and keeps its sidecar.
 #
 # The stub is a Python script, and sandbox-exec would refuse the interpreter
 # exec it needs, so these cases run with RESIDENT_UP_SANDBOX=0. Case 4b proves
@@ -73,19 +76,24 @@ pass() { printf 'test-resident-up: PASS -- %s\n' "$*"; }
 fail() { printf 'test-resident-up: FAIL -- %s\n' "$*" >&2; fails=$((fails + 1)); }
 
 # --- the stub resident --------------------------------------------------------
-# Speaks the contract: validates argv, waits STUB_LOAD_S, binds the socket,
+# Speaks the contract: validates argv, waits BENCH_WORKER_TEST_LOAD_S, binds the socket,
 # then serves one connection at a time: on accept it sends the hello line
 # (unprompted, ok:true, backend mlx-resident) and closes when the client does.
-# STUB_DIE_BEFORE_BIND=1 exits 3 before binding. STUB_NEVER_BIND=1 sleeps
-# forever without binding. STUB_IGNORE_TERM=1 ignores SIGTERM.
-# It records its argv in STUB_ARGV_FILE.
+# BENCH_WORKER_TEST_DIE_BEFORE_BIND=1 exits 3 before binding.
+# BENCH_WORKER_TEST_NEVER_BIND=1 sleeps forever without binding.
+# BENCH_WORKER_TEST_IGNORE_TERM=1 ignores SIGTERM. It records its argv and,
+# when asked, its environment through BENCH_WORKER_TEST_* paths.
 STUB="${WORK}/stub-bench-worker.py"
 cat > "${STUB}" <<'PY'
 #!/usr/bin/env python3
 import json, os, signal, socket, sys, time
 argv = sys.argv[1:]
-with open(os.environ["STUB_ARGV_FILE"], "w") as f:
+with open(os.environ["BENCH_WORKER_TEST_ARGV_FILE"], "w") as f:
     f.write("\n".join(argv) + "\n")
+if os.environ.get("BENCH_WORKER_TEST_ENV_FILE"):
+    with open(os.environ["BENCH_WORKER_TEST_ENV_FILE"], "w") as f:
+        for key, value in sorted(os.environ.items()):
+            f.write(f"{key}={value}\n")
 if not argv or argv[0] != "resident":
     print("stub: first argument must be resident", file=sys.stderr); sys.exit(2)
 opts = {}
@@ -100,14 +108,14 @@ for needed in ("--weights", "--socket", "--speculative-protocol"):
         print(f"stub: missing {needed}", file=sys.stderr); sys.exit(2)
 if opts["--speculative-protocol"] != ["v1.1"]:
     print("stub: --speculative-protocol must be v1.1", file=sys.stderr); sys.exit(2)
-if os.environ.get("STUB_IGNORE_TERM") == "1":
+if os.environ.get("BENCH_WORKER_TEST_IGNORE_TERM") == "1":
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 else:
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-time.sleep(float(os.environ.get("STUB_LOAD_S", "1")))
-if os.environ.get("STUB_DIE_BEFORE_BIND") == "1":
+time.sleep(float(os.environ.get("BENCH_WORKER_TEST_LOAD_S", "1")))
+if os.environ.get("BENCH_WORKER_TEST_DIE_BEFORE_BIND") == "1":
     print("stub: dying before bind, as asked", file=sys.stderr); sys.exit(3)
-if os.environ.get("STUB_NEVER_BIND") == "1":
+if os.environ.get("BENCH_WORKER_TEST_NEVER_BIND") == "1":
     while True:
         time.sleep(1)
 path = opts["--socket"][0]
@@ -165,10 +173,11 @@ run_up() {
   while [[ $# -gt 0 && "$1" == *=* ]]; do envs+=("$1"); shift; done
   # The case's own ENV=VAL pairs come LAST, so a case can override a default.
   env MLXFAST_ENGINE_BIN="${STUB}" \
+    MLXFAST_RESIDENT_LOG_ROOT="${logdir}" \
     RESIDENT_UP_LOG_DIR="${logdir}" \
     RESIDENT_UP_LOCK_PATH="${LOCK}" \
     RESIDENT_UP_WIRED_LIMIT_READER="${WIRED_OK}" \
-    STUB_ARGV_FILE="${logdir}/stub-argv" \
+    BENCH_WORKER_TEST_ARGV_FILE="${logdir}/stub-argv" \
     ${envs[@]+"${envs[@]}"} \
     "${RESIDENT_UP}" "$@" 2>&1
 }
@@ -247,7 +256,7 @@ fi
 
 # --- 6. a resident that dies before it is healthy ----------------------------
 L6="${WORK}/case6"; mkdir -p "${L6}"
-out="$(run_up "${L6}" STUB_DIE_BEFORE_BIND=1 RESIDENT_UP_HEALTH_TIMEOUT_S=30 --weights "${WEIGHTS}" --socket "${WORK}/case6.sock" -- echo should-not-run)"; rc=$?
+out="$(run_up "${L6}" BENCH_WORKER_TEST_DIE_BEFORE_BIND=1 RESIDENT_UP_HEALTH_TIMEOUT_S=30 --weights "${WEIGHTS}" --socket "${WORK}/case6.sock" -- echo should-not-run)"; rc=$?
 if [[ "${rc}" -eq 1 && "${out}" == *"exited before it was healthy"* && "${out}" == *"dying before bind"* && "${out}" != *"should-not-run"* ]]; then
   pass "a resident that dies before it is healthy fails the window with its log, and the command never runs"
 else
@@ -256,7 +265,7 @@ fi
 
 # --- 7. a resident that never binds ------------------------------------------
 L7="${WORK}/case7"; mkdir -p "${L7}"
-out="$(run_up "${L7}" STUB_NEVER_BIND=1 RESIDENT_UP_HEALTH_TIMEOUT_S=3 --weights "${WEIGHTS}" --socket "${WORK}/case7.sock" -- echo should-not-run)"; rc=$?
+out="$(run_up "${L7}" BENCH_WORKER_TEST_NEVER_BIND=1 RESIDENT_UP_HEALTH_TIMEOUT_S=3 --weights "${WEIGHTS}" --socket "${WORK}/case7.sock" -- echo should-not-run)"; rc=$?
 if [[ "${rc}" -eq 1 && "${out}" == *"not healthy within 3s"* && "${out}" != *"should-not-run"* ]] && ! pgrep -f "case7.sock" >/dev/null; then
   pass "a resident that never binds fails on the health timeout and is torn down"
 else
@@ -265,12 +274,46 @@ fi
 
 # --- 8. a resident that ignores SIGTERM --------------------------------------
 L8="${WORK}/case8"; mkdir -p "${L8}"
-out="$(run_up "${L8}" STUB_IGNORE_TERM=1 RESIDENT_UP_HEALTH_TIMEOUT_S=30 --weights "${WEIGHTS}" --socket "${WORK}/case8.sock" -- true)"; rc=$?
+out="$(run_up "${L8}" BENCH_WORKER_TEST_IGNORE_TERM=1 RESIDENT_UP_HEALTH_TIMEOUT_S=30 --weights "${WEIGHTS}" --socket "${WORK}/case8.sock" -- true)"; rc=$?
 sleep 0.5
 if [[ "${rc}" -eq 0 && "${out}" == *"killing process group"* ]] && ! pgrep -f "case8.sock" >/dev/null; then
   pass "a resident that ignores SIGTERM is killed with its process group; nothing survives"
 else
   fail "SIGTERM escalation failed (rc ${rc}): ${out}; survivors: $(pgrep -fl case8.sock | tr '\n' ' ')"
+fi
+
+# --- 9. the resident environment is an allowlist ----------------------------
+L9="${WORK}/case9"
+mkdir -p "${L9}" "${WORK}/resident-env-home" "${WORK}/resident-env-tmp"
+ENV9="${L9}/resident-env"
+out="$(run_up "${L9}" \
+  HOME="${WORK}/resident-env-home" TMPDIR="${WORK}/resident-env-tmp" LANG=C LC_BRIEF24=kept \
+  BENCH_WORKER_TEST_ENV_FILE="${ENV9}" BENCH_WORKER_TEST_ALLOWED=kept MLX_TEST_ALLOWED=kept \
+  DARKBLOOM_NEMOTRON35_MTP_CAPTURE_VERIFY=0 CBV2_STEP_PROFILE=1 BENCH_VERBOSE=1 \
+  MLXFAST_OFFICIAL_BENCHMARK_RUN=secret MLXFAST_QWEN38_GOLDEN_DIR=/secret/goldens \
+  MLXFAST_BASELINE_WORKSPACE=/secret/baseline MLXFAST_BASELINE_CALIBRATION=/secret/calibration \
+  BENCHD_BIN_DIR=/secret/benchd BENCHD_TEST_SECRET=secret GITHUB_TEST_SECRET=secret RUNNER_TEST_SECRET=secret \
+  RESIDENT_UP_TEST_SECRET=secret \
+  --weights "${WEIGHTS}" --socket "${WORK}/case9.sock" -- true)"; rc=$?
+if [[ "${rc}" -eq 0 ]] \
+   && grep -qF "HOME=${WORK}/resident-env-home" "${ENV9}" \
+   && grep -qF "TMPDIR=${WORK}/resident-env-tmp/" "${ENV9}" \
+   && grep -qx 'LANG=C' "${ENV9}" \
+   && grep -qx 'LC_BRIEF24=kept' "${ENV9}" \
+   && grep -qx 'BENCH_WORKER_TEST_ALLOWED=kept' "${ENV9}" \
+   && grep -qx 'MLX_TEST_ALLOWED=kept' "${ENV9}" \
+   && grep -qx 'DARKBLOOM_NEMOTRON35_MTP_CAPTURE_VERIFY=0' "${ENV9}" \
+   && grep -qx 'CBV2_STEP_PROFILE=1' "${ENV9}" \
+   && grep -qx 'BENCH_VERBOSE=1' "${ENV9}"; then
+  pass "the resident keeps process basics and bench-worker/model runtime controls"
+else
+  fail "the resident lost an allowed environment variable (rc ${rc}): ${out}; env=$(cat "${ENV9}" 2>/dev/null | tr '\n' ' ')"
+fi
+if grep -Eq '^(MLXFAST_|BENCHD_|GITHUB_|RUNNER_|RESIDENT_UP_)' "${ENV9}" 2>/dev/null \
+   || ! awk -F= '$1 !~ /^(PATH|HOME|TMPDIR|LANG|LC_[A-Za-z0-9_]*|BENCH_WORKER_[A-Za-z0-9_]*|MLX_[A-Za-z0-9_]*|DARKBLOOM_[A-Za-z0-9_]*|CBV2_[A-Za-z0-9_]*|BENCH_VERBOSE|__CF_USER_TEXT_ENCODING)$/ { bad=1 } END { exit bad }' "${ENV9}"; then
+  fail "the resident received a variable outside the allowlist: $(cat "${ENV9}" 2>/dev/null | tr '\n' ' ')"
+else
+  pass "ranked flags, evaluator paths and runner state are absent from the resident environment"
 fi
 
 release_lock
@@ -330,6 +373,18 @@ if [[ "${rc}" -eq 2 && "${out}" == *"no command after '--'"* ]]; then pass "a mi
 out="$("${RESIDENT_UP}" -- true 2>&1)"; rc=$?
 if [[ "${rc}" -eq 2 && "${out}" == *"--weights <dir> is required"* ]]; then pass "a missing --weights refuses"; else fail "missing weights (rc ${rc}): ${out}"; fi
 
+# --- 17. the per-job log directory must stay inside the stable root ---------
+OUTSIDE_LOG="${WORK}/outside-log"
+LOG_ROOT="${WORK}/stable-log-root"
+mkdir -p "${OUTSIDE_LOG}" "${LOG_ROOT}"
+out="$(run_up "${OUTSIDE_LOG}" MLXFAST_RESIDENT_LOG_ROOT="${LOG_ROOT}" --weights "${WEIGHTS}" --socket "${WORK}/outside.sock" -- true)"; rc=$?
+if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (log-dir-outside-root)"* \
+   && "${out}" == *"outside MLXFAST_RESIDENT_LOG_ROOT"* ]]; then
+  pass "a RESIDENT_UP_LOG_DIR outside MLXFAST_RESIDENT_LOG_ROOT refuses by name"
+else
+  fail "an outside resident log directory was accepted (rc ${rc}): ${out}"
+fi
+
 
 # ===========================================================================
 # THE PER-LEG FORM: --boot / --stop.
@@ -369,11 +424,12 @@ run_leg() {
   local envs=()
   while [[ $# -gt 0 && "$1" == *=* ]]; do envs+=("$1"); shift; done
   env -u MLXFAST_ENGINE_BIN \
+    MLXFAST_RESIDENT_LOG_ROOT="${BOOT_LOG}" \
     RESIDENT_UP_LOG_DIR="${BOOT_LOG}" \
     RESIDENT_UP_LOCK_PATH="${LOCK}" \
     RESIDENT_UP_WIRED_LIMIT_READER="${WIRED_OK}" \
     RESIDENT_UP_HEALTH_TIMEOUT_S=30 \
-    STUB_ARGV_FILE="${BOOT_LOG}/stub-argv" \
+    BENCH_WORKER_TEST_ARGV_FILE="${BOOT_LOG}/stub-argv" \
     ${envs[@]+"${envs[@]}"} \
     "${TREE_UP}" "$@" 2>&1
 }
@@ -445,7 +501,30 @@ else
   fail "a second --stop was not a no-op (rc ${rc}): ${out}"
 fi
 
-# --- B7. a boot after a stop works: the box-wide scan sees a clean box -------
+# --- B7. a failed private-temp removal makes --stop fail --------------------
+FAIL_TMP="${WORK}/tmp.cleanup-fail"
+FAIL_SOCKET="${WORK}/cleanup-fail.sock"
+FAIL_RM_BIN="${WORK}/fail-rm-bin"
+mkdir -p "${FAIL_TMP}" "${FAIL_RM_BIN}"
+printf '%s\n' "${FAIL_TMP}" > "${FAIL_SOCKET}.tmpdir"
+cat > "${FAIL_RM_BIN}/rm" <<'SH'
+#!/bin/sh
+if [ "$1" = "-rf" ]; then
+  exit 73
+fi
+exec /bin/rm "$@"
+SH
+chmod +x "${FAIL_RM_BIN}/rm"
+out="$(run_leg PATH="${FAIL_RM_BIN}:${PATH}" --stop --socket "${FAIL_SOCKET}")"; rc=$?
+if [[ "${rc}" -eq 1 && "${out}" == *"temporary directory cleanup failed"* \
+   && -d "${FAIL_TMP}" && -f "${FAIL_SOCKET}.tmpdir" ]]; then
+  pass "--stop fails and keeps the tmpdir sidecar when private-temp removal fails"
+else
+  fail "--stop ignored a private-temp removal failure (rc ${rc}): ${out}"
+fi
+/bin/rm -rf "${FAIL_TMP}" "${FAIL_SOCKET}.tmpdir" "${FAIL_RM_BIN}"
+
+# --- B8. a boot after a stop works: the box-wide scan sees a clean box -------
 SOCKET_OUT2="${WORK}/leg2.socket"
 out="$(run_leg --boot --spec mtp --draft-len 4 --socket-out "${SOCKET_OUT2}")"; rc=$?
 boot2_socket="$(head -n 1 "${SOCKET_OUT2}" 2>/dev/null || true)"
@@ -456,7 +535,7 @@ else
 fi
 run_leg --stop --socket "${boot2_socket}" >/dev/null 2>&1
 
-# --- B8. a flag without a value refuses BY NAME ------------------------------
+# --- B9. a flag without a value refuses BY NAME ------------------------------
 for flag in --spec --draft-len --socket-out --socket; do
   out="$("${TREE_UP}" --boot "${flag}" 2>&1)"; rc=$?
   if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (bad-argument)"* && "${out}" == *"${flag} needs"* ]]; then
@@ -466,7 +545,7 @@ for flag in --spec --draft-len --socket-out --socket; do
   fi
 done
 
-# --- B9. --boot needs all three, and each refusal names the missing one ------
+# --- B10. --boot needs all three, and each refusal names the missing one -----
 out="$("${TREE_UP}" --boot --draft-len 0 --socket-out "${WORK}/x" 2>&1)"; rc=$?
 if [[ "${rc}" -eq 2 && "${out}" == *"--boot needs --spec"* ]]; then pass "--boot without --spec refuses by name"; else fail "--boot without --spec (rc ${rc}): ${out}"; fi
 out="$("${TREE_UP}" --boot --spec serial --socket-out "${WORK}/x" 2>&1)"; rc=$?
@@ -476,7 +555,7 @@ if [[ "${rc}" -eq 2 && "${out}" == *"--boot needs --socket-out"* ]]; then pass "
 out="$("${TREE_UP}" --stop 2>&1)"; rc=$?
 if [[ "${rc}" -eq 2 && "${out}" == *"--stop needs --socket"* ]]; then pass "--stop without --socket refuses by name"; else fail "--stop without --socket (rc ${rc}): ${out}"; fi
 
-# --- B10. spec and draft length must agree ----------------------------------
+# --- B11. spec and draft length must agree ----------------------------------
 out="$("${TREE_UP}" --boot --spec serial --draft-len 3 --socket-out "${WORK}/x" 2>&1)"; rc=$?
 if [[ "${rc}" -eq 2 && "${out}" == *"serial requires --draft-len 0"* ]]; then
   pass "--spec serial with a draft length refuses: a serial control leg drafts nothing"
@@ -496,10 +575,11 @@ else
   fail "an unknown --spec did not refuse (rc ${rc}): ${out}"
 fi
 
-# --- B11. the sandbox's temporary directory does not outlive the resident ----
+# --- B12. sandbox TMPDIR is outside logs and does not outlive the resident ---
 if [[ -x /usr/bin/sandbox-exec ]]; then
   SBT="${WORK}/sandbox-tree"
-  mkdir -p "${SBT}/tools" "${SBT}/.build/release" "${SBT}/weights"
+  SB_TMP_ROOT="${WORK}/sandbox-private"
+  mkdir -p "${SBT}/tools" "${SBT}/.build/release" "${SBT}/weights" "${SB_TMP_ROOT}"
   cp "${RESIDENT_UP}" "${ROOT_DIR}/tools/seatbelt-profile.py" "${SBT}/tools/"
   chmod +x "${SBT}/tools/resident-up.sh"
   # A framework build's bin/python3 starts Python.app with posix_spawn, which
@@ -508,7 +588,7 @@ if [[ -x /usr/bin/sandbox-exec ]]; then
   cat > "${SBT}/resident" <<'PY'
 import json, os, signal, socket, sys
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-if os.environ.get("STUB_DIE_BEFORE_BIND") == "1":
+if os.environ.get("BENCH_WORKER_TEST_DIE_BEFORE_BIND") == "1":
     sys.exit(3)
 path = sys.argv[sys.argv.index("--socket") + 1]
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -529,20 +609,25 @@ while True:
         conn.close()
 PY
   run_sandboxed() {
-    env -u MLXFAST_ENGINE_BIN -u RESIDENT_UP_LOG_DIR \
+    env -u MLXFAST_ENGINE_BIN -u RESIDENT_UP_LOG_DIR -u MLXFAST_RESIDENT_LOG_ROOT \
       RESIDENT_UP_SANDBOX=1 \
+      RUNNER_TEMP="${SB_TMP_ROOT}" \
       RESIDENT_UP_LOCK_PATH="${LOCK}" \
       RESIDENT_UP_WIRED_LIMIT_READER="${WIRED_OK}" \
       RESIDENT_UP_HEALTH_TIMEOUT_S=30 \
       "$@" 2>&1
   }
-  sb_tmp_dirs() { find "${SBT}/.build/resident" -maxdepth 1 -name 'tmp.*' 2>/dev/null; }
+  sb_tmp_dirs() { find "${SB_TMP_ROOT}" -maxdepth 1 -name 'tmp.*' 2>/dev/null; }
   out="$(run_sandboxed "${SBT}/tools/resident-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/sb.socket")"; rc=$?
   sb_socket="$(head -n 1 "${WORK}/sb.socket" 2>/dev/null || true)"
-  if [[ "${rc}" -eq 0 && -S "${sb_socket}" && -n "$(sb_tmp_dirs)" ]]; then
-    pass "--boot under sandbox-exec serves, with its tmp.* directory in <tree>/.build/resident"
+  sb_tmp="$(head -n 1 "${sb_socket}.tmpdir" 2>/dev/null || true)"
+  if [[ "${rc}" -eq 0 && -S "${sb_socket}" && -d "${sb_tmp}" \
+     && "${sb_tmp}" == "${SB_TMP_ROOT}/tmp."* \
+     && "${sb_tmp}" != "${SBT}/.build/resident/"* \
+     && "$(python3 -c 'import os,sys;print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))' "${sb_tmp}" 2>/dev/null)" == "700" ]]; then
+    pass "--boot uses a mode-0700 tmp.* directory outside RESIDENT_UP_LOG_DIR"
   else
-    fail "--boot under sandbox-exec did not serve (rc ${rc}, socket '${sb_socket}', tmp '$(sb_tmp_dirs)'): ${out}"
+    fail "--boot under sandbox-exec did not use a private sibling TMPDIR (rc ${rc}, socket '${sb_socket}', tmp '${sb_tmp}'): ${out}"
   fi
   out="$(run_sandboxed "${SBT}/tools/resident-up.sh" --stop --socket "${sb_socket}")"; rc=$?
   if [[ "${rc}" -eq 0 && -z "$(sb_tmp_dirs)" && ! -e "${sb_socket}.tmpdir" ]]; then
@@ -550,14 +635,35 @@ PY
   else
     fail "--stop left a tmp.* directory behind (rc ${rc}): $(sb_tmp_dirs | tr '\n' ' ') ${out}"
   fi
-  out="$(run_sandboxed STUB_DIE_BEFORE_BIND=1 "${SBT}/tools/resident-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/sb2.socket")"; rc=$?
+  out="$(run_sandboxed BENCH_WORKER_TEST_DIE_BEFORE_BIND=1 "${SBT}/tools/resident-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/sb2.socket")"; rc=$?
   if [[ "${rc}" -eq 1 && -z "$(sb_tmp_dirs)" ]]; then
     pass "a sandboxed boot that fails leaves no tmp.* directory behind"
   else
     fail "a failed sandboxed boot left a tmp.* directory behind (rc ${rc}): $(sb_tmp_dirs | tr '\n' ' ') ${out}"
   fi
+
+  WRAP_SOCKET="${WORK}/wrapper-cleanup.sock"
+  FAIL_WRAP_RM_BIN="${WORK}/fail-wrap-rm-bin"
+  mkdir -p "${FAIL_WRAP_RM_BIN}"
+  cat > "${FAIL_WRAP_RM_BIN}/rm" <<'SH'
+#!/bin/sh
+if [ "$1" = "-rf" ]; then
+  exit 73
+fi
+exec /bin/rm "$@"
+SH
+  chmod +x "${FAIL_WRAP_RM_BIN}/rm"
+  out="$(run_sandboxed PATH="${FAIL_WRAP_RM_BIN}:${PATH}" "${SBT}/tools/resident-up.sh" --weights "${SBT}/weights" --socket "${WRAP_SOCKET}" -- true)"; rc=$?
+  wrap_tmp="$(head -n 1 "${WRAP_SOCKET}.tmpdir" 2>/dev/null || true)"
+  if [[ "${rc}" -eq 1 && "${out}" == *"temporary directory"* \
+     && -n "${wrap_tmp}" && -d "${wrap_tmp}" && -f "${WRAP_SOCKET}.tmpdir" ]]; then
+    pass "a failed wrapper cleanup returns non-zero and keeps the tmpdir sidecar for retry"
+  else
+    fail "the wrapper ignored a private-temp cleanup failure (rc ${rc}, tmp '${wrap_tmp}'): ${out}"
+  fi
+  /bin/rm -rf "${wrap_tmp}" "${WRAP_SOCKET}.tmpdir" "${FAIL_WRAP_RM_BIN}"
 else
-  pass "case 15 skipped: no /usr/bin/sandbox-exec on this host"
+  pass "sandbox TMPDIR case skipped: no /usr/bin/sandbox-exec on this host"
 fi
 release_lock
 

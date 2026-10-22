@@ -29,16 +29,21 @@ fail() { failures=$((failures + 1)); echo "FAIL  $*" >&2; }
 
 # The canary evaluator paths. Every one exists, so a deny is observable.
 C="${WORK}/canary"
-mkdir -p "${C}/goldens" "${C}/benchd-bin" "${C}/baseline" "${C}/private" "${C}/runner/_work/repo"
+mkdir -p "${C}/goldens" "${C}/benchd-bin" "${C}/baseline" "${C}/private" \
+  "${C}/resident-root/job" "${C}/runner/_work/repo"
 printf '{"weight_map":{"a":"model.safetensors"}}\n' > "${C}/goldens/canary.golden.json"
 printf 'benchd\n' > "${C}/benchd-bin/benchd"
 printf '{}\n' > "${C}/calibration.json"
+printf 'private audit\n' > "${C}/private-audit.json"
 canary_env=(
   MLXFAST_QWEN38_GOLDEN_DIR="${C}/goldens"
   MLXFAST_BASELINE_WORKSPACE="${C}/baseline"
   MLXFAST_BASELINE_CALIBRATION="${C}/calibration.json"
   BENCHD_BIN_DIR="${C}/benchd-bin"
+  BENCHD_PRIVATE_AUDIT_PATH="${C}/private-audit.json"
   MLXFAST_PRIVATE_DIR="${C}/private"
+  MLXFAST_RESIDENT_LOG_ROOT="${C}/resident-root"
+  RESIDENT_UP_LOG_DIR="${C}/resident-root/job"
   RUNNER_WORKSPACE="${C}/runner/_work/repo"
 )
 
@@ -52,12 +57,14 @@ state_rules=(
   '(allow mach-lookup (global-name "com.apple.MTLCompilerService") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.opendirectoryd.membership") (global-name "com.apple.logd") (global-name "com.apple.diagnosticd"))'
 )
 profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" python3 "${GENERATOR}" \
-  --exec /bin/bash --tree "${WORK}/tree" --write-subpath "${WORK}/out" --write-prefix "${WORK}/.out." --official)"
+  --exec /bin/bash --tree "${WORK}/tree" --write-subpath "${WORK}/out" --write-prefix "${WORK}/.out." \
+  --unix-socket "${WORK}/resident.sock" --official)"
 rc=$?
 if [[ "${rc}" -ne 0 ]]; then
   fail "generator: exit ${rc} with every evaluator path set"
 else
   for path in "${C}/goldens" "${C}/baseline" "${C}/calibration.json" "${C}/benchd-bin" "${C}/private" \
+    "${C}/private-audit.json" "${C}/resident-root" \
     "${WORK}/home/.cache/mlxfast-engine-build" "${C}/runner/.runner" "${C}/runner/.credentials"; do
     grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" <<< "${profile}" \
       || fail "generator: no read and write deny for ${path}"
@@ -70,6 +77,10 @@ else
     || fail "generator: the output tree is not writable"
   grep -qF "(allow file-write* (regex #\"^${WORK//./\\.}/\\.out\\.\"))" <<< "${profile}" \
     || fail "generator: the staging prefix is not an escaped regex"
+  grep -qF "(allow network-bind network-inbound network-outbound (local unix-socket (path-literal \"${WORK}/resident.sock\")))" <<< "${profile}" \
+    || fail "generator: the resident socket has no local network allowance"
+  grep -qF "(allow file-write* (literal \"${WORK}/resident.sock\"))" <<< "${profile}" \
+    || fail "generator: the resident socket has no file-write allowance"
   [[ "$(tail -n 1 <<< "${profile}")" == "(deny file-read* file-write* "* ]] \
     || fail "generator: the evaluator denies are not the last rules"
   for rule in "(deny network*)" "(deny process-fork)" "(deny process-exec*)" "(deny file-write*)"; do
@@ -78,7 +89,15 @@ else
   for rule in "${state_rules[@]}"; do
     grep -Fxq "${rule}" <<< "${profile}" || fail "generator: non-build profile has no exact ${rule}"
   done
-  pass "generator: denies network, fork, foreign exec and all writes; allows the named tree and prefix; denies every evaluator path last"
+  pass "generator: denies network, fork, foreign exec and all writes; allows the named tree and prefix; denies every evaluator path and resident log root last"
+fi
+
+fallback_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" RESIDENT_UP_LOG_DIR="${C}/resident-root/job" \
+  python3 "${GENERATOR}" --exec /bin/bash --tree "${WORK}/tree")"
+if grep -qF "(deny file-read* file-write* (subpath \"${C}/resident-root/job\"))" <<< "${fallback_profile}"; then
+  pass "generator: RESIDENT_UP_LOG_DIR is the deny fallback when the stable root is unset"
+else
+  fail "generator: no resident log fallback deny when MLXFAST_RESIDENT_LOG_ROOT is unset"
 fi
 
 build_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" python3 "${GENERATOR}" \
@@ -157,6 +176,20 @@ else
     pass "wrapper: the CLI cannot read the same bytes in the golden directory (EPERM)"
   else
     fail "wrapper: the CLI read a canary golden: ${out}"
+  fi
+
+  default_resident_root="${REPO_ROOT}/.build/resident"
+  default_root_canary="${default_resident_root}/brief24b-canary-index.json"
+  mkdir -p "${default_resident_root}"
+  printf '{"weight_map":{"a":"must-not-read.safetensors"}}\n' > "${default_root_canary}"
+  out="$(env -i PATH="${PATH}" HOME="${WORK}/home" TMPDIR="${WORK}/tmp" \
+    MLXFAST_SWIFT_BIN="${CLI}" "${WRAPPER}" checkpoint-shards --index "${default_root_canary}" 2>&1)"
+  rc=$?
+  rm -f "${default_root_canary}"
+  if [[ "${rc}" -ne 0 && "${out}" == *"Operation not permitted"* ]]; then
+    pass "wrapper: with the root unset, the local default resident root is denied"
+  else
+    fail "wrapper: the default resident root was readable (rc ${rc}): ${out}"
   fi
 
   before="$(find "${C}/benchd-bin" -mindepth 1 | sort)"

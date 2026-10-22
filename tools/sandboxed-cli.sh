@@ -29,6 +29,10 @@
 #
 # Environment:
 #   MLXFAST_SWIFT_BIN   the CLI (default <repo>/.build/release/mlxfast-swift)
+#   MLXFAST_RESIDENT_LOG_ROOT  stable resident-log root denied to the CLI
+#                              (default ~/.mlxfast-resident-logs on a
+#                              self-hosted runner; <repo>/.build/resident
+#                              locally)
 #   An official run (RUNNER_ENVIRONMENT=self-hosted or
 #   MLXFAST_OFFICIAL_BENCHMARK_RUN=1) refuses when the runner environment does
 #   not name the evaluator-only paths.
@@ -104,6 +108,18 @@ SANDBOX_EXEC=/usr/bin/sandbox-exec
 CLI="${MLXFAST_SWIFT_BIN:-${REPO_ROOT}/.build/release/mlxfast-swift}"
 [[ -x "${CLI}" ]] || refuse "the CLI is not executable at ${CLI}; build it first"
 CLI="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${CLI}")"
+
+if [[ -z "${MLXFAST_RESIDENT_LOG_ROOT:-}" ]]; then
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+    [[ -n "${HOME:-}" ]] || refuse "HOME is unset; the self-hosted resident log root cannot be resolved"
+    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs"
+  else
+    MLXFAST_RESIDENT_LOG_ROOT="${REPO_ROOT}/.build/resident"
+  fi
+fi
+export MLXFAST_RESIDENT_LOG_ROOT
+mkdir -p "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse "could not create the resident log root ${MLXFAST_RESIDENT_LOG_ROOT}"
+chmod 700 "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse "could not set mode 0700 on the resident log root ${MLXFAST_RESIDENT_LOG_ROOT}"
 
 official=()
 if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
