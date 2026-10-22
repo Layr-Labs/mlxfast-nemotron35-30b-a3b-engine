@@ -213,7 +213,7 @@ jobs:
     #
     # WHY 360 STILL SUFFICES AT 16 PHASES, honestly stated: the 900 s ceiling is
     # NOT an operating point. A phase that actually burns 900 s means the box
-    # never reached the 40 C gate, which is itself the refusal condition -- that
+    # never reached the 50 C cool gate, which is itself the refusal condition -- that
     # run is rejected and retried on a clean box rather than proceeding. Sixteen
     # consecutive 900 s waits is not a slow run, it is a broken box, and it fails
     # rather than finishing at minute 359. Observed waits are 0-10 s, i.e. under
@@ -565,9 +565,9 @@ jobs:
         # challenger's and the same guarantee, which is the whole reason the
         # omission is safe to make permanent.
         #
-        # THE 40 C CONTRACT ITSELF IS NOT RE-IMPLEMENTED HERE. The challenger's
-        # fixed 40 C per-phase gate lives in its box-owned measure wrapper
-        # (:162, :2906); ours lives in the pinned benchd measure-job (GATE_TEMP=40,
+        # THE COOL-GATE CONTRACT ITSELF IS NOT RE-IMPLEMENTED HERE. The challenger's
+        # fixed per-phase gate lives in its box-owned measure wrapper
+        # (:162, :2906); ours lives in the pinned benchd measure-job (50 C on Mac/MLX,
         # COOL_TIMEOUT=900 -- mlxfast-bench crates/benchd/src/coolgate.rs and
         # measure_job.rs), which gates EVERY timed leg, baseline and candidate
         # alike. This step gets the machine to the starting line; benchd holds the
