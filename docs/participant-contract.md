@@ -215,6 +215,10 @@ platform decides whether a submission improves the current best.
 Calibration refuses to record a band when either coefficient of variation exceeds
 1 percent on prefill or decode.
 
+In a ranked run, the variance limit is the calibration health band (section
+5.3): every pair's control leg must fall inside it, or the run stops and writes
+no score (section 5.2).
+
 ### 5.2 Paired measurement
 
 The fixture sets `official_pairs = 3` and `official_pair_combine` to the
