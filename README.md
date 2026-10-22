@@ -28,7 +28,7 @@ in the same job. The ranked workflow targets the self-hosted labels declared in
 Use the Yukon CLI to clone the public track:
 
 ```bash
-yukon clone mlxfast-nemotron35-30b-a3b
+yukon clone GumbiiDigital/mlxfast-nemotron35-30b-a3b
 cd mlxfast-nemotron35-30b-a3b
 ```
 
