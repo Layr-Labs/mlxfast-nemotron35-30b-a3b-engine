@@ -293,7 +293,7 @@ Use Yukon for account and submission operations:
 
 ```bash
 export PATH="${HOME}/.local/bin:${PATH}"
-yukon login <api-key> --api <url>
+yukon login <api-key> --api https://api.yukon.org
 yukon setup
 yukon run
 yukon submit --model "<exact model name>" --note-file submission-note.md
