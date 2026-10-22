@@ -16,7 +16,7 @@
 #
 # This drop-in stands in, byte-for-byte on the observable shell contract, for the
 # Swift reference:
-#   ~/projects/layr-labs/mlxfast-challenge-dev/benchmark.sh
+#   the upstream mlxfast challenge harness benchmark.sh
 # (canonical, byte-identical across sibling checkouts). It does NOT re-implement the
 # reference's transform / sandbox / weights-staging / cool-gate-polling machinery —
 # `benchd iterate` owns the real run (spawns the MLX engine, runs correctness +

@@ -19,6 +19,7 @@ in the same job. The ranked workflow targets the self-hosted labels declared in
 - The Xcode Metal Toolchain
 - CMake
 - Git
+- jq (`/usr/bin/jq` on macOS 15 and later; otherwise `brew install jq`)
 - At least 45 GiB of free disk space before setup
 - Enough unified memory for the 18,544,229,436-byte checkpoint and its working
   set
