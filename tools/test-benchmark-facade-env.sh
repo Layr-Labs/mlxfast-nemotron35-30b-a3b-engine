@@ -67,9 +67,9 @@
 #   17. an empty live_goldens list is refused by name.
 #   18. a live golden with no timed_prompt_pool entry is refused by name.
 #   19. a declared depth with no oracle for one live golden is refused by name.
-#   20. with RESIDENT_UP_LOG_DIR unset, benchd gets a resident log directory
-#       in the job's temporary directory, outside both trees, because the
-#       ranked job account cannot write the reference workspace.
+#   20. with the resident paths unset, benchd gets a fresh job directory under
+#       the stable local root, and both paths are exported.
+#   20b. a self-hosted run defaults the stable root under HOME.
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -354,6 +354,7 @@ done
 printf '%s\n' "${BENCH_WORKER_RESIDENT_SOCKET-__UNSET__}" > "${STUB_CAPTURE_ENV}"
 printf '%s\n' "$@" > "${STUB_CAPTURE_ARGV}"
 printf '%s\n' "${RESIDENT_UP_LOG_DIR-__UNSET__}" > "${STUB_CAPTURE_ARGV}.resident-log-dir"
+printf '%s\n' "${MLXFAST_RESIDENT_LOG_ROOT-__UNSET__}" > "${STUB_CAPTURE_ARGV}.resident-log-root"
 echo '{}'
 exit 0
 MEASURESTUBEOF
@@ -432,6 +433,7 @@ run_measure() {
   local extra=()
   while [[ $# -gt 0 && "$1" == *=* ]]; do extra+=("$1"); shift; done
   env -u BENCH_WORKER_RESIDENT_SOCKET -u MLXFAST_QWEN_MTP_TRACK_ID -u RUNNER_NAME \
+    -u MLXFAST_RESIDENT_LOG_ROOT \
     STUB_CAPTURE_ENV="${WORK}/${case_name}.env" \
     STUB_CAPTURE_ARGV="${WORK}/${case_name}.argv" \
     STUB_ARGV_FILE="${WORK}/${case_name}.resident-argv" \
@@ -729,14 +731,28 @@ run_measure_with_contract case19 'del(.live_golden_speculative.mtp3[.live_golden
   "SPEC_DECLARATION_MANIFEST=${SPEC_MANIFEST}"
 expect_measure_refusal case19 "declared spec 'mtp3' has no live_golden_speculative entry for live golden '${LAST_LIVE}'"
 
-# Case 20: with no RESIDENT_UP_LOG_DIR, benchd gets one outside both trees.
-mkdir -p "${WORK}/case20-tmp"
-run_measure case20 "RESIDENT_UP_LOG_DIR=" "RUNNER_TEMP=" "TMPDIR=${WORK}/case20-tmp"
+# Case 20: the local default is a stable root with one fresh job directory.
+run_measure case20 "RESIDENT_UP_LOG_DIR="
 case20_dir="$(cat "${WORK}/case20.argv.resident-log-dir" 2>/dev/null)"
+case20_root="$(cat "${WORK}/case20.argv.resident-log-root" 2>/dev/null)"
 if [[ "${rc}" -ne 0 ]]; then
   fail "case 20: the measure script exited ${rc} with RESIDENT_UP_LOG_DIR unset; output: $(cat "${WORK}/case20.out")"
-elif [[ "${case20_dir}" != "${WORK}/case20-tmp/resident-up."* || ! -d "${case20_dir}" ]]; then
-  fail "case 20: benchd got RESIDENT_UP_LOG_DIR '${case20_dir}', not a new directory in the job's temporary directory"
+elif [[ "${case20_root}" != "${RES_ROOT}/.build/resident" \
+     || "${case20_dir}" != "${case20_root}/job."* || ! -d "${case20_dir}" \
+     || "$(python3 -c 'import os,sys;print(format(os.stat(sys.argv[1]).st_mode & 0o777, "o"))' "${case20_root}" 2>/dev/null)" != "700" ]]; then
+  fail "case 20: root '${case20_root}' or fresh job directory '${case20_dir}' is wrong"
+fi
+
+# Case 20b: the self-hosted default is the fixed private directory under HOME.
+mkdir -p "${WORK}/case20b-home"
+run_measure case20b "RUNNER_ENVIRONMENT=self-hosted" "HOME=${WORK}/case20b-home" "RESIDENT_UP_LOG_DIR="
+case20b_root="$(cat "${WORK}/case20b.argv.resident-log-root" 2>/dev/null)"
+case20b_dir="$(cat "${WORK}/case20b.argv.resident-log-dir" 2>/dev/null)"
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 20b: the self-hosted measure script exited ${rc}; output: $(cat "${WORK}/case20b.out")"
+elif [[ "${case20b_root}" != "${WORK}/case20b-home/.mlxfast-resident-logs" \
+     || "${case20b_dir}" != "${case20b_root}/job."* || ! -d "${case20b_dir}" ]]; then
+  fail "case 20b: self-hosted root '${case20b_root}' or job directory '${case20b_dir}' is wrong"
 fi
 
 # Case 21: a staged warm-up whose bytes do not match the fixture is refused

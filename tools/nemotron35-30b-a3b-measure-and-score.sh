@@ -730,17 +730,27 @@ else
   echo "nemotron35-30b-a3b-measure-and-score.sh: the declaration is serial; benchd sends no spec (depth 0)." >&2
 fi
 
-# THE RESIDENT LOG DIRECTORY IS OUTSIDE BOTH TREES. benchd boots each leg's
-# resident with that leg's own tools/resident-up.sh. That script keeps its
-# pidfile, identity file, log and sandbox profile in RESIDENT_UP_LOG_DIR, which
-# is <tree>/.build/resident by default. The ranked job account cannot write the
-# reference workspace, so the control leg must not write there. One directory
-# in this job's temporary directory serves both legs. The legs run one after
-# the other, inside the GPU lock that this script holds.
-if [[ -z "${RESIDENT_UP_LOG_DIR:-}" ]]; then
-  RESIDENT_UP_LOG_DIR="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/resident-up.XXXXXX")"
-  export RESIDENT_UP_LOG_DIR
+# THE RESIDENT LOG ROOT IS STABLE ACROSS JOBS. The sandbox denies this whole
+# root, so a resident cannot read retained logs from this job or an older one.
+# Each job gets one fresh directory inside it for both serial legs. The
+# resident's private TMPDIR remains outside this root.
+if [[ -z "${MLXFAST_RESIDENT_LOG_ROOT:-}" ]]; then
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+    [[ -n "${HOME:-}" ]] || {
+      echo "nemotron35-30b-a3b-measure-and-score.sh: HOME is unset; the self-hosted resident log root cannot be resolved." >&2
+      exit 1
+    }
+    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs"
+  else
+    MLXFAST_RESIDENT_LOG_ROOT="${SCRIPT_DIR}/.build/resident"
+  fi
 fi
+export MLXFAST_RESIDENT_LOG_ROOT
+mkdir -p "${MLXFAST_RESIDENT_LOG_ROOT}"
+chmod 700 "${MLXFAST_RESIDENT_LOG_ROOT}"
+RESIDENT_UP_LOG_DIR="$(mktemp -d "${MLXFAST_RESIDENT_LOG_ROOT%/}/job.XXXXXX")"
+chmod 700 "${RESIDENT_UP_LOG_DIR}"
+export RESIDENT_UP_LOG_DIR
 
 # --box, AND THE CONDITION IS INVERTED FROM THE OBVIOUS ONE. benchd lets
 # RUNNER_NAME win over the flag, so passing --box on a runner would be dead

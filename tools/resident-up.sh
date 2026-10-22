@@ -112,6 +112,8 @@
 #                                    attaching phase run ONE binary)
 #   RESIDENT_UP_LOG_DIR              pidfile, pgid file, identity file, resident
 #                                    log (default <repo>/.build/resident)
+#   MLXFAST_RESIDENT_LOG_ROOT        stable parent denied to participant code;
+#                                    RESIDENT_UP_LOG_DIR must be inside it
 #   RESIDENT_UP_LOCK_PATH            the GPU lock file (default
 #                                    /tmp/mtplx-gpu-exclusive.lock)
 #   RESIDENT_UP_HEALTH_TIMEOUT_S     ceiling on the load + first hello
@@ -126,10 +128,12 @@
 # THE RESIDENT RUNS UNDER sandbox-exec. It executes the tree's own model code,
 # and on the ranked box that is participant code. The profile denies every
 # file write except the resident's socket and a private temporary directory
-# under RESIDENT_UP_LOG_DIR (tmp.<pid>-<time>, mode 0700; every stop, failure
-# and signal removes it), denies network except its own Unix socket, denies
-# process-fork and every exec but the worker, and denies every read of the
-# evaluator-only paths the runner environment names: MLXFAST_QWEN38_GOLDEN_DIR,
+# under RUNNER_TEMP or TMPDIR (tmp.*, mode 0700; every stop, failure and signal
+# removes it), denies network except its own Unix socket, denies process-fork
+# and every exec but the worker, and denies every read of the evaluator-only
+# paths the runner environment names: MLXFAST_RESIDENT_LOG_ROOT (falling back
+# to RESIDENT_UP_LOG_DIR when the root is unset),
+# MLXFAST_QWEN38_GOLDEN_DIR,
 # MLXFAST_CORRECTNESS_GOLDEN_PATH, MLXFAST_PRIVATE_DIR,
 # MLXFAST_BASELINE_WORKSPACE (unless this tree is that workspace),
 # MLXFAST_BASELINE_CALIBRATION, BENCHD_BIN_DIR, the build cache root
@@ -212,18 +216,27 @@ if [[ "${MODE}" == "stop" ]]; then
       stopped="${stop_pid}"
     fi
   fi
-  # The resident's private temporary directory. It is mode 0700 and lives in
-  # the tree's .build/resident by default, so a directory left behind there
-  # is one that another account cannot list (ranked preflight 7a).
+  # The resident's private temporary directory. Only a tmp.* directory may be
+  # removed. Keep its sidecar when removal fails so a checked retry can find it.
   stop_tmpfile="${SOCKET_PATH}.tmpdir"
+  stop_tmp_cleanup_failed=0
   if [[ -r "${stop_tmpfile}" ]]; then
     stop_tmp="$(head -n 1 "${stop_tmpfile}")"
     case "${stop_tmp}" in
-      /*/tmp.*) rm -rf -- "${stop_tmp}" 2>/dev/null || true ;;
+      /*/tmp.*)
+        if ! rm -rf -- "${stop_tmp}" 2>/dev/null || [[ -e "${stop_tmp}" ]]; then
+          log "FAILED to remove the resident temporary directory ${stop_tmp}"
+          stop_tmp_cleanup_failed=1
+        fi
+        ;;
       *) log "ignoring ${stop_tmpfile}: '${stop_tmp}' is not a resident temporary directory" ;;
     esac
   fi
-  rm -f "${SOCKET_PATH}" "${stop_pidfile}" "${SOCKET_PATH}.ready" "${stop_tmpfile}" 2>/dev/null || true
+  rm -f "${SOCKET_PATH}" "${stop_pidfile}" "${SOCKET_PATH}.ready" 2>/dev/null || true
+  if [[ "${stop_tmp_cleanup_failed}" == "1" ]]; then
+    die "resident temporary directory cleanup failed; ${stop_tmpfile} was kept for retry"
+  fi
+  rm -f "${stop_tmpfile}" 2>/dev/null || true
   if [[ -n "${stopped}" ]]; then
     log "stopped the resident on ${SOCKET_PATH} (pid ${stopped}); socket, pid sidecar and ready marker removed"
   else
@@ -281,13 +294,31 @@ else
 fi
 [[ -x "${BENCH_WORKER}" ]] || refuse worker-missing "bench-worker is missing or not executable: ${BENCH_WORKER} (build and stage it: setup.sh, or swift build -c release --scratch-path .build-worker --product bench-worker && tools/stage-bench-worker.sh)"
 
-LOG_DIR="${RESIDENT_UP_LOG_DIR:-${SCRIPT_DIR}/.build/resident}"
 LOCK_PATH="${RESIDENT_UP_LOCK_PATH:-/tmp/mtplx-gpu-exclusive.lock}"
 HEALTH_TIMEOUT_S="${RESIDENT_UP_HEALTH_TIMEOUT_S:-5400}"
 [[ "${HEALTH_TIMEOUT_S}" =~ ^[1-9][0-9]*$ ]] || refuse bad-argument "RESIDENT_UP_HEALTH_TIMEOUT_S must be a positive integer (got '${HEALTH_TIMEOUT_S}')"
 WIRED_LIMIT_READER="${RESIDENT_UP_WIRED_LIMIT_READER:-sysctl -n iogpu.wired_limit_mb}"
 
-mkdir -p "${LOG_DIR}"
+if [[ -z "${MLXFAST_RESIDENT_LOG_ROOT:-}" ]]; then
+  if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" ]]; then
+    [[ -n "${HOME:-}" ]] || refuse log-root "HOME is unset; the self-hosted resident log root cannot be resolved"
+    MLXFAST_RESIDENT_LOG_ROOT="${HOME}/.mlxfast-resident-logs"
+  else
+    MLXFAST_RESIDENT_LOG_ROOT="${SCRIPT_DIR}/.build/resident"
+  fi
+fi
+export MLXFAST_RESIDENT_LOG_ROOT
+LOG_DIR="${RESIDENT_UP_LOG_DIR:-${MLXFAST_RESIDENT_LOG_ROOT}}"
+mkdir -p "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse log-root "could not create ${MLXFAST_RESIDENT_LOG_ROOT}"
+chmod 700 "${MLXFAST_RESIDENT_LOG_ROOT}" || refuse log-root "could not set mode 0700 on ${MLXFAST_RESIDENT_LOG_ROOT}"
+resolved_log_root="$(python3 -c 'import os, sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "${MLXFAST_RESIDENT_LOG_ROOT}")"
+resolved_log_dir="$(python3 -c 'import os, sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "${LOG_DIR}")"
+case "${resolved_log_dir}" in
+  "${resolved_log_root}"|"${resolved_log_root}"/*) : ;;
+  *) refuse log-dir-outside-root "RESIDENT_UP_LOG_DIR '${LOG_DIR}' is outside MLXFAST_RESIDENT_LOG_ROOT '${MLXFAST_RESIDENT_LOG_ROOT}'" ;;
+esac
+mkdir -p "${LOG_DIR}" || refuse log-dir "could not create ${LOG_DIR}"
+chmod 700 "${LOG_DIR}" || refuse log-dir "could not set mode 0700 on ${LOG_DIR}"
 RUN_TAG="$$-$(date -u +%Y%m%dT%H%M%SZ)"
 SOCKET_PATH="${SOCKET_PATH:-${TMPDIR:-/tmp}/bench-worker-resident.${RUN_TAG}.sock}"
 PIDFILE="${LOG_DIR}/resident.pid"
@@ -399,10 +430,19 @@ fi
 RESIDENT_PID=""
 RESIDENT_PGID=""
 RESIDENT_TMP_DIR=""
+RESIDENT_TMP_SIDECAR="${SOCKET_PATH}.tmpdir"
 BOOT_DONE=0
 
 remove_resident_tmp() {
-  [[ -z "${RESIDENT_TMP_DIR}" ]] || rm -rf -- "${RESIDENT_TMP_DIR}" 2>/dev/null || true
+  [[ -n "${RESIDENT_TMP_DIR}" ]] || return 0
+  if ! rm -rf -- "${RESIDENT_TMP_DIR}" 2>/dev/null || [[ -e "${RESIDENT_TMP_DIR}" ]]; then
+    log "FAILED to remove the resident temporary directory ${RESIDENT_TMP_DIR}; ${RESIDENT_TMP_SIDECAR} was kept for retry"
+    return 1
+  fi
+  rm -f -- "${RESIDENT_TMP_SIDECAR}" 2>/dev/null || {
+    log "FAILED to remove the resident temporary-directory sidecar ${RESIDENT_TMP_SIDECAR}"
+    return 1
+  }
 }
 
 group_members() { ps -o pid= -g "${RESIDENT_PGID}" 2>/dev/null | tr -d ' ' | grep -v '^$' || true; }
@@ -436,6 +476,14 @@ teardown() {
   rm -f "${SOCKET_PATH}" "${PIDFILE}" "${PGIDFILE}" 2>/dev/null || true
   remove_resident_tmp
 }
+wrapper_exit() {
+  local rc=$?
+  trap - EXIT
+  if ! teardown; then
+    rc=1
+  fi
+  exit "${rc}"
+}
 # THE TRAP IS THE WRAPPER FORM'S. A --boot deliberately EXITS with the resident
 # still running -- that is the whole contract -- so it must not tear down on
 # exit. Its failure paths call teardown explicitly instead, so a boot that never
@@ -443,15 +491,16 @@ teardown() {
 # resident's temporary directory, and only when the boot did not complete; on
 # a complete boot --stop removes it.
 if [[ "${MODE}" == "wrap" ]]; then
-  trap teardown EXIT
+  trap wrapper_exit EXIT
 else
-  trap '[[ "${BOOT_DONE}" == "1" ]] || remove_resident_tmp' EXIT
+  trap '[[ "${BOOT_DONE}" == "1" ]] || remove_resident_tmp || exit 1' EXIT
 fi
 trap 'exit 130' INT TERM
 
 # --- the resident's sandbox ----------------------------------------------------
-# See the header. The profile and the resident's private TMPDIR live under
-# LOG_DIR (RESIDENT_UP_LOG_DIR, default <tree>/.build/resident).
+# See the header. The profile lives under LOG_DIR. The resident's private
+# TMPDIR is a sibling tmp.* directory under RUNNER_TEMP or TMPDIR, outside the
+# denied log tree.
 RESIDENT_SANDBOX="${RESIDENT_UP_SANDBOX:-1}"
 case "${RESIDENT_SANDBOX}" in
   1) : ;;
@@ -466,8 +515,12 @@ esac
 RESIDENT_LAUNCH=()
 if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
   [[ -x /usr/bin/sandbox-exec ]] || refuse sandbox-missing "/usr/bin/sandbox-exec is not available; the resident must run under it. Nothing has been loaded."
-  RESIDENT_TMP_DIR="${LOG_DIR}/tmp.${RUN_TAG}"
-  mkdir -m 700 "${RESIDENT_TMP_DIR}"
+  RESIDENT_TMP_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+  [[ -d "${RESIDENT_TMP_ROOT}" ]] || refuse sandbox-tmp "the resident temporary root is missing: ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
+  RESIDENT_TMP_DIR="$(mktemp -d "${RESIDENT_TMP_ROOT%/}/tmp.resident-up.XXXXXX")" \
+    || refuse sandbox-tmp "could not create a private resident temporary directory under ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
+  chmod 700 "${RESIDENT_TMP_DIR}"
+  printf '%s\n' "${RESIDENT_TMP_DIR}" > "${RESIDENT_TMP_SIDECAR}"
   RESIDENT_PROFILE="${LOG_DIR}/resident.${RUN_TAG}.sb"
   # The profile rules live in one place, tools/seatbelt-profile.py, which the
   # transform wrapper (tools/sandboxed-cli.sh) also uses.
@@ -475,7 +528,7 @@ if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
   # refuses when the environment does not name a path that the profile denies.
   RESIDENT_PROFILE_MODE=()
   [[ "${RUNNER_ENVIRONMENT:-}" != "self-hosted" ]] || RESIDENT_PROFILE_MODE=(--official)
-  python3 "${SCRIPT_DIR}/tools/seatbelt-profile.py" "${RESIDENT_PROFILE_MODE[@]+"${RESIDENT_PROFILE_MODE[@]}"}" \
+  RESIDENT_UP_LOG_DIR="${LOG_DIR}" python3 "${SCRIPT_DIR}/tools/seatbelt-profile.py" "${RESIDENT_PROFILE_MODE[@]+"${RESIDENT_PROFILE_MODE[@]}"}" \
     --exec "${BENCH_WORKER}" --tree "${SCRIPT_DIR}" \
     --write-subpath "${RESIDENT_TMP_DIR}" --unix-socket "${SOCKET_PATH}" > "${RESIDENT_PROFILE}" \
     || refuse sandbox-profile "could not write the resident sandbox profile ${RESIDENT_PROFILE}. Nothing has been loaded."
@@ -495,10 +548,20 @@ fi
 # Under the sandbox the argv is `sandbox-exec -f <profile> <worker> resident ...`;
 # sandbox-exec applies the profile and then execs the worker in the same
 # process, so the pid and the process group stay the resident's.
-RESIDENT_ENV=()
-if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
-  RESIDENT_ENV=(env "TMPDIR=${RESIDENT_TMP_DIR}/")
-fi
+resident_tmpdir="${TMPDIR:-/tmp}"
+[[ -z "${RESIDENT_TMP_DIR}" ]] || resident_tmpdir="${RESIDENT_TMP_DIR}"
+# The resident gets only process basics plus engine/runtime knobs. In
+# particular, no MLXFAST_ evaluator paths and no BENCHD_, GITHUB_ or RUNNER_
+# runner state cross the participant-code boundary.
+RESIDENT_ENV=(env -i "PATH=${PATH}" "HOME=${HOME:-}" "TMPDIR=${resident_tmpdir%/}/")
+while IFS='=' read -r resident_env_name _; do
+  [[ "${resident_env_name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+  case "${resident_env_name}" in
+    LANG|LC_*|BENCH_WORKER_*|MLX_*|DARKBLOOM_*|CBV2_*|BENCH_VERBOSE)
+      RESIDENT_ENV+=("${resident_env_name}=${!resident_env_name}")
+      ;;
+  esac
+done < <(env)
 "${RESIDENT_ENV[@]+"${RESIDENT_ENV[@]}"}" python3 - "${RESIDENT_LAUNCH[@]+"${RESIDENT_LAUNCH[@]}"}" "${BENCH_WORKER}" resident \
   --weights "${WEIGHTS_DIR}" \
   --speculative-protocol v1.1 \
@@ -567,7 +630,6 @@ if [[ "${MODE}" == "boot" ]]; then
   printf '%s\n' "${SOCKET_PATH}" > "${SOCKET_OUT}"
   printf '%s\n' "${RESIDENT_PID}" > "${SOCKET_PATH}.pid"
   printf '%s %s %s\n' "${SPEC}" "${DRAFT_LEN}" "${RESIDENT_PID}" > "${SOCKET_PATH}.ready"
-  [[ -z "${RESIDENT_TMP_DIR}" ]] || printf '%s\n' "${RESIDENT_TMP_DIR}" > "${SOCKET_PATH}.tmpdir"
   BOOT_DONE=1
   log "boot complete: ${SPEC} leg resident pid ${RESIDENT_PID} on ${SOCKET_PATH}; socket written to ${SOCKET_OUT}. Stop it with: tools/resident-up.sh --stop --socket ${SOCKET_PATH}"
   exit 0
