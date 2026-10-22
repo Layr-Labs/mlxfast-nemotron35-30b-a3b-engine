@@ -43,10 +43,12 @@ engine upstream revision.
 `benchmark.json` lists every editable path. The groups are:
 
 1. the MTP declaration;
-2. the offline transform;
-3. the listed Nemotron model files;
-4. the listed batching, cache, attention, RoPE, and server files;
-5. the listed MLX and Metal kernels.
+2. the listed Nemotron model files;
+3. the listed batching, cache, attention, RoPE, and server files;
+4. the listed MLX and Metal kernels.
+
+The manifest lists 93 editable entries. The offline transform is trusted. A
+ranked run copies transformed weights from the pinned reference workspace.
 
 The manifest declares a 7,949,663-byte total cap, a 524,288-byte per-file cap,
 and a 262,144-byte growth cap. No path is exempt.
@@ -72,18 +74,24 @@ composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75
 
 It measures three pairs and takes the arithmetic mean of the three per-pair
 composites. Each pair has a serial control leg and a candidate leg. Both legs
-run on the same machine.
+run on the same machine. Both legs use one live prompt for timed prefill and the
+next live prompt for decode.
 
 The public measured-window dimensions are:
 
 - one stream
 - 488 seed tokens
 - 128 checked decode steps
-- one prompt per leg
+- two timed prompt roles per leg: one for prefill and one for decode
+- one separate warm-up prompt that is never scored
+
+Decode seconds per token includes the seed window. The fixture caps decode
+speedup at 5.0, prefill speedup at 1.5, and the seed-window ratio at 1.40.
+Ceiling failures refuse the pair instead of clamping its score.
 
 The fixture is the authority for the live pool. It currently names
 `pool-14`, `pool-15`, and `pool-16` and publishes the SHA-256 and byte count
-for each pinned artifact.
+for each pinned artifact. It pins `pool-17` for warm-up only.
 
 The cached values documented in
 [benchmark-window-freeze.md](benchmark-window-freeze.md) are local diagnostics

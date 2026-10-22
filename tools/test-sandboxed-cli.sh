@@ -43,6 +43,14 @@ canary_env=(
 )
 
 # --- part 1: the profile generator -------------------------------------------
+state_rules=(
+  "(deny ipc-posix-shm*)"
+  "(deny ipc-sysv*)"
+  "(deny ipc-posix-sem*)"
+  "(deny user-preference-write)"
+  "(deny mach-lookup)"
+  '(allow mach-lookup (global-name "com.apple.MTLCompilerService") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.opendirectoryd.membership") (global-name "com.apple.logd") (global-name "com.apple.diagnosticd"))'
+)
 profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" python3 "${GENERATOR}" \
   --exec /bin/bash --tree "${WORK}/tree" --write-subpath "${WORK}/out" --write-prefix "${WORK}/.out." --official)"
 rc=$?
@@ -67,8 +75,20 @@ else
   for rule in "(deny network*)" "(deny process-fork)" "(deny process-exec*)" "(deny file-write*)"; do
     grep -qF "${rule}" <<< "${profile}" || fail "generator: no ${rule}"
   done
+  for rule in "${state_rules[@]}"; do
+    grep -Fxq "${rule}" <<< "${profile}" || fail "generator: non-build profile has no exact ${rule}"
+  done
   pass "generator: denies network, fork, foreign exec and all writes; allows the named tree and prefix; denies every evaluator path last"
 fi
+
+build_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" python3 "${GENERATOR}" \
+  --build --tree "${WORK}/tree")"
+for rule in "${state_rules[@]}"; do
+  if grep -Fxq "${rule}" <<< "${build_profile}"; then
+    fail "generator: build profile contains non-build rule ${rule}"
+  fi
+done
+pass "generator: the six non-build state rules are absent from --build"
 
 out="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" BENCHD_BIN_DIR= \
   python3 "${GENERATOR}" --exec /bin/bash --official 2>&1)"

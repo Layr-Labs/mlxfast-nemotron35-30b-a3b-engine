@@ -196,6 +196,8 @@ c.pop("official_baseline", None)
 c["mlx_swift_lm_revision"] = "${FORK_SHA}"
 c["live_goldens"] = []
 c["timed_prompt_pool"] = []
+c.pop("warmup_golden", None)
+c.pop("decode_golden_offset", None)
 c["hidden_correctness_golden"] = {"sha256": "${SENTINEL}", "bytes": 0}
 c["live_golden_speculative"] = {}
 

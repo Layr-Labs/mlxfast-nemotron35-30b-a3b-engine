@@ -318,9 +318,11 @@ fi
 ALL_KEY_A="correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/all-pool-a.golden.json"
 ALL_KEY_B="correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/all-pool-b.golden.json"
 ALL_KEY_C="correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/all-oracle-mtp1.golden.json"
+ALL_KEY_D="correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/all-warmup.golden.json"
 printf '{"version":1,"case":"all-pool-a"}\n' > "${WORK}/bucket/${ALL_KEY_A}"
 printf '{"version":1,"case":"all-pool-b"}\n' > "${WORK}/bucket/${ALL_KEY_B}"
 printf '{"version":1,"case":"all-oracle-mtp1"}\n' > "${WORK}/bucket/${ALL_KEY_C}"
+printf '{"version":1,"case":"all-warmup"}\n' > "${WORK}/bucket/${ALL_KEY_D}"
 
 pin_sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 pin_bytes() { wc -c < "$1" | tr -d '[:space:]'; }
@@ -328,6 +330,7 @@ pin_bytes() { wc -c < "$1" | tr -d '[:space:]'; }
 A_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_A}")"; A_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_A}")"
 B_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_B}")"; B_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_B}")"
 C_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_C}")"; C_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_C}")"
+D_SHA="$(pin_sha "${WORK}/bucket/${ALL_KEY_D}")"; D_BYTES="$(pin_bytes "${WORK}/bucket/${ALL_KEY_D}")"
 
 # write_all_contract PATH B_BYTES -- the second tape's byte pin is a parameter
 # so the truncation case can make exactly one thing wrong.
@@ -341,6 +344,7 @@ write_all_contract() {
   "live_golden_speculative": {
     "mtp1": {"all-pool-a": {"r2_path": "${ALL_KEY_C}", "sha256": "${C_SHA}", "bytes": ${C_BYTES}}}
   },
+  "warmup_golden": {"r2_path": "${ALL_KEY_D}", "sha256": "${D_SHA}", "bytes": ${D_BYTES}},
   "hidden_correctness_golden": {"sha256": "${A_SHA}", "bytes": ${A_BYTES}}
 }
 ALLJSON
@@ -372,7 +376,7 @@ if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
    "${WORK}/allrepo/tools/fetch-goldens-loopback.sh" --all --out "${ALL_OUT}" \
    >"${WORK}/case11.log" 2>&1; then
   ok11=1
-  for want in all-pool-a.golden.json all-pool-b.golden.json all-oracle-mtp1.golden.json; do
+  for want in all-pool-a.golden.json all-pool-b.golden.json all-oracle-mtp1.golden.json all-warmup.golden.json; do
     [[ -f "${ALL_OUT}/${want}" ]] || { fail "case 11: ${want} was not staged"; ok11=0; }
   done
   [[ "$(pin_sha "${ALL_OUT}/all-pool-a.golden.json")" == "${A_SHA}" ]] \
@@ -380,13 +384,14 @@ if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
   # No .partial may survive a successful run, and the staged files are read-only.
   compgen -G "${ALL_OUT}/*.partial" >/dev/null \
     && { fail "case 11: a .partial file survived a successful run"; ok11=0; }
+  # shellcheck disable=SC2012  # exact, fixed test filename; mode text is the assertion
   perms="$(ls -l "${ALL_OUT}/all-pool-a.golden.json" | cut -c2-10)"
   [[ "${perms}" == "r--r--r--" ]] \
     || { fail "case 11: staged golden is ${perms}, expected r--r--r-- (0444)"; ok11=0; }
   grep -q "hidden_correctness_golden resolves to all-pool-a.golden.json" "${WORK}/case11.log" \
     || { fail "case 11: the digest-only hidden oracle was not resolved among the staged files"; ok11=0; }
-  grep -q "staged 3 object(s)" "${WORK}/case11.log" \
-    || { fail "case 11: the run did not report 3 staged objects"; ok11=0; }
+  grep -q "staged 4 object(s)" "${WORK}/case11.log" \
+    || { fail "case 11: the run did not report 4 staged objects"; ok11=0; }
   [[ "${ok11}" == "1" ]] && pass "--all staged the whole pinned set, verified it, and resolved the hidden oracle"
 else
   fail "case 11: --all refused a healthy set ($(tail -3 "${WORK}/case11.log"))"
@@ -404,7 +409,7 @@ if R2_BUCKET_ENDPOINT="${ENDPOINT}" \
   after="$(shasum -a 256 "${ALL_OUT}"/*.json | shasum -a 256 | awk '{print $1}')"
   if [[ "${before}" != "${after}" ]]; then
     fail "case 12: the second run changed the staged files"
-  elif ! grep -q "staged 0 object(s), kept 3" "${WORK}/case12.log"; then
+  elif ! grep -q "staged 0 object(s), kept 4" "${WORK}/case12.log"; then
     fail "case 12: the second run did not report every file as already staged ($(tail -2 "${WORK}/case12.log"))"
   else
     pass "a second --all run fetched nothing and left the staged set untouched"

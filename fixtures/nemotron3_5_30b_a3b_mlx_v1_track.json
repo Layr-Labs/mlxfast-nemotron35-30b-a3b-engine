@@ -19,6 +19,12 @@
   "scored_batch_size": 1,
   "decode_speedup_floor": 0.95,
   "prefill_speedup_floor": 0.95,
+  "decode_speedup_ceiling": 5.0,
+  "prefill_speedup_ceiling": 1.5,
+  "seed_window_max_ratio": 1.4,
+  "require_private_dir": true,
+  "decode_golden_offset": 1,
+  "decode_window_includes_seed": true,
   "scores_against_live_control_leg": true,
   "paired_flow_retired": true,
   "prefill_band_up_tolerance": 0.05,
@@ -46,6 +52,11 @@
     "pool-15",
     "pool-16"
   ],
+  "warmup_golden": {
+    "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-17.golden.json",
+    "sha256": "e9faf75ca8c8fee0e389aa17ce047dcfeef7684c7559e3ea73ac2a254340c2e1",
+    "bytes": 31378
+  },
   "timed_prompt_pool": [
     {
       "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
@@ -232,7 +243,7 @@
   },
   "scoring_semantics": {
     "ruling_date": "2026-08-27",
-    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75, computed per pair. Per pair: gain = serial-control leg seconds per token / candidate leg seconds per token on the same prompt, for prefill and for the decode window separately (serial-anchored -- a faster candidate scores > 1). The run score is the arithmetic mean of the per-pair composites over official_pairs (official_pair_combine = mean)."
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75, computed per pair. Per pair: gain = serial-control leg seconds per token / candidate leg seconds per token for prefill and for decode including the seed window (serial-anchored -- a faster candidate scores > 1). Timed prefill and decode use different live prompts. The run score is the arithmetic mean of the per-pair composites over official_pairs (official_pair_combine = mean)."
   },
   "license": {
     "spdx": "other",

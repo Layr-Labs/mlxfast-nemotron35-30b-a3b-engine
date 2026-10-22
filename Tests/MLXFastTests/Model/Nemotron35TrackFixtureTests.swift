@@ -148,6 +148,28 @@ struct Nemotron35TrackFixtureTests {
         #expect(object["scored_batch_size"] as? Int == 1)
     }
 
+    @Test("anti-cheat guards and warm-up golden are pinned")
+    func antiCheatGuardsAndWarmupGoldenArePinned() throws {
+        let object = try nemotron35TrackContractObject()
+        #expect(object["decode_speedup_ceiling"] as? Double == 5.0)
+        #expect(object["prefill_speedup_ceiling"] as? Double == 1.5)
+        #expect(object["seed_window_max_ratio"] as? Double == 1.40)
+        #expect(object["require_private_dir"] as? Bool == true)
+        #expect(object["decode_golden_offset"] as? Int == 1)
+        #expect(object["decode_window_includes_seed"] as? Bool == true)
+        #expect(object["official_prefill_timed_runs"] == nil)
+
+        let warmup = try #require(object["warmup_golden"] as? [String: Any])
+        #expect(
+            warmup["r2_path"] as? String
+                == "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-17.golden.json")
+        #expect(
+            warmup["sha256"] as? String
+                == "e9faf75ca8c8fee0e389aa17ce047dcfeef7684c7559e3ea73ac2a254340c2e1")
+        #expect(warmup["bytes"] as? Int == 31_378)
+        #expect(warmup.count == 3)
+    }
+
     @Test("scored_exponents equals the ruled certify pair, exact field names")
     func scoredExponentsMatchesRuledPair() throws {
         let object = try nemotron35TrackContractObject()

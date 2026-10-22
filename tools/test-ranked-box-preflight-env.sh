@@ -131,6 +131,9 @@ else:
     for per_prompt in (contract.get("live_golden_speculative") or {}).values():
         for spec_entry in per_prompt.values():
             spec_entry["sha256"], spec_entry["bytes"] = stage(spec_entry["r2_path"])
+if contract.get("warmup_golden"):
+    warmup = contract["warmup_golden"]
+    warmup["sha256"], warmup["bytes"] = stage(warmup["r2_path"])
 # Armed in both shapes: a fixture that pins its goldens but does not score yet
 # is unarmed too, and every check after section 5 is unreachable on it.
 contract["official_scoring_enabled"] = True
@@ -267,7 +270,19 @@ elif ! grep -q "baseline calibration parses and names this track, this box" "${W
   fail "case 1 (healthy box): the calibration check did not run against RUNNER_NAME"
 elif ! grep -q "reference workspace carries its own transformed weights" "${WORK}/out"; then
   fail "case 1 (healthy box): the reference-weights check did not run"
+elif ! grep -q "warm-up golden .* matches its contract pin" "${WORK}/out"; then
+  fail "case 1 (healthy box): the pinned warm-up golden was not accepted"
 fi
+
+# --- case 1b: a staged filename may not be a symlink outside the pool -------
+escape_name="$(jq -r '.timed_prompt_pool[0].r2_path | split("/")[-1]' \
+  "${ROOT}/fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json")"
+mv "${GOLDEN_DIR}/${escape_name}" "${WORK}/${escape_name}"
+ln -s "${WORK}/${escape_name}" "${GOLDEN_DIR}/${escape_name}"
+expect_refusal "case 1b (golden final-file symlink escape)" \
+  "outside canonical MLXFAST_QWEN38_GOLDEN_DIR"
+rm "${GOLDEN_DIR}/${escape_name}"
+mv "${WORK}/${escape_name}" "${GOLDEN_DIR}/${escape_name}"
 
 # --- cases 2-3: the two names are required ---------------------------------
 run_preflight_unset() {
@@ -333,8 +348,8 @@ expect_refusal "case 8 (no fingerprint sidecar)" "no fingerprint sidecar"
 mv "${WORK}/fingerprint.hidden" "${REF_WS}/.build/release/mlx.metallib.fingerprint"
 
 # --- case 8b: the reference tree must carry its own transformed weights -----
-# Borrowing the candidate's transform would put a submission on both sides of
-# the ratio, so an untransformed reference tree is a refusal, not a fallback.
+# Borrowing the candidate workspace's weights would put one tree on both sides
+# of the ratio, so an untransformed reference tree is a refusal, not a fallback.
 mv "${REF_WS}/weights/config.json" "${WORK}/weights-config.hidden"
 expect_refusal "case 8b (no reference weights)" "no transformed weights"
 mv "${WORK}/weights-config.hidden" "${REF_WS}/weights/config.json"
@@ -351,8 +366,8 @@ expect_refusal "case 10 (wrong version)" "version is 4" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.version = 2'
-expect_refusal "case 10b (a version 2 file recorded the whole window as decode)" \
-  "decode is now the decode window only (decode-run time / N)" \
+expect_refusal "case 10b (legacy version 2 file)" \
+  "do not bind the current fixture guards" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.track_id = "some-other-track-mlx-v9"'
@@ -380,7 +395,7 @@ expect_refusal "case 15b (a live prompt has no entry)" "has no entry for live pr
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
 write_calibration "${BAD}" '.version = 1 | . + .prompts[0] | del(.prompts)'
-expect_refusal "case 15c (a version 1 file recorded the whole window as decode)" \
+expect_refusal "case 15c (legacy version 1 file)" \
   "Recalibrate this box" \
   "MLXFAST_BASELINE_CALIBRATION=${BAD}"
 
@@ -661,9 +676,32 @@ elif ! grep -q "timed pool armed: ${pool_size} pinned tapes" "${WORK}/out"; then
   fail "case 39 (pool of ${pool_size}): the pass line does not state the pool size"
 fi
 
+# Case 40: a file not named by a live/oracle/warm-up pin is refused.
+case_root="${WORK}/case40"
+mkdir -p "${case_root}/tools" "${case_root}/fixtures" "${case_root}/goldens"
+cp "${ROOT}/tools/ranked-box-preflight.sh" "${case_root}/tools/"
+chmod +x "${case_root}/tools/ranked-box-preflight.sh"
+cp "${ROOT}/fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json" "${case_root}/fixtures/"
+cp "${GOLDEN_DIR}"/*.json "${case_root}/goldens/"
+printf '{}\n' > "${case_root}/goldens/unknown-extra.json"
+env -i PATH="${PATH}" HOME="${HOME}" \
+  MACMON_STUB_COUNTER="${WORK}/macmon.counter" \
+  MLXFAST_MACMON="${MACMON}" \
+  MLXFAST_QWEN38_GOLDEN_DIR="${case_root}/goldens" \
+  RUNNER_NAME="${BOX_NAME}" \
+  MLXFAST_BASELINE_WORKSPACE="${REF_WS}" \
+  MLXFAST_BASELINE_CALIBRATION="${CALIBRATION}" \
+  "${case_root}/tools/ranked-box-preflight.sh" > "${WORK}/out" 2>&1
+rc=$?
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 40 (unknown extra): the preflight accepted an unpinned JSON file"
+elif ! grep -q "not in the pinned live/oracle/warm-up set: unknown-extra.json" "${WORK}/out"; then
+  fail "case 40 (unknown extra): the refusal did not name the extra file: $(tail -3 "${WORK}/out" | tr '\n' ' ')"
+fi
+
 
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-ranked-box-preflight-env.sh: all 37 cases passed"
+  echo "test-ranked-box-preflight-env.sh: all cases passed, including warm-up and unknown-extra checks"
   exit 0
 fi
 echo "test-ranked-box-preflight-env.sh: ${failures} case(s) failed" >&2

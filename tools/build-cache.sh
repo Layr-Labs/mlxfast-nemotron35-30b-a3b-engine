@@ -2,7 +2,7 @@
 # build-cache.sh -- keep the ranked job's worker build between dispatches.
 #
 # WHY. actions/checkout cleans the workspace, so every ranked dispatch rebuilt
-# bench-worker, the trusted CLI and (with Xcode) mlx.metallib from cold: minutes
+# bench-worker and (with Xcode) mlx.metallib from cold: minutes
 # of the job that measure nothing. The build is a pure function of the tracked
 # sources (the vendored engine fork included), the resolved packages, the
 # vendored Metal sources
@@ -30,7 +30,6 @@ ARTEFACTS=(
   ".build-worker/release/bench-worker"
   ".build-worker/release/mlx.metallib"
   ".build-worker/release/mlx.metallib.fingerprint"
-  ".build/release/mlxfast-swift"
 )
 sha256_of_file() { shasum -a 256 -- "$1" | cut -d ' ' -f 1; }
 sha256_of_stdin() { shasum -a 256 | cut -d ' ' -f 1; }

@@ -59,9 +59,9 @@
 #   MLXFAST_BASELINE_WORKSPACE   the built reference tree the control leg runs
 #                                 on. Required; there is no default, because a
 #                                 guessed tree is a different denominator.
-#   MLXFAST_QWEN38_GOLDEN_DIR    the staged golden pool. Each live golden is
-#                                 resolved from it as <name>.golden.json,
-#                                 exactly as the ranked path resolves it.
+#   MLXFAST_QWEN38_GOLDEN_DIR    the staged live and warm-up goldens. Each path
+#                                 is resolved from the fixture exactly as the
+#                                 ranked path resolves it.
 #   BENCHD_BIN_DIR               where tools/fetch-benchd.sh keeps the pinned
 #                                 binary and its benchd.manifest.json. The
 #                                 manifest's `source_commit` is recorded in the
@@ -150,6 +150,11 @@ done < <(jq -r '(.live_goldens // [])[]' "${CONTRACT}")
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
 [[ -n "${GOLDEN_DIR}" ]] \
   || die "MLXFAST_QWEN38_GOLDEN_DIR is unset; the live goldens are staged on the box out of band and this script fetches nothing"
+[[ -d "${GOLDEN_DIR}" ]] || die "MLXFAST_QWEN38_GOLDEN_DIR is not a directory: ${GOLDEN_DIR}"
+if [[ -z "${MLXFAST_PRIVATE_DIR:-}" ]]; then
+  MLXFAST_PRIVATE_DIR="$(cd "${GOLDEN_DIR}" && pwd -P)"
+fi
+export MLXFAST_PRIVATE_DIR
 GOLDEN_ARGS=()
 for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   [[ -f "${GOLDEN_DIR}/${name}.golden.json" ]] \
@@ -157,12 +162,54 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   GOLDEN_ARGS+=(--golden "${GOLDEN_DIR}/${name}.golden.json" --prompt "${name}")
 done
 
+WARMUP_ARGS=()
+warmup_entry="$(jq -c '.warmup_golden // empty' "${CONTRACT}")"
+if [[ -n "${warmup_entry}" && "${warmup_entry}" != "null" ]]; then
+  warmup_r2_path="$(printf '%s' "${warmup_entry}" | jq -r '.r2_path // empty')"
+  warmup_base="${warmup_r2_path##*/}"
+  warmup_sha="$(printf '%s' "${warmup_entry}" | jq -r '.sha256 // empty')"
+  warmup_bytes="$(printf '%s' "${warmup_entry}" | jq -r '.bytes // empty')"
+  [[ -n "${warmup_r2_path}" && -n "${warmup_base}" && "${warmup_base}" == *.golden.json ]] \
+    || die "warmup_golden.r2_path is missing or malformed: '${warmup_r2_path}'"
+  printf '%s' "${warmup_sha}" | grep -Eq '^[0-9a-f]{64}$' \
+    || die "warmup_golden.sha256 is not 64 lowercase hex characters: '${warmup_sha}'"
+  printf '%s' "${warmup_bytes}" | grep -Eq '^[1-9][0-9]*$' \
+    || die "warmup_golden.bytes is not a positive integer: '${warmup_bytes}'"
+  warmup_path="${GOLDEN_DIR}/${warmup_base}"
+  [[ -f "${warmup_path}" ]] || die "the warm-up golden is not staged at ${warmup_path}"
+  private_abs="$(cd "${MLXFAST_PRIVATE_DIR}" 2>/dev/null && pwd -P)" \
+    || die "MLXFAST_PRIVATE_DIR is not a directory: ${MLXFAST_PRIVATE_DIR}"
+  warmup_abs="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${warmup_path}")" \
+    || die "cannot resolve the whole warm-up golden path: ${warmup_path}"
+  case "${warmup_abs}" in
+    "${private_abs}"|"${private_abs}"/*) : ;;
+    *) die "the warm-up golden ${warmup_abs} is outside canonical MLXFAST_PRIVATE_DIR ${private_abs}" ;;
+  esac
+  got_bytes="$(wc -c < "${warmup_path}" | tr -d '[:space:]')"
+  [[ "${got_bytes}" == "${warmup_bytes}" ]] \
+    || die "warm-up golden byte-count mismatch (staged ${got_bytes}, pinned ${warmup_bytes}): ${warmup_path}"
+  got_sha="$(shasum -a 256 "${warmup_path}" | awk '{print $1}')"
+  [[ "${got_sha}" == "${warmup_sha}" ]] \
+    || die "warm-up golden sha256 mismatch (staged ${got_sha}, pinned ${warmup_sha}): ${warmup_path}"
+fi
+
 # The PINNED benchd, resolved exactly as the ranked path resolves it.
 BENCHD="${BENCHD:-${BENCHCTL:-}}"
 if [[ -z "${BENCHD:-}" ]]; then
   BENCHD="$("${SCRIPT_DIR}/tools/fetch-benchd.sh")"
 fi
 [[ -x "${BENCHD}" ]] || die "benchd not found at ${BENCHD}; run ./tools/fetch-benchd.sh or set BENCHD"
+if [[ -n "${warmup_entry}" && "${warmup_entry}" != "null" ]]; then
+  calibrate_help="$("${BENCHD}" calibrate-baseline --help 2>&1 || true)"
+  printf '%s' "${calibrate_help}" \
+    | grep -Eq -- '(^|[[:space:]])--warmup-golden([[:space:]]|$)' \
+    || die "the fixture declares warmup_golden but this benchd calibrate-baseline has no --warmup-golden; this old benchd would ignore the new anti-cheat guards"
+  WARMUP_ARGS=(--warmup-golden "${warmup_path}")
+  if printf '%s' "${calibrate_help}" | grep -q -- '--warmup-golden-sha256' \
+    && printf '%s' "${calibrate_help}" | grep -q -- '--warmup-golden-bytes'; then
+    WARMUP_ARGS+=(--warmup-golden-sha256 "${warmup_sha}" --warmup-golden-bytes "${warmup_bytes}")
+  fi
+fi
 
 # THE REFERENCE TREE'S OWN BUILD. benchd re-roots the relative engine path
 # under the workspace, so the flag value is the workspace-relative path
@@ -177,7 +224,7 @@ REFERENCE_ENGINE_REL=".build/release/bench-worker"
 # transform produced.
 REFERENCE_WEIGHTS="${BASELINE_WORKSPACE}/weights"
 [[ -d "${REFERENCE_WEIGHTS}" ]] \
-  || die "the reference workspace has no transformed weights at ${REFERENCE_WEIGHTS}; tools/stage-baseline-workspace.sh runs the transform there, exactly as the ranked job runs it for the candidate"
+  || die "the reference workspace has no transformed weights at ${REFERENCE_WEIGHTS}; tools/stage-baseline-workspace.sh runs the trusted transform there"
 
 # The benchmarker's own identity, recorded in the band. The channel manifest
 # beside the pinned binary is the source of truth; the environment name benchd
@@ -241,6 +288,7 @@ os.execv(argv[0], argv)
   --engine "${REFERENCE_ENGINE_REL}" \
   --weights "${REFERENCE_WEIGHTS}" \
   "${GOLDEN_ARGS[@]}" \
+  ${WARMUP_ARGS[@]+"${WARMUP_ARGS[@]}"} \
   --passes "${PASSES}" \
   --box "${BOX_NAME}" \
   --track "${MANIFEST_TRACK_ID}" \

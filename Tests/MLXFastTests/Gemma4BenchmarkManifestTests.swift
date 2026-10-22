@@ -109,7 +109,10 @@ struct Gemma4BenchmarkManifestTests {
         // MLXLMServer/Runtime/ToolStreamHandler.swift joined the surface. The
         // runner, its registry, bench-worker and the server stay trusted:
         // nothing names them.
-        #expect(editablePaths.count == 94, "editablePaths count drifted; update this pin deliberately if the surface changed")
+        //
+        // 94 -> 93 when the offline transform became trusted. Ranked
+        // jobs clone the pinned reference tree's transformed weights.
+        #expect(editablePaths.count == 93, "editablePaths count drifted; update this pin deliberately if the surface changed")
 
         let fm = FileManager.default
         for path in editablePaths {

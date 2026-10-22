@@ -433,7 +433,19 @@ if [[ ! -f "${CONTRACT_FIXTURE}" ]]; then
   echo "benchmark.sh: every run requires the track contract fixture at ${CONTRACT_FIXTURE}" >&2
   exit 1
 fi
-benchd_args+=(--contract "${CONTRACT_FIXTURE}")
+CONTRACT_ARG="${CONTRACT_FIXTURE}"
+if [[ "${OFFICIAL}" != "1" ]]; then
+  # These guards describe the paired control run. Candidate-only local runs
+  # have no control leg, so benchd refuses them. Keep the full fixture for
+  # ranked and calibration paths; give local runs a short-lived view instead.
+  LOCAL_RUN_TEMP="$(mktemp -d "${TMPDIR:-/tmp}/mlxfast-benchmark.XXXXXX")"
+  chmod 700 "${LOCAL_RUN_TEMP}"
+  trap 'rm -rf "${LOCAL_RUN_TEMP}"' EXIT
+  CONTRACT_ARG="${LOCAL_RUN_TEMP}/contract.json"
+  jq 'del(.warmup_golden, .decode_golden_offset)' \
+    "${CONTRACT_FIXTURE}" > "${CONTRACT_ARG}"
+fi
+benchd_args+=(--contract "${CONTRACT_ARG}")
 # THE SPECULATIVE LEG. `--mtp-depth <N>` asks benchd for the native-MTP leg
 # at draft depth N on the timed decode window; absent, the window is serial.
 if [[ -n "${MTP_DEPTH}" ]]; then

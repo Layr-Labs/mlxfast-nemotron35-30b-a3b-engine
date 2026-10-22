@@ -79,7 +79,12 @@ if [[ ! "${SETUP_LOG_LABEL}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   echo "setup.sh: MLXFAST_SETUP_LOG_LABEL must match ^[A-Za-z0-9._-]+$" >&2
   exit 1
 fi
-SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+TRUSTED_CLI="${MLXFAST_TRUSTED_CLI:-}"
+if [[ -n "${TRUSTED_CLI}" ]]; then
+  SWIFT_BIN="${TRUSTED_CLI}"
+else
+  SWIFT_BIN="${MLXFAST_SWIFT_BIN:-.build/release/mlxfast-swift}"
+fi
 # The participant runtime worker builds under its own SwiftPM scratch root
 # (.build-worker) so a participant-code build never writes into the trusted
 # CLI's build tree (.build). mlx.metallib is a participant artifact and lives
@@ -206,6 +211,10 @@ Important environment variables:
                                      as a deprecated alias.
   MLXFAST_SWIFT_BIN                  Trusted user-facing Swift CLI.
                                      Default: ${SWIFT_BIN}
+  MLXFAST_TRUSTED_CLI                Reference-built Swift CLI. When set, it
+                                     must resolve to an executable file inside
+                                     MLXFAST_BASELINE_WORKSPACE. Setup skips
+                                     the .build resolve and mlxfast-swift build.
   MLXFAST_BENCH_WORKER_EXECUTABLE    Scored engine executable (the fork's
                                      generic bench-worker).
                                      Default: ${BENCH_WORKER_BIN}
@@ -226,10 +235,20 @@ Important environment variables:
                                      ~/bin; setup.sh never installs it through
                                      Homebrew.
 
+EOF
+  if [[ -n "${TRUSTED_CLI}" ]]; then
+    cat <<EOF
 After setup:
-  .build/release/mlxfast-swift transform --output weights
+  # The ranked caller clones the pinned reference workspace's transformed weights.
   # Benchmarking/grading lives in benchd, resolved from its release channel by ./tools/fetch-benchd.sh
 EOF
+  else
+    cat <<EOF
+After setup:
+  ${SWIFT_BIN} transform --output weights
+  # Benchmarking/grading lives in benchd, resolved from its release channel by ./tools/fetch-benchd.sh
+EOF
+  fi
 }
 
 if [[ "$#" -gt 0 ]]; then
@@ -244,6 +263,29 @@ if [[ "$#" -gt 0 ]]; then
       exit 2
       ;;
   esac
+fi
+
+if [[ -n "${TRUSTED_CLI}" ]]; then
+  BASELINE_WORKSPACE="${MLXFAST_BASELINE_WORKSPACE:-}"
+  if [[ -z "${BASELINE_WORKSPACE}" || ! -d "${BASELINE_WORKSPACE}" ]]; then
+    echo "${SETUP_LOG_LABEL}: MLXFAST_BASELINE_WORKSPACE is not a directory: ${BASELINE_WORKSPACE:-unset}" >&2
+    exit 1
+  fi
+  BASELINE_WORKSPACE_REAL="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${BASELINE_WORKSPACE}")"
+  TRUSTED_CLI_REAL="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${TRUSTED_CLI}")"
+  if [[ ! -f "${TRUSTED_CLI_REAL}" || ! -x "${TRUSTED_CLI_REAL}" ]]; then
+    echo "${SETUP_LOG_LABEL}: MLXFAST_TRUSTED_CLI is not an executable regular file: ${TRUSTED_CLI_REAL}" >&2
+    exit 1
+  fi
+  case "${TRUSTED_CLI_REAL}" in
+    "${BASELINE_WORKSPACE_REAL}"/*) : ;;
+    *)
+      echo "${SETUP_LOG_LABEL}: MLXFAST_TRUSTED_CLI resolves outside MLXFAST_BASELINE_WORKSPACE: ${TRUSTED_CLI_REAL} is not inside ${BASELINE_WORKSPACE_REAL}" >&2
+      exit 1
+      ;;
+  esac
+  TRUSTED_CLI="${TRUSTED_CLI_REAL}"
+  SWIFT_BIN="${TRUSTED_CLI_REAL}"
 fi
 
 format_duration() {
@@ -298,16 +340,25 @@ ${SETUP_LOG_LABEL}: summary
   trusted CLI: ${SWIFT_BIN}
   scored engine: ${BENCH_WORKER_BIN}
   mlx.metallib: ${metallib_line}
-  benchd engine: $(dirname "${SWIFT_BIN}")/bench-worker (+ sibling mlx.metallib)
+  benchd engine: .build/release/bench-worker (+ sibling mlx.metallib)
   reference checkpoint: ${reference_line}
 EOF
 
-  cat <<EOF
+  if [[ -n "${TRUSTED_CLI}" ]]; then
+    cat <<EOF
+  next:
+    # The ranked caller clones the pinned reference workspace's transformed weights.
+    # Benchmarking/grading lives in benchd, resolved from its release channel:
+    # ./tools/fetch-benchd.sh
+EOF
+  else
+    cat <<EOF
   next:
     ${SWIFT_BIN} transform --reference "${REFERENCE_DIR}" --output weights
     # Benchmarking/grading lives in benchd, resolved from its release channel:
     # ./tools/fetch-benchd.sh
 EOF
+  fi
 }
 
 load_homebrew_shellenv() {
@@ -2111,9 +2162,15 @@ list_reference_shards() {
 
   ensure_swift_harness_ready || return 1
 
-  # The CLI links the editable transform module, so it runs confined, like the
-  # workflow's transform step (tools/sandboxed-cli.sh).
-  MLXFAST_SWIFT_BIN="${SWIFT_BIN}" tools/sandboxed-cli.sh checkpoint-shards --index "${index_path}"
+  if [[ -n "${TRUSTED_CLI}" ]]; then
+    # This executable comes from the pinned reference tree. That tree
+    # is denied to participant code, so do not start this trusted binary inside
+    # the participant CLI sandbox that denies its own path.
+    "${SWIFT_BIN}" checkpoint-shards --index "${index_path}"
+  else
+    # The local CLI links the transform module, so confine it.
+    MLXFAST_SWIFT_BIN="${SWIFT_BIN}" tools/sandboxed-cli.sh checkpoint-shards --index "${index_path}"
+  fi
 }
 
 # The manifest's *.safetensors records -- the exact complement of
@@ -2955,7 +3012,11 @@ build_swift_harness() {
     fi
     echo "${SETUP_LOG_LABEL}: MLXFAST_SKIP_SWIFT_BUILD=1 but a product is missing; building anyway"
   fi
-  echo "${SETUP_LOG_LABEL}: building trusted Swift harness and the scored bench-worker engine"
+  if [[ -n "${TRUSTED_CLI}" ]]; then
+    echo "${SETUP_LOG_LABEL}: using trusted Swift CLI ${TRUSTED_CLI}; building the scored bench-worker engine"
+  else
+    echo "${SETUP_LOG_LABEL}: building trusted Swift harness and the scored bench-worker engine"
+  fi
   assert_frozen_dependency_graph || return 1
   # Independent SwiftPM build/cache roots: the trusted CLI builds in .build
   # and the participant worker (which compiles the vendored MLX forks) in
@@ -2969,17 +3030,25 @@ build_swift_harness() {
   # the network and can write only its own scratch path. Thus the dependency
   # fetch runs first, outside the sandbox. It runs the committed manifests and
   # compiles no editable file.
-  mkdir -p .build/clang-module-cache .build-worker/clang-module-cache
+  if [[ -n "${TRUSTED_CLI}" ]]; then
+    mkdir -p .build-worker/clang-module-cache
+  else
+    mkdir -p .build/clang-module-cache .build-worker/clang-module-cache
+  fi
   local swiftpm_sandbox_flags=()
   if [[ "${RUNNER_ENVIRONMENT:-}" == "self-hosted" || "${MLXFAST_OFFICIAL_BENCHMARK_RUN:-0}" == "1" ]]; then
-    swift package resolve --force-resolved-versions || return 1
+    if [[ -z "${TRUSTED_CLI}" ]]; then
+      swift package resolve --force-resolved-versions || return 1
+    fi
     swift package resolve --force-resolved-versions --scratch-path .build-worker || return 1
     swiftpm_sandbox_flags=(--disable-sandbox --skip-update --manifest-cache local)
   fi
-  CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
-    tools/sandboxed-build.sh --write "${PWD}/.build" -- \
-    swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
-    --product mlxfast-swift || return 1
+  if [[ -z "${TRUSTED_CLI}" ]]; then
+    CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build/clang-module-cache}" \
+      tools/sandboxed-build.sh --write "${PWD}/.build" -- \
+      swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \
+      --product mlxfast-swift || return 1
+  fi
   CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-${PWD}/.build-worker/clang-module-cache}" \
     tools/sandboxed-build.sh --write "${PWD}/.build-worker" -- \
     swift build -c release --force-resolved-versions "${swiftpm_sandbox_flags[@]+"${swiftpm_sandbox_flags[@]}"}" \

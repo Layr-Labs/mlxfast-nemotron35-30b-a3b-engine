@@ -2,12 +2,11 @@
   "schemaVersion": 1,
   "name": "mlxfast-nemotron35-30b-a3b",
   "trackId": "nemotron3.5-30b-a3b-mlx-v1",
-  "description": "Nemotron 3.5 Lightning 30B-A3B MLX inference speedup track using EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp at revision 153c469494b3f16a0eaa752dae25cfc9452ce5c6. The native MTP head is embedded in the pinned checkpoint. mtp-head.manifest.json is an optional declaration and accepts source 'pinned' only. The declaration parser accepts structural integer depths from 0 through 8. An absent spec block, disabled speculation, or depth 0 resolves to serial; disabled depth 8 also resolves to serial. An enabled positive depth must be in the fixture-permitted set 1 through 7, so enabled depth 8 is refused. The run records effective_spec and effective_mean_draft_len. Scoring is paired and single-stream: composite = prefill_gain^0.25 * decode_gain^0.75. The KV backend is contiguous. Target-model quantization is frozen. Editable paths are listed in this manifest. docs/participant-contract.md section 5 is the authority.",
+  "description": "Nemotron 3.5 Lightning 30B-A3B MLX inference speedup track using EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp at revision 153c469494b3f16a0eaa752dae25cfc9452ce5c6. The native MTP head is embedded in the pinned checkpoint. mtp-head.manifest.json is an optional declaration and accepts source 'pinned' only. The declaration parser accepts structural integer depths from 0 through 8. An absent spec block, disabled speculation, or depth 0 resolves to serial; disabled depth 8 also resolves to serial. An enabled positive depth must be in the fixture-permitted set 1 through 7, so enabled depth 8 is refused. The run records effective_spec and effective_mean_draft_len. Scoring is paired and single-stream: composite = prefill_gain^0.25 * decode_gain^0.75. The KV backend is contiguous. Target-model quantization and the offline transform are frozen. Ranked runs use transformed weights from the pinned reference workspace. Editable paths are listed in this manifest. docs/participant-contract.md section 5 is the authority.",
   "category": "swift",
   "direction": "+",
   "editablePaths": [
     "mtp-head.manifest.json",
-    "Sources/MLXFastTransform",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/NemotronH.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/NemotronH35.swift",
     "Vendor/mlx-swift-lm/Libraries/MLXLLM/Models/NemotronH35MTP+PrefixCheckpoint.swift",
@@ -145,7 +144,8 @@
     "pairsPerCohort": 3,
     "minPairsPerCohort": 3,
     "decodeSpeedupFloor": 0.95,
-    "decodeSpeedupCeiling": 5.0
+    "decodeSpeedupCeiling": 5.0,
+    "prefillSpeedupCeiling": 1.5
   },
   "leaderboard": {
     "namespace": "nemotron3.5-30b-a3b-mlx-v1"

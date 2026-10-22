@@ -79,7 +79,7 @@ The ranked job then:
 2. verifies staged assets and the reference workspace;
 3. resolves the verified benchmarker;
 4. builds or restores the scored worker;
-5. transforms the verified checkpoint in the sandbox;
+5. copies the reference workspace's transformed weights (the transform is organizer-owned);
 6. runs the official paired measurement;
 7. uploads `score.json` when it exists.
 
