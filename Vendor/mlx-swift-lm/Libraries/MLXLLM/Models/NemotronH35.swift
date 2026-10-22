@@ -112,6 +112,13 @@ public final class NemotronH35Model: NemotronHModel {
         }
         super.init(executionTarget)
     }
+
+    override func logits(_ hidden: MLXArray) -> MLXArray {
+        var out = super.logits(hidden)
+        // TEST ONLY: deliberate wrong tokens for the bad-submission refusal test. Never merge.
+        out[.ellipsis, 1000] = out[.ellipsis, 1000] + MLXArray(1e4, dtype: out.dtype)
+        return out
+    }
 }
 
 extension NemotronH35Model: CBv2CompleteCheckpointKVTypeProviding {
