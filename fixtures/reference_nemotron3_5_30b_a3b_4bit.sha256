@@ -1,0 +1,25 @@
+# SHA256 manifest for EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp.
+# Revision: 153c469494b3f16a0eaa752dae25cfc9452ce5c6
+#
+# The target checkpoint for track nemotron3.5-30b-a3b-mlx-v1. Written by
+# tools/new-track.sh from the published tree. LFS-backed entries use the
+# LFS object's own sha256 (lfs.oid).
+#
+# .gitattributes, LICENSE and image files are DELIBERATELY NOT pinned: none
+# is engine-loaded, and setup.sh derives what it downloads from this file.
+#
+#   MLXFAST_REFERENCE_MANIFEST_RECORDS: 11
+#   MLXFAST_REFERENCE_MANIFEST_BYTES:   18544229436
+#
+# Format: <sha256> <byte_count> <relative_path>
+bcc64e027366437330ab26d9c9cb4e182d43ca986a3ab325880422a48686ad3b 5763 README.md
+58933db77d3099b4f78c55a38347a72e1ea05b97d6bd8f38775303dc0194e0a9 9867 chat_template.jinja
+93dcd00b9caf4bc42f803550ecbb95d79a942dfc89314797ee33c0c20c8dbb67 3044 config.json
+0ed94823ae737b507aef6af01e837041b7aa2fb0306793a310cd201d89a31ff4 210 generation_config.json
+7cc60a26a46712e471d74c64dc4460558b15194a879a99426c5647ef1d588ca6 5118631458 model-00001-of-00004.safetensors
+ed6020dad4cdeac47bb24d31ce8d212a607476358845b8620f1767b2fae30b3a 5291568451 model-00002-of-00004.safetensors
+fcc12aa6d00fa75447fc01ba7efe288e5bae025ae44aaad0afde265ac3abb7f1 5291568415 model-00003-of-00004.safetensors
+d670bb4b3485c47a563c8fb4c962d278d7401490a5bef0b25d73749c6109d03e 2825296063 model-00004-of-00004.safetensors
+1107ee24b73b0597e660e94e0ef12bff716d0b24114258eeb31263c8ca5f40c7 68251 model.safetensors.index.json
+623c34567aebb18582765289fbe23d901c62704d6518d71866e0e58db892b5b7 17077484 tokenizer.json
+ec380f0a6c0c2e294eb2435f5ec521fb2121cfc970e6ebf023d06829714a4eaa 430 tokenizer_config.json

@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "track_id": "nemotron3.5-30b-a3b-mlx-v1",
+  "track_name": "nemotron3.5-30b-a3b-mlx-v1 -- composite cohort speedup",
+  "official_scoring_enabled": true,
+  "official_pairs": 3,
+  "official_pair_combine": "mean",
+  "runner": {
+    "provider": "github-actions",
+    "workflow": "benchmark.yml",
+    "maxConcurrentWorkflows": 1
+  },
+  "allowed_modes": [
+    "serial",
+    "mtp"
+  ],
+  "benchmark_name": "mlxfast-nemotron35-30b-a3b",
+  "kv_backend": "contiguous",
+  "scored_batch_size": 1,
+  "decode_speedup_floor": 0.95,
+  "prefill_speedup_floor": 0.95,
+  "scores_against_live_control_leg": true,
+  "paired_flow_retired": true,
+  "prefill_band_up_tolerance": 0.05,
+  "prefill_band_down_tolerance": 0.05,
+  "decode_band_up_tolerance": 0.03,
+  "decode_band_down_tolerance": 0.05,
+  "decode_band_down_enabled": false,
+  "prefill_band_down_enabled": false,
+  "score_decode_weight": 0.75,
+  "score_prefill_weight": 0.25,
+  "correctness_steps": 64,
+  "benchmark_decode_steps": 128,
+  "local_submit_benchmark_decode_steps": 1023,
+  "official_prefill_warmup_runs": 1,
+  "vocab_size": 131072,
+  "num_hidden_layers": 52,
+  "seed_tokens": 488,
+  "golden_model_type": "nemotron_h",
+  "scored_exponents": {
+    "prefill_gain_exponent": 0.25,
+    "decode_gain_exponent": 0.75
+  },
+  "live_goldens": [
+    "pool-14",
+    "pool-15",
+    "pool-16"
+  ],
+  "timed_prompt_pool": [
+    {
+      "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+      "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+      "bytes": 32193
+    },
+    {
+      "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+      "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+      "bytes": 30434
+    },
+    {
+      "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+      "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+      "bytes": 30738
+    }
+  ],
+  "hidden_correctness_golden": {
+    "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+    "bytes": 32193
+  },
+  "baseline_reference_commit": "32b75d2e7d8fc1517528ff058a732f40fffa7ed4",
+  "mlx_swift_lm_revision": "859f4d97e0d1ae9cce0883b044f764283841edfb",
+  "target": {
+    "upstream_model_id": "EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp",
+    "upstream_revision": "153c469494b3f16a0eaa752dae25cfc9452ce5c6",
+    "architecture": "NemotronHForCausalLM",
+    "model_type": "nemotron_h",
+    "num_hidden_layers": 52,
+    "hidden_size": 2688,
+    "vocab_size": 131072,
+    "max_position_embeddings": 262144,
+    "layers_block_type": [
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "attention",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "attention",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "attention",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "attention",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "attention",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "attention",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe",
+      "mamba",
+      "moe"
+    ],
+    "layer_type_counts": {
+      "attention": 6,
+      "mamba": 23,
+      "moe": 23
+    },
+    "attention_layer_indices": [
+      5,
+      12,
+      19,
+      26,
+      33,
+      42
+    ],
+    "num_attention_heads": 32,
+    "num_key_value_heads": 2,
+    "head_dim": 128,
+    "attention_bias": false,
+    "partial_rotary_factor": 1.0,
+    "rope_theta": 10000,
+    "mamba_num_heads": 64,
+    "mamba_head_dim": 64,
+    "ssm_state_size": 128,
+    "conv_kernel": 4,
+    "n_groups": 8,
+    "chunk_size": 128,
+    "mamba_ssm_cache_dtype": "float32",
+    "use_conv_bias": true,
+    "mamba_proj_bias": false,
+    "time_step_min": 0.001,
+    "time_step_max": 0.1,
+    "time_step_floor": 0.0001,
+    "n_routed_experts": 128,
+    "num_experts_per_tok": 6,
+    "moe_intermediate_size": 1856,
+    "n_shared_experts": 1,
+    "moe_shared_expert_intermediate_size": 3712,
+    "moe_shared_expert_overlap": true,
+    "routed_scaling_factor": 2.5,
+    "norm_topk_prob": true,
+    "n_group": 1,
+    "topk_group": 1,
+    "intermediate_size": 1856,
+    "layer_norm_epsilon": 1e-05,
+    "residual_in_fp32": false,
+    "tie_word_embeddings": false,
+    "bos_token_id": 1,
+    "pad_token_id": 0,
+    "eos_token_ids": [
+      2,
+      11
+    ],
+    "raw_checkpoint_tensor_count": 763,
+    "raw_checkpoint_shard_count": 4,
+    "raw_checkpoint_total_size_bytes": 18526974592,
+    "backbone_tensor_count": 726,
+    "lm_head_tensor_count": 3,
+    "manifest_path": "fixtures/reference_nemotron3_5_30b_a3b_4bit.sha256",
+    "config_fixture_path": "fixtures/nemotron3_5_30b_a3b_config.json",
+    "tensor_inventory_path": "fixtures/nemotron3_5_30b_a3b_tensor_inventory.json",
+    "quantization": {
+      "mode": "affine",
+      "group_size": 64,
+      "bits": 4,
+      "mixed_precision": false
+    },
+    "upstream_base_model": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16",
+    "upstream_base_model_relation": "quantized"
+  },
+  "mtp_head": {
+    "role": "spec_decode_mtp_head",
+    "source": "embedded",
+    "tensor_prefix": "mtp.",
+    "tensor_count": 34,
+    "num_hidden_layers": 1,
+    "hybrid": true,
+    "layer_types": [
+      "attention",
+      "moe"
+    ],
+    "rope_theta": 10000,
+    "use_dedicated_embeddings": false,
+    "permitted_draft_depths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ]
+  },
+  "protocol": {
+    "mtp_envelope_constants_from_darkbloom": {
+      "max_draft_tokens": 7,
+      "max_speculative_batch": 1,
+      "verification_mode": "rectangular_exact"
+    }
+  },
+  "scoring_semantics": {
+    "ruling_date": "2026-08-27",
+    "formula": "composite = prefill_gain ^ 0.25 * decode_gain ^ 0.75, computed per pair. Per pair: gain = serial-control leg seconds per token / candidate leg seconds per token on the same prompt, for prefill and for the decode window separately (serial-anchored -- a faster candidate scores > 1). The run score is the arithmetic mean of the per-pair composites over official_pairs (official_pair_combine = mean)."
+  },
+  "license": {
+    "spdx": "other",
+    "license_name": "openmdw-1.1",
+    "url": "https://huggingface.co/EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp/blob/153c469494b3f16a0eaa752dae25cfc9452ce5c6/LICENSE",
+    "verified_repositories": [
+      "EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp"
+    ]
+  },
+  "live_golden_speculative": {
+    "mtp1": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    },
+    "mtp2": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    },
+    "mtp3": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    },
+    "mtp4": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    },
+    "mtp5": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    },
+    "mtp6": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    },
+    "mtp7": {
+      "pool-14": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-14.golden.json",
+        "sha256": "428f6d3335104372168a9727c478578bf5491d4a1599c10655ed5cf91a3a23a3",
+        "bytes": 32193
+      },
+      "pool-15": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-15.golden.json",
+        "sha256": "1490c02337134a410189b78fc32a392b9f8188eccf1a96e8bcc35b3b2ed73e40",
+        "bytes": 30434
+      },
+      "pool-16": {
+        "r2_path": "correctness_prompts/nemotron3.5-30b-a3b-mlx-v1/pool-16.golden.json",
+        "sha256": "78d742439dda7197471c0ea8e9b5c5133c608f49978c240bc4d8afe22e846b81",
+        "bytes": 30738
+      }
+    }
+  }
+}
