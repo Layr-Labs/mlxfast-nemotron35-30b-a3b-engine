@@ -54,19 +54,19 @@ The KV backend is `contiguous`. An unsupported backend is refused.
 
 ## 3. What you may edit
 
-`benchmark.json` `editablePaths` lists 94 entries and is the complete
-authority. The surface has five groups:
+`benchmark.json` `editablePaths` lists 93 entries and is the complete
+authority. The surface has four groups:
 
 1. `mtp-head.manifest.json`
-2. `Sources/MLXFastTransform/`
-3. The listed Nemotron model files
-4. The listed batching, cache, attention, RoPE, and server files
-5. The listed MLX and Metal kernel files
+2. The listed Nemotron model files
+3. The listed batching, cache, attention, RoPE, and server files
+4. The listed MLX and Metal kernel files
 
 The two vendor directories contain plain files. They are not submodules.
 
 Everything that verifies, measures, scores, or records trusted state is outside
-the editable surface.
+the editable surface. `Sources/MLXFastTransform/` is also trusted and is not
+editable.
 
 ### 3.1 Optional path
 
@@ -96,7 +96,9 @@ No path is exempt.
 ### 3.3 Frozen target quantization
 
 Do not re-quantize, re-represent, or change the numerical format of a target
-weight. An editable transform does not permit a target-format change.
+weight. The local transform is frozen. Ranked runs copy transformed weights
+from the pinned reference workspace, so a submission cannot change target
+format through the transform.
 
 Passing the token-tolerance gate does not authorize target re-quantization.
 
@@ -206,8 +208,9 @@ per token is the denominator.
 
 The fixture sets `prefill_speedup_floor = 0.95` and
 `decode_speedup_floor = 0.95`. The manifest restates the decode floor as
-`decodeSpeedupFloor = 0.95`. The manifest sets `decodeSpeedupCeiling = 5.0` as
-the declared decode gain ceiling, separate from the two gain floors.
+`decodeSpeedupFloor = 0.95`. The manifest sets `decodeSpeedupCeiling = 5.0`
+and `prefillSpeedupCeiling = 1.5`, separate from the two gain floors. A pair
+above either ceiling is refused; the score is not clamped.
 
 The benchmarker seals an unrounded double. Equal sealed values tie, and the
 platform decides whether a submission improves the current best.
@@ -225,7 +228,9 @@ The fixture sets `official_pairs = 3` and `official_pair_combine` to the
 arithmetic mean. `official_pairs` must be a multiple of the live-pool size. The
 current live pool has three prompts, so the current value satisfies that rule.
 
-Pair `k` uses live prompt `(k - 1) mod N`, where `N` is the live-pool size.
+Pair `k` uses live prompt `(k - 1) mod N` for timed prefill and live prompt
+`k mod N` for decode, where `N` is the live-pool size. The two roles use
+different prompts.
 
 Each pair has:
 
@@ -249,7 +254,7 @@ timings are separate from that mean composite.
 No file stores a baseline pair. The control leg is measured live.
 
 The fixture's reference revision is public and can be inspected in repository
-history. The staged reference workspace is organizer material and is not
+history. The staged reference workspace is not part of a submission and is not
 available to participants.
 
 ### 5.3 Calibration health band
@@ -307,7 +312,8 @@ placeholder and include one entry for each live-pool prompt before use:
 | Seed tokens | 488 |
 | Checked decode steps | 128 |
 | Streams | 1 |
-| Timed prompts per leg | 1 |
+| Timed prompts per leg | 2 roles: one prefill prompt and a different decode prompt |
+| Warm-up prompt | 1 separate fixture-pinned prompt, never scored |
 | Pairs | 3 |
 | Legs per pair | 2 |
 | Warm-up prefill passes | 1 |
@@ -316,13 +322,15 @@ Timing uses the benchmarker's parent clock:
 
 | Window | From | To |
 |---|---|---|
-| Prefill | `free_decode_begin` sent | validated seed reply |
+| Seed prefill | `free_decode_begin` sent | validated seed reply |
 | Decode | seed reply | `free_decode_run(N)` completion |
 
-Decode seconds per token is the decode window divided by N. Seed prefill is not
-part of decode.
+Scored prefill comes from separate timed prefill requests. The fixture sets
+`decode_window_includes_seed = true`, so decode seconds per token is `(seed
+prefill window + decode window) / N`.
 
-Both legs receive one unmeasured prefill warm-up before the timed window.
+Both legs use the separate `warmup_golden` before the timed windows. It is
+never scored.
 
 For `free_decode_begin`, the worker processes all 488 seed tokens before it
 replies. The reply includes the greedy seed token and `effective_spec`. The
@@ -358,8 +366,19 @@ The fixture names `pool-14`, `pool-15`, and `pool-16`. It publishes these pins:
 
 Every permitted MTP depth maps to the same pinned live pool.
 
+The fixture separately pins `pool-17` for warm-up only:
+
+| Name | SHA-256 | Bytes |
+|---|---|---:|
+| `pool-17` | `e9faf75ca8c8fee0e389aa17ce047dcfeef7684c7559e3ea73ac2a254340c2e1` | 31378 |
+
+The fixture also sets `seed_window_max_ratio = 1.40`,
+`require_private_dir = true`, and `decode_golden_offset = 1`. Guard failures
+include `SPEEDUP-ABOVE-CEILING`, `SEED-WINDOW-ABOVE-LIMIT`,
+`PROMPT-REUSE-REFUSED`, `PRIVATE-DIR-REQUIRED`, and `LEG-TEARDOWN-FAILED`.
+
 Ranked preflight refuses missing or mismatched staged tapes, malformed or
-duplicate pins, pending-organizer sentinels, and extra staged JSON files.
+duplicate pins, pending sentinels, and extra staged JSON files.
 It also refuses an empty `timed_prompt_pool`, an empty `live_goldens` list, or
 a live name with no corresponding timed-pool entry.
 
@@ -367,8 +386,8 @@ a live name with no corresponding timed-pool entry.
 its oracle is missing. It also refuses a speculative declaration when the
 resolved benchmarker lacks `--mtp-depth` or `--control-golden` support.
 
-Hidden artifacts are provisioned by the organizer. No other hidden-artifact
-metadata is part of the participant contract.
+Hidden artifacts are staged outside git. No other hidden-artifact metadata is
+part of the participant contract.
 
 ### 5.7 Thermal and quiescence gates
 
@@ -439,12 +458,19 @@ self-hosted ranked job. Ranked preflight verifies staged artifacts, the
 reference workspace, and calibration data before measurement.
 
 Reference-workspace checks include the pinned git revision, an executable worker,
-a sibling `mlx.metallib` with its fingerprint sidecar, and that workspace's
-transformed weights.
+an executable trusted CLI, a sibling `mlx.metallib` with its fingerprint
+sidecar, and that workspace's transformed weights.
 
 The candidate engine and transformed-weight paths must resolve inside the
-candidate checkout. The measure script uses checkout-relative paths to resolve
-the control leg's corresponding assets in the reference workspace.
+candidate checkout. The ranked workflow copies the reference workspace's
+transformed weights into the candidate checkout. It does not run the candidate
+transform. The measure script uses checkout-relative paths to resolve the
+control leg's corresponding assets in the reference workspace.
+
+The measure script defaults `MLXFAST_PRIVATE_DIR` to the staged golden
+directory. Every live, control, and warm-up golden must resolve inside that
+directory by whole path component. A sibling path with the same prefix is not
+inside it.
 
 The ranked job uses one resident worker per leg. The benchmarker boots and
 stops each resident from that leg's tree.
@@ -479,7 +505,7 @@ The enforced layers include:
 - modifiable-surface checks;
 - deterministic static review;
 - byte-budget checks;
-- sandboxed build, transform, and worker execution;
+- sandboxed build and worker execution;
 - ranked staged-asset and workspace checks.
 
 See [submission-restriction-spec.md](submission-restriction-spec.md).

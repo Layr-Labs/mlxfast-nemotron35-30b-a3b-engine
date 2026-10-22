@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # test-new-track.sh -- tools/new-track.sh stamps a seeded repo into a new track.
 #
-# Offline, no GPU, no toolchain, no Hugging Face. A throwaway python3
-# http.server on 127.0.0.1 stands in for the Hugging Face tree API
-# (HF_API_BASE_URL), so the checkpoint-pinning path -- URL assembly, the
-# LFS/non-LFS split, the omission rule -- runs against real bytes over a real
-# socket without any credential or any network egress.
+# Offline, no GPU, no toolchain, no Hugging Face. A file URL stands in for the
+# Hugging Face tree API (HF_API_BASE_URL), so the checkpoint-pinning path -- URL
+# assembly, the LFS/non-LFS split, and the omission rule -- runs against real
+# bytes without a credential or a socket.
 #
 # The subject is a SEED: the tracked tree of this repository (git archive), in
 # its own git repository with one commit, exactly the shape
@@ -24,12 +23,8 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 WORK="$(mktemp -d)"
-SERVER_PID=""
+# shellcheck disable=SC2329  # invoked through the EXIT trap below
 cleanup() {
-  if [[ -n "${SERVER_PID}" ]]; then
-    kill "${SERVER_PID}" 2>/dev/null || true
-    wait "${SERVER_PID}" 2>/dev/null || true
-  fi
   rm -rf "${WORK}"
 }
 trap cleanup EXIT
@@ -91,8 +86,8 @@ EXEMPTIONS=(
 )
 
 # --- the stand-in Hugging Face tree API --------------------------------------
-# SimpleHTTPRequestHandler strips the query string, so ?recursive=true resolves
-# to the plain path and one file per revision is enough.
+# curl strips the query string from a file URL, so one file per revision is
+# enough for the script's ?recursive=true request.
 HF="${WORK}/hf/api/models/${CKPT_REPO}/tree"
 mkdir -p "${HF}"
 
@@ -127,19 +122,7 @@ cat > "${HF}/${BAD_REV}" <<'JSONEOF'
 ]
 JSONEOF
 
-PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
-( cd "${WORK}/hf" && exec python3 -m http.server "${PORT}" --bind 127.0.0.1 >/dev/null 2>&1 ) &
-SERVER_PID=$!
-
-ready=0
-for _ in $(seq 1 50); do
-  if curl --fail --silent --max-time 1 -o /dev/null "http://127.0.0.1:${PORT}/api/models/${CKPT_REPO}/tree/${CKPT_REV}"; then
-    ready=1; break
-  fi
-  sleep 0.2
-done
-[[ "${ready}" == "1" ]] || { echo "FAIL: the stand-in tree API did not come up on 127.0.0.1:${PORT}" >&2; exit 1; }
-export HF_API_BASE_URL="http://127.0.0.1:${PORT}"
+export HF_API_BASE_URL="file://${WORK}/hf"
 
 # --- seeding -----------------------------------------------------------------
 # seed <dir> -- a fresh single-commit repo holding this repository's TRACKED
@@ -205,6 +188,8 @@ if [[ -f "${F}" ]]; then
   [[ "$(jqf "${F}" '["mlx_swift_lm_revision"]')" == "\"${FORK_SHA}\"" ]] || fail "fixture mlx_swift_lm_revision: $(jqf "${F}" '["mlx_swift_lm_revision"]')"
   [[ "$(jqf "${F}" '["live_goldens"]')"          == "[]" ]] || fail "fixture live_goldens is not empty"
   [[ "$(jqf "${F}" '["timed_prompt_pool"]')"     == "[]" ]] || fail "fixture timed_prompt_pool is not empty"
+  [[ "$(jqf "${F}" '.get("warmup_golden","__ABSENT__")')" == '"__ABSENT__"' ]] || fail "fixture still carries the source track warmup_golden"
+  [[ "$(jqf "${F}" '.get("decode_golden_offset","__ABSENT__")')" == '"__ABSENT__"' ]] || fail "fixture still carries the source track decode_golden_offset"
   [[ "$(jqf "${F}" '["live_golden_speculative"]')" == "{}" ]] || fail "fixture live_golden_speculative is not empty"
   [[ "$(jqf "${F}" '["hidden_correctness_golden"]["sha256"]')" == '"DEMO1-0-9B-A1B-MLX-V1-PENDING-ORGANIZER"' ]] \
     || fail "fixture hidden_correctness_golden sentinel: $(jqf "${F}" '["hidden_correctness_golden"]["sha256"]')"
@@ -241,6 +226,7 @@ else
 fi
 
 # the benchd channel
+# shellcheck disable=SC2016  # this is the literal source text the test requires
 if grep -qF 'BRANCH="${BENCHD_BRANCH:-main}"' "${SEED}/tools/fetch-benchd.sh"; then
   pass "tools/fetch-benchd.sh defaults BENCHD_BRANCH to main (benchd is published from main)"
 else
@@ -268,7 +254,10 @@ else
 fi
 
 # the source track id is gone everywhere but the exemptions
-mapfile -t leftovers < <(cd "${SEED}" && git grep -l -F "${OLD_TRACK}" -- . 2>/dev/null || true)
+leftovers=()
+while IFS= read -r file_name; do
+  leftovers+=("${file_name}")
+done < <(cd "${SEED}" && git grep -l -F "${OLD_TRACK}" -- . 2>/dev/null || true)
 unexpected=()
 for path in ${leftovers[@]+"${leftovers[@]}"}; do
   keep=0
@@ -282,7 +271,10 @@ else
 fi
 
 # the old fixture stem is gone everywhere but the same exempted records
-mapfile -t stem_left < <(cd "${SEED}" && git grep -l -F "$(basename "${OLD_CONTRACT}" .json)" -- . 2>/dev/null || true)
+stem_left=()
+while IFS= read -r file_name; do
+  stem_left+=("${file_name}")
+done < <(cd "${SEED}" && git grep -l -F "$(basename "${OLD_CONTRACT}" .json)" -- . 2>/dev/null || true)
 stem_unexpected=()
 for path in ${stem_left[@]+"${stem_left[@]}"}; do
   keep=0

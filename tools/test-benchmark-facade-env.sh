@@ -13,8 +13,10 @@
 #
 # Cases:
 #   1. --local-iterate: the stub sees MLXFAST_QWEN_MTP_TRACK_ID == benchmark.json
-#      trackId, non-empty, on an `iterate --mode local-iterate` argv.
+#      trackId, non-empty, on an `iterate --mode local-iterate` argv. Its
+#      temporary contract omits paired-only guards and is removed on exit.
 #   2. --official (gates-only env): the same export on `--mode official`.
+#      It receives the full fixture unchanged.
 #   3. a manifest with NO trackId: the facade refuses (exit 1, names the field)
 #      and benchd is never spawned.
 #   4. a caller pre-sets a DIFFERENT MLXFAST_QWEN_MTP_TRACK_ID: refused, never
@@ -51,7 +53,7 @@
 #   13. an engine OUTSIDE the checkout is refused: it has no relative form, so
 #       the control leg would run the candidate's own binary.
 #   14. a WEIGHTS directory outside the checkout is refused for the same reason:
-#       the control leg would read the candidate's own transform.
+#       both legs would read the candidate workspace's weights.
 #   15. --box is passed ONLY when RUNNER_NAME is absent. benchd lets RUNNER_NAME
 #       win over the flag, so on a runner the flag is dead argv; on a hand run
 #       it is the only box identity benchd has, and it comes from the
@@ -104,6 +106,15 @@ for arg in "$@"; do
 done
 printf '%s\n' "${MLXFAST_QWEN_MTP_TRACK_ID-__UNSET__}" > "${STUB_CAPTURE_ENV}"
 printf '%s\n' "$@" > "${STUB_CAPTURE_ARGV}"
+previous=""
+for arg in "$@"; do
+  if [[ "${previous}" == "--contract" ]]; then
+    printf '%s\n' "${arg}" > "${STUB_CAPTURE_CONTRACT_PATH}"
+    cp "${arg}" "${STUB_CAPTURE_CONTRACT}"
+    break
+  fi
+  previous="${arg}"
+done
 echo '{}'
 exit 0
 STUBEOF
@@ -121,6 +132,8 @@ run_facade() {
   env -u MLXFAST_QWEN_MTP_TRACK_ID \
     STUB_CAPTURE_ENV="${WORK}/${case_name}.env" \
     STUB_CAPTURE_ARGV="${WORK}/${case_name}.argv" \
+    STUB_CAPTURE_CONTRACT="${WORK}/${case_name}.contract.json" \
+    STUB_CAPTURE_CONTRACT_PATH="${WORK}/${case_name}.contract-path" \
     BENCHD="${STUB}" \
     MLXFAST_ENGINE_BIN="${STUB}" \
     MLXFAST_CORRECTNESS_GOLDEN_PATH="${GOLDEN}" \
@@ -150,6 +163,26 @@ if [[ -f "${WORK}/case1.argv" ]]; then
     fail "case 1: argv does not carry --mode local-iterate: $(tr '\n' ' ' < "${WORK}/case1.argv")"
   fi
 fi
+if [[ "$(jq -r 'has("warmup_golden") or has("decode_golden_offset")' "${WORK}/case1.contract.json")" != "false" ]]; then
+  fail "case 1: local contract still carries a paired-only guard"
+fi
+case1_contract_path="$(cat "${WORK}/case1.contract-path")"
+if [[ -e "${case1_contract_path}" ]]; then
+  fail "case 1: local temporary contract remains after the run: ${case1_contract_path}"
+fi
+
+# Case 1b: local-submit uses the same temporary, stripped contract path.
+EXTRA_ENV=(MLXFAST_NO_SANDBOX=1)
+run_facade case1b "${FACADE}" --local-submit
+if [[ "${rc}" -ne 0 ]]; then
+  fail "case 1b: local-submit exited ${rc}; output: $(cat "${WORK}/case1b.out")"
+elif ! grep -qx -- 'local-submit' "${WORK}/case1b.argv"; then
+  fail "case 1b: argv does not carry --mode local-submit"
+elif [[ "$(jq -r 'has("warmup_golden") or has("decode_golden_offset")' "${WORK}/case1b.contract.json")" != "false" ]]; then
+  fail "case 1b: local-submit contract still carries a paired-only guard"
+elif [[ -e "$(cat "${WORK}/case1b.contract-path")" ]]; then
+  fail "case 1b: local-submit temporary contract remains after the run"
+fi
 
 # Case 2: --official, gates-only env (the seam-1 run the ranked box takes).
 EXTRA_ENV=(MLXFAST_BENCHMARK_SKIP_TIMED=1 MLXFAST_BENCHMARK_CHECK_GATES=1)
@@ -164,6 +197,12 @@ elif [[ "$(cat "${WORK}/case2.env")" != "${EXPECTED}" ]]; then
 fi
 if [[ -f "${WORK}/case2.argv" ]] && ! grep -qx -- 'official' "${WORK}/case2.argv"; then
   fail "case 2: argv does not carry --mode official: $(tr '\n' ' ' < "${WORK}/case2.argv")"
+fi
+if ! cmp -s "${REPO_ROOT}/fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json" "${WORK}/case2.contract.json"; then
+  fail "case 2: official mode did not receive the full fixture unchanged"
+fi
+if [[ "$(cat "${WORK}/case2.contract-path")" != "${REPO_ROOT}/tools/../fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json" ]]; then
+  fail "case 2: official mode received a copied contract instead of the authoritative fixture"
 fi
 
 # Case 3: a manifest with NO trackId refuses before benchd is spawned. The
@@ -272,6 +311,15 @@ if not contract.get("live_goldens"):
 # Armed in both shapes: a fixture that pins its goldens but does not score yet
 # refuses at the arm gate too.
 contract["official_scoring_enabled"] = True
+if contract.get("warmup_golden"):
+    warmup = contract["warmup_golden"]
+    base = warmup["r2_path"].rsplit("/", 1)[-1]
+    path = os.path.join(golden_dir, base)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"synthetic_warmup": base}) + "\n")
+    data = open(path, "rb").read()
+    warmup["sha256"] = hashlib.sha256(data).hexdigest()
+    warmup["bytes"] = len(data)
 with open(contract_path, "w", encoding="utf-8") as fh:
     json.dump(contract, fh, indent=2)
     fh.write("\n")
@@ -298,7 +346,8 @@ cat > "${MEASURE_STUB}" <<'MEASURESTUBEOF'
 #!/usr/bin/env bash
 for arg in "$@"; do
   if [[ "${arg}" == "--help" ]]; then
-    echo "usage: benchd iterate --engine <bin> [--control-golden <path>]"
+    echo "    --control-golden <path>"
+    echo "    --warmup-golden <path>"
     exit 0
   fi
 done
@@ -554,7 +603,7 @@ OUTSIDE_WEIGHTS="${WORK}/outside-weights"
 mkdir -p "${OUTSIDE_WEIGHTS}"
 run_measure case14 "MLXFAST_WEIGHTS_PATH=${OUTSIDE_WEIGHTS}"
 if [[ "${rc}" -eq 0 ]]; then
-  fail "case 14: weights outside the checkout were accepted; the control leg would read the candidate's own transform"
+  fail "case 14: weights outside the checkout were accepted; both legs would read the candidate workspace's weights"
 elif ! grep -q "outside this checkout" "${WORK}/case14.out"; then
   fail "case 14: the refusal does not explain the re-rooting; got: $(cat "${WORK}/case14.out")"
 fi
@@ -629,6 +678,13 @@ else
     || fail "case 16: the --control-golden-sha256 values are not the live goldens' pins in fixture order"
   [[ "$(argv_values "${WORK}/case16.argv" --control-golden-bytes)" == "${want_bytes}" ]] \
     || fail "case 16: the --control-golden-bytes values are not the live goldens' pins in fixture order"
+  warmup_path="${GOLDEN_DIR}/$(jq -r '.warmup_golden.r2_path | split("/")[-1]' "${MEASURE_CONTRACT}")"
+  argv_pair "${WORK}/case16.argv" --warmup-golden "${warmup_path}" \
+    || fail "case 16: argv carries no pinned --warmup-golden"
+  argv_pair "${WORK}/case16.argv" --warmup-golden-sha256 "$(jq -r '.warmup_golden.sha256' "${MEASURE_CONTRACT}")" \
+    || fail "case 16: argv carries no --warmup-golden-sha256 pin"
+  argv_pair "${WORK}/case16.argv" --warmup-golden-bytes "$(jq -r '.warmup_golden.bytes' "${MEASURE_CONTRACT}")" \
+    || fail "case 16: argv carries no --warmup-golden-bytes pin"
 fi
 
 # run_measure_with_contract CASE FILTER [ENV=VAL...] -- run_measure against a
@@ -683,8 +739,73 @@ elif [[ "${case20_dir}" != "${WORK}/case20-tmp/resident-up."* || ! -d "${case20_
   fail "case 20: benchd got RESIDENT_UP_LOG_DIR '${case20_dir}', not a new directory in the job's temporary directory"
 fi
 
+# Case 21: a staged warm-up whose bytes do not match the fixture is refused
+# before benchd gets a run argv.
+WARMUP_FILE="${GOLDEN_DIR}/$(jq -r '.warmup_golden.r2_path | split("/")[-1]' "${MEASURE_CONTRACT}")"
+cp "${WARMUP_FILE}" "${WORK}/warmup.saved"
+printf 'mismatch\n' >> "${WARMUP_FILE}"
+run_measure case21
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 21: a warm-up golden with the wrong byte count was accepted"
+elif ! grep -q "warm-up golden byte-count mismatch" "${WORK}/case21.out"; then
+  fail "case 21: the pin refusal did not name the warm-up byte count: $(cat "${WORK}/case21.out")"
+elif [[ -f "${WORK}/case21.argv" ]]; then
+  fail "case 21: benchd received a run argv after the warm-up pin mismatch"
+fi
+mv "${WORK}/warmup.saved" "${WARMUP_FILE}"
+
+# Case 22: an old benchd that lacks --warmup-golden is refused. Such a build
+# would silently ignore the fixture's new guard keys.
+OLD_BENCHD="${WORK}/old-benchd"
+cat > "${OLD_BENCHD}" <<'OLDEOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "iterate" && "${2:-}" == "--help" ]]; then
+  echo 'usage: benchd iterate --engine PATH'
+  exit 0
+fi
+exit 0
+OLDEOF
+chmod +x "${OLD_BENCHD}"
+run_measure case22 "BENCHD=${OLD_BENCHD}"
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 22: an old benchd without --warmup-golden was accepted"
+elif ! grep -q "old benchd would ignore the new anti-cheat guards" "${WORK}/case22.out"; then
+  fail "case 22: the refusal did not name the old benchd guard gap: $(cat "${WORK}/case22.out")"
+elif [[ -f "${WORK}/case22.argv" ]]; then
+  fail "case 22: the normal benchd stub got a run argv after the old-benchd refusal"
+fi
+
+# Case 23: the real benchd parses the stripped local contract, then stops at
+# the deliberately missing engine. This cannot load a model or touch the GPU.
+REAL_BENCHD="${REAL_BENCHD:-${REPO_ROOT}/benchd-bin/benchd}"
+real_smoke="skipped (no executable at ${REAL_BENCHD})"
+if [[ -x "${REAL_BENCHD}" ]]; then
+  mkdir -p "${WORK}/case23-weights"
+  env -u MLXFAST_QWEN_MTP_TRACK_ID \
+    BENCHD="${REAL_BENCHD}" \
+    MLXFAST_ENGINE_BIN="${WORK}/case23-missing-engine" \
+    MLXFAST_WEIGHTS_PATH="${WORK}/case23-weights" \
+    MLXFAST_CORRECTNESS_GOLDEN_PATH="${REPO_ROOT}/correctness_prompts/public_longcopy_gate_english_1024_256.json" \
+    MLXFAST_SCORE_PATH="${WORK}/case23.score.json" \
+    MLXFAST_INTEGRITY_PATH="${WORK}/case23.integrity.json" \
+    TMPDIR="${WORK}" \
+    "${FACADE}" --local-iterate > "${WORK}/case23.out" 2>&1
+  rc=$?
+  if [[ "${rc}" -eq 0 ]]; then
+    fail "case 23: real benchd accepted the deliberately missing engine"
+  elif grep -Eq 'WARMUP-GOLDEN-REQUIRED|decode_golden_offset' "${WORK}/case23.out"; then
+    fail "case 23: real benchd refused a paired-only local guard: $(cat "${WORK}/case23.out")"
+  elif ! grep -q 'failed to spawn engine' "${WORK}/case23.out"; then
+    fail "case 23: real benchd did not reach the later missing-engine check: $(cat "${WORK}/case23.out")"
+  else
+    real_smoke="passed"
+  fi
+else
+  echo "SKIP: case 23 real-binary smoke (${real_smoke})"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-benchmark-facade-env.sh: all 20 cases passed (trackId=${EXPECTED})"
+  echo "test-benchmark-facade-env.sh: all checks passed; real-binary smoke ${real_smoke} (trackId=${EXPECTED})"
   exit 0
 fi
 echo "test-benchmark-facade-env.sh: ${failures} case(s) failed" >&2

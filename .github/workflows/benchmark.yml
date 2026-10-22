@@ -339,15 +339,15 @@ jobs:
         #   * HEAD equals the fixture's baseline_reference_commit, exactly. A
         #     tree at any other commit is a different denominator, so a prefix
         #     match would not do.
-        #   * the worker is staged in the layout tools/stage-bench-worker.sh
-        #     writes -- .build/release/bench-worker with mlx.metallib and the
-        #     metallib's fingerprint sidecar beside it. benchd resolves the
+        #   * the trusted CLI and worker are staged in the layout the reference
+        #     build writes. The worker has mlx.metallib and the metallib's
+        #     fingerprint sidecar beside it. benchd resolves the
         #     engine at that fixed path by RE-ROOTING the candidate's relative
         #     --engine under this workspace, and Metal loads the library from
         #     the running binary's own directory.
         #   * the tree carries its OWN transformed weights. The control leg is
-        #     the pinned commit end to end; borrowing the candidate's transform
-        #     would put a submission on both sides of the ratio.
+        #     the pinned commit end to end; borrowing the candidate workspace's
+        #     weights would put one tree on both sides of the ratio.
         #
         # NOTHING HERE FETCHES OR BUILDS THAT TREE. The job holds no credential
         # and the tree is staged out of band by an operator running
@@ -367,6 +367,16 @@ jobs:
             exit 1
           fi
           staged="${MLXFAST_BASELINE_WORKSPACE}/.build/release"
+          baseline_real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${MLXFAST_BASELINE_WORKSPACE}")"
+          trusted_cli_real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${staged}/mlxfast-swift")"
+          if [[ ! -f "${trusted_cli_real}" || ! -x "${trusted_cli_real}" ]]; then
+            echo "::error::the reference workspace has no executable regular trusted CLI at ${trusted_cli_real}; nothing in this job builds it" >&2
+            exit 1
+          fi
+          case "${trusted_cli_real}" in
+            "${baseline_real}"/*) : ;;
+            *) echo "::error::the trusted CLI resolves outside the reference workspace: ${trusted_cli_real} is not inside ${baseline_real}" >&2; exit 1 ;;
+          esac
           if [[ ! -x "${staged}/bench-worker" ]]; then
             echo "::error::the reference workspace has no executable worker at ${staged}/bench-worker; nothing in this job builds it" >&2
             exit 1
@@ -378,10 +388,10 @@ jobs:
             fi
           done
           if [[ ! -f "${MLXFAST_BASELINE_WORKSPACE}/weights/config.json" ]]; then
-            echo "::error::the reference workspace has no transformed weights at ${MLXFAST_BASELINE_WORKSPACE}/weights; the control leg must run on the pinned commit's own transform, not the candidate's" >&2
+            echo "::error::the reference workspace has no transformed weights at ${MLXFAST_BASELINE_WORKSPACE}/weights; the control leg must use the pinned reference tree, not the candidate workspace's weights" >&2
             exit 1
           fi
-          echo "reference workspace ok: ${MLXFAST_BASELINE_WORKSPACE} at ${want}, worker staged with its metallib pair and its own transformed weights"
+          echo "reference workspace ok: ${MLXFAST_BASELINE_WORKSPACE} at ${want}, trusted CLI and worker staged with the metallib pair and transformed weights"
 
       - name: Ranked box preflight (staged assets, contract pins, no credential)
         # Items 2-5 of the fail-closed inventory in this file's header. Runs
@@ -401,8 +411,7 @@ jobs:
       - name: Restore the worker build cache (content-keyed, box-owned)
         # tools/build-cache.sh keys the build on every tracked source, the
         # vendored fork sources, the resolved packages, the vendored Metal
-        # fingerprint and the
-        # toolchain; a hit restores bench-worker, the trusted CLI and the
+        # fingerprint and the toolchain; a hit restores bench-worker and the
         # metallib pair from ~/.cache/mlxfast-engine-build after a sha256 check
         # against the manifest the save wrote. A miss (first dispatch on a box,
         # or any source change) builds below exactly as before and saves.
@@ -432,12 +441,12 @@ jobs:
         # runner registration, and it cannot use the network. The dependency
         # fetch runs first, outside the sandbox.
         #
-        # On a build-cache hit setup.sh reuses the restored products
-        # (MLXFAST_SKIP_SWIFT_BUILD is honoured only when both products are
-        # present; the cache key already proves they were built from this
-        # exact tree) and adopts the restored metallib pair.
+        # The trusted CLI comes from the pinned reference workspace. On a
+        # build-cache hit setup.sh reuses the restored worker and adopts the
+        # restored metallib pair.
         run: |
           set -euo pipefail
+          export MLXFAST_TRUSTED_CLI="${MLXFAST_BASELINE_WORKSPACE}/.build/release/mlxfast-swift"
           if [[ "${MLXFAST_BUILD_CACHE_HIT}" == "1" ]]; then
             want="$(tools/build-mlx-metallib.sh --print-fingerprint)"
             have="$(awk '/^mlxfast-metallib-fingerprint-v1 /{print $2}' .build-worker/release/mlx.metallib.fingerprint)"
@@ -445,7 +454,7 @@ jobs:
               echo "::error::the cached mlx.metallib.fingerprint (${have:-none}) is not this checkout's vendored-source fingerprint (${want}); the build cache key is broken, refusing" >&2
               exit 1
             fi
-            echo "build cache hit: reusing bench-worker, the trusted CLI and mlx.metallib (fingerprint ${want})"
+            echo "build cache hit: reusing bench-worker and mlx.metallib (fingerprint ${want}); trusted CLI ${MLXFAST_TRUSTED_CLI}"
             MLXFAST_SKIP_SWIFT_BUILD=1 MLXFAST_SKIP_MLX_METALLIB=1 MLXFAST_MLX_METALLIB="${PWD}/.build-worker/release/mlx.metallib" ./setup.sh
             # setup.sh's stager keeps its hands off the metallib when the skip
             # knob is set, so the staged worker in .build/release has no
@@ -485,38 +494,21 @@ jobs:
         if: env.MLXFAST_BUILD_CACHE_HIT != '1'
         run: tools/build-cache.sh save
 
-      - name: Transform the reference checkpoint with the candidate's transform
-        # The documented path runs `mlxfast-swift transform` as its own command
-        # after setup.sh, and the measure script refuses without the weights/
-        # tree it writes (run 34029529034). Sources/MLXFastTransform is on the
-        # editable surface, so the job must run THE CANDIDATE'S transform, never
-        # reuse a tree another tree produced. It is cheap: the transform clones
-        # the verified reference on APFS (1 s, no extra blocks on the box), and
-        # benchd seals the tree's weights_hash into the artifact, so provenance
-        # needs no cache and no box-staged tree.
-        #
-        # THE TRANSFORM RUNS SANDBOXED. The CLI links the editable transform
-        # module, and code in a linked module can run before main(), so the
-        # CLI does not confine itself. tools/sandboxed-cli.sh is trusted and
-        # links nothing: it writes the Seatbelt profile
-        # (tools/seatbelt-profile.py) and starts the CLI under
-        # /usr/bin/sandbox-exec, so the profile is in force before the CLI
-        # runs. The transform can write only weights/, its staging siblings
-        # and a private TMPDIR. It cannot use the network or start another
-        # program, and it cannot read or write the evaluator-only paths the
-        # runner service exports (the goldens, the reference workspace, the
-        # calibration file, benchd-bin, the build cache root, the runner
-        # registration). MLXFAST_OFFICIAL_BENCHMARK_RUN makes the wrapper
-        # refuse when the runner environment does not name those paths.
-        env:
-          MLXFAST_OFFICIAL_BENCHMARK_RUN: "1"
+      - name: Clone the reference tree's transformed weights
+        # The transform is trusted. The pinned reference workspace was
+        # built and transformed out of band, so the ranked job clones that
+        # exact weights tree instead of compiling or running candidate-linked
+        # transform code. APFS clone-copy is preferred; plain copy is the safe
+        # fallback on a filesystem that does not support clones.
         run: |
           set -euo pipefail
-          [[ -d "${MLXFAST_REFERENCE_DIR}" ]] || { echo "::error::MLXFAST_REFERENCE_DIR=${MLXFAST_REFERENCE_DIR} is not a directory" >&2; exit 1; }
           rm -rf weights
-          tools/sandboxed-cli.sh transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
-          [[ -f weights/config.json ]] || { echo "::error::the transform wrote no weights/config.json" >&2; exit 1; }
-          echo "transformed tree: $(find weights -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') files; digest $("${BENCHD_BIN_DIR}/benchd" weights-digest --weights weights 2>/dev/null || echo unavailable)"
+          if ! cp -c -R "${MLXFAST_BASELINE_WORKSPACE}/weights" weights; then
+            rm -rf weights
+            cp -R "${MLXFAST_BASELINE_WORKSPACE}/weights" weights
+          fi
+          [[ -f weights/config.json ]] || { echo "::error::the cloned reference weights have no weights/config.json" >&2; exit 1; }
+          echo "reference weights tree: $(find weights -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ') files; digest $("${BENCHD_BIN_DIR}/benchd" weights-digest --weights weights 2>/dev/null || echo unavailable)"
 
       - name: Record the dispatched candidate sha (author-at-seal)
         # FROM THE BOX (2026-08-26 evidence run). benchd's official seal

@@ -364,11 +364,9 @@ FORBIDDEN_EDITABLE = (
 # (TRUSTED_SCOPE_FILES + TRUSTED_SCOPE_DIRS), which runs the same assertion at
 # dispatch time against the trusted ref.
 #
-# Sources/MLXFastTransform is deliberately NOT here: it is participant-editable
-# by contract. The engine itself is the vendored Vendor/mlx-swift-lm tree, and
-# only the ten Nemotron model files in it are declared editable, so there is no
-# sandboxed participant-facing source directory left for this scope to argue
-# about.
+# Sources/MLXFastTransform is trusted. The ranked job uses the pinned
+# reference tree's transformed weights, so the manifest must not expose this
+# source to a submission.
 #
 # `.github` and `tools` are a DELIBERATE DIVERGENCE from upstream's roster,
 # which omits both -- ruled by David 2026-08-20: "parity doctrine governs
@@ -403,6 +401,7 @@ TRUSTED_SCOPE = (
     "Sources/MLXFastTrustedHarness",
     "Sources/MLXFastCLI",
     "Sources/MLXFastCore",
+    "Sources/MLXFastTransform",
     ".github",
     "tools",
     "fixtures",
@@ -1157,7 +1156,7 @@ class Linter:
         """No pinned track golden may sit in this repository.
 
         THE TAPES ARE ORGANIZER MATERIAL, AND THEY ARE NOT IN GIT. The
-        timed-pool tapes and the per-depth oracles are published in R2 at the
+        timed-pool tapes, per-depth oracles and warm-up golden are published in R2 at the
         r2_path keys the contract pins, and the ranked box stages them out of
         band into the directory its runner service exports as
         MLXFAST_QWEN38_GOLDEN_DIR. tools/ranked-box-preflight.sh verifies every
@@ -1183,6 +1182,9 @@ class Linter:
             for entry in (per_prompt or {}).values():
                 if isinstance(entry, dict) and isinstance(entry.get("r2_path"), str):
                     pinned.add(entry["r2_path"])
+        warmup = contract.get("warmup_golden")
+        if isinstance(warmup, dict) and isinstance(warmup.get("r2_path"), str):
+            pinned.add(warmup["r2_path"])
         if not pinned:
             # A track stamped by tools/new-track.sh pins nothing yet: its
             # goldens are recorded on its own box after the port runs. That is

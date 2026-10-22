@@ -234,6 +234,17 @@ printf '%s' "${hidden_sha}" | grep -Eq '^[0-9a-f]{64}$' \
   || fail "hidden_correctness_golden.sha256 is not a 64-hex digest; the token-fidelity oracle is unarmed"
 printf '%s' "${hidden_bytes}" | grep -Eq '^[1-9][0-9]*$' \
   || fail "hidden_correctness_golden.bytes is not a positive integer"
+warmup_r2_path="$(jq -r '.warmup_golden.r2_path // empty' "${CONTRACT}")"
+warmup_sha="$(jq -r '.warmup_golden.sha256 // empty' "${CONTRACT}")"
+warmup_bytes="$(jq -r '.warmup_golden.bytes // empty' "${CONTRACT}")"
+if [[ "$(jq -r 'has("warmup_golden")' "${CONTRACT}")" == "true" ]]; then
+  [[ -n "${warmup_r2_path}" && "${warmup_r2_path##*/}" == *.golden.json ]] \
+    || fail "warmup_golden.r2_path is missing or malformed: '${warmup_r2_path}'"
+  printf '%s' "${warmup_sha}" | grep -Eq '^[0-9a-f]{64}$' \
+    || fail "warmup_golden.sha256 is not a 64-hex digest"
+  printf '%s' "${warmup_bytes}" | grep -Eq '^[1-9][0-9]*$' \
+    || fail "warmup_golden.bytes is not a positive integer"
+fi
 ok "timed pool armed: ${pool_count} pinned tapes + a pinned hidden correctness golden"
 
 # --- 4. the staged tapes match the pins -------------------------------------
@@ -242,6 +253,17 @@ GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
   || fail "MLXFAST_QWEN38_GOLDEN_DIR is unset; the timed-pool tapes are staged onto the box out of band and this job holds no credential to fetch them"
 [[ -d "${GOLDEN_DIR}" ]] \
   || fail "MLXFAST_QWEN38_GOLDEN_DIR does not exist or is not a directory: ${GOLDEN_DIR}"
+GOLDEN_DIR_ABS="$(cd "${GOLDEN_DIR}" && pwd -P)"
+
+require_golden_dir_path() {
+  local path="$1" label="$2" path_abs
+  path_abs="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${path}")" \
+    || fail "${label}: cannot resolve whole staged file path: ${path}"
+  case "${path_abs}" in
+    "${GOLDEN_DIR_ABS}"/*) : ;;
+    *) fail "${label}: staged file ${path_abs} is outside canonical MLXFAST_QWEN38_GOLDEN_DIR ${GOLDEN_DIR_ABS}" ;;
+  esac
+}
 
 verify_pin() {
   # verify_pin <path> <want_sha256> <want_bytes> <label>
@@ -255,17 +277,33 @@ verify_pin() {
     || fail "${label}: sha256 mismatch (staged ${got_sha}, pinned ${want_sha}): ${path}"
 }
 
+verify_golden_pin() {
+  require_golden_dir_path "$1" "$4"
+  verify_pin "$@"
+}
+
 expected_list=""
 while IFS='	' read -r r2_path want_sha want_bytes; do
   [[ -n "${r2_path}" ]] || continue
   name="${r2_path##*/}"
-  verify_pin "${GOLDEN_DIR}/${name}" "${want_sha}" "${want_bytes}" "timed-pool tape ${name}"
+  verify_golden_pin "${GOLDEN_DIR}/${name}" "${want_sha}" "${want_bytes}" "timed-pool tape ${name}"
   expected_list="${expected_list}${name}
 "
 done <<EOF
 $(jq -r '.timed_prompt_pool[] | [.r2_path, .sha256, (.bytes | tostring)] | @tsv' "${CONTRACT}")
 EOF
 ok "all ${pool_count} staged timed-pool tapes match their contract pins (bytes then sha256)"
+
+if [[ -n "${warmup_r2_path}" ]]; then
+  warmup_name="${warmup_r2_path##*/}"
+  verify_golden_pin "${GOLDEN_DIR}/${warmup_name}" "${warmup_sha}" "${warmup_bytes}" \
+    "warm-up golden ${warmup_name}"
+  if ! printf '%s' "${expected_list}" | grep -Fxq "${warmup_name}"; then
+    expected_list="${expected_list}${warmup_name}
+"
+  fi
+  ok "warm-up golden ${warmup_name} matches its contract pin and is staged for warm-up only"
+fi
 
 # Per-depth oracles (David ruling 2026-09-07): every live_golden_speculative
 # entry (one per depth and live golden) must be a well-formed pin AND staged, so
@@ -288,7 +326,7 @@ spec_count=0
 while IFS='	' read -r r2_path want_sha want_bytes; do
   [[ -n "${r2_path}" ]] || continue
   name="${r2_path##*/}"
-  verify_pin "${GOLDEN_DIR}/${name}" "${want_sha}" "${want_bytes}" "per-depth oracle ${name}"
+  verify_golden_pin "${GOLDEN_DIR}/${name}" "${want_sha}" "${want_bytes}" "per-depth oracle ${name}"
   # A per-depth oracle is a pinned cohort member: the staging-directory check
   # below must accept it beside the timed-pool tapes.
   if ! printf '%s' "${expected_list}" | grep -Fxq "${name}"; then
@@ -299,10 +337,8 @@ while IFS='	' read -r r2_path want_sha want_bytes; do
 done < <(jq -r '(.live_golden_speculative // {})[][] | [.r2_path, .sha256, (.bytes|tostring)] | @tsv' "${CONTRACT}")
 ok "${spec_count} per-depth oracle(s) pinned and staged"
 
-# The staging directory must hold the cohort and NOTHING ELSE.
-# tools/nemotron35-30b-a3b-measure-and-score.sh passes EVERY *.json in this directory as a
-# --golden, so an extra file there is an extra cohort member -- it would change
-# what is measured without failing anything downstream.
+# The staging directory must hold the pinned timed/oracle set plus the pinned
+# warm-up golden and NOTHING ELSE.
 unexpected=""
 for staged in "${GOLDEN_DIR}"/*.json; do
   [[ -e "${staged}" ]] || continue
@@ -312,7 +348,7 @@ for staged in "${GOLDEN_DIR}"/*.json; do
   fi
 done
 [[ -z "${unexpected}" ]] \
-  || fail "MLXFAST_QWEN38_GOLDEN_DIR holds *.json file(s) that are not in the pinned cohort:${unexpected} (every *.json there is passed as a --golden, so an extra file silently changes the measured cohort)"
+  || fail "MLXFAST_QWEN38_GOLDEN_DIR holds *.json file(s) that are not in the pinned live/oracle/warm-up set:${unexpected}"
 ok "no unpinned *.json in the staging directory"
 
 # The hidden correctness oracle is pinned by digest only -- the contract gives
@@ -423,11 +459,10 @@ REFERENCE_METALLIB="${BASELINE_WORKSPACE}/.build/release/mlx.metallib"
 ok "reference worker staged with its mlx.metallib and fingerprint sidecar"
 
 # The control leg runs on the pinned commit END TO END, which includes the
-# weights the reference tree's OWN transform produced. Sharing the candidate's
-# transformed tree would put a submission's transform on both sides of the
-# ratio, which is the one thing a control leg exists to prevent.
+# weights the reference tree's OWN transform produced. Sharing the candidate
+# workspace's copy would put one tree on both sides of the ratio.
 [[ -f "${BASELINE_WORKSPACE}/weights/config.json" ]] \
-  || fail "the reference workspace has no transformed weights at ${BASELINE_WORKSPACE}/weights (no config.json); tools/stage-baseline-workspace.sh runs the tree's own transform, and the control leg must not borrow the candidate's"
+  || fail "the reference workspace has no transformed weights at ${BASELINE_WORKSPACE}/weights (no config.json); tools/stage-baseline-workspace.sh runs the tree's own transform, and the control leg must not borrow the candidate workspace's weights"
 ok "reference workspace carries its own transformed weights"
 
 # The commit's own date bounds the calibration from below: a calibration
@@ -472,18 +507,16 @@ except (OSError, json.JSONDecodeError) as exc:
 if not isinstance(cal, dict):
     refuse(f"the baseline calibration file is not a JSON object: {path}")
 
-# Version 3 holds one entry for each prompt in `prompts`, and its decode mean is
-# the DECODE WINDOW per token: decode-run time / N, with no seed prefill in it
-# (benchd ecd66fe, David 2026-10-07). Versions 1 and 2 recorded the whole window
-# (seed prefill plus decode, over N) as decode, so their band does not describe
-# the control leg benchd measures now.
+# Version 3 holds one entry for each prompt in `prompts`. Versions 1 and 2 are
+# unsupported legacy shapes. The current fixture decides whether decode also
+# includes the seed window, so a box must calibrate with the current benchd and
+# contract instead of reusing an older file.
 version = cal.get("version")
 if version in (1, 2):
     refuse(
-        f"baseline calibration version is {version!r}: it recorded decode as the whole "
-        "window (seed prefill plus decode, over N), and decode is now the decode window "
-        "only (decode-run time / N). Recalibrate this box with tools/calibrate-box.sh and "
-        "a benchd at or after ecd66fe, which writes version 3"
+        f"baseline calibration version is {version!r}: versions 1 and 2 are legacy "
+        "formats and do not bind the current fixture guards. Recalibrate this box with "
+        "tools/calibrate-box.sh and the current benchd, which writes version 3"
     )
 if version != 3:
     refuse(

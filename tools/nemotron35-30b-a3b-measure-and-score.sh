@@ -130,14 +130,18 @@
 #                                     falls outside the band; it never uses the
 #                                     band as a denominator.
 #   MLXFAST_QWEN38_GOLDEN_DIR         Directory holding the staged timed-pool
-#                                     golden files. Each LIVE golden is resolved
-#                                     from it as <name>.golden.json (the
-#                                     basename of the fixture entry's r2_path).
+#                                     and warm-up golden files. Each path is
+#                                     resolved from the basename of its fixture
+#                                     r2_path.
 #                                     Box-only, staged out of band and
 #                                     pin-verified by tools/ranked-box-preflight.sh.
 #                                     The name is the FLEET's golden-dir contract,
 #                                     which every box script exports; it is not
 #                                     this track's name and it is not renamed here.
+#   MLXFAST_PRIVATE_DIR              Private root benchd and worker sandboxes deny.
+#                                     Defaults to MLXFAST_QWEN38_GOLDEN_DIR on
+#                                     this ranked path. Every live, control and
+#                                     warm-up golden path must stay inside it.
 #   MLXFAST_ENGINE_BIN               The Engine Protocol v1 engine benchd spawns
 #                                     (`--engine`): the fork's generic
 #                                     bench-worker. Default: the fixed staged
@@ -254,8 +258,9 @@ export MLXFAST_QWEN_MTP_TRACK_ID="${MANIFEST_TRACK_ID}"
 # r2_path (<name>.golden.json) -- carries the {sha256, bytes} pin. A change to
 # the list needs no edit here.
 #
-# Pair k measures golden (k - 1) mod N, so official_pairs must be a multiple
-# of N, and the score is the mean of the per-pair composites. Every golden flag below is repeated
+# Pair k uses golden (k - 1) mod N for prefill and golden k mod N for decode,
+# so official_pairs must be a multiple of N. The score is the mean of the
+# per-pair composites. Every golden flag below is repeated
 # once per live golden, in fixture order, and benchd matches the flags by
 # position.
 LIVE_GOLDEN_NAMES=()
@@ -279,6 +284,46 @@ SPEC_DESC="$("${SCRIPT_DIR}/tools/spec-declaration.sh" describe)"
 # The goldens are box-only, staged out of band into MLXFAST_QWEN38_GOLDEN_DIR
 # and pin-verified by tools/ranked-box-preflight.sh.
 GOLDEN_DIR="${MLXFAST_QWEN38_GOLDEN_DIR:-}"
+if [[ -z "${MLXFAST_PRIVATE_DIR:-}" ]]; then
+  if [[ -d "${GOLDEN_DIR}" ]]; then
+    MLXFAST_PRIVATE_DIR="$(cd "${GOLDEN_DIR}" && pwd -P)"
+  else
+    MLXFAST_PRIVATE_DIR="${GOLDEN_DIR}"
+  fi
+fi
+export MLXFAST_PRIVATE_DIR
+
+# The warm-up golden is a separate, never-scored prompt. Its basename is
+# resolved inside the staged golden directory, and its pin is checked here
+# before benchd gets it. Passing the flag also makes an old benchd fail closed:
+# old builds ignore unknown fixture keys, so the fixture alone cannot arm this
+# guard.
+WARMUP_GOLDEN_BASE=""
+WARMUP_GOLDEN_SHA256=""
+WARMUP_GOLDEN_BYTES=""
+WARMUP_GOLDEN_PATH=""
+WARMUP_ARGS=()
+warmup_entry="$(jq -c '.warmup_golden // empty' "${CONTRACT}")"
+if [[ -n "${warmup_entry}" && "${warmup_entry}" != "null" ]]; then
+  warmup_r2_path="$(printf '%s' "${warmup_entry}" | jq -r '.r2_path // empty')"
+  WARMUP_GOLDEN_BASE="${warmup_r2_path##*/}"
+  WARMUP_GOLDEN_SHA256="$(printf '%s' "${warmup_entry}" | jq -r '.sha256 // empty')"
+  WARMUP_GOLDEN_BYTES="$(printf '%s' "${warmup_entry}" | jq -r '.bytes // empty')"
+  if [[ -z "${warmup_r2_path}" || -z "${WARMUP_GOLDEN_BASE}" || "${WARMUP_GOLDEN_BASE}" != *.golden.json ]] \
+    || ! printf '%s' "${WARMUP_GOLDEN_SHA256}" | grep -Eq '^[0-9a-f]{64}$' \
+    || ! printf '%s' "${WARMUP_GOLDEN_BYTES}" | grep -Eq '^[1-9][0-9]*$'; then
+    echo "nemotron35-30b-a3b-measure-and-score.sh: warmup_golden is unarmed or malformed (r2_path='${warmup_r2_path}', sha256='${WARMUP_GOLDEN_SHA256}', bytes='${WARMUP_GOLDEN_BYTES}')." >&2
+    exit 1
+  fi
+  if [[ -n "${GOLDEN_DIR}" ]]; then
+    WARMUP_GOLDEN_PATH="${GOLDEN_DIR}/${WARMUP_GOLDEN_BASE}"
+  fi
+  if ! "${BENCHD}" iterate --help 2>&1 \
+    | grep -Eq -- '(^|[[:space:]])--warmup-golden([[:space:]]|$)'; then
+    echo "nemotron35-30b-a3b-measure-and-score.sh: REFUSING -- the fixture declares warmup_golden but this benchd has no --warmup-golden; this old benchd would ignore the new anti-cheat guards." >&2
+    exit 1
+  fi
+fi
 
 # For each live golden: the timed oracle the candidate leg verifies against
 # (the serial tape, or the per-depth oracle), and the serial tape the
@@ -337,6 +382,64 @@ for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   SERIAL_GOLDEN_BYTES_LIST+=("${serial_bytes}")
 done
 
+# benchd denies MLXFAST_PRIVATE_DIR to the worker. Every golden it receives
+# must live under that same canonical root; a string-prefix sibling such as
+# /x/priv2 is not under /x/priv. Resolve the whole file through symlinks, then
+# compare whole path components before any benchd verb runs.
+require_private_golden_path() {
+  local flag="$1" path="$2" private_abs path_abs
+  if [[ -z "${MLXFAST_PRIVATE_DIR}" || ! -d "${MLXFAST_PRIVATE_DIR}" ]]; then
+    echo "nemotron35-30b-a3b-measure-and-score.sh: REFUSING -- ${flag} path ${path} has no canonical MLXFAST_PRIVATE_DIR directory (got '${MLXFAST_PRIVATE_DIR:-unset}')." >&2
+    return 1
+  fi
+  if [[ ! -d "$(dirname "${path}")" ]]; then
+    echo "nemotron35-30b-a3b-measure-and-score.sh: REFUSING -- ${flag} parent directory is missing: $(dirname "${path}")" >&2
+    return 1
+  fi
+  private_abs="$(cd "${MLXFAST_PRIVATE_DIR}" && pwd -P)"
+  path_abs="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "${path}")" || {
+    echo "nemotron35-30b-a3b-measure-and-score.sh: REFUSING -- cannot resolve whole ${flag} path: ${path}" >&2
+    return 1
+  }
+  case "${path_abs}" in
+    "${private_abs}"|"${private_abs}"/*) return 0 ;;
+    *)
+      echo "nemotron35-30b-a3b-measure-and-score.sh: REFUSING -- ${flag} path ${path_abs} is outside canonical MLXFAST_PRIVATE_DIR ${private_abs}." >&2
+      return 1
+      ;;
+  esac
+}
+
+verify_pinned_golden() {
+  local label="$1" path="$2" want_sha="$3" want_bytes="$4" got_sha got_bytes
+  [[ -f "${path}" ]] || {
+    echo "nemotron35-30b-a3b-measure-and-score.sh: ${label} not found at ${path}" >&2
+    return 1
+  }
+  got_bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
+  [[ "${got_bytes}" == "${want_bytes}" ]] || {
+    echo "nemotron35-30b-a3b-measure-and-score.sh: ${label} byte-count mismatch at ${path} (staged ${got_bytes}, pinned ${want_bytes})." >&2
+    return 1
+  }
+  got_sha="$(shasum -a 256 "${path}" | awk '{print $1}')"
+  [[ "${got_sha}" == "${want_sha}" ]] || {
+    echo "nemotron35-30b-a3b-measure-and-score.sh: ${label} sha256 mismatch at ${path} (staged ${got_sha}, pinned ${want_sha})." >&2
+    return 1
+  }
+}
+
+if [[ -n "${GOLDEN_DIR}" ]]; then
+  for base in "${GOLDEN_BASENAMES[@]}"; do
+    require_private_golden_path --golden "${GOLDEN_DIR}/${base}" || exit 1
+  done
+  for base in "${SERIAL_GOLDEN_BASENAMES[@]}"; do
+    require_private_golden_path --control-golden "${GOLDEN_DIR}/${base}" || exit 1
+  done
+  if [[ -n "${WARMUP_GOLDEN_PATH}" ]]; then
+    require_private_golden_path --warmup-golden "${WARMUP_GOLDEN_PATH}" || exit 1
+  fi
+fi
+
 # ---------------------------------------------------------------------------
 # --preflight-only: a pre-GPU DRY RUN that exercises the arm gate and (when the
 # goldens are staged) the integrity pins, WITHOUT spawning the engine or loading
@@ -371,6 +474,14 @@ if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
       echo "nemotron35-30b-a3b-measure-and-score.sh: preflight -- live golden not staged (MLXFAST_QWEN38_GOLDEN_DIR unset or ${GOLDEN_BASENAMES[$i]} absent); benchd re-verifies the {sha256, bytes} pin on the real run." >&2
     fi
   done
+  if [[ -n "${WARMUP_GOLDEN_PATH}" ]]; then
+    if [[ -f "${WARMUP_GOLDEN_PATH}" ]]; then
+      verify_pinned_golden "warm-up golden" "${WARMUP_GOLDEN_PATH}" \
+        "${WARMUP_GOLDEN_SHA256}" "${WARMUP_GOLDEN_BYTES}" || exit 1
+    else
+      echo "nemotron35-30b-a3b-measure-and-score.sh: preflight -- warm-up golden not staged at ${WARMUP_GOLDEN_PATH}; benchd re-verifies its pin on the real run." >&2
+    fi
+  fi
   exit 0
 fi
 
@@ -401,6 +512,15 @@ done
 for bytes in "${GOLDEN_BYTES_LIST[@]}"; do
   GOLDEN_PIN_ARGS+=(--golden-bytes "${bytes}")
 done
+if [[ -n "${WARMUP_GOLDEN_PATH}" ]]; then
+  verify_pinned_golden "warm-up golden" "${WARMUP_GOLDEN_PATH}" \
+    "${WARMUP_GOLDEN_SHA256}" "${WARMUP_GOLDEN_BYTES}" || exit 1
+  WARMUP_ARGS=(
+    --warmup-golden "${WARMUP_GOLDEN_PATH}"
+    --warmup-golden-sha256 "${WARMUP_GOLDEN_SHA256}"
+    --warmup-golden-bytes "${WARMUP_GOLDEN_BYTES}"
+  )
+fi
 
 # ---------------------------------------------------------------------------
 # THE PAIRED LEG PAIR. Both names are REQUIRED on a real run and neither has a
@@ -479,9 +599,9 @@ fi
 # constraint. The control leg runs on the reference tree's OWN transform, which
 # benchd finds by re-rooting this path under MLXFAST_BASELINE_WORKSPACE. A
 # weights directory somewhere else on the box has no checkout-relative form, so
-# the control leg would read the CANDIDATE's transformed tree -- a submission's
-# own transform on both sides of the ratio, which is the one thing a control leg
-# exists to prevent. Refuse, by name, exactly as for the engine.
+# the control leg would read the CANDIDATE workspace's weights -- one tree on
+# both sides of the ratio, which is the one thing a control leg exists to
+# prevent. Refuse, by name, exactly as for the engine.
 WEIGHTS_PATH_ABS="$(cd "${WEIGHTS_PATH}" && pwd -P)"
 case "${WEIGHTS_PATH_ABS}" in
   "${SCRIPT_DIR_ABS}"/*)
@@ -489,7 +609,7 @@ case "${WEIGHTS_PATH_ABS}" in
     ;;
   *)
     echo "nemotron35-30b-a3b-measure-and-score.sh: the transformed weights at ${WEIGHTS_PATH_ABS} are outside this checkout (${SCRIPT_DIR_ABS})." >&2
-    echo "  benchd re-roots this path under MLXFAST_BASELINE_WORKSPACE to find the serial-control leg's own transformed weights. A weights directory outside the checkout has no relative form, so the control leg would read this submission's transform and the ratio would carry it on both sides." >&2
+    echo "  benchd re-roots this path under MLXFAST_BASELINE_WORKSPACE to find the serial-control leg's own transformed weights. A weights directory outside the checkout has no relative form, so both legs would read this workspace's weights." >&2
     exit 1
     ;;
 esac
@@ -678,6 +798,7 @@ exec "${BENCHD}" iterate \
   ${SPEC_ARGS[@]+"${SPEC_ARGS[@]}"} \
   --weights "${WEIGHTS_PATH}" \
   "${GOLDEN_ARGS[@]}" \
+  ${WARMUP_ARGS[@]+"${WARMUP_ARGS[@]}"} \
   --mode official \
   --baseline-workspace "${BASELINE_WORKSPACE}" \
   --baseline-calibration "${BASELINE_CALIBRATION}" \

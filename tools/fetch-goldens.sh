@@ -14,8 +14,8 @@
 #
 #   2. THE WHOLE PINNED SET, for the organizer staging a ranked box:
 #        tools/fetch-goldens.sh --all --out DIR
-#      It reads the contract, then fetches every timed_prompt_pool tape and
-#      every live_golden_speculative oracle into DIR. DIR is the directory the
+#      It reads the contract, then fetches every timed_prompt_pool tape,
+#      live_golden_speculative oracle and the warm-up golden into DIR. DIR is the directory the
 #      box's runner service exports as MLXFAST_QWEN38_GOLDEN_DIR. These objects
 #      are organizer material, so this mode needs R2 credentials and refuses
 #      without them. Run tools/ranked-box-preflight.sh afterwards: it verifies
@@ -98,7 +98,7 @@ already use is checked into the clone at
 correctness_prompts/public_longcopy_gate_english_1024_256.json.
 
 THE HIDDEN GUARD: every pin in fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json (the
-timed_prompt_pool tapes, the per-depth oracles and hidden_correctness_golden)
+timed_prompt_pool tapes, the per-depth oracles, the warm-up golden and hidden_correctness_golden)
 is organizer material. This script refuses to fetch any of them by key OR by
 digest, so a copy-pasted pin from the contract cannot quietly pull that
 material onto a participant machine. --allow-hidden lifts that refusal for one
@@ -106,11 +106,11 @@ object and additionally requires R2 credentials to be present.
 
 Usage: tools/fetch-goldens.sh --all --out DIR
 
-Stage the WHOLE pinned set for a ranked box: every timed_prompt_pool tape and
-every live_golden_speculative oracle, each verified against its {sha256, bytes}
-pin, into DIR. A file that already matches its pin is left alone, so the mode
-is safe to re-run. It finishes by finding the hidden_correctness_golden digest
-among the staged files.
+Stage the WHOLE pinned set for a ranked box: every timed_prompt_pool tape,
+every live_golden_speculative oracle and the warm-up golden, each verified
+against its {sha256, bytes} pin, into DIR. A file that already matches its pin
+is left alone, so the mode is safe to re-run. It finishes by finding the
+hidden_correctness_golden digest among the staged files.
 
   --all           Stage the whole pinned set. Needs R2_ACCESS_KEY_ID and
                   R2_SECRET_ACCESS_KEY.
@@ -204,9 +204,11 @@ hidden_pins() {
   awk '
     /^  "timed_prompt_pool": \[/ { in_pool=1; next }
     /^  "hidden_correctness_golden": \{/ { in_hidden=1; next }
+    /^  "warmup_golden": \{/ { in_warmup=1; next }
     in_pool && /^  \]/ { in_pool=0; next }
     in_hidden && /^  \}/ { in_hidden=0; next }
-    (in_pool || in_hidden) && /"(sha256|r2_path)":/ {
+    in_warmup && /^  \}/ { in_warmup=0; next }
+    (in_pool || in_hidden || in_warmup) && /"(sha256|r2_path)":/ {
       value=$0
       sub(/^[^:]*: *"/, "", value)
       sub(/".*$/, "", value)
@@ -385,18 +387,19 @@ EOF
   [[ -d "${OUT_PATH}" ]] \
     || { echo "fetch-goldens.sh: --out is not a directory: ${OUT_PATH}" >&2; exit 1; }
 
-  # Every pin the contract declares: the timed-pool tapes and the per-depth
-  # oracles (one per depth and live golden). A depth may reuse another depth's
-  # tape, so a key is staged once.
+  # Every path pin the contract declares: the timed-pool tapes, per-depth
+  # oracles and the warm-up golden. A path may be reused, so a key is staged
+  # once.
   PINS="$(jq -r '
     [ (.timed_prompt_pool // [])[],
-      (.live_golden_speculative // {})[][] ]
+      (.live_golden_speculative // {})[][],
+      (.warmup_golden // empty) ]
     | map(select(type == "object" and (.r2_path | type) == "string"))
     | unique_by(.r2_path)[]
     | [.r2_path, .sha256, (.bytes | tostring)]
     | @tsv' "${CONTRACT}")"
   [[ -n "${PINS}" ]] \
-    || { echo "fetch-goldens.sh: the contract declares no timed_prompt_pool or live_golden_speculative pin to stage" >&2; exit 1; }
+    || { echo "fetch-goldens.sh: the contract declares no timed_prompt_pool, live_golden_speculative or warmup_golden pin to stage" >&2; exit 1; }
 
   staged=0
   kept=0

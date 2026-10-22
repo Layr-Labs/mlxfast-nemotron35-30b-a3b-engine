@@ -128,8 +128,10 @@ quantization is frozen.
 
 ## 7. Sandbox
 
-The ranked workflow runs participant-controlled transform, build, and worker
-code in restricted macOS sandbox profiles.
+The ranked workflow runs participant-controlled build and worker code in
+restricted macOS sandbox profiles. It does not run the transform: it copies the
+reference workspace's transformed weights. The transform profile below applies to
+the local `mlxfast-swift transform` command.
 
 The transform profile allows writes to the `--output` directory, sibling
 `.<output-name>.*` staging paths, and a private `TMPDIR`. It denies process

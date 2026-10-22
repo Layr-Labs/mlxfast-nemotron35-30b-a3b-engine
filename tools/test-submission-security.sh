@@ -1356,7 +1356,8 @@ lint_needle_count() {
 
 lint_entry_hits() {
   local prefix="$1" bucket="$2" entry="$3"
-  local manifest="${WORK}/lint-scope-$(printf '%s' "${prefix}/${bucket}/${entry}" \
+  local manifest
+  manifest="${WORK}/lint-scope-$(printf '%s' "${prefix}/${bucket}/${entry}" \
     | tr -c 'A-Za-z0-9' '_').json"
   inject_manifest "${manifest}" "${bucket}" "${entry}"
   local out
@@ -1447,14 +1448,16 @@ done
 # are decided here rather than inherited, so exact / inside / containing /
 # near-miss are each asserted in both directions.
 
-# 1. Every protected path must be refused when named exactly. All SEVEN: the
+# 1. Every protected path must be refused when named exactly. The transform is
+#    trusted, so it is protected with the trusted harness paths. The
 #    last two, '.github' and 'tools', are this repository's deliberate
 #    divergence from upstream's five-entry roster (ruled by David 2026-08-20 --
 #    parity doctrine governs measurement surfaces, not security posture), and
 #    they are asserted here exactly like the inherited five so the divergence is
 #    a tested property rather than a comment.
 for scope_path in "Sources/MLXFastTrustedHarness" "Sources/MLXFastCLI" \
-                  "Sources/MLXFastCore" "Package.swift" "Package.resolved" \
+                  "Sources/MLXFastCore" "Sources/MLXFastTransform" \
+                  "Package.swift" "Package.resolved" \
                   ".github" "tools"; do
   assert_equal "lint/trusted-scope entry '${scope_path}' refused (equals)" \
     "$(trusted_scope_hits editablePaths "${scope_path}")" "1"
@@ -1648,7 +1651,7 @@ for divergent_miss in "toolsmith" ".githubusercontent" "tools-extra"; do
     "$(trusted_scope_hits editablePaths "${divergent_miss}")" "0"
 done
 
-# The roster is NINE. Asserted directly, so shrinking it back to upstream's
+# The roster is TEN. Asserted directly, so shrinking it back to upstream's
 # five -- "reconciling the divergence" -- fails here rather than silently
 # unguarding the gates. Counted from the linter's own roster, not restated.
 #
@@ -1658,7 +1661,7 @@ done
 # this assertion goes red when the roster GROWS as well as when it shrinks, so
 # it cannot silently bless a widened trust boundary either -- re-count it
 # deliberately, entry by entry, rather than matching it to whatever the roster
-# currently holds. The nine, and why each is a path a submission must never be
+# currently holds. The ten, and why each is a path a submission must never be
 # able to declare editable:
 #
 #   Package.swift, Package.resolved      the frozen dependency graph -- an
@@ -1667,6 +1670,7 @@ done
 #   Sources/MLXFastCLI                   the trusted driver
 #   Sources/MLXFastCore                  the pins and constants it drives from
 #     (those five are upstream's own TRUSTED_SCOPE roster)
+#   Sources/MLXFastTransform             the trusted weight transform
 #   .github                              the overlay, the static review, the
 #                                        surface gate, the CI tripwires
 #   tools                                this linter, the hostile-archive
@@ -1681,7 +1685,7 @@ done
 #     (those two added 2026-08-24; each is a file whose editability would let a
 #      submission rewrite the terms it is judged by)
 assert_equal "lint/trusted-scope roster carries both divergent entries" \
-  "$(trusted_scope_roster_size)" "9"
+  "$(trusted_scope_roster_size)" "10"
 for required_entry in ".github" "tools"; do
   assert_equal "lint/trusted-scope roster still contains '${required_entry}'" \
     "$(trusted_scope_roster | grep -cFx "${required_entry}")" "1"
@@ -1808,6 +1812,16 @@ assert_equal "requant-only/self-widened contract does not re-grant the head dire
 assert_equal "requant-only/self-widening edit to benchmark.json is itself refused" \
   "$(printf '%s\n' "${rq_out}" | grep -c 'benchmark.json is outside the modifiable surface')" "1"
 
+# The offline transform is trusted. A submission cannot use it as the
+# runtime-code half of an in-memory head re-quantization.
+rq="$(real_contract_fixture)"
+rq_base="$(git -C "${rq}" rev-parse HEAD)"
+printf 'let x = 2\n' > "${rq}/Sources/MLXFastTransform/Placeholder.swift"
+rq_head="$(commit_all "${rq}" edit-frozen-transform)"
+assert_exit "requant-only/trusted transform edit refused" 1 \
+  "outside the modifiable surface" "${rq}" \
+  surface_gate "${rq}" "${rq_base}" "${rq_head}"
+
 # --- F4. POSITIVE DISCRIMINATOR: a declaration-only requant submission passes -
 #
 # Without this the section proves only that the gate refuses things, not that it
@@ -1823,7 +1837,6 @@ c = json.load(open(p))
 c["bytes"] = 123456789
 json.dump(c, open(p, "w"), indent=2)
 PY
-printf 'let x = 2\n' > "${rq}/Sources/MLXFastTransform/Placeholder.swift"
 rq_head="$(commit_all "${rq}" declare-requant)"
 assert_exit "requant-only/declaration-only requant submission accepted" 0 "" "${rq}" \
   surface_gate "${rq}" "${rq_base}" "${rq_head}"
@@ -1957,19 +1970,19 @@ done
 
 # The count moves DELIBERATELY. A second entry riding along would pass every
 # check above and this one is what refuses it.
-assert_equal "head-surface/editablePaths holds exactly 94 entries" \
+assert_equal "head-surface/editablePaths holds exactly 93 entries" \
   "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["editablePaths"]))' \
       "${REPO_ROOT}/benchmark.json")" \
-  "94"
+  "93"
 
 # The count is stated in four places. A half-updated ripple is the defect class
 # a reviewer catches, so the three prose sites are held to the manifest.
 for count_site in README.md TASK.md docs/participant-contract.md; do
-  assert_equal "head-surface/${count_site} states the same 94 entries" \
-    "$(grep -c 'lists 94 entries' "${REPO_ROOT}/${count_site}")" "1"
+  assert_equal "head-surface/${count_site} states the same 93 entries" \
+    "$(grep -c 'lists 93 entries' "${REPO_ROOT}/${count_site}")" "1"
 done
-assert_equal "head-surface/the Swift count pin states 94" \
-  "$(grep -c 'editablePaths.count == 94' "${REPO_ROOT}/Tests/MLXFastTests/Gemma4BenchmarkManifestTests.swift")" \
+assert_equal "head-surface/the Swift count pin states 93" \
+  "$(grep -c 'editablePaths.count == 93' "${REPO_ROOT}/Tests/MLXFastTests/Gemma4BenchmarkManifestTests.swift")" \
   "1"
 
 # --- J. the docs may not describe a DISK re-quantization -------------------
@@ -2027,7 +2040,7 @@ rm -f "${DOCS_GUARD_PROBE}"
 # checkpoint"). Banning the string outright would delete the clearest sentence
 # in the contract. So every line carrying it must be a denial.
 ck_affirmative="$(docs_disk_requant_hits 're-quantized checkpoint' \
-  | grep -v 'do not make\|does not make\|no re-quantized checkpoint' | wc -l | tr -d '[:space:]')"
+  | awk '!/do not make|does not make|no re-quantized checkpoint/{count++} END{print count+0}')"
 assert_equal "docs-on-load/'re-quantized checkpoint' appears only as a denial" \
   "${ck_affirmative}" "0"
 

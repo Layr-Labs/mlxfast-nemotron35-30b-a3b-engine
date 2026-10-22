@@ -142,6 +142,16 @@ def main():
         lines += ["(deny process-fork)", "(deny process-exec*)"]
         for program in args.execs:
             lines.append("(allow process-exec (literal %s))" % quoted(resolved(program)))
+        # No state that outlives the process: shared memory, SysV IPC and the
+        # preferences daemon would let one job keep answers for the next.
+        lines += [
+            "(deny ipc-posix-shm*)",
+            "(deny ipc-sysv*)",
+            "(deny ipc-posix-sem*)",
+            "(deny user-preference-write)",
+            "(deny mach-lookup)",
+            '(allow mach-lookup (global-name "com.apple.MTLCompilerService") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.opendirectoryd.membership") (global-name "com.apple.logd") (global-name "com.apple.diagnosticd"))',
+        ]
     lines += [
         '(deny mach-lookup (global-name "com.apple.mDNSResponder"))',
         '(deny mach-lookup (global-name "com.apple.system.mDNSResponder"))',

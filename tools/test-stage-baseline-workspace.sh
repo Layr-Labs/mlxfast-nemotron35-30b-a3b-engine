@@ -126,8 +126,8 @@ elif ! grep -q "MLXFAST_BASELINE_SOURCE is unset" "${WORK}/case5.out"; then
 fi
 
 # --- case 6: a real run needs the box's reference checkpoint ----------------
-# The reference tree transforms its OWN weights; borrowing the candidate's
-# would put a submission's transform on both sides of the ratio.
+# The reference tree transforms its OWN weights; it must not borrow the
+# candidate workspace's copy.
 MIRROR="${WORK}/mirror"
 mkdir -p "${MIRROR}"
 run_stage case6 "MLXFAST_BASELINE_SOURCE=${MIRROR}" "${TARGET}"

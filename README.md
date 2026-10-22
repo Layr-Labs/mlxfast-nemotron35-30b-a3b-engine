@@ -53,6 +53,9 @@ Transform the checkpoint:
   --output weights
 ```
 
+This local command uses the frozen transform. Ranked runs copy transformed
+weights from the pinned reference workspace instead.
+
 Run the short local check:
 
 ```bash
@@ -111,7 +114,7 @@ Both JSON files identify the pinned checkpoint through `model_provenance`.
 
 | Path | Purpose |
 |---|---|
-| `Sources/MLXFastTransform/` | Offline transform |
+| `Sources/MLXFastTransform/` | Trusted offline transform; not editable |
 | `Sources/MLXFastCLI/` | Trusted CLI |
 | `Sources/MLXFastCore/` | Shared contracts |
 | `Sources/MLXFastTrustedHarness/` | Trusted enforcement |
@@ -127,17 +130,16 @@ licenses.
 
 ## What you may change
 
-`benchmark.json` `editablePaths` lists 94 entries and is the authority. The
+`benchmark.json` `editablePaths` lists 93 entries and is the authority. The
 surface includes:
 
 1. `mtp-head.manifest.json`
-2. `Sources/MLXFastTransform/`
-3. The listed Nemotron model files
-4. The listed batching, cache, attention, RoPE, and server files
-5. The listed MLX and Metal kernel files
+2. The listed Nemotron model files
+3. The listed batching, cache, attention, RoPE, and server files
+4. The listed MLX and Metal kernel files
 
 Everything else is trusted. A submission cannot change measurement, scoring,
-gates, fixtures, target weights, or the benchmarker.
+gates, fixtures, target weights, the offline transform, or the benchmarker.
 
 ### MTP head
 
@@ -194,8 +196,8 @@ gain = control_leg_seconds_per_token / candidate_leg_seconds_per_token
 
 Higher is better. `benchmark.json` sets `direction` to `+`.
 
-The ranked run measures three pairs. Each pair uses one live prompt and two
-legs:
+The ranked run measures three pairs. Each pair uses one live prompt for timed
+prefill, the next live prompt for decode, and two legs:
 
 1. A serial control leg at the fixture's `baseline_reference_commit`.
 2. The candidate leg at the declared draft depth.
@@ -203,8 +205,9 @@ legs:
 The score is the arithmetic mean of the three per-pair composites. The fixture
 sets `official_pairs = 3`. Each pair must independently clear
 `prefill_speedup_floor = 0.95` and `decode_speedup_floor = 0.95`. The manifest
-sets `decodeSpeedupCeiling = 5.0` on decode gain. The first failed pair stops
-the run.
+sets `decodeSpeedupCeiling = 5.0` and `prefillSpeedupCeiling = 1.5`. A ceiling
+failure refuses the pair instead of clamping its score. The first failed pair
+stops the run.
 
 `official_pair_combine` is the authority for how pair composites combine. Its
 current value is `mean`.
@@ -226,17 +229,22 @@ backend is `contiguous`.
 | Seed tokens | 488 |
 | Checked decode steps | 128 |
 | Streams | 1 |
-| Timed prompts per leg | 1 |
+| Timed prompts per leg | 2 roles: one prefill prompt and a different decode prompt |
+| Warm-up prompt | 1 separate fixture-pinned prompt, never scored |
 | Pairs | 3 |
 | Legs per pair | 2 |
 
 The benchmarker applies a 10% per-stream token-tolerance budget.
 
-Both legs receive one unmeasured prefill warm-up. The parent prefill clock runs
-from sending `free_decode_begin` through the validated seed reply. The decode
-clock then runs through `free_decode_run(N)` completion and is divided by N.
-Prefill before begin, seed re-prefill during run, and future decode work during
-begin are prohibited.
+Both legs use the fixture's separate `warmup_golden` for warm-up. The prompt is
+never scored. The parent seed clock runs from sending `free_decode_begin`
+through the validated seed reply. The decode clock then runs through
+`free_decode_run(N)` completion. Scored decode is `(seed window + decode
+window) / N`; scored prefill comes from separate timed prefill requests.
+
+The seed window must be no more than 1.40 times timed prefill per token. Guard
+failures include `SPEEDUP-ABOVE-CEILING`, `SEED-WINDOW-ABOVE-LIMIT`,
+`PROMPT-REUSE-REFUSED`, `PRIVATE-DIR-REQUIRED`, and `LEG-TEARDOWN-FAILED`.
 
 Before each timed phase the benchmarker applies quiescence gates (one-minute load
 average below 2.0, GPU utilization below 10%, 15-second polling, 900-second
@@ -248,12 +256,13 @@ temperature readings.
 ## Current public state
 
 - `official_scoring_enabled` is `true`.
-- The fixture pins `pool-14`, `pool-15`, and `pool-16`.
+- The fixture pins `pool-14`, `pool-15`, and `pool-16` for scoring and
+  `pool-17` for warm-up only.
 - The fixture publishes each hidden artifact's SHA-256 and byte count.
 - Every supported MTP depth maps to the pinned live pool.
 - The ranked workflow targets the self-hosted labels in
   `.github/workflows/benchmark.yml`.
-- Hidden artifacts are provisioned by the organizer. They are not in git.
+- Hidden artifacts are staged outside git.
 - The public measured window is 488 seed tokens and 128 checked decode steps.
 
 ## Building after an edit

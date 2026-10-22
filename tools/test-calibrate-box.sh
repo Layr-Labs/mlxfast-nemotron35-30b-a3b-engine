@@ -100,6 +100,14 @@ mkdir -p "${GOLDEN_DIR}"
 for name in "${LIVE_GOLDEN_NAMES[@]}"; do
   echo '{}' > "${GOLDEN_DIR}/${name}.golden.json"
 done
+WARMUP_BASE="$(jq -r '.warmup_golden.r2_path | split("/")[-1]' "${ROOT}/fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json")"
+printf '{"synthetic_warmup":true}\n' > "${GOLDEN_DIR}/${WARMUP_BASE}"
+WARMUP_SHA="$(shasum -a 256 "${GOLDEN_DIR}/${WARMUP_BASE}" | awk '{print $1}')"
+WARMUP_BYTES="$(wc -c < "${GOLDEN_DIR}/${WARMUP_BASE}" | tr -d '[:space:]')"
+jq --arg sha "${WARMUP_SHA}" --argjson bytes "${WARMUP_BYTES}" \
+  '.warmup_golden.sha256 = $sha | .warmup_golden.bytes = $bytes' \
+  "${ROOT}/fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json" > "${WORK}/warmup-contract.tmp"
+mv "${WORK}/warmup-contract.tmp" "${ROOT}/fixtures/nemotron3_5_30b_a3b_mlx_v1_track.json"
 
 # --- the stub benchd --------------------------------------------------------
 # Records its argv and the track id it was handed, then writes the calibration
@@ -107,6 +115,12 @@ done
 STUB="${WORK}/benchd-stub"
 cat > "${STUB}" <<'STUBEOF'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "calibrate-baseline" && "${2:-}" == "--help" ]]; then
+  echo '    --warmup-golden PATH'
+  echo '    --warmup-golden-sha256 HEX'
+  echo '    --warmup-golden-bytes N'
+  exit 0
+fi
 printf '%s\n' "$@" > "${STUB_CAPTURE_ARGV}"
 printf '%s\n' "${MLXFAST_QWEN_MTP_TRACK_ID-__UNSET__}" > "${STUB_CAPTURE_ENV}"
 printf '%s\n' "${BENCH_WORKER_RESIDENT_SOCKET-__UNSET__}" > "${STUB_CAPTURE_SOCKET}"
@@ -219,6 +233,12 @@ else
     || fail "case 1: argv does not carry --box ${BOX_NAME}"
   argv_has_pair "${WORK}/case1.argv" --out "${WORK}/case1.out.json" \
     || fail "case 1: argv does not carry the requested --out"
+  argv_has_pair "${WORK}/case1.argv" --warmup-golden "${GOLDEN_DIR}/${WARMUP_BASE}" \
+    || fail "case 1: argv does not carry the separate warm-up golden"
+  argv_has_pair "${WORK}/case1.argv" --warmup-golden-sha256 "${WARMUP_SHA}" \
+    || fail "case 1: argv does not carry the warm-up sha256 pin"
+  argv_has_pair "${WORK}/case1.argv" --warmup-golden-bytes "${WARMUP_BYTES}" \
+    || fail "case 1: argv does not carry the warm-up byte pin"
   [[ -f "${WORK}/case1.out.json" ]] || fail "case 1: no calibration file was written"
   grep -q "wrote ${WORK}/case1.out.json" "${WORK}/case1.log" \
     || fail "case 1: the script does not print the file it wrote"
@@ -385,8 +405,40 @@ if [[ -f "${WORK}/case14.argv" ]]; then
   fail "case 14: benchd was spawned with no live goldens"
 fi
 
+# --- case 15: a warm-up pin mismatch is refused before benchd --------------
+cp "${GOLDEN_DIR}/${WARMUP_BASE}" "${WORK}/warmup.saved"
+printf 'mismatch\n' >> "${GOLDEN_DIR}/${WARMUP_BASE}"
+run_calibrate case15 -- "${BOX_NAME}" "${WORK}/case15.out.json"
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 15: calibrate-box.sh accepted a warm-up golden with the wrong byte count"
+elif ! grep -q "warm-up golden byte-count mismatch" "${WORK}/case15.log"; then
+  fail "case 15: the refusal does not name the warm-up byte mismatch: $(cat "${WORK}/case15.log")"
+fi
+if [[ -f "${WORK}/case15.argv" ]]; then
+  fail "case 15: benchd was spawned after the warm-up pin mismatch"
+fi
+mv "${WORK}/warmup.saved" "${GOLDEN_DIR}/${WARMUP_BASE}"
+
+# --- case 16: an old benchd without the warm-up flag is refused ------------
+OLD_BENCHD="${WORK}/old-benchd"
+cat > "${OLD_BENCHD}" <<'OLDEOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "calibrate-baseline" && "${2:-}" == "--help" ]]; then
+  echo 'usage: benchd calibrate-baseline --golden PATH'
+  exit 0
+fi
+exit 0
+OLDEOF
+chmod +x "${OLD_BENCHD}"
+run_calibrate case16 "BENCHD=${OLD_BENCHD}" -- "${BOX_NAME}" "${WORK}/case16.out.json"
+if [[ "${rc}" -eq 0 ]]; then
+  fail "case 16: calibrate-box.sh accepted an old benchd without --warmup-golden"
+elif ! grep -q "old benchd would ignore the new anti-cheat guards" "${WORK}/case16.log"; then
+  fail "case 16: the refusal does not name the old benchd guard gap: $(cat "${WORK}/case16.log")"
+fi
+
 if [[ "${failures}" -eq 0 ]]; then
-  echo "test-calibrate-box.sh: all 14 cases passed"
+  echo "test-calibrate-box.sh: all 16 cases passed"
   exit 0
 fi
 echo "test-calibrate-box.sh: ${failures} case(s) failed" >&2

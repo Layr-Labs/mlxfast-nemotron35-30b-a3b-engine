@@ -35,15 +35,14 @@
 #
 # THE TREE TRANSFORMS ITS OWN WEIGHTS. The control leg runs on the pinned commit
 # END TO END -- its engine, its Metal library AND the weights its own transform
-# produced -- so this script runs the transform in the reference tree exactly as
-# the ranked job runs it for the candidate:
+# produced -- so this script runs the trusted transform in the pinned
+# reference tree:
 #
 #   .build/release/mlxfast-swift transform --reference "${MLXFAST_REFERENCE_DIR}" --output weights
 #
-# Sharing the candidate's transformed tree instead would put a submission's
-# transform on both sides of the ratio, which is the one thing a control leg
-# exists to prevent. MLXFAST_REFERENCE_DIR is the box's verified checkpoint, the
-# same name the ranked job reads.
+# Sharing the candidate workspace's copy instead would put one tree on both
+# sides of the ratio, which is the one thing a control leg exists to prevent.
+# MLXFAST_REFERENCE_DIR is the box's verified checkpoint.
 #
 # Usage:
 #   tools/stage-baseline-workspace.sh <dir> [--prestaged-metallib] [--dry-run]
@@ -112,7 +111,7 @@ if [[ "${DRY_RUN}" == "0" ]]; then
       || die "the target directory is not empty: ${TARGET}; this script never writes into a tree it did not make, because a run may be using it"
   fi
   [[ -n "${MLXFAST_REFERENCE_DIR:-}" ]] \
-    || die "MLXFAST_REFERENCE_DIR is unset; the reference tree transforms its OWN weights from the box's verified checkpoint, and sharing the candidate's transformed tree would put a submission's transform on both sides of the ratio"
+    || die "MLXFAST_REFERENCE_DIR is unset; the reference tree transforms its OWN weights from the box's verified checkpoint, and the control leg must not borrow the candidate workspace's copy"
   [[ -d "${MLXFAST_REFERENCE_DIR}" ]] \
     || die "MLXFAST_REFERENCE_DIR is not a directory: ${MLXFAST_REFERENCE_DIR}"
   if [[ "${PRESTAGED_METALLIB}" == "1" ]]; then

@@ -2,7 +2,7 @@
 #
 # sandboxed-cli.sh -- run a verb of the trusted CLI under Seatbelt.
 #
-# The CLI (.build/release/mlxfast-swift) links the editable transform module.
+# The CLI (.build/release/mlxfast-swift) links the transform module.
 # Code in a linked module can run before main(), so the CLI cannot confine
 # itself. This script is trusted and links nothing: it writes the profile
 # (tools/seatbelt-profile.py) and starts the CLI under /usr/bin/sandbox-exec,

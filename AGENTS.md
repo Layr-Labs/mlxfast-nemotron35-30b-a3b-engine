@@ -24,18 +24,20 @@ guide disagrees with it.
 ## Current state
 
 - Official scoring is armed.
-- The fixture pins the live pool.
+- The fixture pins the live pool and a separate, never-scored warm-up golden.
 - The ranked workflow targets the self-hosted labels in
   `.github/workflows/benchmark.yml`.
-- Scoring is paired and single-stream.
+- Scoring is paired and single-stream. Timed prefill and decode use different
+  live prompts. Decode includes the seed window.
 - The candidate leg runs at its declared MTP depth.
 - The serial control leg runs at `baseline_reference_commit`.
 - No file stores a baseline pair.
 - The per-machine calibration file is a health band, not a denominator.
 
 `Vendor/mlx-swift-lm` and `Vendor/mlx-swift` are vendored trees of plain
-files. Edit only paths listed in `benchmark.json`. Do not push vendored changes
-to an upstream repository.
+files. Edit only paths listed in `benchmark.json`. The offline transform is
+trusted and is not editable. Do not push vendored changes to an upstream
+repository.
 
 ## Local measurement
 
@@ -148,7 +150,6 @@ as described in [CI coverage](docs/ci-coverage.md).
 - KV-cache handling
 - Weight preparation and reuse
 - MLX scheduling and synchronization
-- Safe transform metadata
 
 ## Prohibited strategies
 

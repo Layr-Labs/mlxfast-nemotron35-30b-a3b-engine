@@ -33,6 +33,10 @@ A ranked pair measures its serial control leg and candidate leg on the same
 machine in the same job. Live control seconds per token is the numerator in each
 gain. Candidate seconds per token is the denominator.
 
+The ranked decode figure includes the seed window:
+`(seed window + decode window) / decode token count`. Ranked prefill is measured
+separately.
+
 No file stores a ranked baseline pair. Ranked goldens reject
 `benchmark.baseline_prefill_seconds_per_token` and
 `benchmark.baseline_decode_seconds_per_token`.
