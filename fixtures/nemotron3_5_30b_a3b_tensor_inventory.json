@@ -1,0 +1,6122 @@
+{
+ "schema_version": 1,
+ "source": {
+  "upstream_model_id": "EigenLabs/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MLX-4bit-mtp",
+  "upstream_revision": "153c469494b3f16a0eaa752dae25cfc9452ce5c6",
+  "config_bytes": 3044,
+  "config_sha256": "93dcd00b9caf4bc42f803550ecbb95d79a942dfc89314797ee33c0c20c8dbb67",
+  "index_bytes": 68251,
+  "index_sha256": "1107ee24b73b0597e660e94e0ef12bff716d0b24114258eeb31263c8ca5f40c7"
+ },
+ "shards": [
+  {
+   "index": 1,
+   "name": "model-00001-of-00004.safetensors",
+   "tensor_count": 214
+  },
+  {
+   "index": 2,
+   "name": "model-00002-of-00004.safetensors",
+   "tensor_count": 222
+  },
+  {
+   "index": 3,
+   "name": "model-00003-of-00004.safetensors",
+   "tensor_count": 222
+  },
+  {
+   "index": 4,
+   "name": "model-00004-of-00004.safetensors",
+   "tensor_count": 105
+  }
+ ],
+ "tensors": {
+  "backbone.embeddings.biases": {
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.embeddings.scales": {
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.embeddings.weight": {
+   "dtype": "U32",
+   "shape": [
+    131072,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.0.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.1.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.10.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.11.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.12.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.13.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.14.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.15.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.15.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.15.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.15.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.15.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.16.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.16.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.17.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.18.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.19.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.2.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.2.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.20.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.20.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.21.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.22.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.23.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.24.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.25.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.26.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.27.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.28.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.29.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.3.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.3.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.30.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.30.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.31.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.31.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.31.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.31.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.31.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 2
+  },
+  "backbone.layers.32.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.32.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.33.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.34.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.35.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.36.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.37.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.38.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.39.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.4.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.4.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.40.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.40.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.41.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.42.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.43.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.44.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.45.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.46.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.47.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.47.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.47.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.47.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.47.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 3
+  },
+  "backbone.layers.48.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.48.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.49.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.5.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.5.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.50.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.50.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.51.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "backbone.layers.6.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.6.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.7.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.8.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.A_log": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.D": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.conv1d.bias": {
+   "dtype": "BF16",
+   "shape": [
+    6144
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.conv1d.weight": {
+   "dtype": "BF16",
+   "shape": [
+    6144,
+    4,
+    1
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.dt_bias": {
+   "dtype": "BF16",
+   "shape": [
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.in_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.in_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    10304,
+    42
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.in_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    10304,
+    336
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    4096
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.out_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.out_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.mixer.out_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 1
+  },
+  "backbone.layers.9.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 1
+  },
+  "backbone.norm_f.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "lm_head.biases": {
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    42
+   ],
+   "shard_index": 4
+  },
+  "lm_head.scales": {
+   "dtype": "BF16",
+   "shape": [
+    131072,
+    42
+   ],
+   "shard_index": 4
+  },
+  "lm_head.weight": {
+   "dtype": "U32",
+   "shape": [
+    131072,
+    336
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.eh_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    84
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.eh_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    84
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.eh_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    672
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.enorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.hnorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.k_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.k_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.k_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.o_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.o_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    64
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.o_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    512
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.q_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.q_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    4096,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.q_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    4096,
+    336
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.v_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.v_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    256,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.mixer.v_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    256,
+    336
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.0.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.final_layernorm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.gate.e_score_correction_bias": {
+   "dtype": "F32",
+   "shape": [
+    128
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.gate.weight": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.shared_experts.down_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.shared_experts.down_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    2688,
+    58
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.shared_experts.down_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    2688,
+    464
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.shared_experts.up_proj.biases": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.shared_experts.up_proj.scales": {
+   "dtype": "BF16",
+   "shape": [
+    3712,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.shared_experts.up_proj.weight": {
+   "dtype": "U32",
+   "shape": [
+    3712,
+    336
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.switch_mlp.fc1.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.switch_mlp.fc1.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    1856,
+    42
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.switch_mlp.fc1.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    1856,
+    336
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.switch_mlp.fc2.biases": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.switch_mlp.fc2.scales": {
+   "dtype": "BF16",
+   "shape": [
+    128,
+    2688,
+    29
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.mixer.switch_mlp.fc2.weight": {
+   "dtype": "U32",
+   "shape": [
+    128,
+    2688,
+    232
+   ],
+   "shard_index": 4
+  },
+  "mtp.layers.1.norm.weight": {
+   "dtype": "BF16",
+   "shape": [
+    2688
+   ],
+   "shard_index": 4
+  }
+ },
+ "summary": {
+  "tensor_count": 763,
+  "shard_count": 4,
+  "dtype_counts": {
+   "BF16": 566,
+   "F32": 24,
+   "U32": 173
+  },
+  "mtp_tensor_count": 34,
+  "backbone_tensor_count": 726,
+  "lm_head_tensor_count": 3,
+  "total_size_bytes": 18526974592
+ }
+}
