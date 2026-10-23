@@ -365,19 +365,55 @@ fi
 # resident. The probe closes at once, which ends its session.
 probe_resident() {
   python3 - "$1" <<'PY'
-import json, socket, sys
+import json, socket, sys, time
+
+MAX_HELLO_BYTES = 1024 * 1024
+PROBE_DEADLINE_SECONDS = 30.0
+OVERFLOW_EXIT = 2
+DEADLINE_EXIT = 3
+
+
+class HelloOverflow(Exception):
+    pass
+
+
+class ProbeDeadline(Exception):
+    pass
+
+
+def set_remaining_timeout(sock, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ProbeDeadline(f"no hello line within {PROBE_DEADLINE_SECONDS:g}s")
+    sock.settimeout(remaining)
+
+
 try:
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    s.settimeout(10)
-    s.connect(sys.argv[1])
-    line = b""
-    while not line.endswith(b"\n"):
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        line += chunk
-    s.close()
+    deadline = time.monotonic() + PROBE_DEADLINE_SECONDS
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        set_remaining_timeout(sock, deadline)
+        sock.connect(sys.argv[1])
+        line = bytearray()
+        while not line.endswith(b"\n"):
+            set_remaining_timeout(sock, deadline)
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout as err:
+                raise ProbeDeadline(
+                    f"no hello line within {PROBE_DEADLINE_SECONDS:g}s"
+                ) from err
+            if not chunk:
+                break
+            if len(line) + len(chunk) > MAX_HELLO_BYTES:
+                raise HelloOverflow(f"hello exceeds {MAX_HELLO_BYTES} bytes")
+            line.extend(chunk)
     reply = json.loads(line.decode())
+except HelloOverflow as err:
+    print(f"probe overflow: {err}", file=sys.stderr)
+    sys.exit(OVERFLOW_EXIT)
+except ProbeDeadline as err:
+    print(f"probe deadline: {err}", file=sys.stderr)
+    sys.exit(DEADLINE_EXIT)
 except Exception as err:                       # noqa: BLE001 - any failure is unhealthy
     print(f"probe failed: {err}", file=sys.stderr)
     sys.exit(1)
@@ -387,6 +423,13 @@ if reply.get("ok") is not True:
 print(json.dumps({k: reply.get(k) for k in
                   ("backend", "device", "protocol_version", "spec_modes", "runner", "resident")}))
 PY
+}
+
+refuse_bad_probe() {
+  local code="$1"
+  local message="$2"
+  [[ "${MODE}" != "boot" ]] || teardown
+  refuse "${code}" "${message} The resident was stopped and the boot was refused."
 }
 
 # ONE RESIDENT PER BOX, ACROSS TREES. The pidfile below lives under the tree
@@ -432,6 +475,7 @@ RESIDENT_PGID=""
 RESIDENT_TMP_DIR=""
 RESIDENT_TMP_SIDECAR="${SOCKET_PATH}.tmpdir"
 BOOT_DONE=0
+HELLO_FILE=""
 
 remove_resident_tmp() {
   [[ -n "${RESIDENT_TMP_DIR}" ]] || return 0
@@ -476,24 +520,38 @@ teardown() {
   rm -f "${SOCKET_PATH}" "${PIDFILE}" "${PGIDFILE}" 2>/dev/null || true
   remove_resident_tmp
 }
+remove_hello_file() { [[ -z "${HELLO_FILE}" ]] || rm -f -- "${HELLO_FILE}" 2>/dev/null || true; }
 wrapper_exit() {
   local rc=$?
   trap - EXIT
+  remove_hello_file
   if ! teardown; then
     rc=1
   fi
   exit "${rc}"
 }
-# THE TRAP IS THE WRAPPER FORM'S. A --boot deliberately EXITS with the resident
-# still running -- that is the whole contract -- so it must not tear down on
-# exit. Its failure paths call teardown explicitly instead, so a boot that never
-# became healthy still leaves nothing behind. The --boot trap removes only the
-# resident's temporary directory, and only when the boot did not complete; on
-# a complete boot --stop removes it.
+# A --boot deliberately EXITS with the resident still running -- that is the
+# whole contract -- but only once BOOT_DONE=1. Every other --boot exit after the
+# resident started (die, a set -e failure, a signal) tears it down here, so no
+# failure path leaves it up. Before the resident starts, only its temporary
+# directory is removed; on a complete boot --stop removes that.
+boot_exit() {
+  local rc=$?
+  trap - EXIT
+  remove_hello_file
+  [[ "${BOOT_DONE}" != "1" ]] || exit "${rc}"
+  [[ "${rc}" -ne 0 ]] || rc=1
+  if [[ -n "${RESIDENT_PID}" ]]; then
+    teardown || true
+  else
+    remove_resident_tmp || true
+  fi
+  exit "${rc}"
+}
 if [[ "${MODE}" == "wrap" ]]; then
   trap wrapper_exit EXIT
 else
-  trap '[[ "${BOOT_DONE}" == "1" ]] || remove_resident_tmp || exit 1' EXIT
+  trap boot_exit EXIT
 fi
 trap 'exit 130' INT TERM
 
@@ -601,8 +659,14 @@ while :; do
     [[ "${MODE}" != "boot" ]] || teardown
     exit 1
   fi
-  if [[ -S "${SOCKET_PATH}" ]] && probe_resident "${SOCKET_PATH}" >/dev/null 2>&1; then
-    break
+  if [[ -S "${SOCKET_PATH}" ]]; then
+    probe_rc=0
+    probe_resident "${SOCKET_PATH}" >/dev/null 2>&1 || probe_rc=$?
+    case "${probe_rc}" in
+      0) break ;;
+      2) refuse_bad_probe resident-hello-overflow "the resident hello exceeded the 1 MiB probe limit." ;;
+      3) refuse_bad_probe resident-hello-deadline "the resident did not finish its hello within the 30s probe deadline." ;;
+    esac
   fi
   now="$(date +%s)"
   if (( now - start >= HEALTH_TIMEOUT_S )); then
@@ -615,10 +679,23 @@ while :; do
 done
 log "resident healthy on ${SOCKET_PATH} after $(( $(date +%s) - start ))s; every phase now attaches instead of loading"
 
-HELLO_JSON="$(probe_resident "${SOCKET_PATH}")" || die "the resident stopped answering before the run started"
+probe_rc=0
+HELLO_JSON="$(probe_resident "${SOCKET_PATH}")" || probe_rc=$?
+case "${probe_rc}" in
+  0) : ;;
+  2) refuse_bad_probe resident-hello-overflow "the resident hello exceeded the 1 MiB probe limit." ;;
+  3) refuse_bad_probe resident-hello-deadline "the resident did not finish its hello within the 30s probe deadline." ;;
+  *) [[ "${MODE}" != "boot" ]] || teardown; die "the resident stopped answering before the run started" ;;
+esac
 
 # --- the window's identity ---------------------------------------------------
-python3 - "${IDENTITY_FILE}" "${HELLO_JSON}" <<PY
+# The hello travels through a private file, never argv: a valid hello near the
+# 1 MiB cap can expand past ARG_MAX once escaped (E2BIG). Any failure here exits
+# through the EXIT trap, which removes the file and stops the resident.
+HELLO_FILE="$(mktemp "${LOG_DIR}/resident-hello.XXXXXX")" || die "could not create the resident hello file"
+chmod 600 "${HELLO_FILE}"
+printf '%s' "${HELLO_JSON}" > "${HELLO_FILE}"
+python3 - "${IDENTITY_FILE}" "${HELLO_FILE}" <<PY || die "could not write the resident identity file"
 import json, sys
 json.dump({
     "engine": "bench-worker",
@@ -632,10 +709,12 @@ json.dump({
     "mode": "${MODE}",
     "spec": "${SPEC:-unset}",
     "draft_len": "${DRAFT_LEN:-unset}",
-    "hello": json.loads(sys.argv[2]),
+    "hello": json.load(open(sys.argv[2])),
     "started": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
 }, open(sys.argv[1], "w"), indent=2)
 PY
+remove_hello_file
+HELLO_FILE=""
 
 # --- --boot ends here, with the resident STILL RUNNING -----------------------
 # The contract with benchd: the socket path is the FIRST LINE of --socket-out,
