@@ -38,7 +38,13 @@ fail() { failures=$((failures + 1)); echo "FAIL  $*" >&2; }
 MARKER="CANARY-MARKER-7c1e"
 C="${WORK}/canary"
 mkdir -p "${C}/goldens" "${C}/benchd-bin" "${C}/baseline" "${C}/private" "${C}/cache" \
-  "${C}/runner/_work/repo" "${WORK}/audit" "${WORK}/out" "${WORK}/home"
+  "${C}/runner/_work/repo" "${WORK}/audit" "${WORK}/out" \
+  "${WORK}/home/actions-runner" "${WORK}/home/actions-runner-x" "${WORK}/home/unrelated"
+for directory in actions-runner actions-runner-x unrelated; do
+  for name in .credentials .credentials_rsaparams .runner; do
+    printf '%s\n' "${MARKER}" > "${WORK}/home/${directory}/${name}"
+  done
+done
 printf '{"canary":"%s"}\n' "${MARKER}" > "${C}/goldens/canary.golden.json"
 printf '%s\n' "${MARKER}" > "${C}/benchd-bin/benchd"
 printf '%s\n' "${MARKER}" > "${C}/baseline/README.md"
@@ -82,6 +88,21 @@ else
   for rule in "(deny process-fork)" "(deny process-exec*)" "(deny signal)" "(allow signal (target self))"; do
     ! grep -qF "${rule}" <<< "${profile}" || { ok=0; fail "generator: the build profile has ${rule}; a build starts compilers"; }
   done
+  expected_home_runner_rules="$(
+    for directory in actions-runner actions-runner-x; do
+      for name in .credentials .credentials_rsaparams .runner; do
+        printf '(deny file-read* file-write* (subpath "%s"))\n' "${WORK}/home/${directory}/${name}"
+      done
+    done
+  )"
+  actual_home_runner_rules="$(grep -F "(subpath \"${WORK}/home/actions-runner" <<< "${profile}" || true)"
+  if [[ "${actual_home_runner_rules}" == "${expected_home_runner_rules}" ]] \
+    && ! grep -qF "(subpath \"${WORK}/home/unrelated/" <<< "${profile}"; then
+    pass "generator: the build profile denies six sibling-runner registration files in deterministic order, but not an unrelated directory"
+  else
+    ok=0
+    fail "generator: the build profile sibling-runner denies are wrong: ${actual_home_runner_rules}"
+  fi
   [[ "$(tail -n 1 <<< "${profile}")" == "(deny file-read* file-write* "* ]] \
     || { ok=0; fail "generator: the evaluator denies are not the last rules of the build profile"; }
   [[ "${ok}" -eq 0 ]] || pass "generator: the build profile denies network and all writes, allows fork and exec, and denies every evaluator path last"

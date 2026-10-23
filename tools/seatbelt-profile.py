@@ -34,9 +34,11 @@ stable resident log root is also denied
 (MLXFAST_RESIDENT_LOG_ROOT, falling back to RESIDENT_UP_LOG_DIR and then
 ~/.mlxfast-resident-logs), the build
 cache root (MLXFAST_BUILD_CACHE_DIR, else
-~/.cache/mlxfast-engine-build) and the runner registration files two levels
-above RUNNER_WORKSPACE. The reference workspace is not denied when --tree is
-inside it, because then the confined program is that workspace's own.
+~/.cache/mlxfast-engine-build), the runner registration files two levels
+above RUNNER_WORKSPACE, and the registration files in every actions-runner*
+directory directly under HOME. The reference workspace is not denied when
+--tree is inside it, because then the confined program is that workspace's
+own.
 
 With --official, the four paths that an official run must name
 (MLXFAST_QWEN38_GOLDEN_DIR, MLXFAST_BASELINE_WORKSPACE,
@@ -125,6 +127,16 @@ def evaluator_paths(env, tree):
     if runner_workspace:
         runner_root = os.path.dirname(os.path.dirname(os.path.abspath(runner_workspace)))
         paths += [os.path.join(runner_root, name) for name in RUNNER_REGISTRATION_FILES]
+    try:
+        home_entries = sorted(os.listdir(home))
+    except OSError:
+        home_entries = []
+    for entry in home_entries:
+        runner_root = os.path.join(home, entry)
+        # Another runner under the same account carries credentials that a
+        # compiler could print, even when RUNNER_WORKSPACE names this runner.
+        if entry.startswith("actions-runner") and os.path.isdir(runner_root):
+            paths += [os.path.join(runner_root, name) for name in RUNNER_REGISTRATION_FILES]
     return [resolved(path) for path in paths if path]
 
 

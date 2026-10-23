@@ -573,6 +573,19 @@ done < <(env)
 ) >"${RESIDENT_LOG}" 2>&1 <<'PY' &
 import os, sys
 os.setsid()
+# The resident shares an account with trusted jobs. Do not let it inherit a
+# trusted lock or other authority through a shell descriptor.
+for name in os.listdir("/dev/fd"):
+    try:
+        fd = int(name)
+    except ValueError:
+        continue
+    if fd < 3:
+        continue
+    try:
+        os.close(fd)
+    except OSError:
+        pass
 os.execv(sys.argv[1], sys.argv[1:])
 PY
 RESIDENT_PID=$!
