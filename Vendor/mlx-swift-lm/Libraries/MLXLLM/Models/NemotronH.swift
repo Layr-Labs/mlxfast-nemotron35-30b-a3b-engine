@@ -1148,7 +1148,11 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        logits(cbv2Hidden(
+        // organizer e2e test: a fixed 151 us busy-wait per decode step (a sleep is
+        // stretched by timer coalescing in a background service; a spin is not)
+        let organizerPauseEnd = DispatchTime.now().uptimeNanoseconds + 151_000
+        while DispatchTime.now().uptimeNanoseconds < organizerPauseEnd {}
+        return logits(cbv2Hidden(
             tokens, caches: caches, recurrentState: recurrentState))
     }
 }
