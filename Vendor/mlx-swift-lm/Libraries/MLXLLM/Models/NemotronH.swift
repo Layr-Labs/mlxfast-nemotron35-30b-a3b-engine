@@ -95,6 +95,17 @@ class NemotronHRMSNormGated: Module {
     }
 }
 
+// MARK: - Prefill x5 switches
+
+/// Prefill x5: stable counting sort with expert-run tiles, expert-run NAX
+/// gather and the fused segsum scan. NEMOTRON_PREFILL_X5=0 restores the
+/// argsort / stock gather / masked-decay graph.
+enum NemotronHPrefillX5 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_X5"] != "0"
+    /// The run gather clones the NAX kernel; without NAX stock runs another one.
+    static let runGather = enabled && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+}
+
 // MARK: - Multi-token SSM scan (copy of SSM.swift ssmAttn, fewer copies)
 
 /// tril(CB_g * exp(S), 0) with CB broadcast over the R heads of its group:
@@ -104,7 +115,60 @@ class NemotronHRMSNormGated: Module {
 private final class NemotronHScanKernels: Sendable {
     static let shared = NemotronHScanKernels()
     let maskedDecay: MLXFast.MLXFastKernel
+    let scanDecay: MLXFast.MLXFastKernel
     private init() {
+        // Fused segsum (tril(x, -1) -> cumsum(axis -2) in strided_scan order)
+        // + exp + CB product + tril, plus the decay's last row.
+        scanDecay = MLXFast.metalKernel(
+            name: "nemotron_ssm_scan_decay",
+            inputNames: ["dtA", "CB", "L"], outputNames: ["out", "last"],
+            source: """
+                // One threadgroup = 32 simdgroups x 32 lanes: column block
+                // j0..j0+31 of one (batch, head). Simdgroup s owns column
+                // j0+s, lane r is row rb*32+r: the same lane/row mapping and
+                // per-32-row simd_prefix_inclusive_sum + carried prefix as
+                // MLX strided_scan (cumsum axis -2) over tril(x, -1).
+                threadgroup float tile[32][33];
+                const uint lane = thread_index_in_simdgroup;
+                const uint s = simdgroup_index_in_threadgroup;
+                const uint j0 = threadgroup_position_in_grid.x * 32;
+                const uint bh = threadgroup_position_in_grid.z;
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                const uint j = j0 + s;
+                const device CBT* cb = CB + size_t(bb * (H / R) + hh / R) * L * L;
+                device float* o = out + size_t(bh) * L * L;
+                float prefix = 0.0f;
+                for (int rb = 0; rb < L; rb += 32) {
+                    const int i = rb + int(lane);
+                    float v = 0.0f;
+                    if (i < L && int(j) < L && i > int(j)) {
+                        v = dtA[(size_t(bb) * L + i) * H + hh];
+                    }
+                    v = simd_prefix_inclusive_sum(v);
+                    v = v + prefix;
+                    prefix = simd_shuffle(v, 31);
+                    float r = 0.0f;
+                    if (i < L && int(j) < L) {
+                        float d = metal::precise::exp(v);
+                        if (i == L - 1) {
+                            last[size_t(bh) * L + j] = d;
+                        }
+                        if (int(j) <= i) {
+                            float c = static_cast<float>(cb[size_t(i) * L + j]);
+                            r = c * d;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    tile[lane][s] = r;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    const int wi = rb + int(s);
+                    const uint wj = j0 + lane;
+                    if (wi < L && int(wj) < L) {
+                        o[size_t(wi) * L + wj] = tile[s][lane];
+                    }
+                }
+            """)
         maskedDecay = MLXFast.metalKernel(
             name: "nemotron_ssm_masked_decay",
             inputNames: ["CB", "S", "L", "R"], outputNames: ["out"],
@@ -162,28 +226,39 @@ func nemotronSSMAttn(
         stepB = MLX.transposed(stepB, axes: [0, 2, 3, 1])
         let CB = MLX.swappedAxes(stepC, 1, 2).matmul(stepB)
 
-        // segsum(stepDtA.swappedAxes(1, 2)) with a broadcast instead of repeat.
-        let segIn = stepDtA.swappedAxes(1, 2)[.ellipsis, .newAxis]
-        let segTri = MLX.tril(MLX.broadcast(segIn, to: [b, h, n, n]), k: -1)
-        let segsum = MLX.cumsum(segTri, axis: -2)
-
         let surrogateAttentionMatrix: MLXArray
-        if segsum.dtype == .float32 {
-            surrogateAttentionMatrix = NemotronHScanKernels.shared.maskedDecay(
-                [CB, segsum, n, repeats],
-                template: [("T", CB.dtype)],
-                grid: (n, n, b * h), threadGroup: (32, 8, 1),
-                outputShapes: [[b, h, n, n]], outputDTypes: [.float32])[0]
+        let decayLast: MLXArray
+        if NemotronHPrefillX5.enabled, stepDtA.dtype == .float32, h % g == 0 {
+            let fused = NemotronHScanKernels.shared.scanDecay(
+                [stepDtA, CB, n],
+                template: [("CBT", CB.dtype), ("H", h), ("R", repeats)],
+                grid: (((n + 31) / 32) * 1024, 1, b * h), threadGroup: (1024, 1, 1),
+                outputShapes: [[b, h, n, n], [b, h, 1, n]], outputDTypes: [.float32, .float32])
+            surrogateAttentionMatrix = fused[0]
+            decayLast = fused[1]
         } else {
-            let decayFull = MLX.exp(segsum)
-            surrogateAttentionMatrix = MLX.tril(
-                MLX.repeated(CB, count: repeats, axis: 1) * decayFull, k: 0)
+            // segsum(stepDtA.swappedAxes(1, 2)) with a broadcast instead of repeat.
+            let segIn = stepDtA.swappedAxes(1, 2)[.ellipsis, .newAxis]
+            let segTri = MLX.tril(MLX.broadcast(segIn, to: [b, h, n, n]), k: -1)
+            let segsum = MLX.cumsum(segTri, axis: -2)
+            decayLast = MLX.exp(segsum[0..., 0..., (-1)..., 0...])
+            if segsum.dtype == .float32 {
+                surrogateAttentionMatrix = NemotronHScanKernels.shared.maskedDecay(
+                    [CB, segsum, n, repeats],
+                    template: [("T", CB.dtype)],
+                    grid: (n, n, b * h), threadGroup: (32, 8, 1),
+                    outputShapes: [[b, h, n, n]], outputDTypes: [.float32])[0]
+            } else {
+                let decayFull = MLX.exp(segsum)
+                surrogateAttentionMatrix = MLX.tril(
+                    MLX.repeated(CB, count: repeats, axis: 1) * decayFull, k: 0)
+            }
         }
         var y = surrogateAttentionMatrix.matmul(stepDtx.swappedAxes(1, 2))
         y = MLX.swappedAxes(y, 1, 2)
 
         // decay[..., -1:, :] == exp(segsum[..., -1:, :]) element-wise.
-        let decay = MLX.exp(segsum[0..., 0..., (-1)..., 0...]).transposed(0, 3, 1, 2)
+        let decay = decayLast.transposed(0, 3, 1, 2)
         stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
         var dtxdecay = stepDtx * decay
         dtxdecay = dtxdecay.swappedAxes(1, 2).swappedAxes(2, 3)
@@ -737,7 +812,10 @@ class NemotronHSwitchMLP: Module {
     /// (3) the unsort gather, fp32 promotion, score multiply, K-way sum and
     /// narrowing are one kernel that reproduces col_reduce_small's order
     /// (lsize.y == K <= 8: row j is op(v_j, 0), then total = op(row_j, total)
-    /// for j = 1..K-1). Every value is bitwise identical to the unfused graph.
+    /// for j = 1..K-1). With x5 enabled, (4) argsort + inverse + sorted ids
+    /// come from one stable counting sort and (5) where stock takes the
+    /// sorted-rhs NAX gather, fc1/fc2 run its expert-run-aligned clone.
+    /// Every value is bitwise identical to the unfused graph.
     func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray) -> MLXArray? {
         let k = indices.dim(-1)
         guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
@@ -747,16 +825,30 @@ class NemotronHSwitchMLP: Module {
         else { return nil }
         let tokens = indices.size / k
         let flat = indices.flattened()
-        let order = argSort(flat)
         let kernels = NemotronHPrefillKernels.shared
-        let inverse = kernels.inversePermutation(
-            [order], template: [("T", order.dtype)],
-            grid: (order.size, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[order.size]], outputDTypes: [order.dtype])[0]
+        let order: MLXArray, inverse: MLXArray, idx: MLXArray
+        var runTiles: NemotronHRunTiles? = nil
+        if NemotronHPrefillX5.enabled, let sorted = nemotronCountingSort(flat, experts: numExperts) {
+            (order, inverse, idx) = (sorted.order, sorted.inverse, sorted.sorted)
+            runTiles = sorted.tiles
+        } else {
+            order = argSort(flat)
+            inverse = kernels.inversePermutation(
+                [order], template: [("T", order.dtype)],
+                grid: (order.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[order.size]], outputDTypes: [order.dtype])[0]
+            idx = flat[order]
+        }
         let xs = MLX.expandedDimensions(x, axes: [-2, -3])
             .flattened(start: 0, end: -3)[order.floorDivide(k)]
-        let idx = flat[order]
-        var y = fc1(xs, idx, sortedIndices: true)
+        func gather(_ lin: SwitchLinear, _ input: MLXArray) -> MLXArray {
+            if let tiles = runTiles, let q = lin as? QuantizedSwitchLinear,
+               let fused = nemotronRunGather(input, q, tiles: tiles) {
+                return fused
+            }
+            return lin(input, idx, sortedIndices: true)
+        }
+        var y = gather(fc1, xs)
         // Stock relu2 promotes against an int scalar; fuse only when that
         // keeps the activation dtype (graph metadata, never evaluated).
         if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
@@ -767,7 +859,7 @@ class NemotronHSwitchMLP: Module {
         } else {
             y = relu2(y)
         }
-        y = fc2(y, idx, sortedIndices: true)
+        y = gather(fc2, y)
         guard y.dim(-1) == inputDims, y.size == indices.size * inputDims else { return nil }
         var outShape = indices.shape
         outShape[outShape.count - 1] = inputDims
@@ -807,9 +899,71 @@ class NemotronHSwitchMLP: Module {
 private final class NemotronHPrefillKernels: Sendable {
     static let shared = NemotronHPrefillKernels()
     let inversePermutation: MLXFast.MLXFastKernel
+    let countingSort: MLXFast.MLXFastKernel
     let relu2: MLXFast.MLXFastKernel
     let combine: MLXFast.MLXFastKernel
     private init() {
+        // Stable counting sort of expert ids (MLX argsort is a stable merge
+        // sort, so ties keep ascending flat index): one threadgroup of E*S
+        // threads; thread (e, s) counts expert e in sub-range s, a serial
+        // exclusive scan over (e, s) gives each thread its first slot, and the
+        // second pass writes slots in ascending index order.
+        countingSort = MLXFast.metalKernel(
+            name: "nemotron_moe_counting_sort",
+            inputNames: ["flat", "n", "tmax"], outputNames: ["order", "inv", "sorted", "tiles"],
+            source: """
+                constexpr int S = THREADS / E;
+                threadgroup uint counts[THREADS];
+                uint tid = thread_position_in_threadgroup.x;
+                uint e = tid / S;
+                uint s = tid % S;
+                int chunk = (n + S - 1) / S;
+                int lo = min(n, int(s) * chunk);
+                int hi = min(n, lo + chunk);
+                uint c = 0;
+                for (int i = lo; i < hi; ++i) {
+                    c += (flat[i] == e) ? 1u : 0u;
+                }
+                counts[tid] = c;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0) {
+                    uint acc = 0;
+                    for (int q = 0; q < THREADS; ++q) {
+                        uint v = counts[q];
+                        counts[q] = acc;
+                        acc += v;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0) {
+                    // Expert-run tiles of BMT rows: (first row, rows, expert).
+                    int t = 0;
+                    for (int ee = 0; ee < E; ++ee) {
+                        int start = int(counts[ee * S]);
+                        int end = (ee + 1 < E) ? int(counts[(ee + 1) * S]) : n;
+                        for (int r = start; r < end && t < tmax; r += BMT) {
+                            tiles[3 * t] = r;
+                            tiles[3 * t + 1] = min(BMT, end - r);
+                            tiles[3 * t + 2] = ee;
+                            t++;
+                        }
+                    }
+                    for (; t < tmax; ++t) {
+                        tiles[3 * t] = 0;
+                        tiles[3 * t + 1] = 0;
+                        tiles[3 * t + 2] = 0;
+                    }
+                }
+                uint pos = counts[tid];
+                for (int i = lo; i < hi; ++i) {
+                    if (flat[i] == e) {
+                        order[pos] = uint32_t(i);
+                        inv[i] = uint32_t(pos);
+                        sorted[pos] = uint32_t(e);
+                        pos++;
+                    }
+                }
+            """)
         inversePermutation = MLXFast.metalKernel(
             name: "nemotron_inverse_permutation",
             inputNames: ["order"], outputNames: ["inv"],
@@ -863,11 +1017,47 @@ private final class NemotronHPrefillKernels: Sendable {
     }
 }
 
+/// Rows per tile the stock gather_qmm_rhs_nax dispatch picks for M rows
+/// and E experts (`bm = (M / E < 64) ? 32 : 64` in quantized.cpp).
+func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { rows / experts < 64 ? 32 : 64 }
+
+/// Expert-run tiles [count, 3] int32 of `bm` rows: (first sorted row, rows,
+/// expert); trailing slots have rows == 0.
+struct NemotronHRunTiles {
+    let tiles: MLXArray
+    let count: Int
+    let bm: Int
+    let rows: Int
+}
+
+/// (order, inverse, sorted) identical to (argSort(flat), argSort(order),
+/// flat[order]) for uint32 expert ids < experts, plus the expert-run tiles;
+/// nil when unsupported.
+private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
+    -> (order: MLXArray, inverse: MLXArray, sorted: MLXArray, tiles: NemotronHRunTiles)?
+{
+    let threads = 1024
+    guard flat.ndim == 1, flat.dtype == .uint32, experts > 0, experts <= threads,
+          threads % experts == 0, flat.size > 0, flat.size < (1 << 24)
+    else { return nil }
+    let n = flat.size
+    let bm = nemotronGatherTileRows(rows: n, experts: experts)
+    let count = (n + bm - 1) / bm + experts
+    let out = NemotronHPrefillKernels.shared.countingSort(
+        [flat, n, count], template: [("E", experts), ("THREADS", threads), ("BMT", bm)],
+        grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
+        outputShapes: [[n], [n], [n], [count, 3]],
+        outputDTypes: [.uint32, .uint32, .uint32, .int32])
+    return (out[0], out[1], out[2], NemotronHRunTiles(tiles: out[3], count: count, bm: bm, rows: n))
+}
+
 /// Compile the multi-token kernels at model load (same names, template
 /// arguments, dtypes and address spaces as the prefill calls: every array
 /// input has >= 8 elements so none is passed as `constant`), so the first
 /// timed prefill does not pay their Metal JIT. Values are discarded.
-private func nemotronWarmUpPrefillKernels(expertsPerToken k: Int, dtype: DType) {
+private func nemotronWarmUpPrefillKernels(
+    expertsPerToken k: Int, experts: Int, ssmHeads: Int, ssmGroups: Int, dtype: DType
+) {
     guard (1...8).contains(k) else { return }
     let kernels = NemotronHPrefillKernels.shared
     let rows = 2 * k
@@ -893,7 +1083,1242 @@ private func nemotronWarmUpPrefillKernels(expertsPerToken k: Int, dtype: DType) 
         [cb, seg, 4, 8], template: [("T", dtype)],
         grid: (4, 4, 64), threadGroup: (32, 8, 1),
         outputShapes: [[1, 64, 4, 4]], outputDTypes: [.float32])[0])
+    if NemotronHPrefillX5.enabled {
+        // Counting sort for both tile heights (bm 32: rows / E < 64, else 64).
+        for n in [rows, 64 * experts] {
+            if let cs = nemotronCountingSort(MLXArray.zeros([n], dtype: .uint32), experts: experts) {
+                arrays.append(cs.order)
+            }
+        }
+        if ssmGroups > 0, ssmHeads % ssmGroups == 0 {
+            let dtA = MLXArray.zeros([1, 4, ssmHeads], dtype: .float32)
+            let cbw = MLXArray.zeros([1, ssmGroups, 4, 4], dtype: dtype)
+            arrays.append(contentsOf: NemotronHScanKernels.shared.scanDecay(
+                [dtA, cbw, 4],
+                template: [("CBT", dtype), ("H", ssmHeads), ("R", ssmHeads / ssmGroups)],
+                grid: (1024, 1, ssmHeads), threadGroup: (1024, 1, 1),
+                outputShapes: [[1, ssmHeads, 4, 4], [1, ssmHeads, 1, 4]],
+                outputDTypes: [.float32, .float32]))
+        }
+    }
+    if NemotronHPrefillX5.runGather {
+        let xw = MLXArray.zeros([rows, 1, 64], dtype: dtype)
+        let ww = MLXArray.zeros([1, 64, 8], dtype: .uint32)
+        let sw = MLXArray.zeros([1, 64, 1], dtype: dtype)
+        let tw = MLXArray([Int32(0), Int32(rows), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).reshaped(4, 3)
+        for bm in [32, 64] {
+            arrays.append(NemotronHRunGatherKernel.shared.kernel(
+                [xw, ww, sw, sw, tw, 64, 64],
+                template: [("T", dtype), ("GS", 64), ("BITS", 4), ("BM", bm), ("BN", 64), ("BK", 64),
+                           ("ALIGN_N", true), ("ALIGN_K", true)],
+                grid: (128, 4, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[rows, 1, 64]], outputDTypes: [dtype])[0])
+        }
+    }
     eval(arrays)
+}
+
+// MARK: - Run-aligned NAX gather (stock affine_gather_qmm_rhs_nax per row)
+
+/// The part of the MLX JIT preamble (mlx-generated gemm_nax + quantized_nax)
+/// that the stock affine_gather_qmm_rhs_nax uses, verbatim, followed by its
+/// run-aligned clone. Dropped declarations are never instantiated: the clone
+/// compiles to the same AIR with the full or the trimmed preamble.
+private let nemotronRunGatherHeader = #"""
+// Subset of the MLX JIT preamble that stock affine_gather_qmm_rhs_nax is
+// compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Every
+// declaration kept is verbatim; unused ones are dropped.
+
+#define STEEL_CONST static constant constexpr const
+#define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
+#define STEEL_PRAGMA_NO_UNROLL _Pragma("clang loop unroll(disable)")
+
+// steel/utils/type_traits.h
+#include <metal_stdlib>
+
+#pragma METAL internals : enable
+
+namespace metal {
+
+template <typename T>
+struct is_empty : metal::bool_constant<__is_empty(T)> {};
+
+#ifdef __cpp_variable_templates
+template <typename T>
+constexpr constant bool is_empty_v = is_empty<T>::value;
+#endif
+
+template <typename... Ts>
+struct make_void {
+  typedef void type;
+};
+
+template <typename... Ts>
+using void_t = typename make_void<Ts...>::type;
+
+template <class T>
+struct is_static : metal::bool_constant<is_empty<remove_cv_t<T>>::value> {};
+
+template <typename T>
+struct pointer_element {};
+
+template <typename T>
+struct pointer_element<thread T*> {
+  using type = remove_cv_t<T>;
+};
+template <typename T>
+struct pointer_element<device T*> {
+  using type = remove_cv_t<T>;
+};
+template <typename T>
+struct pointer_element<constant T*> {
+  using type = remove_cv_t<T>;
+};
+template <typename T>
+struct pointer_element<threadgroup T*> {
+  using type = remove_cv_t<T>;
+};
+
+template <typename T>
+using pointer_element_t = typename pointer_element<remove_cv_t<T>>::type;
+
+} // namespace metal
+
+#pragma METAL internals : disable
+
+// steel/utils/integral_constant.h
+#include <metal_stdlib>
+
+#pragma METAL internals : enable
+
+namespace mlx {
+namespace steel {
+
+///////////////////////////////////////////////////////////////////////////////
+// Integral constant with casting
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T, T v>
+struct integral_constant {
+  static constexpr constant T value = v;
+  using value_type = T;
+  using type = integral_constant;
+
+  METAL_FUNC constexpr operator value_type() const thread noexcept {
+    return value;
+  }
+};
+
+template <bool B>
+using bool_constant = integral_constant<bool, B>;
+using true_type = bool_constant<true>;
+using false_type = bool_constant<false>;
+
+template <class T>
+struct is_integral : bool_constant<metal::is_integral<T>::value> {};
+
+template <class T, T v>
+struct is_integral<integral_constant<T, v>>
+    : bool_constant<metal::is_integral<T>::value> {};
+
+template <typename T>
+constexpr constant bool is_integral_v = is_integral<T>::value;
+
+template <int val>
+using Int = integral_constant<int, val>;
+
+///////////////////////////////////////////////////////////////////////////////
+// Binary Operators on Integral constants
+///////////////////////////////////////////////////////////////////////////////
+
+#define integral_const_binop(__op__, __operator__)          \
+  template <typename T, T tv, typename U, U uv>             \
+  METAL_FUNC constexpr auto __operator__(                   \
+      integral_constant<T, tv>, integral_constant<U, uv>) { \
+    constexpr auto res = tv __op__ uv;                      \
+    using res_t = metal::remove_addrspace_t<decltype(res)>; \
+    return integral_constant<res_t, res>{};                 \
+  }
+
+integral_const_binop(+, operator+);
+integral_const_binop(-, operator-);
+integral_const_binop(*, operator*);
+integral_const_binop(/, operator/);
+
+integral_const_binop(==, operator==);
+integral_const_binop(!=, operator!=);
+integral_const_binop(<, operator<);
+integral_const_binop(>, operator>);
+integral_const_binop(<=, operator<=);
+integral_const_binop(>=, operator>=);
+
+integral_const_binop(&&, operator&&);
+integral_const_binop(||, operator||);
+
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator||(true_type, T) {
+  return true_type{};
+}
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator||(T, true_type) {
+  return true_type{};
+}
+
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator&&(false_type, T) {
+  return false_type{};
+}
+
+template <typename T, typename = metal::enable_if_t<!is_integral_v<T>>>
+METAL_FUNC constexpr auto operator&&(T, false_type) {
+  return false_type{};
+}
+
+// Dispatch utilities
+template <typename F>
+void dispatch_bool(bool v, F f) {
+  if (v) {
+    f(true_type{});
+  } else {
+    f(false_type{});
+  }
+}
+
+template <int start, int stop, int step, typename F>
+constexpr void const_for_loop(F f) {
+  if constexpr (start < stop) {
+    constexpr auto idx = Int<start>{};
+    f(idx);
+    const_for_loop<start + step, stop, step, F>(f);
+  }
+}
+
+#undef integral_const_binop
+
+///////////////////////////////////////////////////////////////////////////////
+// Reduction operators
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+METAL_FUNC constexpr T sum(T x) {
+  return x;
+}
+
+template <typename T, typename... Us>
+METAL_FUNC constexpr auto sum(T x, Us... us) {
+  return x + sum(us...);
+}
+
+} // namespace steel
+} // namespace mlx
+
+#pragma METAL internals : disable
+
+// steel/gemm/nax.h
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
+#include <metal_stdlib>
+
+
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+using namespace metal;
+
+///////////////////////////////////////////////////////////////////////////////
+// MMA helper
+///////////////////////////////////////////////////////////////////////////////
+
+namespace mlx {
+namespace steel {
+
+///////////////////////////////////////////////////////////////////////////////
+// NAX Steel with new tiles
+///////////////////////////////////////////////////////////////////////////////
+
+struct BaseNAXFrag {
+  STEEL_CONST short kFragRows = 16;
+  STEEL_CONST short kFragCols = 16;
+
+  STEEL_CONST short kElemsPerFrag = (kFragRows * kFragCols) / 32;
+
+  STEEL_CONST short kElemRows = 2;
+  STEEL_CONST short kElemCols = 4;
+
+  STEEL_CONST short kElemRowsJump = 8;
+
+  static_assert(
+      kElemRows * kElemCols == kElemsPerFrag,
+      "MMAFrag shape is not consistent with MMAFrag size");
+
+  template <typename U>
+  using dtype_frag_t = typename metal::vec<U, kElemsPerFrag>;
+
+  METAL_FUNC static short2 get_coord() {
+    const ushort simd_lane_id = __metal_get_thread_index_in_simdgroup(ushort());
+    const short qid = simd_lane_id >> 2;
+    const short fm = ((qid & 4) | ((simd_lane_id >> 1) & 3));
+    const short fn = ((qid & 2) | (simd_lane_id & 1)) * 4;
+    return short2{fn, fm};
+  }
+
+  template <
+      typename T,
+      typename SrcPtrType,
+      typename StrX,
+      typename StrY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load(
+      thread dtype_frag_t<T>& dst,
+      SrcPtrType src,
+      StrX str_x,
+      StrY str_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x * str_y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      if constexpr (metal::is_same_v<StrY, Int<1>>) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[i * kElemCols + j] = static_cast<T>(src[r * str_x + c + j]);
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[i * kElemCols + j] =
+              static_cast<T>(src[r * str_x + (c + j) * str_y]);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename SrcPtrType,
+      typename StrX,
+      typename StrY,
+      typename LimX,
+      typename LimY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_safe(
+      thread dtype_frag_t<T>& dst,
+      SrcPtrType src,
+      StrX str_x,
+      StrY str_y,
+      LimX lim_x,
+      LimY lim_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    src += sc.y * str_x + sc.x * str_y;
+    auto lx = lim_x - sc.y;
+    auto ly = lim_y - sc.x;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        if ((r < lx) && ((c + j) < ly)) {
+          dst[i * kElemCols + j] =
+              static_cast<T>(src[r * str_x + (c + j) * str_y]);
+        } else {
+          dst[i * kElemCols + j] = T(0);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+    dst += sc.y * str_x + sc.x * str_y;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      if constexpr (metal::is_same_v<StrY, Int<1>>) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[r * str_x + c + j] = static_cast<U>(src[i * kElemCols + j]);
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < kElemCols; j++) {
+          dst[r * str_x + (c + j) * str_y] =
+              static_cast<U>(src[i * kElemCols + j]);
+        }
+      }
+    }
+  }
+
+  template <
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
+      typename StartX,
+      typename StopX,
+      typename StartY,
+      typename StopY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store_slice(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      StartX start_x,
+      StopX stop_x,
+      StartY start_y,
+      StopY stop_y,
+      OffX off_x = Int<0>{},
+      OffY off_y = Int<0>{}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+
+    const_for_loop<0, kElemRows, 1>([&](auto idx_row) {
+      const auto r = off_x + idx_row * Int<kElemRowsJump>{};
+      if (r >= stop_x - sc.y || r < start_x - sc.y) {
+        return;
+      }
+
+      const_for_loop<0, kElemCols, 1>([&](auto idx_col) {
+        const auto c = off_y + idx_col;
+        if (c >= stop_y - sc.x || c < start_y - sc.x) {
+          return;
+        }
+
+        const auto src_idx = idx_row * Int<kElemCols>{} + idx_col;
+        dst[(r + sc.y) * str_x + (c + sc.x) * str_y] =
+            static_cast<U>(src[src_idx]);
+      });
+    });
+  }
+
+  template <
+      typename CType,
+      typename AType,
+      typename BType,
+      bool transpose_a = false,
+      bool transpose_b = false>
+  METAL_FUNC static constexpr void mma(
+      thread dtype_frag_t<CType>& Cn0,
+      thread dtype_frag_t<CType>& Cn1,
+      const thread dtype_frag_t<AType>& A,
+      metal::bool_constant<transpose_a>,
+      const thread dtype_frag_t<BType>& Bn0,
+      const thread dtype_frag_t<BType>& Bn1,
+      metal::bool_constant<transpose_b>) {
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+        16,
+        32,
+        16,
+        transpose_a,
+        transpose_b,
+        true,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+
+    // Create matmul op
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> gemm_op;
+
+    // Create matmul operands in registers
+    auto ct_a =
+        gemm_op
+            .template get_left_input_cooperative_tensor<AType, BType, CType>();
+    auto ct_b =
+        gemm_op
+            .template get_right_input_cooperative_tensor<AType, BType, CType>();
+
+    // Create matmul output in register
+    auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+        metal::remove_addrspace_t<decltype(ct_a)>,
+        metal::remove_addrspace_t<decltype(ct_b)>,
+        CType>();
+
+    // Load A in to left operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_a[i] = A[i];
+    }
+
+    // Load B into right operand registers
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_b[i] = Bn0[i];
+      ct_b[kElemsPerFrag + i] = Bn1[i];
+    }
+
+    // Load C into output registers (op handles accumulation)
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      ct_c[i] = Cn0[i];
+      ct_c[kElemsPerFrag + i] = Cn1[i];
+    }
+
+    // Do matmul
+    gemm_op.run(ct_a, ct_b, ct_c);
+
+    // Copy out results
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemsPerFrag; i++) {
+      Cn0[i] = ct_c[i];
+      Cn1[i] = ct_c[kElemsPerFrag + i];
+    }
+  }
+
+};
+
+template <
+    typename T,
+    short kTileRows_,
+    short kTileCols_,
+    class NAXFrag_ = BaseNAXFrag>
+struct NAXTile {
+  using NAXFrag_t = NAXFrag_;
+  using elem_type = T;
+
+  STEEL_CONST short kFragRows = NAXFrag_t::kFragRows;
+  STEEL_CONST short kFragCols = NAXFrag_t::kFragCols;
+  STEEL_CONST short kElemsPerFrag = NAXFrag_t::kElemsPerFrag;
+
+  STEEL_CONST short kTileRows = kTileRows_;
+  STEEL_CONST short kTileCols = kTileCols_;
+
+  STEEL_CONST short kRows = kTileRows * kFragRows;
+  STEEL_CONST short kCols = kTileCols * kFragCols;
+
+  STEEL_CONST short kNumFrags = kTileRows * kTileCols;
+  STEEL_CONST short kElemsPerTile = kNumFrags * kElemsPerFrag;
+
+  STEEL_CONST short kFragThrRows = NAXFrag_t::kElemRows;
+  STEEL_CONST short kFragThrCols = NAXFrag_t::kElemCols;
+  STEEL_CONST short kFragRowsJump = NAXFrag_t::kElemRowsJump;
+
+  STEEL_CONST short kRowsPerThread = kTileRows * NAXFrag_t::kElemRows;
+  STEEL_CONST short kColsPerThread = kTileCols * NAXFrag_t::kElemCols;
+
+  typedef typename NAXFrag_t::template dtype_frag_t<T> frag_type;
+
+  frag_type val_frags[kNumFrags]; // = {frag_type(0)};
+
+  METAL_FUNC NAXTile() thread {}
+
+  METAL_FUNC constexpr void clear() thread {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kNumFrags; ++i) {
+      val_frags[i] = frag_type(0);
+    }
+  }
+
+  METAL_FUNC constexpr thread frag_type& frag_at(const short i, const short j)
+      thread {
+    return val_frags[i * kTileCols + j];
+  }
+
+  template <int i, int j>
+  METAL_FUNC constexpr thread frag_type& frag_at() thread {
+    return val_frags[i * kTileCols + j];
+  }
+
+  template <int i, int j>
+  METAL_FUNC constexpr const thread frag_type& frag_at() const thread {
+    return val_frags[i * kTileCols + j];
+  }
+
+  template <bool transpose>
+  METAL_FUNC constexpr thread frag_type& frag_at(
+      const short i,
+      const short j,
+      metal::bool_constant<transpose>) thread {
+    if constexpr (transpose) {
+      return frag_at(j, i);
+    } else {
+      return frag_at(i, j);
+    }
+  }
+
+  template <typename U, int str_x, int str_y>
+  METAL_FUNC void load(const threadgroup U* src) thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            Int<str_x>{},
+            Int<str_y>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void load(const device U* src, const int ld) thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            Int<1>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void store(device U* dst, const int ld) const thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void load_safe(
+      const device U* src,
+      const int ld,
+      const short2 src_tile_dims) thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::load_safe(
+            frag_at<idx_row.value, idx_col.value>(),
+            src,
+            ld,
+            Int<1>{},
+            src_tile_dims.y,
+            src_tile_dims.x,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <typename U>
+  METAL_FUNC void store_slice(
+      device U* dst,
+      const int ld,
+      const short2 start,
+      const short2 stop) const thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::store_slice(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            start.y,
+            stop.y,
+            start.x,
+            stop.x,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+};
+
+template <
+    class CTile,
+    class ATile,
+    class BTile,
+    bool transpose_a,
+    bool transpose_b>
+METAL_FUNC void tile_matmad_nax(
+    thread CTile& C,
+    thread ATile& A,
+    metal::bool_constant<transpose_a>,
+    thread BTile& B,
+    metal::bool_constant<transpose_b>) {
+  // Static checks
+  constexpr short TMa = transpose_a ? ATile::kTileCols : ATile::kTileRows;
+  constexpr short TM = CTile::kTileRows;
+  static_assert(TMa == TM, "MXU tile matmul: M dimensions do not match");
+
+  constexpr short TNb = transpose_b ? BTile::kTileRows : BTile::kTileCols;
+  constexpr short TN = CTile::kTileCols;
+  static_assert(TNb == TN, "MXU tile matmul: N dimensions do not match");
+
+  constexpr short TKa = transpose_a ? ATile::kTileRows : ATile::kTileCols;
+  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
+  static_assert(TKa == TK, "MXU tile matmul: K dimensions do not match");
+
+  constexpr auto ta = metal::bool_constant<transpose_a>{};
+  constexpr auto tb = metal::bool_constant<transpose_b>{};
+
+  if constexpr (TN == 1 && TM % 2 == 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; mm += 2) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; ++nn) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          CTile::NAXFrag_t::mma(
+              C.frag_at(mm, nn),
+              C.frag_at(mm + 1, nn),
+              A.frag_at(mm, kk, ta),
+              A.frag_at(mm + 1, kk, ta),
+              metal::bool_constant<transpose_a>{},
+              B.frag_at(kk, nn, tb),
+              metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  } else if constexpr (TN % 2 == 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short mm = 0; mm < TM; ++mm) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; nn += 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          CTile::NAXFrag_t::mma(
+              C.frag_at(mm, nn),
+              C.frag_at(mm, nn + 1),
+              A.frag_at(mm, kk, ta),
+              metal::bool_constant<transpose_a>{},
+              B.frag_at(kk, nn, tb),
+              B.frag_at(kk, nn + 1, tb),
+              metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  }
+}
+
+} // namespace steel
+} // namespace mlx
+
+// quantized_nax.h
+#include <metal_simdgroup>
+#include <metal_stdlib>
+
+using namespace metal;
+using namespace mlx::steel;
+
+using namespace metal;
+
+#define MLX_MTL_CONST static constant constexpr const
+
+MLX_MTL_CONST int SIMD_SIZE = 32;
+MLX_MTL_CONST int QUAD_SIZE = 4;
+
+template <int bits, int wsize = 8>
+inline constexpr short get_pack_factor() {
+  return (bits == 3 || bits == 5) ? 8 : (bits == 6 ? 4 : wsize / bits);
+}
+
+template <int bits, int wsize = 8>
+inline constexpr short get_bytes_per_pack() {
+  constexpr int power_of_2_bits = (bits & (bits - 1)) == 0;
+  return power_of_2_bits ? (wsize / 8) : (bits == 5 ? 5 : 3);
+}
+
+template <typename U, int N, int bits>
+inline void
+dequantize(const device uint8_t* w, U scale, U bias, threadgroup U* w_local) {
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  const float s = float(scale);
+  const float b = float(bias);
+
+  if (bits == 2) {
+    float sc[4] = {s, s / 4.0f, s / 16.0f, s / 64.0f};
+    for (int i = 0; i < (N / 4); i++) {
+      w_local[4 * i] = static_cast<U>(sc[0] * (w[i] & 0x03) + b);
+      w_local[4 * i + 1] = static_cast<U>(sc[1] * (w[i] & 0x0c) + b);
+      w_local[4 * i + 2] = static_cast<U>(sc[2] * (w[i] & 0x30) + b);
+      w_local[4 * i + 3] = static_cast<U>(sc[3] * (w[i] & 0xc0) + b);
+    }
+  }
+
+  else if (bits == 3) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 3 * i;
+
+      w_local[0] = static_cast<U>((w[0] & 0x7) * s + b);
+      w_local[1] = static_cast<U>(((w[0] & 0x38) >> 3) * s + b);
+      w_local[2] =
+          static_cast<U>((((w[0] & 0xc0) >> 6) + ((w[1] & 0x1) << 2)) * s + b);
+      w_local[3] = static_cast<U>(((w[1] & 0xe) >> 1) * s + b);
+      w_local[4] = static_cast<U>(((w[1] & 0x70) >> 4) * s + b);
+      w_local[5] =
+          static_cast<U>((((w[1] & 0x80) >> 7) + ((w[2] & 0x3) << 1)) * s + b);
+      w_local[6] = static_cast<U>(((w[2] & 0x1c) >> 2) * s + b);
+      w_local[7] = static_cast<U>(((w[2] & 0xe0) >> 5) * s + b);
+    }
+  }
+
+  else if (bits == 4) {
+    float sc[2] = {s, s / 16.0f};
+    for (int i = 0; i < (N / 2); i++) {
+      w_local[2 * i] = static_cast<U>(sc[0] * (w[i] & 0x0f) + b);
+      w_local[2 * i + 1] = static_cast<U>(sc[1] * (w[i] & 0xf0) + b);
+    }
+  }
+
+  else if (bits == 5) {
+    for (int i = 0; i < (N / 8); i++) {
+      w_local += 8 * i;
+      w += 5 * i;
+
+      w_local[0] = static_cast<U>((w[0] & 0x1f) * s + b);
+      w_local[1] =
+          static_cast<U>((((w[0] & 0xe0) >> 5) + ((w[1] & 0x3) << 3)) * s + b);
+      w_local[2] = static_cast<U>(((w[1] & 0x7c) >> 2) * s + b);
+      w_local[3] =
+          static_cast<U>((((w[1] & 0x80) >> 7) + ((w[2] & 0xf) << 1)) * s + b);
+      w_local[4] =
+          static_cast<U>((((w[2] & 0xf0) >> 4) + ((w[3] & 0x1) << 4)) * s + b);
+      w_local[5] = static_cast<U>(((w[3] & 0x3e) >> 1) * s + b);
+      w_local[6] =
+          static_cast<U>((((w[3] & 0xc0) >> 6) + ((w[4] & 0x7) << 2)) * s + b);
+      w_local[7] = static_cast<U>(((w[4] & 0xf8) >> 3) * s + b);
+    }
+  }
+
+  else if (bits == 6) {
+    for (int i = 0; i < (N / 4); i++) {
+      w_local += 4 * i;
+      w += 3 * i;
+      w_local[0] = static_cast<U>((w[0] & 0x3f) * s + b);
+      w_local[1] =
+          static_cast<U>((((w[0] >> 6) & 0x03) + ((w[1] & 0x0f) << 2)) * s + b);
+      w_local[2] =
+          static_cast<U>((((w[1] >> 4) & 0x0f) + ((w[2] & 0x03) << 4)) * s + b);
+      w_local[3] = static_cast<U>(((w[2] >> 2) & 0x3f) * s + b);
+    }
+  }
+
+  else if (bits == 8) {
+    for (int i = 0; i < N; i++) {
+      w_local[i] = static_cast<U>(s * w[i] + b);
+    }
+  }
+}
+
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size,
+    short group_size,
+    short bits>
+struct QuantizedBlockLoader {
+  static_assert(
+      BCOLS <= group_size,
+      "The group size should be larger than the columns");
+  static_assert(
+      group_size % BCOLS == 0,
+      "The group size should be divisible by the columns");
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
+  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+
+  const int src_ld;
+  const int tile_stride;
+  short group_step_cnt;
+  const int group_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device T* scales;
+  const device T* biases;
+
+  QuantizedBlockLoader(
+      const device uint8_t* src_,
+      const device T* scales_,
+      const device T* biases_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      : src_ld(src_ld_),
+        tile_stride(
+            reduction_dim ? BCOLS_PACKED* bytes_per_pack
+                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+        group_step_cnt(0),
+        group_stride(BROWS* src_ld / group_size),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads* thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * bytes_per_pack),
+        scales(scales_ + bi * src_ld / group_size),
+        biases(biases_ + bi * src_ld / group_size) {}
+
+  void load_unsafe() const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+
+    T scale = *scales;
+    T bias = *biases;
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          (device uint8_t*)(src + i * bytes_per_pack),
+          scale,
+          bias,
+          dst + i * pack_factor);
+    }
+  }
+
+  void next() thread {
+    src += tile_stride;
+    if (reduction_dim == 1) {
+      if (group_steps > 1) {
+        group_step_cnt++;
+        if (group_step_cnt == group_steps) {
+          group_step_cnt = 0;
+          scales++;
+          biases++;
+        }
+      } else {
+        scales++;
+        biases++;
+      }
+    } else {
+      scales += group_stride;
+      biases += group_stride;
+    }
+  }
+};
+
+// Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned
+// to expert runs. tiles[t] = (first sorted row, rows <= BM, expert). Every
+// tile holds exactly one expert segment, so the stock segment loop collapses
+// to one pass; the loader, K loop, NAX fragment MMA sequence and store of a
+// row are the stock ones (m_lo_lim = 0, m_hi_lim from the tile's row count).
+template <
+    typename T,
+    int group_size,
+    int bits,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool align_N,
+    bool align_K>
+METAL_FUNC void nemotron_gather_qmm_runs_impl(
+    const device T* x,
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device int* tiles,
+    device T* y,
+    const int N,
+    const int K,
+    threadgroup T* Ws,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id) {
+  const int tile_rows = tiles[tid.y * 3 + 1];
+  if (tile_rows <= 0) {
+    return;
+  }
+  const int row0 = tiles[tid.y * 3 + 0];
+  const uint32_t index = uint32_t(tiles[tid.y * 3 + 2]);
+
+  constexpr bool transpose = true;
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      transpose,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int K_it = K / BK;
+  const size_t stride_w = size_t(N) * K_w;
+  const size_t stride_s = size_t(N) * K_g;
+  const int y_col = tid.x * BN;
+  const size_t y_col_long = size_t(y_col);
+
+  const short tgp_bm = short(min(BM, tile_rows));
+  const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+
+  const int k_remain = K - K_it * BK;
+  const short2 tile_w = short2(k_remain, tgp_bn);
+
+  auto wl = (const device uint8_t*)w;
+  x += size_t(row0) * K;
+  y += size_t(row0) * N + y_col_long;
+  wl += y_col_long * K_w;
+  scales += y_col_long * K_g;
+  biases += y_col_long * K_g;
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+
+  const short sgp_sm = min(SM, short(max(0, int(tgp_bm) - tm)));
+  const short sgp_sn =
+      align_N ? SN : min(SN, short(max(0, (N - (y_col + tn)))));
+
+  const bool is_unaligned_sm = (sgp_sm != SM);
+  const bool is_unaligned_bn = align_N ? false : (tgp_bn != BN);
+
+  constexpr short BR = TN;
+  constexpr short BC = TK;
+
+  using AccumType = float;
+
+  threadgroup_barrier(mem_flags::mem_none);
+
+  const short m_lo_lim = 0;
+  const short m_hi_lim = min(int(sgp_sm), max(0, int(tgp_bm) - tm));
+  const bool sg_active = m_hi_lim > m_lo_lim;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  const device T* xn = x + tm * K;
+
+  thread loader_w_t loader_w(
+      wl + index * stride_w,
+      scales + index * stride_s,
+      biases + index * stride_s,
+      K,
+      Ws,
+      simd_group_id,
+      simd_lane_id);
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(align_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      for (int k = 0; k < K_it; k++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (kAlignedM.value) {
+              Atile.load(xn + kk1, K);
+            } else {
+              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+
+        xn += BK;
+        loader_w.next();
+      }
+
+      if (!align_K) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader_w.load_safe(tile_w);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            volatile int compiler_barrier;
+
+            const short psk = min(int(SK), max(0, (BK - kk1)));
+            Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+
+            Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+      }
+
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kAlignedN.value) {
+        if (m_lo_lim == 0 && m_hi_lim == SM) {
+          Dtile.store(y + tm * N + tn, N);
+        } else {
+          Dtile.store_slice(
+              y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+        }
+      } else {
+        Dtile.store_slice(
+            y + tm * N + tn,
+            N,
+            short2(0, m_lo_lim),
+            short2(sgp_sn, m_hi_lim));
+      }
+    });
+  });
+}
+"""#
+
+private final class NemotronHRunGatherKernel: Sendable {
+    static let shared = NemotronHRunGatherKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K>(
+                    x, w, scales, biases, tiles, y, N, K, Ws,
+                    threadgroup_position_in_grid,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            """,
+            header: nemotronRunGatherHeader)
+    }
+}
+
+/// Same rows as `lin(x, idx, sortedIndices: true)` with one threadgroup per
+/// (N block, expert-run tile). Only where stock GatherQMM takes the
+/// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
+/// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
+/// with the same bm; nil = use the stock op.
+func nemotronRunGather(
+    _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles
+) -> MLXArray? {
+    guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
+          x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16 || x.dtype == .float16
+    else { return nil }
+    let ops = lin.nemotronGatherOperands(for: x.dtype)
+    guard !ops.hasLinearBias, let biases = ops.biases, ops.weight.dtype == .uint32,
+          ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
+    else { return nil }
+    let n = x.dim(0), k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
+    guard n == tiles.rows, n >= 16, n / experts >= 4,
+          tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
+          ops.weight.dim(2) * 8 == k, k % 64 == 0,
+          ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
+    else { return nil }
+    return NemotronHRunGatherKernel.shared.kernel(
+        [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k],
+        template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
+                   ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0)],
+        grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+        outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
 }
 
 // MARK: - MoE
@@ -1237,7 +2662,9 @@ public class NemotronHModel:
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
         }
         Device.withDefaultDevice(.gpu) {
-            nemotronWarmUpPrefillKernels(expertsPerToken: args.numExpertsPerTok, dtype: .bfloat16)
+            nemotronWarmUpPrefillKernels(
+                expertsPerToken: args.numExpertsPerTok, experts: args.nRoutedExperts,
+                ssmHeads: args.mambaNumHeads, ssmGroups: args.nGroups, dtype: .bfloat16)
         }
     }
 
