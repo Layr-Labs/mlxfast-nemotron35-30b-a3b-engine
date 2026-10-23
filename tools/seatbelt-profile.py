@@ -25,8 +25,14 @@ The evaluator-only paths come from the environment, not from arguments, so
 that every caller denies the same set: MLXFAST_QWEN38_GOLDEN_DIR,
 MLXFAST_CORRECTNESS_GOLDEN_PATH, MLXFAST_PRIVATE_DIR,
 MLXFAST_BASELINE_WORKSPACE, MLXFAST_BASELINE_CALIBRATION, BENCHD_BIN_DIR,
-BENCHD_PRIVATE_AUDIT_PATH, the stable resident log root
-(MLXFAST_RESIDENT_LOG_ROOT, falling back to RESIDENT_UP_LOG_DIR), the build
+BENCHD_PRIVATE_AUDIT_PATH. The rule resolves the audit file and its parent. If
+the parent is / or contains any protected root, it denies the audit file only.
+Otherwise it denies the parent directory, including a dedicated private
+directory inside /private/tmp. The protected roots are /, HOME, --tree,
+RUNNER_TEMP, TMPDIR, /tmp, /private/tmp, /var/tmp and /private/var/tmp. The
+stable resident log root is also denied
+(MLXFAST_RESIDENT_LOG_ROOT, falling back to RESIDENT_UP_LOG_DIR and then
+~/.mlxfast-resident-logs), the build
 cache root (MLXFAST_BUILD_CACHE_DIR, else
 ~/.cache/mlxfast-engine-build) and the runner registration files two levels
 above RUNNER_WORKSPACE. The reference workspace is not denied when --tree is
@@ -90,10 +96,28 @@ def inside(path, root):
 
 
 def evaluator_paths(env, tree):
-    paths = [env.get(name, "") for name in OFFICIAL_REQUIRED + OTHER_EVALUATOR_PATHS]
-    paths.append(env.get("MLXFAST_RESIDENT_LOG_ROOT") or env.get("RESIDENT_UP_LOG_DIR", ""))
+    paths = [env.get(name, "") for name in OFFICIAL_REQUIRED + OTHER_EVALUATOR_PATHS
+             if name != "BENCHD_PRIVATE_AUDIT_PATH"]
     home = env.get("HOME") or os.path.expanduser("~")
+    paths.append(env.get("MLXFAST_RESIDENT_LOG_ROOT")
+                 or env.get("RESIDENT_UP_LOG_DIR")
+                 or os.path.join(home, ".mlxfast-resident-logs"))
     paths.append(env.get("MLXFAST_BUILD_CACHE_DIR") or os.path.join(home, ".cache/mlxfast-engine-build"))
+    audit = env.get("BENCHD_PRIVATE_AUDIT_PATH", "")
+    if audit:
+        audit_path = resolved(audit)
+        audit_parent = os.path.dirname(audit_path)
+        protected = ["/", home, tree, env.get("RUNNER_TEMP", ""),
+                     env.get("TMPDIR", ""), "/tmp", "/private/tmp",
+                     "/var/tmp", "/private/var/tmp"]
+        protected = [resolved(root) for root in protected if root]
+        # A broad parent must not hide a protected tree. A directory below a
+        # protected tree is dedicated and can be denied as a whole.
+        if audit_parent == "/" or any(inside(root, audit_parent)
+                                       for root in protected):
+            paths.append(audit_path)
+        else:
+            paths.append(audit_parent)
     baseline = env.get("MLXFAST_BASELINE_WORKSPACE", "")
     if baseline and tree and inside(resolved(tree), resolved(baseline)):
         paths.remove(baseline)
@@ -144,7 +168,10 @@ def main():
         lines.append("(allow network-bind network-inbound network-outbound (local unix-socket (path-literal %s)))" % quoted(sock))
         lines.append("(allow network-outbound (remote unix-socket (path-literal %s)))" % quoted(sock))
     if not args.build:
-        lines += ["(deny process-fork)", "(deny process-exec*)"]
+        # Signals: deny all, then allow the process itself (raise, abort, thread signals).
+        # "(deny signal (target others))" alone is not enforced on macOS 27 (measured:
+        # a sandboxed kill -TERM still reached a sibling process); this pair is.
+        lines += ["(deny process-fork)", "(deny process-exec*)", "(deny signal)", "(allow signal (target self))"]
         for program in args.execs:
             lines.append("(allow process-exec (literal %s))" % quoted(resolved(program)))
         # No state that outlives the process: shared memory, SysV IPC and the

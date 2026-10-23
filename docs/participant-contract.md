@@ -341,12 +341,14 @@ Do not prefill before `free_decode_begin`, re-prefill the seed during
 
 ### 5.5 Token fidelity
 
-The benchmarker applies a 10% per-stream token-tolerance budget.
+This fixture declares no timed token tolerance. The timed prefill token, timed
+decode seed and every timed decode token must match the oracle exactly. One
+different timed token refuses the run.
 
 The candidate leg is checked against the oracle for its declared depth. The
-serial control leg is checked against the serial tape. The gate permits output
-within the published tolerance; it does not require token-for-token identity
-with a serial trajectory.
+serial control leg is checked against the serial tape. The separate, untimed
+teacher-forced correctness cases use the 10% per-case token-mismatch budget.
+That budget does not apply to timed measurement.
 
 Fixed verification mode is `rectangular_exact`. An unsupported batch width or
 shape capability is refused before measurement.

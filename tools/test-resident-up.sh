@@ -39,6 +39,8 @@
 #   18. under the real sandbox-exec, private TMPDIR is outside
 #       RESIDENT_UP_LOG_DIR; --stop and a failed boot remove it. macOS only.
 #       A failed wrapper cleanup returns non-zero and keeps its sidecar.
+#   19. the worker inherits a 256 MiB file-size limit, so a bad resident cannot
+#       grow its retained stdout/stderr log without bound.
 #
 # The stub is a Python script, and sandbox-exec would refuse the interpreter
 # exec it needs, so these cases run with RESIDENT_UP_SANDBOX=0. Case 4b proves
@@ -86,7 +88,7 @@ fail() { printf 'test-resident-up: FAIL -- %s\n' "$*" >&2; fails=$((fails + 1));
 STUB="${WORK}/stub-bench-worker.py"
 cat > "${STUB}" <<'PY'
 #!/usr/bin/env python3
-import json, os, signal, socket, sys, time
+import json, os, resource, signal, socket, sys, time
 argv = sys.argv[1:]
 with open(os.environ["BENCH_WORKER_TEST_ARGV_FILE"], "w") as f:
     f.write("\n".join(argv) + "\n")
@@ -94,6 +96,9 @@ if os.environ.get("BENCH_WORKER_TEST_ENV_FILE"):
     with open(os.environ["BENCH_WORKER_TEST_ENV_FILE"], "w") as f:
         for key, value in sorted(os.environ.items()):
             f.write(f"{key}={value}\n")
+if os.environ.get("BENCH_WORKER_TEST_LIMIT_FILE"):
+    with open(os.environ["BENCH_WORKER_TEST_LIMIT_FILE"], "w") as f:
+        f.write(str(resource.getrlimit(resource.RLIMIT_FSIZE)[0]) + "\n")
 if not argv or argv[0] != "resident":
     print("stub: first argument must be resident", file=sys.stderr); sys.exit(2)
 opts = {}
@@ -186,7 +191,7 @@ run_up() {
 hold_lock
 L1="${WORK}/case1"; mkdir -p "${L1}"
 SOCK1="${WORK}/case1.sock"
-out="$(run_up "${L1}" RESIDENT_UP_HEALTH_TIMEOUT_S=30 --weights "${WEIGHTS}" --socket "${SOCK1}" -- \
+out="$(run_up "${L1}" RESIDENT_UP_HEALTH_TIMEOUT_S=30 BENCH_WORKER_TEST_LIMIT_FILE="${L1}/file-limit" --weights "${WEIGHTS}" --socket "${SOCK1}" -- \
   bash -c 'echo "socket=$BENCH_WORKER_RESIDENT_SOCKET hello=${BENCH_WORKER_RESIDENT_HELLO:-unset} identity=$RESIDENT_IDENTITY_FILE"; test -S "$BENCH_WORKER_RESIDENT_SOCKET" && echo socket-live; kill -0 "$RESIDENT_UP_PID" && echo resident-live; exit 7')"
 rc=$?
 if [[ "${rc}" -eq 7 ]]; then pass "the wrapped command's exit code (7) is returned"; else fail "expected exit 7, got ${rc}: ${out}"; fi
@@ -203,6 +208,11 @@ else
   fail "the resident argv is wrong: $(tr '\n' ' ' < "${L1}/stub-argv" 2>/dev/null)"
 fi
 if [[ "${out}" == *"resident healthy on ${SOCK1}"* ]]; then pass "the health probe read the resident's hello"; else fail "no health line: ${out}"; fi
+if [[ "$(cat "${L1}/file-limit" 2>/dev/null)" == "268435456" ]]; then
+  pass "the resident alone receives the 256 MiB file-size cap"
+else
+  fail "the resident file-size cap is not 256 MiB: $(cat "${L1}/file-limit" 2>/dev/null)"
+fi
 if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["hello"]["backend"]=="mlx-resident" and d["weight_owner"]=="bench-worker-resident"' "${L1}/resident-identity.json" 2>/dev/null; then
   pass "the identity file records the resident's hello"
 else

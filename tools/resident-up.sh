@@ -562,10 +562,15 @@ while IFS='=' read -r resident_env_name _; do
       ;;
   esac
 done < <(env)
-"${RESIDENT_ENV[@]+"${RESIDENT_ENV[@]}"}" python3 - "${RESIDENT_LAUNCH[@]+"${RESIDENT_LAUNCH[@]}"}" "${BENCH_WORKER}" resident \
-  --weights "${WEIGHTS_DIR}" \
-  --speculative-protocol v1.1 \
-  --socket "${SOCKET_PATH}" >"${RESIDENT_LOG}" 2>&1 <<'PY' &
+(
+  # Bash ulimit -f uses 1024-byte blocks outside POSIX mode: 262144 is 256 MiB.
+  # Keep the cap on the resident only; the trusted boot helper stays uncapped.
+  ulimit -f 262144
+  exec "${RESIDENT_ENV[@]+"${RESIDENT_ENV[@]}"}" python3 - "${RESIDENT_LAUNCH[@]+"${RESIDENT_LAUNCH[@]}"}" "${BENCH_WORKER}" resident \
+    --weights "${WEIGHTS_DIR}" \
+    --speculative-protocol v1.1 \
+    --socket "${SOCKET_PATH}"
+) >"${RESIDENT_LOG}" 2>&1 <<'PY' &
 import os, sys
 os.setsid()
 os.execv(sys.argv[1], sys.argv[1:])

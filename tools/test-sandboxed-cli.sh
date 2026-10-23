@@ -29,18 +29,18 @@ fail() { failures=$((failures + 1)); echo "FAIL  $*" >&2; }
 
 # The canary evaluator paths. Every one exists, so a deny is observable.
 C="${WORK}/canary"
+PRIVATE_AUDIT_DIR="/private/var/mlxfast-private-audit-test-$$"
 mkdir -p "${C}/goldens" "${C}/benchd-bin" "${C}/baseline" "${C}/private" \
   "${C}/resident-root/job" "${C}/runner/_work/repo"
 printf '{"weight_map":{"a":"model.safetensors"}}\n' > "${C}/goldens/canary.golden.json"
 printf 'benchd\n' > "${C}/benchd-bin/benchd"
 printf '{}\n' > "${C}/calibration.json"
-printf 'private audit\n' > "${C}/private-audit.json"
 canary_env=(
   MLXFAST_QWEN38_GOLDEN_DIR="${C}/goldens"
   MLXFAST_BASELINE_WORKSPACE="${C}/baseline"
   MLXFAST_BASELINE_CALIBRATION="${C}/calibration.json"
   BENCHD_BIN_DIR="${C}/benchd-bin"
-  BENCHD_PRIVATE_AUDIT_PATH="${C}/private-audit.json"
+  BENCHD_PRIVATE_AUDIT_PATH="${PRIVATE_AUDIT_DIR}/private-audit.json"
   MLXFAST_PRIVATE_DIR="${C}/private"
   MLXFAST_RESIDENT_LOG_ROOT="${C}/resident-root"
   RESIDENT_UP_LOG_DIR="${C}/resident-root/job"
@@ -54,6 +54,8 @@ state_rules=(
   "(deny ipc-posix-sem*)"
   "(deny user-preference-write)"
   "(deny mach-lookup)"
+  "(deny signal)"
+  "(allow signal (target self))"
   '(allow mach-lookup (global-name "com.apple.MTLCompilerService") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.opendirectoryd.membership") (global-name "com.apple.logd") (global-name "com.apple.diagnosticd"))'
 )
 profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" python3 "${GENERATOR}" \
@@ -64,7 +66,7 @@ if [[ "${rc}" -ne 0 ]]; then
   fail "generator: exit ${rc} with every evaluator path set"
 else
   for path in "${C}/goldens" "${C}/baseline" "${C}/calibration.json" "${C}/benchd-bin" "${C}/private" \
-    "${C}/private-audit.json" "${C}/resident-root" \
+    "${PRIVATE_AUDIT_DIR}" "${C}/resident-root" \
     "${WORK}/home/.cache/mlxfast-engine-build" "${C}/runner/.runner" "${C}/runner/.credentials"; do
     grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" <<< "${profile}" \
       || fail "generator: no read and write deny for ${path}"
@@ -100,6 +102,77 @@ else
   fail "generator: no resident log fallback deny when MLXFAST_RESIDENT_LOG_ROOT is unset"
 fi
 
+default_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" python3 "${GENERATOR}" \
+  --exec /bin/bash --tree "${WORK}/tree")"
+if grep -qF "(deny file-read* file-write* (subpath \"${WORK}/home/.mlxfast-resident-logs\"))" <<< "${default_profile}"; then
+  pass "generator: the self-hosted resident log root is denied when both log variables are unset"
+else
+  fail "generator: no default resident log deny when both log variables are unset"
+fi
+
+audit_guards_ok=1
+for guarded_audit in "/p1fix-audit.json" "${WORK}/home/p1fix-audit.json" "${WORK}/tree/p1fix-audit.json"; do
+  guarded_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" BENCHD_PRIVATE_AUDIT_PATH="${guarded_audit}" \
+    python3 "${GENERATOR}" --exec /bin/bash --tree "${WORK}/tree")"
+  guarded_parent="$(dirname "${guarded_audit}")"
+  grep -qF "(deny file-read* file-write* (subpath \"${guarded_audit}\"))" <<< "${guarded_profile}" \
+    || audit_guards_ok=0
+  if [[ "${guarded_parent}" != "${guarded_audit}" ]] \
+    && grep -qF "(deny file-read* file-write* (subpath \"${guarded_parent}\"))" <<< "${guarded_profile}"; then
+    audit_guards_ok=0
+  fi
+done
+if [[ "${audit_guards_ok}" -eq 1 ]]; then
+  pass "generator: unsafe audit parents deny only the audit file"
+else
+  fail "generator: an audit under root, HOME or a parent of the tree denied its parent"
+fi
+
+runner_temp="${WORK}/runner-temp"
+runner_audit="${runner_temp}/private-audit.json"
+runner_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" RUNNER_TEMP="${runner_temp}" \
+  BENCHD_PRIVATE_AUDIT_PATH="${runner_audit}" \
+  python3 "${GENERATOR}" --exec /bin/bash --tree "${WORK}/tree")"
+if grep -qF "(deny file-read* file-write* (subpath \"${runner_audit}\"))" <<< "${runner_profile}" \
+  && ! grep -qF "(deny file-read* file-write* (subpath \"${runner_temp}\"))" <<< "${runner_profile}"; then
+  pass "generator: an audit under RUNNER_TEMP denies only the audit file"
+else
+  fail "generator: an audit under RUNNER_TEMP denied the temp parent"
+fi
+
+private_var_tmpdir="/private/var/folders/p1fix-$$/T"
+private_var_audit="/private/var/p1fix-audit-$$.json"
+private_var_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" TMPDIR="${private_var_tmpdir}" \
+  BENCHD_PRIVATE_AUDIT_PATH="${private_var_audit}" \
+  python3 "${GENERATOR}" --exec /bin/bash --tree "${WORK}/tree")"
+if grep -qF "(deny file-read* file-write* (subpath \"${private_var_audit}\"))" <<< "${private_var_profile}" \
+  && ! grep -qF '(deny file-read* file-write* (subpath "/private/var"))' <<< "${private_var_profile}"; then
+  pass "generator: an audit whose /private/var parent contains TMPDIR denies only the file"
+else
+  fail "generator: an audit parent that contains TMPDIR was denied as a directory"
+fi
+
+dedicated_temp_root="/private/tmp/p1fix-audit-private-$$"
+dedicated_temp_parent="${dedicated_temp_root}/audits"
+dedicated_temp_audit="${dedicated_temp_parent}/private-audit.json"
+dedicated_temp_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" \
+  BENCHD_PRIVATE_AUDIT_PATH="${dedicated_temp_audit}" \
+  python3 "${GENERATOR}" --exec /bin/bash --tree "${WORK}/tree")"
+if grep -qF "(deny file-read* file-write* (subpath \"${dedicated_temp_parent}\"))" <<< "${dedicated_temp_profile}"; then
+  pass "generator: a dedicated audit directory below /private/tmp denies its parent"
+else
+  fail "generator: a dedicated audit directory below /private/tmp did not deny its parent"
+fi
+
+private_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" \
+  BENCHD_PRIVATE_AUDIT_PATH="${PRIVATE_AUDIT_DIR}/private-audit.json" \
+  python3 "${GENERATOR}" --exec /bin/bash --tree "${WORK}/tree")"
+if grep -qF "(deny file-read* file-write* (subpath \"${PRIVATE_AUDIT_DIR}\"))" <<< "${private_profile}"; then
+  pass "generator: an audit under a dedicated private directory denies its parent"
+else
+  fail "generator: a dedicated private audit directory was not denied"
+fi
+
 build_profile="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" python3 "${GENERATOR}" \
   --build --tree "${WORK}/tree")"
 for rule in "${state_rules[@]}"; do
@@ -107,7 +180,7 @@ for rule in "${state_rules[@]}"; do
     fail "generator: build profile contains non-build rule ${rule}"
   fi
 done
-pass "generator: the six non-build state rules are absent from --build"
+pass "generator: the seven non-build state rules are absent from --build"
 
 out="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" BENCHD_BIN_DIR= \
   python3 "${GENERATOR}" --exec /bin/bash --official 2>&1)"

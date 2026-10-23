@@ -38,12 +38,13 @@ fail() { failures=$((failures + 1)); echo "FAIL  $*" >&2; }
 MARKER="CANARY-MARKER-7c1e"
 C="${WORK}/canary"
 mkdir -p "${C}/goldens" "${C}/benchd-bin" "${C}/baseline" "${C}/private" "${C}/cache" \
-  "${C}/runner/_work/repo" "${WORK}/out" "${WORK}/home"
+  "${C}/runner/_work/repo" "${WORK}/audit" "${WORK}/out" "${WORK}/home"
 printf '{"canary":"%s"}\n' "${MARKER}" > "${C}/goldens/canary.golden.json"
 printf '%s\n' "${MARKER}" > "${C}/benchd-bin/benchd"
 printf '%s\n' "${MARKER}" > "${C}/baseline/README.md"
 printf '{"canary":"%s"}\n' "${MARKER}" > "${C}/calibration.json"
 printf '%s\n' "${MARKER}" > "${C}/private/note"
+printf '%s\n' "${MARKER}" > "${WORK}/audit/private-audit.json"
 printf '%s\n' "${MARKER}" > "${C}/cache/product"
 printf '{"canary":"%s"}\n' "${MARKER}" > "${C}/runner/.credentials"
 printf '{"canary":"%s"}\n' "${MARKER}" > "${C}/runner/.runner"
@@ -52,6 +53,7 @@ canary_env=(
   MLXFAST_BASELINE_WORKSPACE="${C}/baseline"
   MLXFAST_BASELINE_CALIBRATION="${C}/calibration.json"
   BENCHD_BIN_DIR="${C}/benchd-bin"
+  BENCHD_PRIVATE_AUDIT_PATH="${WORK}/audit/private-audit.json"
   MLXFAST_PRIVATE_DIR="${C}/private"
   MLXFAST_BUILD_CACHE_DIR="${C}/cache"
   RUNNER_WORKSPACE="${C}/runner/_work/repo"
@@ -69,14 +71,15 @@ if [[ "${rc}" -ne 0 ]]; then
 else
   ok=1
   for path in "${C}/goldens" "${C}/baseline" "${C}/calibration.json" "${C}/benchd-bin" "${C}/private" \
-    "${C}/cache" "${C}/runner/.runner" "${C}/runner/.credentials" "${C}/runner/.credentials_rsaparams"; do
+    "${WORK}/audit" "${WORK}/home/.mlxfast-resident-logs" "${C}/cache" \
+    "${C}/runner/.runner" "${C}/runner/.credentials" "${C}/runner/.credentials_rsaparams"; do
     grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" <<< "${profile}" \
       || { ok=0; fail "generator: the build profile has no read and write deny for ${path}"; }
   done
   for rule in "(deny network*)" "(deny file-write*)"; do
     grep -qF "${rule}" <<< "${profile}" || { ok=0; fail "generator: the build profile has no ${rule}"; }
   done
-  for rule in "(deny process-fork)" "(deny process-exec*)"; do
+  for rule in "(deny process-fork)" "(deny process-exec*)" "(deny signal)" "(allow signal (target self))"; do
     ! grep -qF "${rule}" <<< "${profile}" || { ok=0; fail "generator: the build profile has ${rule}; a build starts compilers"; }
   done
   [[ "$(tail -n 1 <<< "${profile}")" == "(deny file-read* file-write* "* ]] \
