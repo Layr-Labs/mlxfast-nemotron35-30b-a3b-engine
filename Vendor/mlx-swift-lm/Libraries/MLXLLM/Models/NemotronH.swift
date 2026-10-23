@@ -286,6 +286,28 @@ func nemotronSSMAttn(
 
 // MARK: - Mamba2Mixer
 
+private enum NemotronShortConvKernel {
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_short_conv_silu",
+        inputNames: ["input", "weight", "bias"], outputNames: ["out"],
+        source: """
+            auto channel = thread_position_in_grid.x;
+            auto position = thread_position_in_grid.y;
+            auto in = input + position * C + channel;
+            auto w = weight + channel * 4;
+            float acc = 0;
+            for (int i = 0; i < 4; ++i) {
+                acc += static_cast<float>(in[0]) * w[i];
+                in += C;
+            }
+            T convolved = static_cast<T>(acc);
+            T x = convolved + bias[channel];
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            T sigmoid = x < 0 ? y : 1 - y;
+            out[position * C + channel] = x * sigmoid;
+            """)
+}
+
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
@@ -351,6 +373,22 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
+    func activatedConv(_ padded: MLXArray) -> MLXArray {
+        guard convKernelSize == 4, padded.ndim == 3, padded.dim(0) == 1,
+            (4...11).contains(padded.dim(1)), padded.dim(2) == convDim,
+            padded.dtype == .bfloat16, conv1d.weight.dtype == .bfloat16,
+            conv1d.weight.shape == [convDim, 4, 1], conv1d.groups == convDim,
+            conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
+            let bias = conv1d.bias, bias.dtype == .bfloat16, bias.shape == [convDim]
+        else { return silu(conv1d(padded)) }
+        let length = padded.dim(1) - 3
+        return NemotronShortConvKernel.kernel(
+            [padded, conv1d.weight, bias],
+            template: [("T", DType.bfloat16), ("C", convDim)],
+            grid: (convDim, length, 1), threadGroup: (min(convDim, 256), 1, 1),
+            outputShapes: [[1, length, convDim]], outputDTypes: [.bfloat16])[0]
+    }
+
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
         var convInput = input
 
@@ -380,8 +418,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             cache[0] = padded[0..., start ..< end, 0...]
         }
 
-        let convOutput = conv1d(padded)
-        return silu(convOutput)
+        return activatedConv(padded)
     }
 
     private func mambaForward(
@@ -481,7 +518,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let end = padded.dim(1)
         let nextConvState =
             padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
-        let convOutput = silu(conv1d(padded))
+        let convOutput = activatedConv(padded)
         let convSplits = split(
             convOutput,
             indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
@@ -679,6 +716,92 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
 
 // MARK: - MoE Gate
 
+enum NemotronHRouterSelection {
+    static let sigmoidHeader = """
+        inline float nemotron_h_router_sigmoid(float x) {
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            return (x < 0) ? y : 1 - y;
+        }
+        """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            threadgroup float original[128];
+            threadgroup float normalized[6];
+            float corrected[4];
+            bool selected[4] = {false, false, false, false};
+            float chosen[6];
+            for (uint i = 0; i < 4; ++i) {
+                const uint id = lane + 32 * i;
+                original[id] = nemotron_h_router_sigmoid(float(gates[row * 128 + id]));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < 4; ++i) {
+                const uint id = lane + 32 * i;
+                corrected[i] = original[id] + bias[id];
+            }
+            for (uint slot = 0; slot < 6; ++slot) {
+                uint local_id = 0xffffffff;
+                float local_score = -INFINITY;
+                for (uint i = 0; i < 4; ++i) {
+                    if (!selected[i] && (local_id == 0xffffffff
+                        || (!metal::isnan(corrected[i])
+                            && (metal::isnan(local_score) || corrected[i] > local_score)))) {
+                        local_id = lane + 32 * i;
+                        local_score = corrected[i];
+                    }
+                }
+                const bool ordered = local_id != 0xffffffff && !metal::isnan(local_score);
+                const bool any_ordered = simd_any(ordered);
+                const float maximum = simd_max(ordered ? local_score : -INFINITY);
+                const uint winner = simd_min(
+                    ((!any_ordered && local_id != 0xffffffff)
+                        || (ordered && local_score == maximum)) ? local_id : 0xffffffff);
+                if (lane == 0) {
+                    indices[row * 6 + slot] = winner;
+                    chosen[slot] = original[winner];
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    if (lane + 32 * i == winner) { selected[i] = true; }
+                }
+            }
+            if (lane == 0) {
+                // Match row_reduce_small's value + total order from positive zero.
+                float total = 0.0f;
+                for (uint slot = 0; slot < 6; ++slot) { total = chosen[slot] + total; }
+                const float denominator = total + 1e-20f;
+                for (uint slot = 0; slot < 6; ++slot) {
+                    normalized[slot] = chosen[slot] / denominator;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
+            """,
+        header: sigmoidHeader, ensureRowContiguous: true)
+
+    static func apply(
+        gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
+        routedScalingFactor: Float, normTopkProb: Bool
+    ) -> (MLXArray, MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
+            gates.dim(2) == 128, gates.dtype == .bfloat16,
+            eSCB.shape == [128], eSCB.dtype == .float32,
+            topK == 6, nGroup == 1, topkGroup == 1,
+            normTopkProb, routedScalingFactor == 2.5
+        else { return nil }
+        let shape = [1, gates.dim(1), 6]
+        let result = kernel(
+            [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+            outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        return (result[0], result[1])
+    }
+}
+
 private func groupExpertSelect(
     gates: MLXArray,
     eSCB: MLXArray,  // e_score_correction_bias
@@ -688,6 +811,11 @@ private func groupExpertSelect(
     routedScalingFactor: Float,
     normTopkProb: Bool
 ) -> (MLXArray, MLXArray) {
+    if let selected = NemotronHRouterSelection.apply(
+        gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
+        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb) {
+        return selected
+    }
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
 
     // Original scores using sigmoid

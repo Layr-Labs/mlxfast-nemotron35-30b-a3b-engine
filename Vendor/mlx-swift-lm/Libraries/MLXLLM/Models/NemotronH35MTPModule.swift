@@ -70,6 +70,23 @@ final class NemotronH35MTPAttentionBlock: Module {
             .transposed(0, 2, 1, 3)
         return cache.appendTrusted(keys: keys, values: values)
     }
+
+    func appendTrustedKVRows(
+        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+    ) -> [MLXArray] {
+        let e = nemotronMTPNormRows(embedding) { embeddingNorm($0) }
+        let h = nemotronMTPNormRows(hidden) { hiddenNorm($0) }
+        let fused = nemotronMTPLinearRows(concatenated([e, h], axis: -1), projection)
+        let x = nemotronMTPNormRows(fused) { norm($0) }
+        let batch = x.dim(0), length = x.dim(1)
+        let keys = nemotronMTPLinearRows(x, mixer.wk)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        let values = nemotronMTPLinearRows(x, mixer.wv)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        return cache.appendTrusted(keys: keys, values: values)
+    }
 }
 
 final class NemotronH35MTPExpertBlock: Module {
@@ -114,6 +131,12 @@ final class NemotronH35MTPModule: Module {
         hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
     ) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
+            hidden: hidden, embedding: embedding, cache: cache)
+    }
+    func appendTrustedKVRows(
+        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+    ) -> [MLXArray] {
+        (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKVRows(
             hidden: hidden, embedding: embedding, cache: cache)
     }
 }
