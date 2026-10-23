@@ -95,6 +95,120 @@ class NemotronHRMSNormGated: Module {
     }
 }
 
+// MARK: - Multi-token SSM scan (copy of SSM.swift ssmAttn, fewer copies)
+
+/// tril(CB_g * exp(S), 0) with CB broadcast over the R heads of its group:
+/// exactly the stock where(i >= j, astype(repeat(CB), f32) * Exp(S), 0)
+/// (Exp is metal::precise::exp) without the [B, H, L, L] repeat, promotion,
+/// exp and product intermediates.
+private final class NemotronHScanKernels: Sendable {
+    static let shared = NemotronHScanKernels()
+    let maskedDecay: MLXFast.MLXFastKernel
+    private init() {
+        maskedDecay = MLXFast.metalKernel(
+            name: "nemotron_ssm_masked_decay",
+            inputNames: ["CB", "S", "L", "R"], outputNames: ["out"],
+            source: """
+                uint j = thread_position_in_grid.x;
+                uint i = thread_position_in_grid.y;
+                uint bh = thread_position_in_grid.z;
+                size_t idx = (size_t(bh) * L + i) * L + j;
+                float v;
+                if (j <= i) {
+                    float c = static_cast<float>(CB[(size_t(bh / R) * L + i) * L + j]);
+                    float d = metal::precise::exp(S[idx]);
+                    v = c * d;
+                } else {
+                    v = 0.0f;
+                }
+                out[idx] = v;
+            """)
+    }
+}
+
+/// Bitwise copy of `ssmAttn` (SSM.swift, not editable) for L > 1 with a
+/// prior state. Only materialized copies feeding element-wise ops change:
+/// the segsum input is a broadcast view instead of `repeated` (the tril
+/// `where` writes the same contiguous array either way, so the cumsum sees
+/// identical input), and the CB repeat/promotion/exp/product/tril chain is
+/// one kernel with the same per-element arithmetic. Every matmul, cumsum
+/// and the state/output algebra is unchanged.
+func nemotronSSMAttn(
+    x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
+    dt: MLXArray, dtBias: MLXArray, state: MLXArray,
+    timeStepLimit: (Float, Float)
+) -> (MLXArray, MLXArray) {
+    let (b, l, h, dh) = x.shape4
+    let (_, _, g, d) = B.shape4
+
+    let dt = computeDt(dt, dtBias, timeStepLimit)
+    let repeats = h / g
+    let A = -MLX.exp(ALog).asType(dt.dtype)
+    let dtA = dt * A.reshaped(1, 1, -1)
+    let dtx = dt.reshaped(b, l, h, 1) * x
+
+    let step = 256
+    var currentState = state
+    var outputs = [MLXArray]()
+    outputs.reserveCapacity((l + step - 1) / step)
+    for start in stride(from: 0, to: l, by: step) {
+        let end = min(start + step, l)
+        let n = end - start
+        let stepDtx = dtx[0..., start ..< end, 0..., 0...]
+        let stepDtA = dtA[0..., start ..< end, 0...]
+        var stepB = B[0..., start ..< end, 0..., 0...]
+        let stepC = C[0..., start ..< end, 0..., 0...]
+
+        stepB = MLX.transposed(stepB, axes: [0, 2, 3, 1])
+        let CB = MLX.swappedAxes(stepC, 1, 2).matmul(stepB)
+
+        // segsum(stepDtA.swappedAxes(1, 2)) with a broadcast instead of repeat.
+        let segIn = stepDtA.swappedAxes(1, 2)[.ellipsis, .newAxis]
+        let segTri = MLX.tril(MLX.broadcast(segIn, to: [b, h, n, n]), k: -1)
+        let segsum = MLX.cumsum(segTri, axis: -2)
+
+        let surrogateAttentionMatrix: MLXArray
+        if segsum.dtype == .float32 {
+            surrogateAttentionMatrix = NemotronHScanKernels.shared.maskedDecay(
+                [CB, segsum, n, repeats],
+                template: [("T", CB.dtype)],
+                grid: (n, n, b * h), threadGroup: (32, 8, 1),
+                outputShapes: [[b, h, n, n]], outputDTypes: [.float32])[0]
+        } else {
+            let decayFull = MLX.exp(segsum)
+            surrogateAttentionMatrix = MLX.tril(
+                MLX.repeated(CB, count: repeats, axis: 1) * decayFull, k: 0)
+        }
+        var y = surrogateAttentionMatrix.matmul(stepDtx.swappedAxes(1, 2))
+        y = MLX.swappedAxes(y, 1, 2)
+
+        // decay[..., -1:, :] == exp(segsum[..., -1:, :]) element-wise.
+        let decay = MLX.exp(segsum[0..., 0..., (-1)..., 0...]).transposed(0, 3, 1, 2)
+        stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
+        var dtxdecay = stepDtx * decay
+        dtxdecay = dtxdecay.swappedAxes(1, 2).swappedAxes(2, 3)
+        var nextState = dtxdecay.matmul(stepB)
+
+        let previousState = currentState
+        let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
+        nextState =
+            nextState
+            + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
+        let reshapedState = previousState.reshaped(b, 1, g, repeats, dh, d)
+        let reshapedC = stepC.reshaped(b, n, g, 1, d, 1)
+        let yPrev = (reshapedState.matmul(reshapedC))
+            .squeezed(axis: -1)
+            .flattened(start: 2, end: 3)
+        y = y + expDtACumsum[.ellipsis, .newAxis] * yPrev
+
+        outputs.append(y.asType(x.dtype))
+        currentState = nextState
+    }
+
+    let y = MLX.concatenated(outputs, axis: 1) + x * D.reshaped(1, 1, h, 1)
+    return (y, currentState)
+}
+
 // MARK: - Mamba2Mixer
 
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
@@ -304,7 +418,11 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let C = convSplits[2].reshaped(
             batch, convOutput.dim(1), numGroups, ssmStateSize)
         let dtArray = dt.reshaped(batch, dt.dim(1), numHeads)
-        let (y, nextState) = ssmUpdate(
+        let (y, nextState) = convOutput.dim(1) > 1
+            ? nemotronSSMAttn(
+                x: hidden, ALog: aLog, B: B, C: C, D: D, dt: dtArray,
+                dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit)
+            : ssmUpdate(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,
@@ -610,6 +728,56 @@ class NemotronHSwitchMLP: Module {
         super.init()
     }
 
+    /// Multi-token MoE (sorted gather route) fused with the caller's
+    /// weighted reduction. Same graph as `callAsFunction` followed by
+    /// `(y * scores[..., None]).sum(-2).asType(y.dtype)`, except that
+    /// (1) the inverse permutation is a scatter instead of a second argsort
+    /// (a permutation has exactly one inverse), (2) relu2 is one pass with the
+    /// stock Maximum/Multiply element arithmetic in the activation dtype, and
+    /// (3) the unsort gather, fp32 promotion, score multiply, K-way sum and
+    /// narrowing are one kernel that reproduces col_reduce_small's order
+    /// (lsize.y == K <= 8: row j is op(v_j, 0), then total = op(row_j, total)
+    /// for j = 1..K-1). Every value is bitwise identical to the unfused graph.
+    func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray) -> MLXArray? {
+        let k = indices.dim(-1)
+        guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
+              scores.shape == indices.shape,
+              x.dtype == .bfloat16 || x.dtype == .float16, x.dim(-1) == inputDims,
+              inputDims % 4 == 0
+        else { return nil }
+        let tokens = indices.size / k
+        let flat = indices.flattened()
+        let order = argSort(flat)
+        let kernels = NemotronHPrefillKernels.shared
+        let inverse = kernels.inversePermutation(
+            [order], template: [("T", order.dtype)],
+            grid: (order.size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[order.size]], outputDTypes: [order.dtype])[0]
+        let xs = MLX.expandedDimensions(x, axes: [-2, -3])
+            .flattened(start: 0, end: -3)[order.floorDivide(k)]
+        let idx = flat[order]
+        var y = fc1(xs, idx, sortedIndices: true)
+        // Stock relu2 promotes against an int scalar; fuse only when that
+        // keeps the activation dtype (graph metadata, never evaluated).
+        if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
+            y = kernels.relu2(
+                [y], template: [("T", y.dtype)],
+                grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [y.shape], outputDTypes: [y.dtype])[0]
+        } else {
+            y = relu2(y)
+        }
+        y = fc2(y, idx, sortedIndices: true)
+        guard y.dim(-1) == inputDims, y.size == indices.size * inputDims else { return nil }
+        var outShape = indices.shape
+        outShape[outShape.count - 1] = inputDims
+        return kernels.combine(
+            [y, inverse, scores, inputDims],
+            template: [("T", y.dtype), ("K", k)],
+            grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0]
+    }
+
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
@@ -632,6 +800,100 @@ class NemotronHSwitchMLP: Module {
 
         return MLX.squeezed(y, axis: -2)
     }
+}
+
+// MARK: - Exact multi-token MoE element kernels
+
+private final class NemotronHPrefillKernels: Sendable {
+    static let shared = NemotronHPrefillKernels()
+    let inversePermutation: MLXFast.MLXFastKernel
+    let relu2: MLXFast.MLXFastKernel
+    let combine: MLXFast.MLXFastKernel
+    private init() {
+        inversePermutation = MLXFast.metalKernel(
+            name: "nemotron_inverse_permutation",
+            inputNames: ["order"], outputNames: ["inv"],
+            source: """
+                uint p = thread_position_in_grid.x;
+                inv[order[p]] = static_cast<T>(p);
+            """)
+        // Stock relu2: Maximum(x, 0) (NaN-propagating) then Multiply(m, m), in T.
+        relu2 = MLXFast.metalKernel(
+            name: "nemotron_relu2",
+            inputNames: ["x"], outputNames: ["out"],
+            source: """
+                uint i = thread_position_in_grid.x;
+                T v = x[i];
+                T zero = static_cast<T>(0);
+                T m = metal::isnan(v) ? v : (v > zero ? v : zero);
+                out[i] = m * m;
+            """)
+        // y: [tokens*K, N] expert outputs in sorted order; inv[t*K+k] is the
+        // sorted row of (t, k); scores: [tokens*K] fp32. Reproduces
+        // take(y, inv) -> astype(fp32) -> multiply(scores) -> sum(axis=-2)
+        // (col_reduce_small) -> astype(T). The +0.0f is the reduce's
+        // op(v, init); separate statements keep each product rounded once.
+        combine = MLXFast.metalKernel(
+            name: "nemotron_moe_unsort_combine",
+            inputNames: ["y", "inv", "scores", "N"], outputNames: ["out"],
+            source: """
+                uint c = thread_position_in_grid.x * 4;
+                uint t = thread_position_in_grid.y;
+                float total[4];
+                for (int k = 0; k < K; ++k) {
+                    uint src = inv[t * K + k];
+                    float s = scores[t * K + k];
+                    const device T* row = y + size_t(src) * N + c;
+                    for (int j = 0; j < 4; ++j) {
+                        float v = static_cast<float>(row[j]);
+                        float p = v * s;
+                        float a = p + 0.0f;
+                        if (k == 0) {
+                            total[j] = a;
+                        } else {
+                            total[j] = a + total[j];
+                        }
+                    }
+                }
+                device T* o = out + size_t(t) * N + c;
+                for (int j = 0; j < 4; ++j) {
+                    o[j] = static_cast<T>(total[j]);
+                }
+            """)
+    }
+}
+
+/// Compile the multi-token kernels at model load (same names, template
+/// arguments, dtypes and address spaces as the prefill calls: every array
+/// input has >= 8 elements so none is passed as `constant`), so the first
+/// timed prefill does not pay their Metal JIT. Values are discarded.
+private func nemotronWarmUpPrefillKernels(expertsPerToken k: Int, dtype: DType) {
+    guard (1...8).contains(k) else { return }
+    let kernels = NemotronHPrefillKernels.shared
+    let rows = 2 * k
+    let order = argSort(MLXArray((0 ..< rows).map { Int32(rows - 1 - $0) }))
+    var arrays: [MLXArray] = []
+    arrays.append(kernels.inversePermutation(
+        [order], template: [("T", order.dtype)],
+        grid: (rows, 1, 1), threadGroup: (256, 1, 1),
+        outputShapes: [[rows]], outputDTypes: [order.dtype])[0])
+    let y = MLXArray.zeros([rows, 1, 8], dtype: dtype)
+    arrays.append(kernels.relu2(
+        [y], template: [("T", dtype)],
+        grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
+        outputShapes: [y.shape], outputDTypes: [dtype])[0])
+    arrays.append(kernels.combine(
+        [y.reshaped(rows, 8), order, MLXArray.zeros([1, 2, k], dtype: .float32), 8],
+        template: [("T", dtype), ("K", k)],
+        grid: (2, 2, 1), threadGroup: (32, 1, 1),
+        outputShapes: [[1, 2, 8]], outputDTypes: [dtype])[0])
+    let cb = MLXArray.zeros([1, 8, 4, 4], dtype: dtype)
+    let seg = MLXArray.zeros([1, 64, 4, 4], dtype: .float32)
+    arrays.append(NemotronHScanKernels.shared.maskedDecay(
+        [cb, seg, 4, 8], template: [("T", dtype)],
+        grid: (4, 4, 64), threadGroup: (32, 8, 1),
+        outputShapes: [[1, 64, 4, 4]], outputDTypes: [.float32])[0])
+    eval(arrays)
 }
 
 // MARK: - MoE
@@ -668,8 +930,13 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        var y = switchMLP(x, inds)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        var y: MLXArray
+        if let fused = switchMLP.fusedSortedCombine(x, inds, scores) {
+            y = fused
+        } else {
+            y = switchMLP(x, inds)
+            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        }
 
         if let sharedExperts {
             y = y + sharedExperts(x)
@@ -968,6 +1235,9 @@ public class NemotronHModel:
 
         if !args.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
+        }
+        Device.withDefaultDevice(.gpu) {
+            nemotronWarmUpPrefillKernels(expertsPerToken: args.numExpertsPerTok, dtype: .bfloat16)
         }
     }
 

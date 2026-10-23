@@ -19,6 +19,10 @@ extension NemotronHMamba2Mixer {
             [batch, max(0, convKernelSize - 1), convDim], dtype: hiddenStates.dtype)
         let ssmState = initial?.ssm ?? MLXArray.zeros(
             [batch, numHeads, headDim, ssmStateSize], dtype: .float32)
+        if nemotronMTPCompactSSM && length > 1 {
+            return mtpCompactForward(hiddenStates, modelLayerIndex: modelLayerIndex,
+                evaluation: evaluation, convState: convState, initialSSM: ssmState)
+        }
         let arrays = mtpCapturedArrays(hiddenStates, convState: convState, initialSSM: ssmState)
         do {
             try evaluation.stageCaptured(modelLayerIndex: modelLayerIndex,
@@ -27,6 +31,60 @@ extension NemotronHMamba2Mixer {
             preconditionFailure("Nemotron MTP captured-state stage failed: \(error)")
         }
         return arrays[0]
+    }
+
+    /// Compact verify: the window kernel writes only the final SSM state and
+    /// the window's y; a strict accepted prefix replays the same kernel for
+    /// `keep` steps from the same input state at commit (bitwise equal to the
+    /// captured per-position state). Conv states are views of `padded`.
+    func mtpCompactForward(
+        _ hiddenStates: MLXArray, modelLayerIndex: Int,
+        evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
+    ) -> MLXArray {
+        let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
+        let projected = nemotronMTPLinearRows(hiddenStates, inProj)
+        let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        let gate = parts[0], input = parts[1]
+        let padded = concatenated([convState, input], axis: 1)
+        let convolution = silu(conv1d(padded))
+        let dt = computeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
+        let (logA, skip) = (self.aLog, self.D)
+        let result = nemotronMTPSSMCompact(
+            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+            heads: heads, headDim: dim, groups: groups, stateDim: state,
+            steps: length, writeOutput: true)
+        let history = convKernelSize - 1
+        let tape = [padded, convolution, dt]
+        let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
+        do {
+            try evaluation.stagePrefixReplay(
+                modelLayerIndex: modelLayerIndex, positions: length,
+                finalConv: padded[0..., length ..< (length + history), 0...],
+                finalSSM: result.finalState,
+                materializedByteCount: tapeBytes + result.finalState.nbytes,
+                evaluationRoots: tape,
+                strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
+                strictReplayRetainedRoots: tape + [initialSSM],
+                replay: { keep in
+                    CBv2RecurrentLayerState(
+                        conv: padded[0..., keep ..< (keep + history), 0...],
+                        ssm: nemotronMTPSSMCompact(
+                            convolution: convolution, ALog: logA, D: skip, dt: dt,
+                            state: initialSSM, heads: heads, headDim: dim, groups: groups,
+                            stateDim: state, steps: keep, writeOutput: false).finalState)
+                })
+        } catch {
+            preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
+        }
+        let y = result.output.reshaped(batch, length, heads * dim)
+        let normalized = NemotronMTPExecution.batchedNorm
+            ? norm(y, gate: gate)
+            : concatenated((0..<length).map { position in
+                norm(y[0..., position..<(position + 1), 0...],
+                     gate: gate[0..., position..<(position + 1), 0...])
+            }, axis: 1)
+        return nemotronMTPLinearRows(normalized, outProj)
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -41,10 +99,12 @@ extension NemotronHMamba2Mixer {
         // update, so rejecting a suffix cannot advance persistent recurrence.
         let padded = concatenated([convState, input], axis: 1)
         let convolution = silu(conv1d(padded))
-        let convStates = (0..<length).map { position in
-            let end = convKernelSize - 1 + position + 1
-            return padded[0..., (position + 1)..<end, 0...]
-        }
+        // Per-position conv histories as one strided view of `padded`
+        // (window p = rows p+1 ..< p+convKernelSize). Pure data movement:
+        // identical values to stacking the per-position slices.
+        let convStack = asStrided(
+            padded, [length, convKernelSize - 1, convDim],
+            strides: [convDim, convDim, 1], offset: convDim)
         var outputs: [MLXArray] = []
         let capturedSSM: MLXArray
         if NemotronMTPExecution.windowSSM && length > 1 {
@@ -57,8 +117,14 @@ extension NemotronHMamba2Mixer {
                 dt: dt.reshaped(batch, length, numHeads), dtBias: dtBias,
                 state: ssmState, timeStepLimit: timeStepLimit)
             capturedSSM = result.capturedStates
-            outputs = (0..<length).map {
-                result.output[0..., $0..<($0 + 1), 0..., 0...].flattened(start: 2)
+            if NemotronMTPExecution.batchedNorm {
+                // [1, L, H, Dh] is contiguous: one reshape equals the
+                // concatenation of the per-position flattened slices.
+                outputs = [result.output.reshaped(batch, length, -1)]
+            } else {
+                outputs = (0..<length).map {
+                    result.output[0..., $0..<($0 + 1), 0..., 0...].flattened(start: 2)
+                }
             }
         } else {
             var ssmStates: [MLXArray] = []
@@ -79,14 +145,14 @@ extension NemotronHMamba2Mixer {
         }
         let normalized: MLXArray
         if NemotronMTPExecution.batchedNorm {
-            normalized = norm(concatenated(outputs, axis: 1), gate: gate)
+            normalized = norm(
+                outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 1), gate: gate)
         } else {
             normalized = concatenated(outputs.enumerated().map { position, y in
                 norm(y, gate: gate[0..., position..<(position + 1), 0...])
             }, axis: 1)
         }
-        return [nemotronMTPLinearRows(normalized, outProj),
-                concatenated(convStates, axis: 0), capturedSSM]
+        return [nemotronMTPLinearRows(normalized, outProj), convStack, capturedSSM]
     }
 }
 
@@ -101,5 +167,50 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
         let output = lmHead.map { nemotronMTPHeadRows(hidden, $0) }
             ?? nemotronMTPMapRows(hidden) { logits($0) }
         return (output, hidden)
+    }
+}
+
+extension NemotronH35Model {
+    /// Compile, at load time, every SSM verify-kernel instantiation an MTP
+    /// round can use (window widths 2...8; compact replay prefixes 1...7), so
+    /// a JIT compile never lands inside a timed decode window. Dummy inputs
+    /// use the real parameter dtypes, hence the exact runtime instantiations.
+    func warmMTPSSMKernels(activationDType: DType) {
+        guard let mixer = modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first
+        else { return }
+        let history = mixer.convKernelSize - 1
+        let (heads, dim, groups, stateDim) =
+            (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        var roots: [MLXArray] = []
+        for width in 2...8 {
+            let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
+            let convolution = silu(mixer.conv1d(padded))
+            let rawDt = MLXArray.zeros([1, width, heads], dtype: activationDType)
+            let state = MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32)
+            if nemotronMTPCompactSSM {
+                let dt = computeDt(rawDt, mixer.dtBias, mixer.timeStepLimit)
+                let window = nemotronMTPSSMCompact(
+                    convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
+                    state: state, heads: heads, headDim: dim, groups: groups,
+                    stateDim: stateDim, steps: width, writeOutput: true)
+                let replay = nemotronMTPSSMCompact(
+                    convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
+                    state: state, heads: heads, headDim: dim, groups: groups,
+                    stateDim: stateDim, steps: width - 1, writeOutput: false)
+                roots += [window.output, window.finalState, replay.finalState]
+            } else if NemotronMTPExecution.windowSSM {
+                let values = split(convolution,
+                    indices: [mixer.intermediateSize, mixer.intermediateSize + groups * stateDim],
+                    axis: -1)
+                let window = nemotronMTPSSMWindow(
+                    hiddenStates: values[0].reshaped(1, width, heads, dim),
+                    ALog: mixer.aLog, B: values[1].reshaped(1, width, groups, stateDim),
+                    C: values[2].reshaped(1, width, groups, stateDim), D: mixer.D,
+                    dt: rawDt, dtBias: mixer.dtBias, state: state,
+                    timeStepLimit: mixer.timeStepLimit)
+                roots += [window.output, window.capturedStates]
+            }
+        }
+        if !roots.isEmpty { eval(roots) }
     }
 }

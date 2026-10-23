@@ -231,6 +231,18 @@ private final class NemotronMultiRowQMVKernel: Sendable {
 }
 
 enum NemotronMultiRowQMV {
+    /// Input-independent int32 scalar arguments, built once per (K, N)
+    /// instead of twice per call. Same values as the implicit Int conversion.
+    nonisolated(unsafe) private static var scalars: [Int: (MLXArray, MLXArray)] = [:]
+    private static let scalarsLock = NSLock()
+    static func scalarPair(_ k: Int, _ n: Int) -> (MLXArray, MLXArray) {
+        scalarsLock.lock(); defer { scalarsLock.unlock() }
+        let key = k &* 1_000_003 &+ n
+        if let pair = scalars[key] { return pair }
+        let pair = (MLXArray(Int32(k)), MLXArray(Int32(n)))
+        scalars[key] = pair
+        return pair
+    }
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MULTIROW_QMV"] != "0"
 
@@ -247,8 +259,9 @@ enum NemotronMultiRowQMV {
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
         let fast = k % 512 == 0
+        let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
-            [q.weight, q.scales, biases, x, k, n],
+            [q.weight, q.scales, biases, x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", fast)],
             grid: (32, n / 4, 1),
             threadGroup: (32, 2, 1),
