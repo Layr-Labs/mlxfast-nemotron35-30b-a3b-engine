@@ -391,6 +391,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let keepsFloat32State: Bool
 
     let convDim: Int
+    let mtpCompiledCompactCache = NemotronH35MTPMambaGraphCache()
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
     @ModuleInfo(key: "in_proj") var inProj: Linear

@@ -41,19 +41,13 @@ extension NemotronHMamba2Mixer {
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
         evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
     ) -> MLXArray {
-        let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
-        let projected = nemotronMTPLinearRows(hiddenStates, inProj)
-        let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
-        let gate = parts[0], input = parts[1]
-        let padded = concatenated([convState, input], axis: 1)
-        let convolution = silu(conv1d(padded))
-        let dt = computeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let length = hiddenStates.dim(1)
+        let core = NemotronMTPExecution.compiledMamba
+            ? mtpCompiledCompactCache([hiddenStates, convState, initialSSM], owner: self)
+            : mtpCompactCore(hiddenStates, convState: convState, initialSSM: initialSSM)
+        let (output, padded, convolution, dt, finalState) = (core[0], core[1], core[2], core[3], core[4])
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
-        let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-            heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
@@ -61,8 +55,8 @@ extension NemotronHMamba2Mixer {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
                 finalConv: padded[0..., length ..< (length + history), 0...],
-                finalSSM: result.finalState,
-                materializedByteCount: tapeBytes + result.finalState.nbytes,
+                finalSSM: finalState,
+                materializedByteCount: tapeBytes + finalState.nbytes,
                 evaluationRoots: tape,
                 strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
                 strictReplayRetainedRoots: tape + [initialSSM],
@@ -77,14 +71,32 @@ extension NemotronHMamba2Mixer {
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
         }
-        let y = result.output.reshaped(batch, length, heads * dim)
+        return output
+    }
+
+    /// The stateless body of the compact verify: [mixer output, padded,
+    /// convolution, dt, final SSM state]. Staging stays with the caller.
+    func mtpCompactCore(_ hiddenStates: MLXArray, convState: MLXArray,
+                        initialSSM: MLXArray) -> [MLXArray] {
+        let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
+        let projected = nemotronMTPLinearRows(hiddenStates, inProj)
+        let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        let gate = parts[0], input = parts[1]
+        let padded = concatenated([convState, input], axis: 1)
+        let convolution = silu(conv1d(padded))
+        let dt = computeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let result = nemotronMTPSSMCompact(
+            convolution: convolution, ALog: aLog, D: D, dt: dt, state: initialSSM,
+            heads: numHeads, headDim: headDim, groups: numGroups, stateDim: ssmStateSize,
+            steps: length, writeOutput: true)
+        let y = result.output.reshaped(batch, length, numHeads * headDim)
         let normalized = NemotronMTPExecution.batchedNorm
             ? norm(y, gate: gate)
             : concatenated((0..<length).map { position in
                 norm(y[0..., position..<(position + 1), 0...],
                      gate: gate[0..., position..<(position + 1), 0...])
             }, axis: 1)
-        return nemotronMTPLinearRows(normalized, outProj)
+        return [nemotronMTPLinearRows(normalized, outProj), padded, convolution, dt, result.finalState]
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -156,6 +168,52 @@ extension NemotronHMamba2Mixer {
     }
 }
 
+
+/// Stateless graph cache for `mtpCompactCore`, the same scheme as the MoE
+/// verify cache. Conv/SSM inputs arrive as arguments; staging, offsets and
+/// transactions are never captured.
+final class NemotronH35MTPMambaGraphCache {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func callAsFunction(_ arguments: [MLXArray], owner: NemotronHMamba2Mixer) -> [MLXArray] {
+        let nativeIdentity = Self.nativeIdentity(owner)
+        let parameters = nativeIdentity == nil ? owner.innerState() : nil
+        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
+            + (parameters ?? []).map(ObjectIdentifier.init))
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.identity == identity { return entry }
+            let state = parameters ?? owner.innerState()
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak owner] arguments in
+                guard let owner else { preconditionFailure("Released Nemotron Mamba graph owner") }
+                return owner.mtpCompactCore(arguments[0], convState: arguments[1], initialSSM: arguments[2])
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        return withExtendedLifetime(retired) { current.function(arguments) }
+    }
+
+    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
+        func linear(_ value: Linear) -> Bool {
+            type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
+        }
+        guard type(of: owner) == NemotronHMamba2Mixer.self,
+              type(of: owner.conv1d) == Conv1d.self,
+              type(of: owner.norm) == NemotronHRMSNormGated.self,
+              linear(owner.inProj), linear(owner.outProj) else { return nil }
+        let modules: [Module] = [owner, owner.conv1d, owner.inProj, owner.outProj, owner.norm]
+        return modules.map(ObjectIdentifier.init)
+    }
+}
 
 extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
     public func cbv2ForwardWithHiddenCaptured(
