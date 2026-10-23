@@ -82,11 +82,14 @@ else
     grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" <<< "${profile}" \
       || { ok=0; fail "generator: the build profile has no read and write deny for ${path}"; }
   done
-  for rule in "(deny network*)" "(deny file-write*)"; do
+  for rule in "(deny network*)" "(deny system-sched)" "(deny file-write*)"; do
     grep -qF "${rule}" <<< "${profile}" || { ok=0; fail "generator: the build profile has no ${rule}"; }
   done
   for rule in "(deny process-fork)" "(deny process-exec*)" "(deny signal)" "(allow signal (target self))"; do
     ! grep -qF "${rule}" <<< "${profile}" || { ok=0; fail "generator: the build profile has ${rule}; a build starts compilers"; }
+  done
+  for rule in "(deny file-write-flags)" "(deny file-write-acl)"; do
+    ! grep -Fxq "${rule}" <<< "${profile}" || { ok=0; fail "generator: the build profile has runtime-only ${rule}"; }
   done
   expected_home_runner_rules="$(
     for directory in actions-runner actions-runner-x; do

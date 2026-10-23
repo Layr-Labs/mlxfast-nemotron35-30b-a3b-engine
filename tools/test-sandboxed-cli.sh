@@ -89,9 +89,21 @@ else
     || fail "generator: the resident socket has no local network allowance"
   grep -qF "(allow file-write* (literal \"${WORK}/resident.sock\"))" <<< "${profile}" \
     || fail "generator: the resident socket has no file-write allowance"
+  last_write_allow="$(awk '/^\(allow file-write\*/ { line = NR } END { print line + 0 }' <<< "${profile}")"
+  flags_deny="$(grep -nFx '(deny file-write-flags)' <<< "${profile}" | cut -d: -f1)"
+  acl_deny="$(grep -nFx '(deny file-write-acl)' <<< "${profile}" | cut -d: -f1)"
+  first_evaluator_deny="$(grep -nF '(deny file-read* file-write* ' <<< "${profile}" | head -n 1 | cut -d: -f1)"
+  if [[ -n "${flags_deny}" && -n "${acl_deny}" && -n "${first_evaluator_deny}" \
+     && "${flags_deny}" -gt "${last_write_allow}" \
+     && "${acl_deny}" -gt "${flags_deny}" \
+     && "${acl_deny}" -lt "${first_evaluator_deny}" ]]; then
+    pass "generator: runtime flag and ACL denies follow all write allowances and precede evaluator denies"
+  else
+    fail "generator: runtime flag and ACL deny order is wrong"
+  fi
   [[ "$(tail -n 1 <<< "${profile}")" == "(deny file-read* file-write* "* ]] \
     || fail "generator: the evaluator denies are not the last rules"
-  for rule in "(deny network*)" "(deny process-fork)" "(deny process-exec*)" "(deny file-write*)"; do
+  for rule in "(deny network*)" "(deny system-sched)" "(deny process-fork)" "(deny process-exec*)" "(deny file-write*)"; do
     grep -qF "${rule}" <<< "${profile}" || fail "generator: no ${rule}"
   done
   for rule in "${state_rules[@]}"; do
@@ -201,6 +213,12 @@ for rule in "${state_rules[@]}"; do
   fi
 done
 pass "generator: the seven non-build state rules are absent from --build"
+for rule in "(deny file-write-flags)" "(deny file-write-acl)"; do
+  if grep -Fxq "${rule}" <<< "${build_profile}"; then
+    fail "generator: build profile contains runtime-only rule ${rule}"
+  fi
+done
+pass "generator: file flag and ACL denies are absent from --build"
 
 out="$(env -i PATH="${PATH}" HOME="${WORK}/home" "${canary_env[@]}" BENCHD_BIN_DIR= \
   python3 "${GENERATOR}" --exec /bin/bash --official 2>&1)"

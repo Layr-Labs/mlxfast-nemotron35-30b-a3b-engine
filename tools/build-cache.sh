@@ -34,33 +34,32 @@ ARTEFACTS=(
 sha256_of_file() { shasum -a 256 -- "$1" | cut -d ' ' -f 1; }
 sha256_of_stdin() { shasum -a 256 | cut -d ' ' -f 1; }
 content_key() {
-  local paths dirty
+  local paths rel blob
   # Vendor/mlx-swift-lm is a VENDORED TREE, so the fork's sources are hashed
   # here like every other tracked source. It used to be a gitlink, which the key
   # carried as one commit id.
   paths=('Sources/*' 'Vendor/mlx-swift/*' 'Vendor/mlx-swift-lm/*' 'Package.swift' 'Package.resolved' 'tools/build-mlx-metallib.sh' 'tools/stage-bench-worker.sh')
-  # Blob ids from the index are the content hash of every tracked source; a
-  # path modified in the working tree is re-hashed so a dirty tree never
-  # keys as its committed state.
-  dirty="$(git diff --name-only -- "${paths[@]}")"
+  # Hash each complete NUL-delimited index record: mode, blob id, stage and
+  # full path. A path modified in the working tree is re-hashed so a dirty
+  # tree never keys as its committed state.
   {
-    git ls-files -s -- "${paths[@]}" | awk '{print $4 "\t" $2}' | LC_ALL=C sort
-    if [[ -n "${dirty}" ]]; then
-      while IFS= read -r rel; do
-        [[ -n "${rel}" ]] || continue
-        [[ -f "${rel}" ]] || die "tracked source ${rel} is missing from the working tree; refusing to key a build on it"
-        printf 'dirty\t%s\t%s\n' "${rel}" "$(git hash-object -- "${rel}")"
-      done <<< "${dirty}"
-    fi
-    printf 'metal\t%s\n' "$(tools/build-mlx-metallib.sh --print-fingerprint 2>/dev/null || echo none)"
-    printf 'swift\t%s\n' "$(swift --version 2>/dev/null | head -1)"
-    printf 'host\t%s\n' "$(uname -m)"
+    printf 'index\0'
+    git ls-files -s -z -- "${paths[@]}"
+    printf 'dirty\0'
+    while IFS= read -r -d '' rel; do
+      [[ -f "${rel}" ]] || die "tracked source ${rel} is missing from the working tree; refusing to key a build on it"
+      blob="$(git hash-object -- "${rel}")"
+      printf '%s\0%s\0' "${rel}" "${blob}"
+    done < <(git diff --name-only -z -- "${paths[@]}")
+    printf 'metal\0%s\0' "$(tools/build-mlx-metallib.sh --print-fingerprint 2>/dev/null || echo none)"
+    printf 'swift\0%s\0' "$(swift --version 2>/dev/null | head -1)"
+    printf 'host\0%s\0' "$(uname -m)"
     # The products embed their build directory (SwiftPM resource bundles resolve
     # mlx.metallib from an absolute path baked in at build time), so a product
     # built under one root does not run under another: run 34030992573 restored
     # a worker built elsewhere and the resident died with "Failed to load the
     # default metallib". The root is therefore part of the key.
-    printf 'root\t%s\n' "${ROOT_DIR}"
+    printf 'root\0%s\0' "${ROOT_DIR}"
   } | sha256_of_stdin
 }
 case "${1:-}" in

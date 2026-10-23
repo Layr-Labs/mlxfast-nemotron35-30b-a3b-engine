@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-build-cache.sh -- prove tools/build-cache.sh without a toolchain build.
 #   1. the key is stable across two calls and changes when tracked package or source files change
+#      including a full path with spaces and an index mode change
 #   2. restore misses on an empty cache; save then restore hits and restores byte-identical artefacts
 #   3. a corrupted cached artefact is a miss, and nothing is restored
 # Hermetic: runs in a scratch git clone of this repository with stub artefacts.
@@ -18,6 +19,23 @@ printf '\n// touched\n' >> Package.swift; k3="$(tools/build-cache.sh key)"; git 
 if [[ "${k3}" != "${k1}" ]]; then pass "a tracked source change changes the key"; else fail "the key ignored a source change"; fi
 printf '\n// touched\n' >> Sources/MLXFastTransform/Transform.swift; k4="$(tools/build-cache.sh key)"; git checkout -q -- Sources/MLXFastTransform/Transform.swift
 if [[ "${k4}" != "${k1}" ]]; then pass "a tracked transform source change still changes the key"; else fail "the key ignored a tracked transform source change"; fi
+printf 'same bytes\n' > "Sources/cache name one.swift"
+git add "Sources/cache name one.swift"
+k_space_one="$(tools/build-cache.sh key)"
+git mv "Sources/cache name one.swift" "Sources/cache name two.swift"
+k_space_two="$(tools/build-cache.sh key)"
+if [[ "${k_space_one}" != "${k_space_two}" ]]; then pass "full tracked paths with spaces affect the key"; else fail "the key truncated a tracked path at its first space"; fi
+git reset -q -- "Sources/cache name two.swift"
+rm -f "Sources/cache name two.swift"
+printf 'same bytes\n' > Sources/cache-mode.swift
+git add Sources/cache-mode.swift
+git update-index --chmod=-x Sources/cache-mode.swift
+k_mode_plain="$(tools/build-cache.sh key)"
+git update-index --chmod=+x Sources/cache-mode.swift
+k_mode_exec="$(tools/build-cache.sh key)"
+if [[ "${k_mode_plain}" != "${k_mode_exec}" ]]; then pass "the tracked file mode affects the key"; else fail "the key ignored a tracked file mode change"; fi
+git reset -q -- Sources/cache-mode.swift
+rm -f Sources/cache-mode.swift
 out="$(tools/build-cache.sh restore 2>&1)"; rc=$?
 if [[ "${rc}" -eq 1 && "${out}" == *"miss"* ]]; then pass "an empty cache is a miss"; else fail "empty cache did not miss (rc ${rc}): ${out}"; fi
 mkdir -p .build-worker/release

@@ -149,6 +149,57 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)
 log() { printf 'resident-up.sh: %s\n' "$*" >&2; }
 die() { printf 'resident-up.sh: %s\n' "$*" >&2; exit 1; }
 refuse() { printf 'resident-up.sh: REFUSED (%s): %s\n' "$1" "$2" >&2; exit 2; }
+RESIDENT_TMP_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+
+remove_resident_tmp_tree() {
+  local tree="$1"
+  [[ -e "${tree}" || -L "${tree}" ]] || return 0
+  RESIDENT_TMP_ROOT="${RESIDENT_TMP_ROOT}" python3 - "${tree}" <<'PY' || return 1
+import os
+import stat
+import sys
+
+tree = os.path.abspath(sys.argv[1])
+try:
+    root = os.path.realpath(os.environ["RESIDENT_TMP_ROOT"])
+    tree_real = os.path.realpath(tree)
+    if tree_real == root or os.path.commonpath((root, tree_real)) != root:
+        os._exit(1)
+except Exception:
+    os._exit(1)
+
+stack = [tree]
+while stack:
+    path = stack.pop()
+    try:
+        info = os.lstat(path)
+    except Exception:
+        continue
+    if stat.S_ISLNK(info.st_mode):
+        continue
+    # Only directories (never hard-linked) and single-name files are changed: a
+    # file with another name may be an outside file's inode. File modes are never
+    # changed; removing a name needs rights on its directory only.
+    single_name = stat.S_ISDIR(info.st_mode) or (stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
+    if single_name and hasattr(os, "chflags") and getattr(info, "st_flags", 0):
+        try:
+            os.chflags(path, 0, follow_symlinks=False)
+        except Exception:
+            pass
+    if stat.S_ISDIR(info.st_mode):
+        try:
+            os.chmod(path, 0o700, follow_symlinks=False)
+        except Exception:
+            pass
+        try:
+            names = os.listdir(path)
+        except Exception:
+            continue
+        stack.extend(os.path.join(path, name) for name in names)
+PY
+  rm -rf -- "${tree}" 2>/dev/null || return 1
+  [[ ! -e "${tree}" && ! -L "${tree}" ]]
+}
 
 usage() {
   cat >&2 <<'USAGE'
@@ -224,7 +275,7 @@ if [[ "${MODE}" == "stop" ]]; then
     stop_tmp="$(head -n 1 "${stop_tmpfile}")"
     case "${stop_tmp}" in
       /*/tmp.*)
-        if ! rm -rf -- "${stop_tmp}" 2>/dev/null || [[ -e "${stop_tmp}" ]]; then
+        if ! remove_resident_tmp_tree "${stop_tmp}"; then
           log "FAILED to remove the resident temporary directory ${stop_tmp}"
           stop_tmp_cleanup_failed=1
         fi
@@ -479,7 +530,7 @@ HELLO_FILE=""
 
 remove_resident_tmp() {
   [[ -n "${RESIDENT_TMP_DIR}" ]] || return 0
-  if ! rm -rf -- "${RESIDENT_TMP_DIR}" 2>/dev/null || [[ -e "${RESIDENT_TMP_DIR}" ]]; then
+  if ! remove_resident_tmp_tree "${RESIDENT_TMP_DIR}"; then
     log "FAILED to remove the resident temporary directory ${RESIDENT_TMP_DIR}; ${RESIDENT_TMP_SIDECAR} was kept for retry"
     return 1
   fi
@@ -573,8 +624,17 @@ esac
 RESIDENT_LAUNCH=()
 if [[ "${RESIDENT_SANDBOX}" == "1" ]]; then
   [[ -x /usr/bin/sandbox-exec ]] || refuse sandbox-missing "/usr/bin/sandbox-exec is not available; the resident must run under it. Nothing has been loaded."
-  RESIDENT_TMP_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
   [[ -d "${RESIDENT_TMP_ROOT}" ]] || refuse sandbox-tmp "the resident temporary root is missing: ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
+  if [[ "${MODE}" == "boot" ]]; then
+    for stale_tmp in "${RESIDENT_TMP_ROOT%/}"/tmp.resident-up.*; do
+      [[ -e "${stale_tmp}" || -L "${stale_tmp}" ]] || continue
+      remove_resident_tmp_tree "${stale_tmp}" || true
+    done
+    for stale_tmp in "${RESIDENT_TMP_ROOT%/}"/tmp.resident-up.*; do
+      [[ -e "${stale_tmp}" || -L "${stale_tmp}" ]] || continue
+      refuse stale-resident-tmp "could not remove stale resident temporary directory ${stale_tmp}. Nothing has been loaded."
+    done
+  fi
   RESIDENT_TMP_DIR="$(mktemp -d "${RESIDENT_TMP_ROOT%/}/tmp.resident-up.XXXXXX")" \
     || refuse sandbox-tmp "could not create a private resident temporary directory under ${RESIDENT_TMP_ROOT}. Nothing has been loaded."
   chmod 700 "${RESIDENT_TMP_DIR}"
