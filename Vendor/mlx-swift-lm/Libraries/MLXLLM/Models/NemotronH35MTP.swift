@@ -257,6 +257,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                     }
                 }
             }
+            // Start the trusted-history replay while the seed step is built.
+            if !s.pendingTokens.isEmpty { asyncEval(s.roots) }
         }
         s.pendingTokens = []
         s.pendingHidden = []
