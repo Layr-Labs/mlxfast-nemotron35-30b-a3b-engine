@@ -31,7 +31,13 @@ fail() { failures=$((failures + 1)); echo "FAIL  $*" >&2; }
 C="${WORK}/canary"
 PRIVATE_AUDIT_DIR="/private/var/mlxfast-private-audit-test-$$"
 mkdir -p "${C}/goldens" "${C}/benchd-bin" "${C}/baseline" "${C}/private" \
-  "${C}/resident-root/job" "${C}/runner/_work/repo"
+  "${C}/resident-root/job" "${C}/runner/_work/repo" \
+  "${WORK}/home/actions-runner" "${WORK}/home/actions-runner-x" "${WORK}/home/unrelated"
+for directory in actions-runner actions-runner-x unrelated; do
+  for name in .credentials .credentials_rsaparams .runner; do
+    printf 'runner state\n' > "${WORK}/home/${directory}/${name}"
+  done
+done
 printf '{"weight_map":{"a":"model.safetensors"}}\n' > "${C}/goldens/canary.golden.json"
 printf 'benchd\n' > "${C}/benchd-bin/benchd"
 printf '{}\n' > "${C}/calibration.json"
@@ -91,6 +97,20 @@ else
   for rule in "${state_rules[@]}"; do
     grep -Fxq "${rule}" <<< "${profile}" || fail "generator: non-build profile has no exact ${rule}"
   done
+  expected_home_runner_rules="$(
+    for directory in actions-runner actions-runner-x; do
+      for name in .credentials .credentials_rsaparams .runner; do
+        printf '(deny file-read* file-write* (subpath "%s"))\n' "${WORK}/home/${directory}/${name}"
+      done
+    done
+  )"
+  actual_home_runner_rules="$(grep -F "(subpath \"${WORK}/home/actions-runner" <<< "${profile}" || true)"
+  if [[ "${actual_home_runner_rules}" == "${expected_home_runner_rules}" ]] \
+    && ! grep -qF "(subpath \"${WORK}/home/unrelated/" <<< "${profile}"; then
+    pass "generator: the runtime profile denies six sibling-runner registration files in deterministic order, but not an unrelated directory"
+  else
+    fail "generator: the runtime profile sibling-runner denies are wrong: ${actual_home_runner_rules}"
+  fi
   pass "generator: denies network, fork, foreign exec and all writes; allows the named tree and prefix; denies every evaluator path and resident log root last"
 fi
 

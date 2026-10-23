@@ -41,6 +41,8 @@
 #       A failed wrapper cleanup returns non-zero and keeps its sidecar.
 #   19. the worker inherits a 256 MiB file-size limit, so a bad resident cannot
 #       grow its retained stdout/stderr log without bound.
+#   20. the worker does not inherit descriptors opened by the trusted parent,
+#       including fd 9 above a lowered soft limit of 8 and high fd 200.
 #
 # The stub is a Python script, and sandbox-exec would refuse the interpreter
 # exec it needs, so these cases run with RESIDENT_UP_SANDBOX=0. Case 4b proves
@@ -99,6 +101,18 @@ if os.environ.get("BENCH_WORKER_TEST_ENV_FILE"):
 if os.environ.get("BENCH_WORKER_TEST_LIMIT_FILE"):
     with open(os.environ["BENCH_WORKER_TEST_LIMIT_FILE"], "w") as f:
         f.write(str(resource.getrlimit(resource.RLIMIT_FSIZE)[0]) + "\n")
+if os.environ.get("BENCH_WORKER_TEST_NOFILE_FILE"):
+    with open(os.environ["BENCH_WORKER_TEST_NOFILE_FILE"], "w") as f:
+        f.write(str(resource.getrlimit(resource.RLIMIT_NOFILE)[0]) + "\n")
+if os.environ.get("BENCH_WORKER_TEST_FD_FILE"):
+    def fd_status(fd):
+        try:
+            os.fstat(fd)
+            return "open"
+        except OSError:
+            return "closed"
+    with open(os.environ["BENCH_WORKER_TEST_FD_FILE"], "w") as f:
+        f.write(f"9={fd_status(9)}\n200={fd_status(200)}\n")
 if not argv or argv[0] != "resident":
     print("stub: first argument must be resident", file=sys.stderr); sys.exit(2)
 opts = {}
@@ -147,6 +161,19 @@ while True:
 PY
 chmod +x "${STUB}"
 
+# Bash 3.2 needs more than eight descriptors for this script's own
+# redirections. Lower only each Python child's soft limit instead, including
+# the real launcher and the resident stub it execs.
+REAL_PYTHON="$(command -v python3)"
+LOW_LIMIT_BIN="${WORK}/low-limit-bin"
+mkdir -p "${LOW_LIMIT_BIN}"
+cat > "${LOW_LIMIT_BIN}/python3" <<'SH'
+#!/bin/bash
+ulimit -n 8 || exit 1
+exec "${BENCH_WORKER_TEST_PYTHON}" "$@"
+SH
+chmod +x "${LOW_LIMIT_BIN}/python3"
+
 # --- the lock, held by a background holder for the served cases --------------
 LOCK="${WORK}/gpu.lock"
 : > "${LOCK}"
@@ -191,8 +218,20 @@ run_up() {
 hold_lock
 L1="${WORK}/case1"; mkdir -p "${L1}"
 SOCK1="${WORK}/case1.sock"
-out="$(run_up "${L1}" RESIDENT_UP_HEALTH_TIMEOUT_S=30 BENCH_WORKER_TEST_LIMIT_FILE="${L1}/file-limit" --weights "${WEIGHTS}" --socket "${SOCK1}" -- \
-  bash -c 'echo "socket=$BENCH_WORKER_RESIDENT_SOCKET hello=${BENCH_WORKER_RESIDENT_HELLO:-unset} identity=$RESIDENT_IDENTITY_FILE"; test -S "$BENCH_WORKER_RESIDENT_SOCKET" && echo socket-live; kill -0 "$RESIDENT_UP_PID" && echo resident-live; exit 7')"
+# These stand in for trusted descriptors held by the measure job. Open them
+# before lowering the soft limit so both remain open in this subshell.
+out="$(
+  exec 9>"${WORK}/trusted-parent-fd-9"
+  exec 200>"${WORK}/trusted-parent-fd-200"
+  PATH="${LOW_LIMIT_BIN}:${PATH}" BENCH_WORKER_TEST_PYTHON="${REAL_PYTHON}" \
+    python3 -c 'import os, resource; assert resource.getrlimit(resource.RLIMIT_NOFILE)[0] == 8; os.fstat(9); os.fstat(200)' \
+    || exit
+  run_up "${L1}" PATH="${LOW_LIMIT_BIN}:${PATH}" BENCH_WORKER_TEST_PYTHON="${REAL_PYTHON}" \
+    RESIDENT_UP_HEALTH_TIMEOUT_S=30 BENCH_WORKER_TEST_LIMIT_FILE="${L1}/file-limit" \
+    BENCH_WORKER_TEST_NOFILE_FILE="${L1}/nofile-limit" BENCH_WORKER_TEST_FD_FILE="${L1}/fd-status" \
+    --weights "${WEIGHTS}" --socket "${SOCK1}" -- \
+    bash -c 'echo "socket=$BENCH_WORKER_RESIDENT_SOCKET hello=${BENCH_WORKER_RESIDENT_HELLO:-unset} identity=$RESIDENT_IDENTITY_FILE"; test -S "$BENCH_WORKER_RESIDENT_SOCKET" && echo socket-live; kill -0 "$RESIDENT_UP_PID" && echo resident-live; exit 7'
+)"
 rc=$?
 if [[ "${rc}" -eq 7 ]]; then pass "the wrapped command's exit code (7) is returned"; else fail "expected exit 7, got ${rc}: ${out}"; fi
 if [[ "${out}" == *"socket=${SOCK1} hello=unset identity=${L1}/resident-identity.json"* && "${out}" == *"socket-live"* && "${out}" == *"resident-live"* ]]; then
@@ -212,6 +251,21 @@ if [[ "$(cat "${L1}/file-limit" 2>/dev/null)" == "268435456" ]]; then
   pass "the resident alone receives the 256 MiB file-size cap"
 else
   fail "the resident file-size cap is not 256 MiB: $(cat "${L1}/file-limit" 2>/dev/null)"
+fi
+if [[ "$(cat "${L1}/nofile-limit" 2>/dev/null)" == "8" ]]; then
+  pass "the resident test reaches the launcher with a soft descriptor limit of 8"
+else
+  fail "the resident soft descriptor limit is not 8: $(cat "${L1}/nofile-limit" 2>/dev/null)"
+fi
+if grep -qx '9=closed' "${L1}/fd-status" 2>/dev/null; then
+  pass "the resident closes fd 9 even when its soft limit is 8"
+else
+  fail "the resident inherited trusted parent fd 9"
+fi
+if grep -qx '200=closed' "${L1}/fd-status" 2>/dev/null; then
+  pass "the resident closes high trusted parent fd 200"
+else
+  fail "the resident inherited high trusted parent fd 200"
 fi
 if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["hello"]["backend"]=="mlx-resident" and d["weight_owner"]=="bench-worker-resident"' "${L1}/resident-identity.json" 2>/dev/null; then
   pass "the identity file records the resident's hello"
