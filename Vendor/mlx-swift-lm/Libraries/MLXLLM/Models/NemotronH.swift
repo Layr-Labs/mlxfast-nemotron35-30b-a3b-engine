@@ -2855,17 +2855,18 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
-        // A long single-row forward (the teacher-forced prompt prefill) is
-        // only ever read at its last position. Project just the trailing
-        // rows from the start of the second-to-last 64-row M tile: the
-        // quantized matmul then sees M in 65...128 (> 32, so the same
-        // qmm_nax bm=64 / qmm bm=32 kernel as the full M) and the last row's
-        // tile holds exactly the same rows as in the full projection, so
-        // those logits are bitwise identical. Shorter forwards (decode,
-        // verify windows) keep every position.
+        // A long single-row forward consumes only its last position.
+        // Keep the original last 64-row tile and M > 32 so quantized
+        // dispatch retains qmm_nax bm=64 (or the ordinary qmm bm=32).
+        // Only a final tile of <=32 rows needs the preceding tile to
+        // preserve that dispatch. A fuller last tile can stand alone,
+        // removing 64 unused LM-head rows without changing its inputs.
+        // Short forwards (decode and verify) still keep every position.
         let length = hidden.dim(1)
         if hidden.dim(0) == 1, length > 128 {
-            let start = ((length - 1) / 64) * 64 - 64
+            let lastTileStart = ((length - 1) / 64) * 64
+            let lastTileRows = length - lastTileStart
+            let start = lastTileStart - (lastTileRows <= 32 ? 64 : 0)
             return logits(hidden[0..., start..., 0...])
         }
         return logits(hidden)
