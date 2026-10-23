@@ -134,6 +134,88 @@ else
   fail "wrapper: a run that is not official did not run the command as it is (rc ${rc}): ${out}"
 fi
 
+# Drive the real metallib builder through a small fake vendor tree. Its wrapper
+# still runs the real profile generator, while the fake CMake only records the
+# HOME it receives and writes one stub metallib. This catches moving HOME on the
+# wrapper itself: the profile must use the runner HOME, and only CMake gets the
+# private compiler HOME.
+METAL_TREE="${WORK}/metal-tree"
+METAL_VENDOR="${METAL_TREE}/vendor/Source/Cmlx"
+METAL_BUILD="${METAL_TREE}/build"
+METAL_HOME="${METAL_BUILD}/compiler-home"
+METAL_PROFILE="${WORK}/metallib-profile.sb"
+METAL_CMAKE_HOMES="${WORK}/metallib-cmake-homes"
+METAL_BIN="${WORK}/metallib-bin"
+mkdir -p "${METAL_TREE}/tools" "${METAL_VENDOR}/mlx" "${METAL_VENDOR}/mlx-generated" \
+  "${METAL_VENDOR}/metal-cpp" "${METAL_VENDOR}/json" "${METAL_VENDOR}/fmt" "${METAL_BIN}"
+cp "${REPO_ROOT}/tools/build-mlx-metallib.sh" "${METAL_TREE}/tools/"
+cp "${GENERATOR}" "${METAL_TREE}/tools/"
+printf 'kernel\n' > "${METAL_VENDOR}/mlx/kernel.metal"
+printf 'generated\n' > "${METAL_VENDOR}/mlx-generated/kernel.cpp"
+cat > "${METAL_TREE}/tools/sandboxed-build.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
+profile_args=()
+while [[ "$1" != "--" ]]; do
+  [[ "$1" == "--write" && $# -ge 2 ]] || exit 91
+  mkdir -p "$2"
+  profile_args+=(--write-subpath "$2")
+  shift 2
+done
+shift
+python3 "${root}/tools/seatbelt-profile.py" --build --official --tree "${root}" \
+  "${profile_args[@]}" > "${MLXFAST_TEST_PROFILE_OUT}"
+exec "$@"
+SH
+cat > "${METAL_BIN}/cmake" <<'SH'
+#!/bin/sh
+set -eu
+printf '%s\n' "${HOME}" >> "${MLXFAST_TEST_CMAKE_HOME_OUT}"
+if [ "${1:-}" = "--build" ]; then
+  mkdir -p "${MLXFAST_MLX_METAL_BUILD_DIR}/stub"
+  printf 'stub metallib\n' > "${MLXFAST_MLX_METAL_BUILD_DIR}/stub/mlx.metallib"
+fi
+SH
+cat > "${METAL_BIN}/xcrun" <<'SH'
+#!/bin/sh
+exit 0
+SH
+chmod +x "${METAL_TREE}/tools/build-mlx-metallib.sh" "${METAL_TREE}/tools/sandboxed-build.sh" \
+  "${METAL_BIN}/cmake" "${METAL_BIN}/xcrun"
+out="$(env -i PATH="${METAL_BIN}:${PATH}" HOME="${WORK}/home" TMPDIR="${WORK}/" \
+  "${canary_env[@]}" MLXFAST_BUILD_CACHE_DIR= MLXFAST_OFFICIAL_BENCHMARK_RUN=1 \
+  MLXFAST_MLX_SWIFT_VENDOR="${METAL_TREE}/vendor" \
+  MLXFAST_MLX_METAL_BUILD_DIR="${METAL_BUILD}" \
+  MLXFAST_METAL_COMPILER_HOME="${METAL_HOME}" \
+  MLXFAST_CMAKE_BIN="${METAL_BIN}/cmake" \
+  MLXFAST_METAL_TOOLCHAIN_IDENTIFIER=test-metal-toolchain \
+  MLXFAST_MLX_METALLIB="${METAL_TREE}/out/mlx.metallib" \
+  MLXFAST_TEST_PROFILE_OUT="${METAL_PROFILE}" \
+  MLXFAST_TEST_CMAKE_HOME_OUT="${METAL_CMAKE_HOMES}" \
+  "${METAL_TREE}/tools/build-mlx-metallib.sh" 2>&1)"
+rc=$?
+metal_home_ok=1
+[[ "$(wc -l < "${METAL_CMAKE_HOMES}" 2>/dev/null | tr -d ' ')" == "2" ]] || metal_home_ok=0
+while IFS= read -r compiler_home; do
+  [[ "${compiler_home}" == "${METAL_HOME}" ]] || metal_home_ok=0
+done < "${METAL_CMAKE_HOMES}"
+metal_profile_ok=1
+for path in "${WORK}/home/.mlxfast-resident-logs" "${WORK}/home/.cache/mlxfast-engine-build"; do
+  grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" "${METAL_PROFILE}" || metal_profile_ok=0
+done
+for directory in actions-runner actions-runner-x; do
+  for name in .credentials .credentials_rsaparams .runner; do
+    path="${WORK}/home/${directory}/${name}"
+    grep -qF "(deny file-read* file-write* (subpath \"${path}\"))" "${METAL_PROFILE}" || metal_profile_ok=0
+  done
+done
+if [[ "${rc}" -eq 0 && "${metal_home_ok}" -eq 1 && "${metal_profile_ok}" -eq 1 ]]; then
+  pass "metallib path builds its profile from the real runner HOME and changes HOME only for CMake"
+else
+  fail "metallib HOME split is wrong (rc ${rc}, compiler homes '$(tr '\n' ' ' < "${METAL_CMAKE_HOMES}" 2>/dev/null)', profile ${metal_profile_ok}): ${out}"
+fi
+
 # --- part 2: the real Seatbelt -------------------------------------------------
 if [[ ! -x /usr/bin/sandbox-exec ]]; then
   echo "test-sandboxed-build.sh: part 2 NOT RUN: /usr/bin/sandbox-exec is not on this host"

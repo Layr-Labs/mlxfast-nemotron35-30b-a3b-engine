@@ -17,6 +17,8 @@
 #      by name, and the first window is left alone
 #   6. a resident that dies before it is healthy fails the window, with its log
 #   7. a resident that never binds fails on the health timeout
+#      a resident that streams an oversized or never-ending hello is refused,
+#      stopped, and cannot hold the GPU window forever
 #   8. a resident that ignores SIGTERM is killed with the process group
 #   9. the resident gets only the documented environment allowlist, including
 #      model/runtime controls but excluding evaluator paths and ranked flags
@@ -85,7 +87,10 @@ fail() { printf 'test-resident-up: FAIL -- %s\n' "$*" >&2; fails=$((fails + 1));
 # (unprompted, ok:true, backend mlx-resident) and closes when the client does.
 # BENCH_WORKER_TEST_DIE_BEFORE_BIND=1 exits 3 before binding.
 # BENCH_WORKER_TEST_NEVER_BIND=1 sleeps forever without binding.
-# BENCH_WORKER_TEST_IGNORE_TERM=1 ignores SIGTERM. It records its argv and,
+# BENCH_WORKER_TEST_IGNORE_TERM=1 ignores SIGTERM.
+# BENCH_WORKER_TEST_HELLO_MODE=overflow streams past the hello byte cap;
+# `deadline` streams slowly without a newline until the whole-probe deadline.
+# The stub records its argv and,
 # when asked, its environment through BENCH_WORKER_TEST_* paths.
 STUB="${WORK}/stub-bench-worker.py"
 cat > "${STUB}" <<'PY'
@@ -151,9 +156,18 @@ hello = {"id": 0, "nonce": "stubnonce", "ok": True, "protocol_version": 1,
 while True:
     conn, _ = srv.accept()
     try:
-        conn.sendall((json.dumps(hello) + "\n").encode())
-        while conn.recv(65536):
-            pass
+        hello_mode = os.environ.get("BENCH_WORKER_TEST_HELLO_MODE", "normal")
+        if hello_mode == "overflow":
+            while True:
+                conn.sendall(b"x" * 65536)
+        elif hello_mode == "deadline":
+            while True:
+                conn.sendall(b"x")
+                time.sleep(0.25)
+        else:
+            conn.sendall((json.dumps(hello) + "\n").encode())
+            while conn.recv(65536):
+                pass
     except OSError:
         pass
     finally:
@@ -344,6 +358,31 @@ if [[ "${rc}" -eq 0 && "${out}" == *"killing process group"* ]] && ! pgrep -f "c
   pass "a resident that ignores SIGTERM is killed with its process group; nothing survives"
 else
   fail "SIGTERM escalation failed (rc ${rc}): ${out}; survivors: $(pgrep -fl case8.sock | tr '\n' ' ')"
+fi
+
+# --- 8b. a hostile hello cannot grow memory or hold the GPU window forever ---
+L8B="${WORK}/case8b"; mkdir -p "${L8B}"
+started="${SECONDS}"
+out="$(run_up "${L8B}" BENCH_WORKER_TEST_HELLO_MODE=overflow RESIDENT_UP_HEALTH_TIMEOUT_S=60 --weights "${WEIGHTS}" --socket "${WORK}/case8b.sock" -- echo should-not-run)"; rc=$?
+elapsed=$((SECONDS - started))
+if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (resident-hello-overflow)"* \
+   && "${out}" == *"resident was stopped"* && "${out}" != *"should-not-run"* \
+   && "${elapsed}" -lt 30 ]] && ! pgrep -f "case8b.sock" >/dev/null; then
+  pass "an oversized hello is refused at 1 MiB and the resident is stopped"
+else
+  fail "an oversized hello was not bounded and stopped (rc ${rc}, ${elapsed}s): ${out}"
+fi
+
+L8C="${WORK}/case8c"; mkdir -p "${L8C}"
+started="${SECONDS}"
+out="$(run_up "${L8C}" BENCH_WORKER_TEST_HELLO_MODE=deadline RESIDENT_UP_HEALTH_TIMEOUT_S=60 --weights "${WEIGHTS}" --socket "${WORK}/case8c.sock" -- echo should-not-run)"; rc=$?
+elapsed=$((SECONDS - started))
+if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (resident-hello-deadline)"* \
+   && "${out}" == *"resident was stopped"* && "${out}" != *"should-not-run"* \
+   && "${elapsed}" -ge 25 && "${elapsed}" -le 40 ]] && ! pgrep -f "case8c.sock" >/dev/null; then
+  pass "a hello stream without a newline is refused at the 30s whole-probe deadline and the resident is stopped"
+else
+  fail "a never-ending hello did not meet the deadline and stop rule (rc ${rc}, ${elapsed}s): ${out}"
 fi
 
 # --- 9. the resident environment is an allowlist ----------------------------
@@ -598,6 +637,37 @@ else
   fail "the second leg did not boot (rc ${rc}): ${out}"
 fi
 run_leg --stop --socket "${boot2_socket}" >/dev/null 2>&1
+
+# --- B8b. a boot that fails after the resident started leaves nothing up ----
+# Two failure classes: an explicit die (the identity file cannot be written) and
+# a plain set -e failure (the --socket-out directory cannot be made). Both exit
+# through the --boot EXIT trap, which must stop the resident and remove the
+# private hello file.
+rm -f "${BOOT_LOG}/resident-identity.json"
+mkdir -p "${BOOT_LOG}/resident-identity.json"
+out="$(run_leg --boot --spec serial --draft-len 0 --socket-out "${WORK}/leg-fail1.socket")"; rc=$?
+sleep 0.5
+if [[ "${rc}" -ne 0 && "${out}" == *"could not write the resident identity file"* ]] \
+   && ! pgrep -f "${TREE}/.build/release/bench-worker" >/dev/null \
+   && ! compgen -G "${BOOT_LOG}/resident-hello.*" >/dev/null; then
+  pass "a boot whose identity write fails stops the resident and removes the hello file"
+else
+  fail "a failed identity write left a resident or hello file (rc ${rc}): ${out}; $(pgrep -fl "${TREE}/.build/release/bench-worker" | tr '\n' ' ')"
+fi
+rmdir "${BOOT_LOG}/resident-identity.json"
+pkill -f "${TREE}/.build/release/bench-worker" 2>/dev/null || true
+
+: > "${WORK}/not-a-dir"
+out="$(run_leg --boot --spec serial --draft-len 0 --socket-out "${WORK}/not-a-dir/leg.socket")"; rc=$?
+sleep 0.5
+if [[ "${rc}" -ne 0 ]] && ! pgrep -f "${TREE}/.build/release/bench-worker" >/dev/null \
+   && ! compgen -G "${BOOT_LOG}/resident-hello.*" >/dev/null; then
+  pass "a boot that fails under set -e after the resident started stops the resident"
+else
+  fail "a set -e boot failure left a resident or hello file (rc ${rc}): ${out}; $(pgrep -fl "${TREE}/.build/release/bench-worker" | tr '\n' ' ')"
+fi
+pkill -f "${TREE}/.build/release/bench-worker" 2>/dev/null || true
+/bin/rm -f "${WORK}/not-a-dir"
 
 # --- B9. a flag without a value refuses BY NAME ------------------------------
 for flag in --spec --draft-len --socket-out --socket; do

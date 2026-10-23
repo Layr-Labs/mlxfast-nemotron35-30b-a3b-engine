@@ -190,37 +190,9 @@ jobs:
     # The third label IS the track id (= the branch name = the R2 key prefix).
     # tools/box-runner/box-runner.env RUNNER_LABELS must advertise it.
     runs-on: [self-hosted, macOS, nemotron3.5-30b-a3b-mlx-v1]
-    # A cold run fetches the ~18.5 GB checkpoint before it measures anything,
-    # and then every timed phase waits behind a cool-down that can legitimately
-    # spend 900 s. RECOMPUTED twice (2026-08-26), which is why this is no longer
-    # 180. THE COUNT IS DERIVED FROM THE RULED PAIR COUNT, so it moves whenever
-    # that ruling moves -- it is restated here rather than left implicit:
-    #
-    #   official_pairs 3 (David 2026-09-17, "3 pairs"; the run scores the
-    #   mean of the pairs -- see docs/nemotron35-30b-a3b-port-notes.md section
-    #   4), so 3 pairs x 2 legs (serial control + candidate) = 6 timed legs,
-    #   and benchd gates PER PHASE -- prefill and decode are separate
-    #   cool_gate() calls on a fresh worker -- so up to 12 gated phases x 900 s
-    #   = 180 min of cool-down ALONE, worst case, before a single token is
-    #   timed. The 360 min budget below keeps the headroom the earlier 4-pair
-    #   derivation had.
-    #
-    # 240 min of gating plus a cold ~18.5 GB fetch, a Metal build, head staging
-    # and the measurement itself does not fit in 180. At the cap GitHub kills the
-    # job mid-measurement, which burns the box's slot and produces nothing. 360 is
-    # the challenger's own budget for the same reason (qwen-mtp-ranked-benchmark.yml
-    # :205-208: "cooldowns (up to 900s per timed phase)").
-    #
-    # WHY 360 STILL SUFFICES AT 16 PHASES, honestly stated: the 900 s ceiling is
-    # NOT an operating point. A phase that actually burns 900 s means the box
-    # never reached the 50 C cool gate, which is itself the refusal condition -- that
-    # run is rejected and retried on a clean box rather than proceeding. Sixteen
-    # consecutive 900 s waits is not a slow run, it is a broken box, and it fails
-    # rather than finishing at minute 359. Observed waits are 0-10 s, i.e. under
-    # ~3 min of cool-down across all 16 phases, so the real budget is dominated
-    # by the fetch, the build and the measurement, not by gating. 240 min is the
-    # pathological ceiling this cap must not be BELOW, not the expected cost.
-    timeout-minutes: 360
+    # Queue time is outside this cap. A healthy ranked run takes about 4-15 min;
+    # one that still holds the box at 60 min is refused as a stuck job.
+    timeout-minutes: 60
     env:
       # --- Host contract: the GPU temperature reader ----------------------
       # The challenger's job-env pin, same NAME, ported from
