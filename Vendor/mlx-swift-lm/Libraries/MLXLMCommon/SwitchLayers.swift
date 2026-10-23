@@ -937,23 +937,3 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         return result
     }
 }
-
-extension QuantizedSwitchLinear {
-    /// The packed weight, scales and biases exactly as `callAsFunction`
-    /// hands them to `gatherQuantizedMM` for activations of `dtype`
-    /// (affine scales/offsets through the same cast caches), so a caller that
-    /// reproduces the gather kernel sees identical operands.
-    public func nemotronGatherOperands(for dtype: DType)
-        -> (weight: MLXArray, scales: MLXArray, biases: MLXArray?, hasLinearBias: Bool)
-    {
-        let scales = mode == .affine
-            ? (scaleCastCache.cachedCast(self.scales, to: dtype) ?? self.scales)
-            : self.scales
-        let biases = self.biases.map { offsets in
-            mode == .affine
-                ? (offsetCastCache.cachedCast(offsets, to: dtype) ?? offsets)
-                : offsets
-        }
-        return (weight, scales, biases, bias != nil)
-    }
-}
