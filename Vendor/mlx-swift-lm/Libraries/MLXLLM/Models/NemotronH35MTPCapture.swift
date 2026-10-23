@@ -181,7 +181,8 @@ extension NemotronH35Model {
         let history = mixer.convKernelSize - 1
         let (heads, dim, groups, stateDim) =
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
-        var roots: [MLXArray] = []
+        let normInput = MLXArray.zeros([1, 1, heads * dim], dtype: activationDType)
+        var roots: [MLXArray] = [mixer.norm(normInput, gate: normInput)]
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = silu(mixer.conv1d(padded))
