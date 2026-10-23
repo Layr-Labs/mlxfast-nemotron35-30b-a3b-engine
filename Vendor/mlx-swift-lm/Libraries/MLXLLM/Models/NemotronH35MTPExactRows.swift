@@ -58,7 +58,7 @@ func nemotronMTPMapRows(_ x: MLXArray, _ operation: (MLXArray) -> MLXArray) -> M
 // arithmetic (same lane split, block order, qdot and simd_sum), so every row
 // is bitwise equal to an ordinary decode step. The weight tile is loaded once
 // for all rows instead of once per row.
-private let nemotronMultiRowQMVHeader = """
+let nemotronMultiRowQMVHeader = """
 template <typename T, typename U, int values_per_thread>
 inline U nmr_load_vector(const device T* x, thread U* x_thread) {
   U sum = 0;
