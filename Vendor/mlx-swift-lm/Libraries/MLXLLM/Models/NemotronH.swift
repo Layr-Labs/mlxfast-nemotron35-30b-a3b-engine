@@ -375,7 +375,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
     func activatedConv(_ padded: MLXArray) -> MLXArray {
         guard convKernelSize == 4, padded.ndim == 3, padded.dim(0) == 1,
-            (4...11).contains(padded.dim(1)), padded.dim(2) == convDim,
+            padded.dim(1) >= 4, padded.dim(2) == convDim,
             padded.dtype == .bfloat16, conv1d.weight.dtype == .bfloat16,
             conv1d.weight.shape == [convDim, 4, 1], conv1d.groups == convDim,
             conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
