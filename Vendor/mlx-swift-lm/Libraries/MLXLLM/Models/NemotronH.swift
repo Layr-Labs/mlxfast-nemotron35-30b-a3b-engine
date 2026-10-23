@@ -42,6 +42,9 @@ private protocol NemotronHMixer: Module {
 
 // MARK: - Activations
 
+/// Layers between early asyncEval calls in the CBv2 forward (0 disables).
+let nemotronEarlyEvalInterval = 4
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -900,6 +903,12 @@ private class NemotronHBackbone: Module {
                 attentionCache: cache,
                 recurrentState: recurrentState,
                 captureMTP: captureMTP)
+            // Start the GPU on the finished layers while the host builds the
+            // rest of the graph. Evaluation order only; values are unchanged.
+            if nemotronEarlyEvalInterval > 0, modelLayerIndex + 1 < layers.count,
+               (modelLayerIndex + 1) % nemotronEarlyEvalInterval == 0 {
+                asyncEval(hidden)
+            }
         }
         precondition(
             attentionIndex == caches.count,
