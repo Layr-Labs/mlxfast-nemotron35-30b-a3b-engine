@@ -19,9 +19,17 @@ import MLX
 public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
 
     private let model: any LanguageModel
+    // Resolve immutable loaded-model geometry once for this adapter. In
+    // particular Nemotron discovers activation dtypes by building a private
+    // lazy backbone graph; eligibility checks must not repeat that graph.
+    // Engines/steppers create their adapter after binding model weights and
+    // own it for their request/session. No request tokens or state are cached.
+    private let resolvedRecurrentStateSpec: CBv2RecurrentStateSpec?
 
     public init(_ model: any LanguageModel) {
         self.model = model
+        self.resolvedRecurrentStateSpec =
+            (model as? any CBv2RecurrentLanguageModelForwardable)?.cbv2RecurrentStateSpec
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
@@ -92,7 +100,7 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {
     }
 
     public var recurrentStateSpec: CBv2RecurrentStateSpec? {
-        (model as? any CBv2RecurrentLanguageModelForwardable)?.cbv2RecurrentStateSpec
+        resolvedRecurrentStateSpec
     }
 
     public func forward(

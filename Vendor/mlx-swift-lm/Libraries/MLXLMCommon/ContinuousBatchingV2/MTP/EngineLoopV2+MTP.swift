@@ -62,6 +62,7 @@ extension EngineLoopV2 {
         mtp.recordSeedSteps(graph.seedRows.count)
 
         asyncEval(graph.asyncEvalTargets)
+        if let verify = graph.verify { mtpSpeculateAfterVerify(verify, driver: mtp) }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)

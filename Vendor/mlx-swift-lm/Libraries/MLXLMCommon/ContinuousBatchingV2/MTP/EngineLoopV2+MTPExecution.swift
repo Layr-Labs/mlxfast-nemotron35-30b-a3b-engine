@@ -304,6 +304,19 @@ extension EngineLoopV2 {
                 tokens: row.count, packed: false, vision: visionChunk,
                 stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
                 launchNanos: launchNanos)
+            // Configure the request's assistant backing before building any
+            // target prefill layers. Paged allocation fences its stream; doing
+            // it in observeCommittedTarget below would drain the target's
+            // early submissions partway through construction of this graph.
+            // Keep ownership in the driver until the observation detaches it.
+            if !visionChunk, mtp.tracksPersistentHistory, mtpBasicEligible(rec),
+                let state = try mtp.takeOrMakeAssistantState(
+                    for: rec.id,
+                    maximumSequenceLength: rec.request.promptTokens.count
+                        + max(rec.request.maxTokens, 1))
+            {
+                mtp.restoreAssistantState(state, for: rec.id)
+            }
             if visionChunk, let multimodal {
                 let forward = try multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
