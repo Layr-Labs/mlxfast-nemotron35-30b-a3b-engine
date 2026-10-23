@@ -112,8 +112,8 @@ extension NemotronHMoE {
 //
 // Stock verify runs one affine_gather_qmv threadgroup per (row, slot). Here the
 // first row that routed to an expert leads: it walks that expert's weights once
-// for itself and the next row that routed to it (runs capped at 2; a third
-// occurrence leads again). Later occurrences exit before any weight read. The
+// for itself and the next two rows that routed to it (runs capped at 3, which
+// covers the whole depth-2 window; a fourth occurrence leads again). Later occurrences exit before any weight read. The
 // leader keeps one accumulator, one K-loop order, one qdot and one closing
 // simd_sum per (output, row), copied from qmv_impl (K = 2688 / 1856 are not
 // multiples of 512, so stock dispatches gather_qmv, not gather_qmv_fast).
@@ -218,14 +218,19 @@ private let nemotronMoELeaderSource = """
       before += inds[r * TOPK + j] == expert ? 1 : 0;
     }
   }
-  if ((before & 1) != 0) {
+  if (before % 3 != 0) {
     return;
   }
   int partner = -1;
-  for (int r = R - 1; r > row; r--) {
+  int partner2 = -1;
+  for (int r = row + 1; r < R; r++) {
     for (int j = 0; j < TOPK; j++) {
       if (inds[r * TOPK + j] == expert) {
-        partner = r * TOPK + j;
+        if (partner < 0) {
+          partner = r * TOPK + j;
+        } else if (partner2 < 0) {
+          partner2 = r * TOPK + j;
+        }
       }
     }
   }
@@ -280,7 +285,7 @@ private let nemotronMoELeaderSource = """
         y0[r] = nml_store<T, RELU2>(result[r]);
       }
     }
-  } else {
+  } else if (partner2 < 0) {
     const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
         simd_lid * values_per_thread;
     device T* y1 = y + partner * N + out_row;
@@ -330,6 +335,71 @@ private let nemotronMoELeaderSource = """
       if (simd_lid == 0) {
         y0[r] = nml_store<T, RELU2>(result0[r]);
         y1[r] = nml_store<T, RELU2>(result1[r]);
+      }
+    }
+  } else {
+    const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
+        simd_lid * values_per_thread;
+    const device T* x2 = x + (XSLOT ? partner2 : partner2 / TOPK) * K +
+        simd_lid * values_per_thread;
+    device T* y1 = y + partner * N + out_row;
+    device T* y2 = y + partner2 * N + out_row;
+    thread U x0_thread[values_per_thread];
+    thread U x1_thread[values_per_thread];
+    thread U x2_thread[values_per_thread];
+    thread U result0[results_per_simdgroup] = {0};
+    thread U result1[results_per_simdgroup] = {0};
+    thread U result2[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+        result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        result2[r] += nml_qdot<U, values_per_thread>(wl, x2_thread, s, b, sum2);
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+      x1 += block_size;
+      x2 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+      U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result0[r] += nml_qdot_safe<U, values_per_thread>(
+            wl, x0_thread, s, b, sum0, remaining);
+        result1[r] += nml_qdot_safe<U, values_per_thread>(
+            wl, x1_thread, s, b, sum1, remaining);
+        result2[r] += nml_qdot_safe<U, values_per_thread>(
+            wl, x2_thread, s, b, sum2, remaining);
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result0[r] = simd_sum(result0[r]);
+      result1[r] = simd_sum(result1[r]);
+      result2[r] = simd_sum(result2[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result0[r]);
+        y1[r] = nml_store<T, RELU2>(result1[r]);
+        y2[r] = nml_store<T, RELU2>(result2[r]);
       }
     }
   }

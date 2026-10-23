@@ -166,6 +166,9 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState, captureMTP: true)
         let output = lmHead.map { nemotronMTPHeadRows(hidden, $0) }
             ?? nemotronMTPMapRows(hidden) { logits($0) }
+        // Run the last layers and the head while the host builds the
+        // acceptance packet. Evaluation order only; values are unchanged.
+        asyncEval(output)
         return (output, hidden)
     }
 }

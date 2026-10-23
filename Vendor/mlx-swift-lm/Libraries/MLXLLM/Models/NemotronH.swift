@@ -2857,15 +2857,17 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         // A long single-row forward (the teacher-forced prompt prefill) is
         // only ever read at its last position. Project just the trailing
-        // rows from the start of the second-to-last 64-row M tile: the
-        // quantized matmul then sees M in 65...128 (> 32, so the same
+        // rows from the start of a 64-row M tile: the last tile alone when
+        // it holds more than 32 rows, else from the tile before it. The
+        // quantized matmul then sees M in 33...96 (> 32, so the same
         // qmm_nax bm=64 / qmm bm=32 kernel as the full M) and the last row's
         // tile holds exactly the same rows as in the full projection, so
         // those logits are bitwise identical. Shorter forwards (decode,
         // verify windows) keep every position.
         let length = hidden.dim(1)
         if hidden.dim(0) == 1, length > 128 {
-            let start = ((length - 1) / 64) * 64 - 64
+            let lastTileStart = ((length - 1) / 64) * 64
+            let start = length - lastTileStart > 32 ? lastTileStart : lastTileStart - 64
             return logits(hidden[0..., start..., 0...])
         }
         return logits(hidden)

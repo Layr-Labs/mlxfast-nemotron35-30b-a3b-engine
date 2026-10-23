@@ -493,6 +493,15 @@ public final class CBv2RecurrentRequestState {
                 }
             } else {
                 committed = replay.mapValues { $0.replay(keep) }
+                // The GPU is idle while the host finalizes this round and
+                // builds the next one, and the next window reads this state
+                // first. Submit the replay now; evaluation order only.
+                var replayed: [MLXArray] = []
+                for state in committed.values {
+                    if let conv = state.conv { replayed.append(conv) }
+                    if let ssm = state.ssm { replayed.append(ssm) }
+                }
+                asyncEval(replayed)
             }
             var retainedBytes = 0
             var retainedRoots: [MLXArray] = []
