@@ -75,6 +75,7 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronMoELeader.warm(target)
+        assistant.warmPostVerifySpeculation()
         // Keep last: it ends with Memory.clearCache().
         assistant.warmUpExactShapes()
         return assistant
