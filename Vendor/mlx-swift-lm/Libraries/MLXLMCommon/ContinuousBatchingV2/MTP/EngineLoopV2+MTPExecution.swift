@@ -573,10 +573,11 @@ extension EngineLoopV2 {
                 // Publish the first mutable head-cache generation before
                 // constructing a deeper generation. This is nonblocking and
                 // joins the round's sole finalize fence.
-                if draftIndex == 0 {
-                    asyncEval(stepEvalTargets)
-                    mtp.recordEarlyDraftSubmission()
-                }
+                // Deeper generations are submitted as soon as they are built
+                // too, so the head runs while the host builds the target
+                // graph. Evaluation order only; values are unchanged.
+                asyncEval(stepEvalTargets)
+                if draftIndex == 0 { mtp.recordEarlyDraftSubmission() }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = concatenated(nextRows, axis: 0)
                 draftSteps.append(stepTokens)
