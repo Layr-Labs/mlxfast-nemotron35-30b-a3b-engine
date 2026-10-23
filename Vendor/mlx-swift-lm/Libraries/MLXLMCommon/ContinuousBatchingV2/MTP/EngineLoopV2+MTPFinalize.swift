@@ -359,27 +359,16 @@ extension EngineLoopV2 {
                         (batchIndex * targetWidth + hiddenColumn) * 2
                     return Double(values[base] - values[base + 1])
                 }
-                let carryHidden = verify.lastHidden[
-                    batchIndex ..< (batchIndex + 1),
-                    hiddenColumn ..< (hiddenColumn + 1), 0...]
                 mtp.storeCarry(
                     id: id, token: kept[confirmed - 1],
-                    hidden: carryHidden,
+                    hidden: verify.lastHidden[
+                        batchIndex ..< (batchIndex + 1),
+                        hiddenColumn ..< (hiddenColumn + 1), 0...],
                     shortlist: carryShortlist,
                     previousTopTwoMargin: previousTopTwoMargin,
                     needsHistoryTransition: mtp.tracksPersistentHistory,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
-                // The acceptance packet was just read back, so the GPU is idle
-                // while the host finishes finalize and plans the next step:
-                // let the drafter submit the next round's first draft now.
-                if CBv2MTPFirstDraftPrestage.enabled, carryShortlist == nil,
-                    let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
-                    let state = metadata.assistantState
-                {
-                    prestager.prestageFirstDraft(
-                        token: kept[confirmed - 1], hidden: carryHidden, requestState: state)
-                }
             }
         }
 
@@ -394,57 +383,6 @@ extension EngineLoopV2 {
         // Rejected suffixes advanced eager device offsets past host truth.
         if anyRejected {
             eagerCompositionStale = true
-        }
-    }
-}
-
-/// Optional request-stateful drafter capability: submit the next round's
-/// first draft from finalize, as soon as its carry (token, target hidden) is
-/// final. The drafter must hand that draft out only to the next first
-/// `draftStep` for this exact carry `hidden` object and otherwise discard it
-/// (as a rejected round) before any other state transition. Draft values are
-/// unchanged; only their submission moves earlier.
-public protocol CBv2MTPFirstDraftPrestaging: AnyObject {
-    func prestageFirstDraft(
-        token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState)
-    /// Right after a round's verify graph is submitted: `targetTokens`
-    /// [1, k+1] are the verifier's per-position tokens (the accept walk's
-    /// targets) and `targetHidden` [1, k+1, H] its hidden rows. The drafter
-    /// may queue acceptance-independent head work on them.
-    func speculateAfterVerify(
-        targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState)
-}
-
-public enum CBv2MTPFirstDraftPrestage {
-    /// CBV2_MTP_PRESTAGE_FIRST_DRAFT=0 restores submission at round build.
-    public static let enabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_PRESTAGE_FIRST_DRAFT"] != "0"
-    /// CBV2_MTP_SPECULATE_AFTER_VERIFY=0 disables the post-verify head rows.
-    public static let speculateAfterVerify = enabled
-        && ProcessInfo.processInfo.environment["CBV2_MTP_SPECULATE_AFTER_VERIFY"] != "0"
-}
-
-extension EngineLoopV2 {
-    /// Queue the drafter's acceptance-independent work behind a submitted
-    /// verify. It depends on the verify outputs, so it runs after them; it is
-    /// a separate submission, so the acceptance readback does not wait on it.
-    func mtpSpeculateAfterVerify(
-        _ verify: CBv2MTPRoundInFlight.Verify, driver mtp: CBv2MTPRoundDriver
-    ) {
-        guard CBv2MTPFirstDraftPrestage.speculateAfterVerify,
-            let speculator = mtp.drafter as? any CBv2MTPFirstDraftPrestaging
-        else { return }
-        let batch = verify.rows.count
-        let width = verify.k + 1
-        let draftCount = batch * verify.k
-        let targets = verify.acceptancePacket[draftCount ..< (draftCount + batch * width)]
-            .reshaped([batch, width])
-        for (index, row) in verify.rows.enumerated() {
-            guard let state = row.assistantState else { continue }
-            speculator.speculateAfterVerify(
-                targetTokens: targets[index ..< (index + 1)],
-                targetHidden: verify.lastHidden[index ..< (index + 1)],
-                requestState: state)
         }
     }
 }
