@@ -93,6 +93,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var arrays: [MLXArray] {
             (paged?.cache.innerState() ?? [])
                 + pendingTokens + pendingHidden + savedTokens + savedHidden
+                + [prestagedHidden, prestagedResult?.tokens, prestagedResult?.hidden,
+                   speculation?.ids, speculation?.out, speculation?.keys, speculation?.values,
+                   nextFirstDraft?.ids, nextFirstDraft?.out,
+                   nextFirstDraft?.keys, nextFirstDraft?.values].compactMap { $0 }
                 + [frontier, savedFrontier].compactMap { $0 } + roots
         }
         var materializedBytes: Int {
@@ -263,6 +267,14 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 asyncEval(primed)
                 s.roots = primed
             }
+        } else if kvOnlyHistory && (2...8).contains(
+            s.pendingTokens.reduce(0) { $0 + $1.dim(1) }) {
+            // Share projection loads while retaining one-token arithmetic.
+            let ids = concatenated(s.pendingTokens, axis: 1)
+            let rows = concatenated(s.pendingHidden, axis: 1)
+            s.roots += module.appendTrustedKVRows(
+                hidden: rows, embedding: target.mtpEmbedding(ids), cache: s.cache)
+            asyncEval(s.roots)
         } else {
             // Post-prefill accepted target rows retain one-token arithmetic.
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
@@ -286,7 +298,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = argMax(target.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
+        let ids = argMax(target.logits(out)[0..., -1, 0...], axis: -1).view(dtype: .int32)
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -432,7 +444,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
         let logits = target.lmHead.map { nemotronMTPHeadRows(rows.output, $0) }
             ?? target.logits(rows.output)
-        let ids = argMax(logits, axis: -1).asType(.int32)
+        let ids = argMax(logits, axis: -1).view(dtype: .int32)
         s.speculation = (ids: ids, out: rows.output, keys: rows.keys, values: rows.values)
         let roots = [ids, rows.output] + s.cache.innerState()
         s.roots += roots
