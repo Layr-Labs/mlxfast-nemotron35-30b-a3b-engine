@@ -10,6 +10,7 @@ This is the one source of the profile rules. Three trusted callers use it:
 The profile prints on stdout. The rules:
 
   * deny all network, except the Unix sockets that --unix-socket names;
+  * deny scheduling-priority changes in every profile;
   * deny process-fork, and deny process-exec except the paths --exec names
     (sandbox-exec itself execs the first program after it applies the
     profile, so that program must be named). With --build, fork and exec are
@@ -18,6 +19,7 @@ The profile prints on stdout. The rules:
   * deny every file write, then allow writes to the device nodes, to every
     --write-subpath tree, to every path that starts with a --write-prefix, and
     to every --unix-socket path;
+  * in runtime profiles, deny file flag and ACL changes after those allowances;
   * last, so that they win over every allow: deny every read and write of the
     evaluator-only paths that the environment names.
 
@@ -179,6 +181,7 @@ def main():
     for sock in sockets:
         lines.append("(allow network-bind network-inbound network-outbound (local unix-socket (path-literal %s)))" % quoted(sock))
         lines.append("(allow network-outbound (remote unix-socket (path-literal %s)))" % quoted(sock))
+    lines.append("(deny system-sched)")
     if not args.build:
         # Signals: deny all, then allow the process itself (raise, abort, thread signals).
         # "(deny signal (target others))" alone is not enforced on macOS 27 (measured:
@@ -209,6 +212,8 @@ def main():
         lines.append("(allow file-write* (regex #\"^%s\"))" % regex_escaped(resolved_prefix(prefix)))
     for sock in sockets:
         lines.append("(allow file-write* (literal %s))" % quoted(sock))
+    if not args.build:
+        lines += ["(deny file-write-flags)", "(deny file-write-acl)"]
     # Last, so that these rules win over every allow above.
     for path in evaluator_paths(env, args.tree):
         lines.append("(deny file-read* file-write* (subpath %s))" % quoted(path))

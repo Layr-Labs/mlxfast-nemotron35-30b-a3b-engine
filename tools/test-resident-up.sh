@@ -34,7 +34,9 @@
 #   13. a second --boot while a resident is up refuses box-wide, across trees
 #   14. --stop ends the resident and removes all three files; a second --stop is
 #       a no-op; the next leg boots afterwards
-#   15. a failed private-temp cleanup makes --stop fail and keeps its sidecar
+#   15. --stop repairs hostile nested modes and Darwin flags without following
+#       links outside the private temp tree; a failed cleanup still fails and
+#       keeps its sidecar
 #   16. every flag without a value, every missing required flag, and every
 #       spec/draft-length mismatch refuses BY NAME
 #   17. RESIDENT_UP_LOG_DIR outside MLXFAST_RESIDENT_LOG_ROOT refuses by name
@@ -62,7 +64,9 @@ set -uo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." >/dev/null && pwd -P)"
 RESIDENT_UP="${ROOT_DIR}/tools/resident-up.sh"
 
-WORK="$(mktemp -d)"
+# Under the temp root resident-up.sh uses, so its cleanup accepts the test trees.
+WORK_ROOT="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+WORK="$(mktemp -d "${WORK_ROOT%/}/test-resident-up.XXXXXX")"
 trap 'cleanup' EXIT
 LOCK_HOLDER_PID=""
 cleanup() {
@@ -71,6 +75,13 @@ cleanup() {
   # The per-leg cases stage the stub under the name benchd resolves, so it does
   # not match the pattern above.
   pkill -f "release/bench-worker resident" 2>/dev/null
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ -n "${PROTECTED_TMP:-}" ]]; then
+      chmod 700 "${PROTECTED_TMP}/mode-000" "${PROTECTED_TMP}/mode-000/mode-000" 2>/dev/null || true
+    fi
+    [[ -z "${INSIDE_FLAG_FILE:-}" ]] || chflags nouchg "${INSIDE_FLAG_FILE}" 2>/dev/null || true
+    [[ -z "${OUTSIDE_FILE:-}" ]] || chflags nouchg "${OUTSIDE_FILE}" 2>/dev/null || true
+  fi
   rm -rf "${WORK}"
 }
 
@@ -604,7 +615,65 @@ else
   fail "a second --stop was not a no-op (rc ${rc}): ${out}"
 fi
 
-# --- B7. a failed private-temp removal makes --stop fail --------------------
+# --- B7. --stop repairs modes and flags without following outside links ------
+PROTECTED_TMP="${WORK}/tmp.cleanup-protected"
+PROTECTED_SOCKET="${WORK}/cleanup-protected.sock"
+OUTSIDE_FILE="${WORK}/outside-file"
+OUTSIDE_DIR="${WORK}/outside-dir"
+mkdir -p "${PROTECTED_TMP}/mode-000/mode-000" "${OUTSIDE_DIR}"
+INSIDE_FLAG_FILE="${PROTECTED_TMP}/mode-000/mode-000/file"
+: > "${INSIDE_FLAG_FILE}"
+printf 'outside\n' > "${OUTSIDE_FILE}"
+printf 'outside child\n' > "${OUTSIDE_DIR}/child"
+chmod 640 "${OUTSIDE_FILE}"
+chmod 750 "${OUTSIDE_DIR}"
+ln -s "${OUTSIDE_FILE}" "${PROTECTED_TMP}/outside-file-link"
+ln -s "${OUTSIDE_DIR}" "${PROTECTED_TMP}/outside-dir-link"
+# A hard link shares the outside file's inode: cleanup must not change its mode.
+OUTSIDE_HARD="${WORK}/outside-hard"
+printf 'outside hard\n' > "${OUTSIDE_HARD}"
+chmod 640 "${OUTSIDE_HARD}"
+ln "${OUTSIDE_HARD}" "${PROTECTED_TMP}/mode-000/outside-hard-link"
+outside_flags_before=""
+outside_acl_before=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  chmod +a "everyone allow read" "${OUTSIDE_FILE}" || fail "could not set the outside ACL sentinel"
+  chflags uchg "${OUTSIDE_FILE}" || fail "could not set the outside uchg sentinel"
+  chflags uchg "${INSIDE_FLAG_FILE}" || fail "could not set the inside uchg test flag"
+  outside_flags_before="$(stat -f '%Sf' "${OUTSIDE_FILE}")"
+  outside_acl_before="$(ls -le "${OUTSIDE_FILE}" | tail -n +2)"
+fi
+outside_file_mode_before="$(python3 -c 'import os,sys; print(format(os.lstat(sys.argv[1]).st_mode & 0o777, "o"))' "${OUTSIDE_FILE}")"
+outside_dir_mode_before="$(python3 -c 'import os,sys; print(format(os.lstat(sys.argv[1]).st_mode & 0o777, "o"))' "${OUTSIDE_DIR}")"
+chmod 000 "${PROTECTED_TMP}/mode-000/mode-000"
+chmod 000 "${PROTECTED_TMP}/mode-000"
+printf '%s\n' "${PROTECTED_TMP}" > "${PROTECTED_SOCKET}.tmpdir"
+out="$(run_leg --stop --socket "${PROTECTED_SOCKET}")"; rc=$?
+outside_file_mode_after="$(python3 -c 'import os,sys; print(format(os.lstat(sys.argv[1]).st_mode & 0o777, "o"))' "${OUTSIDE_FILE}")"
+outside_dir_mode_after="$(python3 -c 'import os,sys; print(format(os.lstat(sys.argv[1]).st_mode & 0o777, "o"))' "${OUTSIDE_DIR}")"
+outside_hard_mode_after="$(python3 -c 'import os,sys; print(format(os.lstat(sys.argv[1]).st_mode & 0o777, "o"))' "${OUTSIDE_HARD}" 2>/dev/null || echo missing)"
+outside_darwin_ok=1
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  [[ "$(stat -f '%Sf' "${OUTSIDE_FILE}")" == "${outside_flags_before}" ]] || outside_darwin_ok=0
+  [[ "$(ls -le "${OUTSIDE_FILE}" | tail -n +2)" == "${outside_acl_before}" ]] || outside_darwin_ok=0
+fi
+if [[ "${rc}" -eq 0 && ! -e "${PROTECTED_TMP}" && ! -e "${PROTECTED_SOCKET}.tmpdir" \
+   && -f "${OUTSIDE_FILE}" && -f "${OUTSIDE_DIR}/child" \
+   && "${outside_file_mode_after}" == "${outside_file_mode_before}" \
+   && "${outside_dir_mode_after}" == "${outside_dir_mode_before}" \
+   && "${outside_hard_mode_after}" == "640" \
+   && "${outside_darwin_ok}" -eq 1 ]]; then
+  pass "--stop removes nested mode-000 content and an inside uchg file without touching outside symlink or hard-link targets"
+else
+  fail "--stop cleanup was unsafe or incomplete (rc ${rc}): ${out}"
+fi
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  chflags nouchg "${OUTSIDE_FILE}" 2>/dev/null || true
+  chmod -N "${OUTSIDE_FILE}" 2>/dev/null || true
+fi
+/bin/rm -rf "${PROTECTED_TMP}" "${PROTECTED_SOCKET}.tmpdir" "${OUTSIDE_FILE}" "${OUTSIDE_DIR}"
+
+# --- B7b. a failed private-temp removal makes --stop fail -------------------
 FAIL_TMP="${WORK}/tmp.cleanup-fail"
 FAIL_SOCKET="${WORK}/cleanup-fail.sock"
 FAIL_RM_BIN="${WORK}/fail-rm-bin"
@@ -752,6 +821,8 @@ PY
       "$@" 2>&1
   }
   sb_tmp_dirs() { find "${SB_TMP_ROOT}" -maxdepth 1 -name 'tmp.*' 2>/dev/null; }
+  STALE_BOOT_TMP="${SB_TMP_ROOT}/tmp.resident-up.stale"
+  mkdir -p "${STALE_BOOT_TMP}"
   out="$(run_sandboxed "${SBT}/tools/resident-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/sb.socket")"; rc=$?
   sb_socket="$(head -n 1 "${WORK}/sb.socket" 2>/dev/null || true)"
   sb_tmp="$(head -n 1 "${sb_socket}.tmpdir" 2>/dev/null || true)"
@@ -763,12 +834,36 @@ PY
   else
     fail "--boot under sandbox-exec did not use a private sibling TMPDIR (rc ${rc}, socket '${sb_socket}', tmp '${sb_tmp}'): ${out}"
   fi
+  if [[ ! -e "${STALE_BOOT_TMP}" ]]; then
+    pass "--boot removes a stale tmp.resident-up.* tree before creating its private temp tree"
+  else
+    fail "--boot left the stale resident temp tree ${STALE_BOOT_TMP}"
+  fi
   out="$(run_sandboxed "${SBT}/tools/resident-up.sh" --stop --socket "${sb_socket}")"; rc=$?
   if [[ "${rc}" -eq 0 && -z "$(sb_tmp_dirs)" && ! -e "${sb_socket}.tmpdir" ]]; then
     pass "--stop removes the sandboxed resident's tmp.* directory and its sidecar"
   else
     fail "--stop left a tmp.* directory behind (rc ${rc}): $(sb_tmp_dirs | tr '\n' ' ') ${out}"
   fi
+  STALE_FAIL_TMP="${SB_TMP_ROOT}/tmp.resident-up.cleanup-fail"
+  FAIL_STALE_RM_BIN="${WORK}/fail-stale-rm-bin"
+  mkdir -p "${STALE_FAIL_TMP}" "${FAIL_STALE_RM_BIN}"
+  cat > "${FAIL_STALE_RM_BIN}/rm" <<'SH'
+#!/bin/sh
+if [ "$1" = "-rf" ]; then
+  exit 73
+fi
+exec /bin/rm "$@"
+SH
+  chmod +x "${FAIL_STALE_RM_BIN}/rm"
+  out="$(run_sandboxed PATH="${FAIL_STALE_RM_BIN}:${PATH}" "${SBT}/tools/resident-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/sb-stale-fail.socket")"; rc=$?
+  if [[ "${rc}" -eq 2 && "${out}" == *"REFUSED (stale-resident-tmp)"* \
+     && -d "${STALE_FAIL_TMP}" && ! -e "${WORK}/sb-stale-fail.socket" ]]; then
+    pass "--boot refuses by name when a stale resident temp tree cannot be removed"
+  else
+    fail "--boot did not refuse a stale resident temp tree that survived cleanup (rc ${rc}): ${out}"
+  fi
+  /bin/rm -rf "${STALE_FAIL_TMP}" "${FAIL_STALE_RM_BIN}"
   out="$(run_sandboxed BENCH_WORKER_TEST_DIE_BEFORE_BIND=1 "${SBT}/tools/resident-up.sh" --boot --spec serial --draft-len 0 --socket-out "${WORK}/sb2.socket")"; rc=$?
   if [[ "${rc}" -eq 1 && -z "$(sb_tmp_dirs)" ]]; then
     pass "a sandboxed boot that fails leaves no tmp.* directory behind"
