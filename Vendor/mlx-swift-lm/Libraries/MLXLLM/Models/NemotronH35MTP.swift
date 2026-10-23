@@ -3,41 +3,6 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-/// Drafts score only the first half of the target head's rows; the target
-/// still scores every emitted token over the full vocabulary. Ids below 1000
-/// are control tokens (both EOS ids included), 1000..<1256 the raw bytes, and
-/// every later id is a BPE merge in rank order, so the first half keeps all
-/// control and byte ids and the earliest merges. A row prefix of a row-major
-/// quantized matrix is a strided view (no copy) that runs the same qmv kernel,
-/// so each kept logit equals the full head's. Held outside the module tree so
-/// it registers no parameters.
-private final class NemotronMTPDraftHead {
-    let target: NemotronHModel
-
-    init(target: NemotronHModel) { self.target = target }
-
-    lazy var prefix: QuantizedLinear? = {
-        guard let head = self.target.lmHead as? QuantizedLinear else { return nil }
-        let rows = 0..<(head.weight.dim(0) / 2)
-        return QuantizedLinear(
-            weight: head.weight[rows], bias: head.bias?[rows],
-            scales: head.scales[rows], biases: head.biases?[rows],
-            groupSize: head.groupSize, bits: head.bits, mode: head.mode)
-    }()
-
-    func logits(_ hidden: MLXArray) -> MLXArray {
-        prefix?.callAsFunction(hidden) ?? target.logits(hidden)
-    }
-
-    /// Multi-row twin for the post-verify head rows: the same prefix view
-    /// through the multi-row qmv, so each row's argmax matches the one-token
-    /// draft's over the same rows. The full-head chain is kept as fallback.
-    func rowLogits(_ rows: MLXArray) -> MLXArray {
-        if let prefix { return nemotronMTPLinearRows(rows, prefix) }
-        return target.lmHead.map { nemotronMTPHeadRows(rows, $0) } ?? target.logits(rows)
-    }
-}
-
 /// Request-local embedded assistant with native paged attention. Each draft
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
@@ -45,7 +10,6 @@ private final class NemotronMTPDraftHead {
 public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
     let module: NemotronH35MTPModule
     let target: NemotronH35Model
-    private let draftHead: NemotronMTPDraftHead
     private let kvOnlyHistory: Bool
     private let primePromptHistory: Bool
     private let draftLimit: Int
@@ -76,7 +40,6 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     init(target: NemotronH35Model, maximumDraftTokens: Int? = nil,
          primePromptHistory: Bool = true) {
         self.target = target
-        self.draftHead = NemotronMTPDraftHead(target: target)
         self.module = NemotronH35MTPModule(target.configuration)
         self.kvOnlyHistory = ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_KV_ONLY_HISTORY"] != "0"
         self.primePromptHistory = primePromptHistory
@@ -323,7 +286,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = argMax(draftHead.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
+        let ids = argMax(target.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -467,7 +430,8 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         }
         let rows = module.pagedForwardRows(
             hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
-        let logits = draftHead.rowLogits(rows.output)
+        let logits = target.lmHead.map { nemotronMTPHeadRows(rows.output, $0) }
+            ?? target.logits(rows.output)
         let ids = argMax(logits, axis: -1).asType(.int32)
         s.speculation = (ids: ids, out: rows.output, keys: rows.keys, values: rows.values)
         let roots = [ids, rows.output] + s.cache.innerState()
