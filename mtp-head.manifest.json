@@ -3,7 +3,7 @@
   "source": "pinned",
   "spec": {
     "enabled": true,
-    "num_speculative_tokens": 2
+    "num_speculative_tokens": 5
   },
   "version": 1
 }
