@@ -53,6 +53,59 @@ private func relu2(_ x: MLXArray) -> MLXArray {
 
 // MARK: - MambaRMSNormGated
 
+private enum NemotronHGatedRMSKernel {
+    nonisolated(unsafe) static let identity = MLXArray(1).asType(.bfloat16)
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
+        source: """
+            uint gid = threadgroup_position_in_grid.x;
+            uint lid = thread_position_in_threadgroup.x;
+            uint simd_lane_id = thread_index_in_simdgroup;
+            uint simd_group_id = simdgroup_index_in_threadgroup;
+            int64_t groups = int64_t(x_shape[2]) / 512;
+            int64_t row = int64_t(gid) / groups;
+            int64_t feature = (int64_t(gid) % groups) * 512 + int64_t(lid) * 4;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[4];
+            for (int i = 0; i < 4; i++) {
+                int64_t f = feature + int64_t(i);
+                T g = gate[row * gate_strides[1] + f * gate_strides[2]];
+                auto y = 1 / (1 + metal::exp(metal::abs(g)));
+                T sig = g < 0 ? y : 1 - y;
+                T activated = g * sig;
+                T gated = x[row * x_strides[1] + f * x_strides[2]] * activated;
+                thread_x[i] = gated;
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / 512 + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < 4; i++) {
+                int64_t f = feature + int64_t(i);
+                T normalized = static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                T unweighted = identity * normalized;
+                T weighted = weight[f * weight_strides[0]] * unweighted;
+                out[row * int64_t(x_shape[2]) + f] = weighted;
+            }
+            """, ensureRowContiguous: false)
+}
+
 class NemotronHRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
@@ -66,6 +119,17 @@ class NemotronHRMSNormGated: Module {
     }
 
     func callAsFunction(_ x: MLXArray, gate: MLXArray?) -> MLXArray {
+        if let gate, groupSize == 512, x.ndim == 3, x.dim(0) == 1,
+            x.dim(1) > 0, x.dim(2) > 0, x.dim(2) % 512 == 0,
+            gate.shape == x.shape, weight.shape == [x.dim(2)],
+            x.dtype == .bfloat16, gate.dtype == .bfloat16, weight.dtype == .bfloat16
+        {
+            return NemotronHGatedRMSKernel.kernel(
+                [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (128 * x.dim(1) * (x.dim(2) / 512), 1, 1),
+                threadGroup: (128, 1, 1), outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
+        }
         var states = x
         if let gate {
             states = states * silu(gate)
@@ -308,6 +372,39 @@ private enum NemotronShortConvKernel {
             """)
 }
 
+private enum NemotronPackedConvKernel {
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu",
+        inputNames: ["oldState", "input", "weight", "bias"],
+        outputNames: ["out", "padded"],
+        source: """
+            int64_t channel = int64_t(thread_position_in_grid.x);
+            int64_t position = int64_t(thread_position_in_grid.y);
+            padded[(position + 3) * C + channel] =
+                input[position * input_strides[1] + channel * input_strides[2]];
+            if (position == 0) {
+                for (int i = 0; i < 3; ++i) {
+                    padded[int64_t(i) * C + channel] =
+                        oldState[int64_t(i) * oldState_strides[1] + channel * oldState_strides[2]];
+                }
+            }
+            float acc = 0;
+            for (int i = 0; i < 4; ++i) {
+                int64_t row = position + int64_t(i);
+                T value = row < 3
+                    ? oldState[row * oldState_strides[1] + channel * oldState_strides[2]]
+                    : input[(row - 3) * input_strides[1] + channel * input_strides[2]];
+                acc += static_cast<float>(value)
+                    * weight[channel * weight_strides[0] + int64_t(i) * weight_strides[1]];
+            }
+            T convolved = static_cast<T>(acc);
+            T x = convolved + bias[channel * bias_strides[0]];
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            T sigmoid = x < 0 ? y : 1 - y;
+            out[position * C + channel] = x * sigmoid;
+            """, ensureRowContiguous: false)
+}
+
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
@@ -373,6 +470,29 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
+    func packedConv(_ oldState: MLXArray, _ input: MLXArray)
+        -> (convolution: MLXArray, padded: MLXArray) {
+        guard convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, (1...8).contains(input.dim(1)),
+            input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
+            conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
+            conv1d.padding == 0, let bias = conv1d.bias,
+            bias.dtype == .bfloat16, bias.shape == [convDim]
+        else {
+            let padded = concatenated([oldState, input], axis: 1)
+            return (activatedConv(padded), padded)
+        }
+        let length = input.dim(1)
+        let arrays = NemotronPackedConvKernel.kernel(
+            [oldState, input, conv1d.weight, bias],
+            template: [("T", DType.bfloat16), ("C", convDim)],
+            grid: (convDim, length, 1), threadGroup: (min(convDim, 256), 1, 1),
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim]],
+            outputDTypes: [.bfloat16, .bfloat16])
+        return (arrays[0], arrays[1])
+    }
+
     func activatedConv(_ padded: MLXArray) -> MLXArray {
         guard convKernelSize == 4, padded.ndim == 3, padded.dim(0) == 1,
             (4...11).contains(padded.dim(1)), padded.dim(2) == convDim,
@@ -410,7 +530,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             }
         }
 
-        let padded = concatenated([convState!, convInput], axis: 1)
+        let (convOutput, padded) = packedConv(convState!, convInput)
 
         if let cache {
             let end = padded.dim(1)
@@ -418,7 +538,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             cache[0] = padded[0..., start ..< end, 0...]
         }
 
-        return activatedConv(padded)
+        return convOutput
     }
 
     private func mambaForward(
@@ -514,11 +634,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let ssmState =
             ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
-        let padded = concatenated([convState, convInput], axis: 1)
+        let (convOutput, padded) = packedConv(convState, convInput)
         let end = padded.dim(1)
         let nextConvState =
             padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
-        let convOutput = activatedConv(padded)
         let convSplits = split(
             convOutput,
             indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],

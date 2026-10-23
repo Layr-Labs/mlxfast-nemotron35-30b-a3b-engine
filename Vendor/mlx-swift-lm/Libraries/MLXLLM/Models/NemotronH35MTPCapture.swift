@@ -45,8 +45,7 @@ extension NemotronHMamba2Mixer {
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
-        let padded = concatenated([convState, input], axis: 1)
-        let convolution = activatedConv(padded)
+        let (convolution, padded) = packedConv(convState, input)
         let dt = computeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
@@ -97,8 +96,7 @@ extension NemotronHMamba2Mixer {
         // One causal depthwise convolution covers the complete window. Each
         // position still owns its exact history slice and ordinary M=1 SSM
         // update, so rejecting a suffix cannot advance persistent recurrence.
-        let padded = concatenated([convState, input], axis: 1)
-        let convolution = activatedConv(padded)
+        let (convolution, padded) = packedConv(convState, input)
         // Per-position conv histories as one strided view of `padded`
         // (window p = rows p+1 ..< p+convKernelSize). Pure data movement:
         // identical values to stacking the per-position slices.
@@ -181,7 +179,8 @@ extension NemotronH35Model {
         let history = mixer.convKernelSize - 1
         let (heads, dim, groups, stateDim) =
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
-        var roots: [MLXArray] = []
+        let normInput = MLXArray.zeros([1, 1, heads * dim], dtype: activationDType)
+        var roots: [MLXArray] = [mixer.norm(normInput, gate: normInput)]
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = mixer.activatedConv(padded)
@@ -211,6 +210,10 @@ extension NemotronH35Model {
                 roots += [window.output, window.capturedStates]
             }
         }
+        let packed = mixer.packedConv(
+            MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+            MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
+        roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
     }
 }
