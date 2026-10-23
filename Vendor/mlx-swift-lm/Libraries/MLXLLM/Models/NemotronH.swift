@@ -44,6 +44,9 @@ private protocol NemotronHMixer: Module {
 
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
+// Captured verification only; zero restores the original four-layer cadence.
+private let nemotronCapturedEvalInterval =
+    ProcessInfo.processInfo.environment["NEMOTRON_CAPTURED_EVAL_INTERVAL8"] == "0" ? 4 : 8
 
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
@@ -2680,6 +2683,7 @@ private class NemotronHBackbone: Module {
             : nil
         defer { observation?.end() }
         var hidden = embeddings(inputs)
+        let earlyEvalInterval = captureMTP ? nemotronCapturedEvalInterval : nemotronEarlyEvalInterval
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -2701,8 +2705,8 @@ private class NemotronHBackbone: Module {
                 captureMTP: captureMTP)
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
-            if nemotronEarlyEvalInterval > 0, modelLayerIndex + 1 < layers.count,
-               (modelLayerIndex + 1) % nemotronEarlyEvalInterval == 0 {
+            if earlyEvalInterval > 0, modelLayerIndex + 1 < layers.count,
+               (modelLayerIndex + 1) % earlyEvalInterval == 0 {
                 asyncEval(hidden)
             }
         }
