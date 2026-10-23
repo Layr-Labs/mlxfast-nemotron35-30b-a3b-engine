@@ -693,6 +693,10 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
+        if blockSize > 1, outputs.count > 1 {
+            let tokenMajor = outputs.map { $0.transposed(0, 2, 1, 3) }
+            return concatenated(tokenMajor, axis: 1).transposed(0, 2, 1, 3)
+        }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
     }
 

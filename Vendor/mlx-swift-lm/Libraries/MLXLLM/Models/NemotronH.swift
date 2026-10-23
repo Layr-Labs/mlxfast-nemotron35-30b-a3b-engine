@@ -273,6 +273,24 @@ private final class NemotronHScanKernels: Sendable {
     }
 }
 
+private let nemotronCompiledPrefillDt = compile(shapeless: true) { (inputs: [MLXArray]) -> [MLXArray] in
+    let dt = softplus(inputs[0].asType(.float32) + inputs[1])
+    return [MLX.clip(dt, min: inputs[2], max: inputs[3])]
+}
+
+func nemotronPrefillComputeDt(
+    _ dt: MLXArray, _ dtBias: MLXArray, _ timeStepLimit: (Float, Float)
+) -> MLXArray {
+    guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+          [DType.bfloat16, .float16, .float32].contains(dt.dtype),
+          [DType.bfloat16, .float16, .float32].contains(dtBias.dtype)
+    else { return computeDt(dt, dtBias, timeStepLimit) }
+    // Keep the native Float32 cast, bias promotion, softplus and clip order.
+    // All values are dynamic inputs; no model or request state is captured.
+    return nemotronCompiledPrefillDt([
+        dt, dtBias, MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)])[0]
+}
+
 /// Bitwise copy of `ssmAttn` (SSM.swift, not editable) for L > 1 with a
 /// prior state. Only materialized copies feeding element-wise ops change:
 /// the segsum input is a broadcast view instead of `repeated` (the tril
@@ -288,7 +306,7 @@ func nemotronSSMAttn(
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
 
-    let dt = computeDt(dt, dtBias, timeStepLimit)
+    let dt = nemotronPrefillComputeDt(dt, dtBias, timeStepLimit)
     let repeats = h / g
     let A = -MLX.exp(ALog).asType(dt.dtype)
     let dtA = dt * A.reshaped(1, 1, -1)
@@ -771,6 +789,92 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
 
 // MARK: - MoE Gate
 
+enum NemotronHRouterSelection {
+    static let sigmoidHeader = """
+        inline float nemotron_h_router_sigmoid(float x) {
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            return (x < 0) ? y : 1 - y;
+        }
+        """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint row = threadgroup_position_in_grid.y;
+            threadgroup float original[128];
+            threadgroup float normalized[6];
+            float corrected[4];
+            bool selected[4] = {false, false, false, false};
+            float chosen[6];
+            for (uint i = 0; i < 4; ++i) {
+                const uint id = lane + 32 * i;
+                original[id] = nemotron_h_router_sigmoid(float(gates[row * 128 + id]));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < 4; ++i) {
+                const uint id = lane + 32 * i;
+                corrected[i] = original[id] + bias[id];
+            }
+            for (uint slot = 0; slot < 6; ++slot) {
+                uint local_id = 0xffffffff;
+                float local_score = -INFINITY;
+                for (uint i = 0; i < 4; ++i) {
+                    if (!selected[i] && (local_id == 0xffffffff
+                        || (!metal::isnan(corrected[i])
+                            && (metal::isnan(local_score) || corrected[i] > local_score)))) {
+                        local_id = lane + 32 * i;
+                        local_score = corrected[i];
+                    }
+                }
+                const bool ordered = local_id != 0xffffffff && !metal::isnan(local_score);
+                const bool any_ordered = simd_any(ordered);
+                const float maximum = simd_max(ordered ? local_score : -INFINITY);
+                const uint winner = simd_min(
+                    ((!any_ordered && local_id != 0xffffffff)
+                        || (ordered && local_score == maximum)) ? local_id : 0xffffffff);
+                if (lane == 0) {
+                    indices[row * 6 + slot] = winner;
+                    chosen[slot] = original[winner];
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    if (lane + 32 * i == winner) { selected[i] = true; }
+                }
+            }
+            if (lane == 0) {
+                // Match row_reduce_small's value + total order from positive zero.
+                float total = 0.0f;
+                for (uint slot = 0; slot < 6; ++slot) { total = chosen[slot] + total; }
+                const float denominator = total + 1e-20f;
+                for (uint slot = 0; slot < 6; ++slot) {
+                    normalized[slot] = chosen[slot] / denominator;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
+            """,
+        header: sigmoidHeader, ensureRowContiguous: true)
+
+    static func apply(
+        gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
+        routedScalingFactor: Float, normTopkProb: Bool
+    ) -> (MLXArray, MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
+            gates.dim(2) == 128, gates.dtype == .bfloat16,
+            eSCB.shape == [128], eSCB.dtype == .float32,
+            topK == 6, nGroup == 1, topkGroup == 1,
+            normTopkProb, routedScalingFactor == 2.5
+        else { return nil }
+        let shape = [1, gates.dim(1), 6]
+        let result = kernel(
+            [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+            outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        return (result[0], result[1])
+    }
+}
+
 private func groupExpertSelect(
     gates: MLXArray,
     eSCB: MLXArray,  // e_score_correction_bias
@@ -780,6 +884,11 @@ private func groupExpertSelect(
     routedScalingFactor: Float,
     normTopkProb: Bool
 ) -> (MLXArray, MLXArray) {
+    if let selected = NemotronHRouterSelection.apply(
+        gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
+        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb) {
+        return selected
+    }
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
 
     // Original scores using sigmoid
@@ -899,8 +1008,8 @@ class NemotronHSwitchMLP: Module {
     /// weighted reduction. Same graph as `callAsFunction` followed by
     /// `(y * scores[..., None]).sum(-2).asType(y.dtype)`, except that
     /// (1) the inverse permutation is a scatter instead of a second argsort
-    /// (a permutation has exactly one inverse), (2) relu2 is one pass with the
-    /// stock Maximum/Multiply element arithmetic in the activation dtype, and
+    /// (a permutation has exactly one inverse), (2) relu2 keeps the stock typed
+    /// Maximum/Multiply at the fc1 store or in one separate pass, and
     /// (3) the unsort gather, fp32 promotion, score multiply, K-way sum and
     /// narrowing are one kernel that reproduces col_reduce_small's order
     /// (lsize.y == K <= 8: row j is op(v_j, 0), then total = op(row_j, total)
@@ -940,16 +1049,22 @@ class NemotronHSwitchMLP: Module {
             }
             return lin(input, idx, sortedIndices: true)
         }
-        var y = gather(fc1, xs)
-        // Stock relu2 promotes against an int scalar; fuse only when that
-        // keeps the activation dtype (graph metadata, never evaluated).
-        if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
-            y = kernels.relu2(
-                [y], template: [("T", y.dtype)],
-                grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
-                outputShapes: [y.shape], outputDTypes: [y.dtype])[0]
+        var y: MLXArray
+        if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
+            let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
+            y = activated
         } else {
-            y = relu2(y)
+            y = gather(fc1, xs)
+            // Stock relu2 promotes against an int scalar; fuse only when that
+            // keeps the activation dtype (graph metadata, never evaluated).
+            if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
+                y = kernels.relu2(
+                    [y], template: [("T", y.dtype)],
+                    grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [y.shape], outputDTypes: [y.dtype])[0]
+            } else {
+                y = relu2(y)
+            }
         }
         y = gather(fc2, y)
         guard y.dim(-1) == inputDims, y.size == indices.size * inputDims else { return nil }
@@ -1211,12 +1326,14 @@ private func nemotronWarmUpPrefillKernels(
         let sw = MLXArray.zeros([1, 64, 1], dtype: dtype)
         let tw = MLXArray([Int32(0), Int32(rows), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]).reshaped(4, 3)
         for bm in [32, 64] {
-            arrays.append(NemotronHRunGatherKernel.shared.kernel(
-                [xw, ww, sw, sw, tw, 64, 64],
-                template: [("T", dtype), ("GS", 64), ("BITS", 4), ("BM", bm), ("BN", 64), ("BK", 64),
-                           ("ALIGN_N", true), ("ALIGN_K", true)],
-                grid: (128, 4, 1), threadGroup: (128, 1, 1),
-                outputShapes: [[rows, 1, 64]], outputDTypes: [dtype])[0])
+            for relu2 in [false, true] where !relu2 || dtype == .bfloat16 {
+                arrays.append(NemotronHRunGatherKernel.shared.kernel(
+                    [xw, ww, sw, sw, tw, 64, 64],
+                    template: [("T", dtype), ("GS", 64), ("BITS", 4), ("BM", bm), ("BN", 64), ("BK", 64),
+                               ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", relu2)],
+                    grid: (128, 4, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[rows, 1, 64]], outputDTypes: [dtype])[0])
+            }
         }
     }
     eval(arrays)
@@ -1225,13 +1342,13 @@ private func nemotronWarmUpPrefillKernels(
 // MARK: - Run-aligned NAX gather (stock affine_gather_qmm_rhs_nax per row)
 
 /// The part of the MLX JIT preamble (mlx-generated gemm_nax + quantized_nax)
-/// that the stock affine_gather_qmm_rhs_nax uses, verbatim, followed by its
-/// run-aligned clone. Dropped declarations are never instantiated: the clone
-/// compiles to the same AIR with the full or the trimmed preamble.
+/// that the stock affine_gather_qmm_rhs_nax uses, followed by its run-aligned
+/// clone. Output stores add a typed ReLU2 specialization; the remaining
+/// declarations retain the stock math. Unused declarations are dropped.
 private let nemotronRunGatherHeader = #"""
 // Subset of the MLX JIT preamble that stock affine_gather_qmm_rhs_nax is
-// compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Every
-// declaration kept is verbatim; unused ones are dropped.
+// compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Only the
+// output stores add the typed ReLU2 specialization; unused declarations are dropped.
 
 #define STEEL_CONST static constant constexpr const
 #define STEEL_PRAGMA_UNROLL _Pragma("clang loop unroll(full)")
@@ -1541,7 +1658,20 @@ struct BaseNAXFrag {
     }
   }
 
+  // Narrow exactly as the ordinary store, then apply the typed activation.
+  template <bool RELU2, typename U, typename T>
+  METAL_FUNC static constexpr U store_value(T value) {
+    U h = static_cast<U>(value);
+    if constexpr (RELU2) {
+      U zero = static_cast<U>(0);
+      U m = metal::isnan(h) ? h : (h > zero ? h : zero);
+      return m * m;
+    }
+    return h;
+  }
+
   template <
+      bool RELU2 = false,
       typename T,
       typename DstPtrType,
       typename StrX,
@@ -1568,19 +1698,20 @@ struct BaseNAXFrag {
       if constexpr (metal::is_same_v<StrY, Int<1>>) {
         STEEL_PRAGMA_UNROLL
         for (short j = 0; j < kElemCols; j++) {
-          dst[r * str_x + c + j] = static_cast<U>(src[i * kElemCols + j]);
+          dst[r * str_x + c + j] = store_value<RELU2, U>(src[i * kElemCols + j]);
         }
       } else {
         STEEL_PRAGMA_UNROLL
         for (short j = 0; j < kElemCols; j++) {
           dst[r * str_x + (c + j) * str_y] =
-              static_cast<U>(src[i * kElemCols + j]);
+              store_value<RELU2, U>(src[i * kElemCols + j]);
         }
       }
     }
   }
 
   template <
+      bool RELU2 = false,
       typename T,
       typename DstPtrType,
       typename StrX,
@@ -1620,7 +1751,7 @@ struct BaseNAXFrag {
 
         const auto src_idx = idx_row * Int<kElemCols>{} + idx_col;
         dst[(r + sc.y) * str_x + (c + sc.x) * str_y] =
-            static_cast<U>(src[src_idx]);
+            store_value<RELU2, U>(src[src_idx]);
       });
     });
   }
@@ -1797,11 +1928,11 @@ struct NAXTile {
     });
   }
 
-  template <typename U>
+  template <bool RELU2 = false, typename U>
   METAL_FUNC void store(device U* dst, const int ld) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        NAXFrag_t::store(
+        NAXFrag_t::template store<RELU2>(
             frag_at<idx_row.value, idx_col.value>(),
             dst,
             ld,
@@ -1832,7 +1963,7 @@ struct NAXTile {
     });
   }
 
-  template <typename U>
+  template <bool RELU2 = false, typename U>
   METAL_FUNC void store_slice(
       device U* dst,
       const int ld,
@@ -1840,7 +1971,7 @@ struct NAXTile {
       const short2 stop) const thread {
     const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
       const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
-        NAXFrag_t::store_slice(
+        NAXFrag_t::template store_slice<RELU2>(
             frag_at<idx_row.value, idx_col.value>(),
             dst,
             ld,
@@ -2170,8 +2301,9 @@ struct QuantizedBlockLoader {
 // Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned
 // to expert runs. tiles[t] = (first sorted row, rows <= BM, expert). Every
 // tile holds exactly one expert segment, so the stock segment loop collapses
-// to one pass; the loader, K loop, NAX fragment MMA sequence and store of a
-// row are the stock ones (m_lo_lim = 0, m_hi_lim from the tile's row count).
+// to one pass; the loader, K loop and NAX fragment MMA sequence are stock.
+// The optional typed ReLU2 follows the native output cast. Row bounds stay
+// m_lo_lim = 0, m_hi_lim from the tile's row count.
 template <
     typename T,
     int group_size,
@@ -2182,7 +2314,8 @@ template <
     int WM,
     int WN,
     bool align_N,
-    bool align_K>
+    bool align_K,
+    bool RELU2>
 METAL_FUNC void nemotron_gather_qmm_runs_impl(
     const device T* x,
     const device uint32_t* w,
@@ -2359,13 +2492,13 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
 
       if constexpr (kAlignedN.value) {
         if (m_lo_lim == 0 && m_hi_lim == SM) {
-          Dtile.store(y + tm * N + tn, N);
+          Dtile.template store<RELU2>(y + tm * N + tn, N);
         } else {
-          Dtile.store_slice(
+          Dtile.template store_slice<RELU2>(
               y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
         }
       } else {
-        Dtile.store_slice(
+        Dtile.template store_slice<RELU2>(
             y + tm * N + tn,
             N,
             short2(0, m_lo_lim),
@@ -2386,7 +2519,7 @@ private final class NemotronHRunGatherKernel: Sendable {
             outputNames: ["y"],
             source: """
                 threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
-                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K>(
+                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
                     x, w, scales, biases, tiles, y, N, K, Ws,
                     threadgroup_position_in_grid,
                     simdgroup_index_in_threadgroup,
@@ -2400,12 +2533,15 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// (N block, expert-run tile). Only where stock GatherQMM takes the
 /// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
 /// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
-/// with the same bm; nil = use the stock op.
+/// with the same bm; nil = use the stock op. ReLU2 is BF16-only and retains
+/// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
-    _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles
+    _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
+    relu2: Bool = false
 ) -> MLXArray? {
     guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
-          x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16 || x.dtype == .float16
+          x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16 || x.dtype == .float16,
+          !relu2 || (x.dtype == .bfloat16 && MLX.maximum(x, MLXArray(0)).dtype == x.dtype)
     else { return nil }
     let ops = lin.nemotronGatherOperands(for: x.dtype)
     guard !ops.hasLinearBias, let biases = ops.biases, ops.weight.dtype == .uint32,
@@ -2420,7 +2556,7 @@ func nemotronRunGather(
     return NemotronHRunGatherKernel.shared.kernel(
         [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k],
         template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
-                   ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0)],
+                   ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", relu2)],
         grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
         outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
 }
