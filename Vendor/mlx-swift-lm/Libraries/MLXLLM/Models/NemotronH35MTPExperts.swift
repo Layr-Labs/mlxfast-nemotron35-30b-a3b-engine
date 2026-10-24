@@ -6,6 +6,16 @@ import MLXNN
 extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
+        if type(of: self) == NemotronHMLP.self,
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            x.ndim == 3, x.dim(0) == 1, x.dim(1) > 1, x.dim(2) == 2688,
+            let q = upProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+            q.bias == nil, q.weight.shape == [3712, 336],
+            q.scales.shape == [3712, 42], q.biases?.shape == [3712, 42],
+            let activated = NemotronMultiRowQMV.apply(
+                x.reshaped(x.dim(1), x.dim(2)), q, relu2: true) {
+            return nemotronMTPLinearRows(activated.reshaped(1, x.dim(1), 3712), downProj)
+        }
         let up = nemotronMTPLinearRows(x, upProj)
         let activated = maximum(up, MLXArray(0))
         return nemotronMTPLinearRows(activated * activated, downProj)

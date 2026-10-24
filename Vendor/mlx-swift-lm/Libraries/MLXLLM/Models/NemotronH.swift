@@ -556,12 +556,20 @@ private enum NemotronPackedConvKernel {
         source: """
             int64_t channel = int64_t(thread_position_in_grid.x);
             int64_t position = int64_t(thread_position_in_grid.y);
-            padded[(position + 3) * C + channel] =
-                input[position * input_strides[1] + channel * input_strides[2]];
-            if (position == 0) {
-                for (int i = 0; i < 3; ++i) {
-                    padded[int64_t(i) * C + channel] =
-                        oldState[int64_t(i) * oldState_strides[1] + channel * oldState_strides[2]];
+            if constexpr (TAIL_ONLY) {
+                int64_t length = int64_t(input_shape[1]);
+                if (position >= length - 3) {
+                    padded[(position - (length - 3)) * C + channel] =
+                        input[position * input_strides[1] + channel * input_strides[2]];
+                }
+            } else {
+                padded[(position + 3) * C + channel] =
+                    input[position * input_strides[1] + channel * input_strides[2]];
+                if (position == 0) {
+                    for (int i = 0; i < 3; ++i) {
+                        padded[int64_t(i) * C + channel] =
+                            oldState[int64_t(i) * oldState_strides[1] + channel * oldState_strides[2]];
+                    }
                 }
             }
             float acc = 0;
@@ -646,10 +654,13 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
-    func packedConv(_ oldState: MLXArray, _ input: MLXArray)
+    func packedConv(_ oldState: MLXArray, _ input: MLXArray, tailOnly: Bool = false)
         -> (convolution: MLXArray, padded: MLXArray) {
-        guard convKernelSize == 4, oldState.shape == [1, 3, convDim],
-            input.ndim == 3, input.dim(0) == 1, (1...8).contains(input.dim(1)),
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            type(of: conv1d) == Conv1d.self, convDim > 0,
+            convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, input.dim(1) > 0,
+            input.dim(1) <= Int(Int32.max) - 3,
             input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
             conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
             conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
@@ -660,11 +671,13 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             return (silu(conv1d(padded)), padded)
         }
         let length = input.dim(1)
+        let outputHistoryOnly = tailOnly && length >= convKernelSize - 1
         let arrays = NemotronPackedConvKernel.kernel(
             [oldState, input, conv1d.weight, bias],
-            template: [("T", DType.bfloat16), ("C", convDim)],
+            template: [("T", DType.bfloat16), ("C", convDim), ("TAIL_ONLY", outputHistoryOnly)],
             grid: (convDim, length, 1), threadGroup: (min(convDim, 256), 1, 1),
-            outputShapes: [[1, length, convDim], [1, length + 3, convDim]],
+            outputShapes: [[1, length, convDim],
+                           [1, outputHistoryOnly ? convKernelSize - 1 : length + 3, convDim]],
             outputDTypes: [.bfloat16, .bfloat16])
         return (arrays[0], arrays[1])
     }
@@ -794,7 +807,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let ssmState =
             ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
-        let (convOutput, padded) = packedConv(convState, convInput)
+        let (convOutput, padded) = packedConv(
+            convState, convInput, tailOnly: convInput.dim(1) > 8)
         let end = padded.dim(1)
         let nextConvState =
             padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
@@ -924,22 +938,13 @@ class NemotronHAttention: Module, NemotronHMixer {
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
-        captureMTP: Bool = false,
-        targetQKV: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(x, query: wq, key: wk, value: wv, captureMTP: captureMTP) {
-            projections = outputs
-        } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
-        }
-        let (q, k, v) = projections
+        let q = captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x)
+        let k = captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x)
+        let v = captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x)
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
@@ -2907,7 +2912,7 @@ private class NemotronHBlock: Module {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
             output = (mixer as! NemotronHAttention).cbv2Forward(
-                hidden, cache: attentionCache, captureMTP: captureMTP, targetQKV: true)
+                hidden, cache: attentionCache, captureMTP: captureMTP)
         case .mlp:
             precondition(
                 attentionCache == nil,

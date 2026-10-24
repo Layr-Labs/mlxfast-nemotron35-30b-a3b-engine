@@ -214,6 +214,10 @@ extension NemotronH35Model {
             MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
+        let tail = mixer.packedConv(
+            MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+            MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType), tailOnly: true)
+        roots += [tail.convolution, tail.padded]
         if !roots.isEmpty { eval(roots) }
     }
 }

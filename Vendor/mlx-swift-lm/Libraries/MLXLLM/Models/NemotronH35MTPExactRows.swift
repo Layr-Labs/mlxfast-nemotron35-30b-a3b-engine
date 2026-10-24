@@ -211,7 +211,14 @@ private let nemotronMultiRowQMVSource = """
     for (int r = 0; r < R; r++) {
       U v = simd_sum(result[r][row]);
       if (simd_lid == 0) {
-        yp[r * out_vec_size + row] = static_cast<T>(v);
+        if (RELU2) {
+          T h = static_cast<T>(v);
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          yp[r * out_vec_size + row] = m * m;
+        } else {
+          yp[r * out_vec_size + row] = static_cast<T>(v);
+        }
       }
     }
   }
@@ -248,7 +255,7 @@ enum NemotronMultiRowQMV {
 
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.
-    static func apply(_ x: MLXArray, _ q: QuantizedLinear) -> MLXArray? {
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false) -> MLXArray? {
         guard enabled, x.ndim == 2, (2...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
@@ -262,7 +269,7 @@ enum NemotronMultiRowQMV {
         let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
             [q.weight, q.scales, biases, x, kArray, nArray],
-            template: [("T", x.dtype), ("R", rows), ("FAST", fast)],
+            template: [("T", x.dtype), ("R", rows), ("FAST", fast), ("RELU2", relu2)],
             grid: (32, n / 4, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]],
@@ -291,52 +298,4 @@ func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
         .reshaped(1, count, q.weight.dim(0))
     if let bias = q.bias { result = result + bias }
     return result
-}
-
-// Target Q/K/V share one dispatch; every tile keeps the existing row body.
-enum NemotronTargetQKV {
-    private static let source = """
-      const uint tile = threadgroup_position_in_grid.y;
-      const uint local_tile = tile < 512 ? tile : (tile < 544 ? tile - 512 : tile - 544);
-      {
-        const uint3 threadgroup_position_in_grid = uint3(0, local_tile, 0);
-        const device uint32_t* w = tile < 512 ? qw : (tile < 544 ? kw : vw);
-        const device T* scales = tile < 512 ? qs : (tile < 544 ? ks : vs);
-        const device T* biases = tile < 512 ? qb : (tile < 544 ? kb : vb);
-        device T* y = tile < 512 ? qy : (tile < 544 ? ky : vy);
-        const int N = tile < 512 ? 4096 : 256;
-    """ + nemotronMultiRowQMVSource + "\n}"
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_target_qkv_affine4_gs64",
-        inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
-        outputNames: ["qy", "ky", "vy"], source: source, header: nemotronMultiRowQMVHeader)
-
-    private static func buffers(_ linear: Linear, rows: Int) -> [MLXArray]? {
-        guard type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear,
-              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
-              q.weight.dtype == .uint32, q.weight.shape == [rows, 336],
-              q.scales.dtype == .bfloat16, q.scales.shape == [rows, 42],
-              let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [rows, 42]
-        else { return nil }
-        return [q.weight, q.scales, offsets]
-    }
-
-    static func apply(
-        _ x: MLXArray, query: Linear, key: Linear, value: Linear, captureMTP: Bool
-    ) -> (MLXArray, MLXArray, MLXArray)? {
-        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              x.ndim == 3, x.dim(0) == 1, x.dim(2) == 2688, x.dtype == .bfloat16,
-              x.dim(1) == 1 || (captureMTP && [3, 4].contains(x.dim(1))
-                && NemotronMTPExecution.batchedM1 && NemotronMultiRowQMV.enabled),
-              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
-              let v = buffers(value, rows: 256)
-        else { return nil }
-        let rows = x.dim(1)
-        let outputs = kernel(q + k + v + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
-            template: [("T", x.dtype), ("R", rows), ("FAST", false)],
-            grid: (32, 1152, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
-            outputDTypes: [x.dtype, x.dtype, x.dtype])
-        return (outputs[0], outputs[1], outputs[2])
-    }
 }
