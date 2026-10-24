@@ -71,6 +71,9 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        // Trace the shape-polymorphic trusted-history K/V projection on
+        // private dummy inputs before any request; no KV state is appended.
+        assistant.module.warmTrustedKVProjectionGraph()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
