@@ -356,14 +356,14 @@ private enum NemotronHGatedRMSKernel {
         name: "nemotron_h_gated_rms",
         inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
         source: source, ensureRowContiguous: false)
-    private static func preparedSource() -> String {
+    private static func preparedSource(emitNormalized: Bool = true) -> String {
         let scratch = "threadgroup float local_inv_mean[1];"
         let store = "out[row * int64_t(x_shape[2]) + f] = weighted;"
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         return source.replacingOccurrences(of: scratch,
             with: scratch + "\nthreadgroup T rounded[512];")
-            .replacingOccurrences(of: store, with: store + "\nrounded[lid * 4 + i] = weighted;")
+            .replacingOccurrences(of: store, with: (emitNormalized ? store : "") + "\nrounded[lid * 4 + i] = weighted;")
             + """
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -388,6 +388,10 @@ private enum NemotronHGatedRMSKernel {
         name: "nemotron_h_gated_rms_prepared_output",
         inputNames: ["x", "gate", "weight", "identity", "eps"],
         outputNames: ["out", "prepared"], source: preparedSource(), ensureRowContiguous: false)
+    static let preparedOnlyKernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms_prepared_only",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["prepared"],
+        source: preparedSource(emitNormalized: false), ensureRowContiguous: false)
 
 }
 
@@ -405,6 +409,38 @@ class NemotronHRMSNormGated: Module {
 
     private static let preparedOutputEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_OUT"] != "0"
+
+    private static let preparedOnlyEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_ONLY"] != "0"
+
+    /// The prepared QMV reads only `prepared`; omit the unused dense tensor.
+    /// Diagnostic self-tests retain the original dense path and comparisons.
+    func preparedProjection(_ x: MLXArray, gate: MLXArray, projection q: QuantizedLinear)
+        -> MLXArray?
+    {
+        guard Self.preparedOnlyEnabled,
+              !NemotronMoELeader.selfTest, Self.preparedOutputEnabled,
+              NemotronMTPExecution.batchedM1, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHRMSNormGated.self,
+              groupSize == 512, x.shape == [1, 3, 4096], gate.shape == x.shape,
+              weight.shape == [4096], x.dtype == .bfloat16,
+              gate.dtype == .bfloat16, weight.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16
+        else { return nil }
+        let prepared = NemotronHGatedRMSKernel.preparedOnlyKernel(
+            [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (128 * 3 * 8, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[3, 8, 17 * 32]], outputDTypes: [.float32])[0]
+        return NemotronHeadPreparedActivation.projectPrepared(
+            prepared, q, rows: 3, k: 4096, dtype: .bfloat16, relu2: false, rps: 2)
+            .reshaped(1, 3, 2688)
+    }
 
     /// Native compact verify only. The original BF16 gate/norm/identity/weight
     /// boundaries remain; preparation reads the final rounded BF16 values.

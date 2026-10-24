@@ -486,17 +486,25 @@ enum NemotronHeadPreparedActivation {
 
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
                       prepared: MLXArray? = nil) -> MLXArray {
-        let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        let rows = x.dim(0), k = x.dim(1)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
             ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+        return projectPrepared(packed, q, rows: rows, k: k, dtype: x.dtype, relu2: relu2, rps: rps)
+    }
+
+    /// Same prepared QMV, without requiring an unused dense activation input.
+    static func projectPrepared(_ prepared: MLXArray, _ q: QuantizedLinear,
+                                rows: Int, k: Int, dtype: DType, relu2: Bool, rps: Int) -> MLXArray {
+        precondition(compatible(prepared, rows: rows, k: k) != nil)
+        let n = q.weight.dim(0)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed, args.0, args.1],
-            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
+        return project([q.weight, q.scales, q.biases!, prepared, args.0, args.1],
+            template: [("T", dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
             grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+            outputShapes: [[rows, n]], outputDTypes: [dtype])[0]
     }
 }
 

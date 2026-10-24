@@ -173,6 +173,10 @@ extension NemotronHMamba2Mixer {
             heads: heads, headDim: dim, groups: groups, stateDim: state,
             steps: length, writeOutput: true)
         let y = result.output.reshaped(batch, length, heads * dim)
+        if let q = outProj as? QuantizedLinear,
+           let projectedOut = norm.preparedProjection(y, gate: gate, projection: q) {
+            return [projectedOut, padded, convolution, dt, result.finalState]
+        }
         let normalized: MLXArray
         let prepared: MLXArray?
         if NemotronMTPExecution.batchedNorm,
