@@ -924,22 +924,13 @@ class NemotronHAttention: Module, NemotronHMixer {
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
-        captureMTP: Bool = false,
-        targetQKV: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(x, query: wq, key: wk, value: wv, captureMTP: captureMTP) {
-            projections = outputs
-        } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
-        }
-        let (q, k, v) = projections
+        let q = captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x)
+        let k = captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x)
+        let v = captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x)
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
@@ -1075,8 +1066,8 @@ enum NemotronHRouterSelection {
         routedScalingFactor: Float, normTopkProb: Bool
     ) -> (MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-            gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
-            gates.dim(2) == 128, gates.dtype == .bfloat16,
+            gates.ndim == 3, gates.dim(0) == 1, gates.dim(1) > 0,
+            gates.dim(2) == 128, gates.dtype == .bfloat16, gates.size <= Int(UInt32.max) + 1,
             eSCB.shape == [128], eSCB.dtype == .float32,
             topK == 6, nGroup == 1, topkGroup == 1,
             normTopkProb, routedScalingFactor == 2.5
@@ -1254,8 +1245,8 @@ class NemotronHSwitchMLP: Module {
                 outputShapes: [[order.size]], outputDTypes: [order.dtype])[0]
             idx = flat[order]
         }
-        let xs = MLX.expandedDimensions(x, axes: [-2, -3])
-            .flattened(start: 0, end: -3)[order.floorDivide(k)]
+        let originalRows = MLX.expandedDimensions(x, axes: [-2, -3])
+            .flattened(start: 0, end: -3)
         func gather(_ lin: SwitchLinear, _ input: MLXArray) -> MLXArray {
             if let tiles = runTiles, let q = lin as? QuantizedSwitchLinear,
                let fused = nemotronRunGather(input, q, tiles: tiles) {
@@ -1265,19 +1256,26 @@ class NemotronHSwitchMLP: Module {
         }
         var y: MLXArray
         if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
-            let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
+            let activated = nemotronRunGatherMappedUp(
+                originalRows, q, order: order, expertsPerToken: k, tiles: tiles) {
             y = activated
         } else {
-            y = gather(fc1, xs)
-            // Stock relu2 promotes against an int scalar; fuse only when that
-            // keeps the activation dtype (graph metadata, never evaluated).
-            if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
-                y = kernels.relu2(
-                    [y], template: [("T", y.dtype)],
-                    grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
-                    outputShapes: [y.shape], outputDTypes: [y.dtype])[0]
+            let xs = originalRows[order.floorDivide(k)]
+            if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
+                let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
+                y = activated
             } else {
-                y = relu2(y)
+                y = gather(fc1, xs)
+                // Stock relu2 promotes against an int scalar; fuse only when that
+                // keeps the activation dtype (graph metadata, never evaluated).
+                if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
+                    y = kernels.relu2(
+                        [y], template: [("T", y.dtype)],
+                        grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [y.shape], outputDTypes: [y.dtype])[0]
+                } else {
+                    y = relu2(y)
+                }
             }
         }
         y = gather(fc2, y)
@@ -1545,6 +1543,16 @@ private func nemotronWarmUpPrefillKernels(
                     [xw, ww, sw, sw, tw, 64, 64],
                     template: [("T", dtype), ("GS", 64), ("BITS", 4), ("BM", bm), ("BN", 64), ("BK", 64),
                                ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", relu2)],
+                    grid: (128, 4, 1), threadGroup: (128, 1, 1),
+                    outputShapes: [[rows, 1, 64]], outputDTypes: [dtype])[0])
+            }
+            if dtype == .bfloat16 {
+                let original = MLXArray.zeros([2, 1, 64], dtype: dtype)
+                let order = MLXArray((0..<max(8, rows)).map { UInt32($0 % rows) })
+                arrays.append(NemotronHRunGatherKernel.shared.mappedUp(
+                    [original, ww, sw, sw, tw, 64, 64, order, k],
+                    template: [("T", dtype), ("GS", 64), ("BITS", 4), ("BM", bm), ("BN", 64), ("BK", 64),
+                               ("ALIGN_N", true), ("ALIGN_K", true)],
                     grid: (128, 4, 1), threadGroup: (128, 1, 1),
                     outputShapes: [[rows, 1, 64]], outputDTypes: [dtype])[0])
             }
@@ -1872,6 +1880,34 @@ struct BaseNAXFrag {
     }
   }
 
+  template <bool SAFE, typename T, typename OffX = Int<0>, typename OffY = Int<0>>
+  METAL_FUNC static constexpr void load_mapped(
+      thread dtype_frag_t<T>& dst,
+      const device T* src,
+      const device uint32_t* order,
+      const int row0,
+      const int ld,
+      const int top_k,
+      const short2 limits,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    const short2 sc = get_coord();
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const int r = int(sc.y) + int(off_x) + int(i) * kElemRowsJump;
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        const int c = int(sc.x) + int(off_y) + int(j);
+        if (!SAFE || (r < limits.y && c < limits.x)) {
+          const uint32_t token = order[row0 + r] / uint32_t(top_k);
+          dst[i * kElemCols + j] = static_cast<T>(src[size_t(token) * ld + c]);
+        } else {
+          dst[i * kElemCols + j] = T(0);
+        }
+      }
+    }
+  }
+
   // Narrow exactly as the ordinary store, then apply the typed activation.
   template <bool RELU2, typename U, typename T>
   METAL_FUNC static constexpr U store_value(T value) {
@@ -2138,6 +2174,23 @@ struct NAXTile {
             Int<1>{},
             idx_row * Int<kFragRows>{},
             idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <bool SAFE, typename U>
+  METAL_FUNC void load_mapped(
+      const device U* src,
+      const device uint32_t* order,
+      const int row0,
+      const int ld,
+      const int top_k,
+      const short2 limits) thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::template load_mapped<SAFE>(
+            frag_at<idx_row.value, idx_col.value>(), src, order, row0, ld, top_k, limits,
+            idx_row * Int<kFragRows>{}, idx_col * Int<kFragCols>{});
       });
     });
   }
@@ -2529,7 +2582,8 @@ template <
     int WN,
     bool align_N,
     bool align_K,
-    bool RELU2>
+    bool RELU2,
+    bool MAPPED_INPUT = false>
 METAL_FUNC void nemotron_gather_qmm_runs_impl(
     const device T* x,
     const device uint32_t* w,
@@ -2542,7 +2596,10 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
     threadgroup T* Ws,
     uint3 tid,
     uint simd_group_id,
-    uint simd_lane_id) {
+    uint simd_lane_id,
+    const device uint32_t* order = nullptr,
+    const int top_k = 1) {
+  static_assert(!MAPPED_INPUT || align_K, "Mapped input requires aligned K");
   const int tile_rows = tiles[tid.y * 3 + 1];
   if (tile_rows <= 0) {
     return;
@@ -2580,7 +2637,9 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
   const short2 tile_w = short2(k_remain, tgp_bn);
 
   auto wl = (const device uint8_t*)w;
-  x += size_t(row0) * K;
+  if constexpr (!MAPPED_INPUT) {
+    x += size_t(row0) * K;
+  }
   y += size_t(row0) * N + y_col_long;
   wl += y_col_long * K_w;
   scales += y_col_long * K_g;
@@ -2618,7 +2677,7 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
   NAXTile<AccumType, TM, TN> Dtile;
   Dtile.clear();
 
-  const device T* xn = x + tm * K;
+  const device T* xn = MAPPED_INPUT ? x : x + tm * K;
 
   thread loader_w_t loader_w(
       wl + index * stride_w,
@@ -2649,7 +2708,10 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
 
             volatile int compiler_barrier;
 
-            if constexpr (kAlignedM.value) {
+            if constexpr (MAPPED_INPUT) {
+              Atile.template load_mapped<!kAlignedM.value>(
+                  xn + kk1, order, row0 + tm, K, top_k, short2(SK, sgp_sm));
+            } else if constexpr (kAlignedM.value) {
               Atile.load(xn + kk1, K);
             } else {
               Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
@@ -2726,6 +2788,7 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
 private final class NemotronHRunGatherKernel: Sendable {
     static let shared = NemotronHRunGatherKernel()
     let kernel: MLXFast.MLXFastKernel
+    let mappedUp: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_gather_qmm_runs",
@@ -2738,6 +2801,19 @@ private final class NemotronHRunGatherKernel: Sendable {
                     threadgroup_position_in_grid,
                     simdgroup_index_in_threadgroup,
                     thread_index_in_simdgroup);
+            """,
+            header: nemotronRunGatherHeader)
+        mappedUp = MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_mapped_up",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K", "order", "topK"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, true, true>(
+                    x, w, scales, biases, tiles, y, N, K, Ws,
+                    threadgroup_position_in_grid,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup, order, topK);
             """,
             header: nemotronRunGatherHeader)
     }
@@ -2771,6 +2847,36 @@ func nemotronRunGather(
         [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k],
         template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
                    ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", relu2)],
+        grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+        outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+}
+
+/// Same sorted BF16 up rows, loaded from original token rows without the R*K gather.
+func nemotronRunGatherMappedUp(
+    _ x: MLXArray, _ lin: QuantizedSwitchLinear, order: MLXArray,
+    expertsPerToken: Int, tiles: NemotronHRunTiles
+) -> MLXArray? {
+    guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
+          x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
+          MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+          order.ndim == 1, order.dtype == .uint32, order.size < (1 << 24),
+          (1...8).contains(expertsPerToken), order.size % expertsPerToken == 0,
+          x.dim(0) == order.size / expertsPerToken
+    else { return nil }
+    let ops = lin.nemotronGatherOperands(for: x.dtype)
+    guard !ops.hasLinearBias, let biases = ops.biases, ops.weight.dtype == .uint32,
+          ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
+    else { return nil }
+    let n = order.size, k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
+    guard n == tiles.rows, n >= 16, n / experts >= 4,
+          tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
+          ops.weight.dim(2) * 8 == k, k % 64 == 0,
+          ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
+    else { return nil }
+    return NemotronHRunGatherKernel.shared.mappedUp(
+        [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k, order, expertsPerToken],
+        template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
+                   ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", true)],
         grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
         outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
 }
@@ -2907,7 +3013,7 @@ private class NemotronHBlock: Module {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
             output = (mixer as! NemotronHAttention).cbv2Forward(
-                hidden, cache: attentionCache, captureMTP: captureMTP, targetQKV: true)
+                hidden, cache: attentionCache, captureMTP: captureMTP)
         case .mlp:
             precondition(
                 attentionCache == nil,
