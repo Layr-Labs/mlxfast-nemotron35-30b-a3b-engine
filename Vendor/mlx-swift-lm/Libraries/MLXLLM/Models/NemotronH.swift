@@ -663,7 +663,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     func packedConv(_ oldState: MLXArray, _ input: MLXArray)
         -> (convolution: MLXArray, padded: MLXArray) {
         guard convKernelSize == 4, oldState.shape == [1, 3, convDim],
-            input.ndim == 3, input.dim(0) == 1, (1...8).contains(input.dim(1)),
+            input.ndim == 3, input.dim(0) == 1,
+            (1...8).contains(input.dim(1)) || (NemotronHPrefillWidth.conv && input.dim(1) > 8),
             input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
             conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
             conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
@@ -1017,6 +1018,13 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
 
 // MARK: - MoE Gate
 
+enum NemotronHPrefillWidth {
+    static let conv =
+        ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FUSED_CONV"] != "0"
+    static let router =
+        ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FUSED_ROUTER"] != "0"
+}
+
 enum NemotronHRouterSelection {
     static let sigmoidHeader = """
         inline float nemotron_h_router_sigmoid(float x) {
@@ -1089,7 +1097,8 @@ enum NemotronHRouterSelection {
         routedScalingFactor: Float, normTopkProb: Bool
     ) -> (MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-            gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
+            gates.ndim == 3, gates.dim(0) == 1,
+            (1...8).contains(gates.dim(1)) || (NemotronHPrefillWidth.router && gates.dim(1) > 8),
             gates.dim(2) == 128, gates.dtype == .bfloat16,
             eSCB.shape == [128], eSCB.dtype == .float32,
             topK == 6, nGroup == 1, topkGroup == 1,

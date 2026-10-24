@@ -78,6 +78,9 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMultiRowQMV.warmNarrow()
+        for attention in assistant.module.layers.compactMap({ $0 as? NemotronH35MTPAttentionBlock }) {
+            attention.warmAttentionOutputAdding()
+        }
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
