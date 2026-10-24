@@ -4,9 +4,9 @@ import MLXLMCommon
 import MLXNN
 
 extension NemotronHMLP {
-    func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
+    func mtpForwardRows(_ x: MLXArray) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
-        let activated = nemotronMTPLinearRelu2Rows(x, upProj, prepared: prepared)
+        let activated = nemotronMTPLinearRelu2Rows(x, upProj)
         return nemotronMTPLinearRows(activated, downProj)
     }
 }
@@ -16,17 +16,16 @@ extension NemotronHMLP {
 final class NemotronH35MTPGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
-        let usesPrepared: Bool
-        let function: @Sendable ([MLXArray]) -> [MLXArray]
+        let function: @Sendable (MLXArray) -> MLXArray
     }
     private let lock = NSLock()
-    private var entries: [Bool: Entry] = [:]
+    private var entry: Entry?
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
     var callCount: Int { lock.withLock { calls } }
 
-    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, owner: NemotronHMoE) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, owner: NemotronHMoE) -> MLXArray {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
         // child identity cheaply, and collect array handles only on a miss.
@@ -35,27 +34,24 @@ final class NemotronH35MTPGraphCache {
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
-        let usesPrepared = prepared != nil
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
-            if let entry = entries[usesPrepared], entry.identity == identity { return entry }
+            if let entry, entry.identity == identity { return entry }
             let state = parameters ?? owner.innerState()
-            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
+            let function: @Sendable (MLXArray) -> MLXArray = compile(inputs: [state]) { [weak owner] x in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
-                return [owner.mtpForwardRowsUncompiled(arrays[0],
-                    prepared: usesPrepared ? arrays[1] : nil)]
+                return owner.mtpForwardRowsUncompiled(x)
             }
-            let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
-            retired = entries[usesPrepared]
-            entries[usesPrepared] = replacement
+            let replacement = Entry(identity: identity, function: function)
+            retired = entry
+            entry = replacement
             generations += 1
             return replacement
         }
         // Destroy retired compiler entries outside this helper's lock; compiler
         // evaluation owns a separate global/per-function lock ordering.
-        let result = withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
-        return result.isEmpty ? MLXArray(0) : result[0]
+        return withExtendedLifetime(retired) { current.function(x) }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
@@ -81,26 +77,16 @@ final class NemotronH35MTPGraphCache {
 }
 
 extension NemotronHMoE {
-    func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
+    func mtpForwardRows(_ x: MLXArray) -> MLXArray {
         if NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
             x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) {
-            return mtpCompiledRowsCache(x, prepared: prepared, owner: self)
+            return mtpCompiledRowsCache(x, owner: self)
         }
-        return mtpForwardRowsUncompiled(x, prepared: prepared)
+        return mtpForwardRowsUncompiled(x)
     }
 
-    func mtpForwardRowsUncompiled(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
+    func mtpForwardRowsUncompiled(_ x: MLXArray) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
-        let packed: MLXArray?
-        if NemotronHResidualRMSNorm.preparedMoEEnabled, NemotronMoELeader.enabled,
-           Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-           NemotronMoELeader.preparedGateUp, x.shape == [1, 3, 2688], x.dtype == .bfloat16 {
-            // Share one dynamic operand buffer with both routed and shared up.
-            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
-                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
-        } else {
-            packed = nil
-        }
         // Router matmul retains M=1. Gathered experts already have M=1 per
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
@@ -116,13 +102,13 @@ extension NemotronHMoE {
         }
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed) {
+            x, indices, scores, switchMLP) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
-        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x, prepared: packed) }
+        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x) }
         return y
     }
 }
@@ -214,46 +200,6 @@ inline T nml_store(float v) {
   return m * m;
 }
 """
-
-private let nemotronMoELeaderPreparedHeader = """
-template <typename U, int values_per_thread>
-inline U nml_prepared_vector(const device float* p, thread U* x_thread) {
-  for (int i = 0; i < values_per_thread; i++) {
-    x_thread[i] = p[i * 32];
-  }
-  return p[values_per_thread * 32];
-}
-
-template <typename U, int values_per_thread>
-inline U nml_prepared_vector_safe(const device float* p, thread U* x_thread, int N) {
-  for (int i = 0; i < N; i++) {
-    x_thread[i] = p[i * 32];
-  }
-  for (int i = N; i < values_per_thread; i++) {
-    x_thread[i] = 0;
-  }
-  return p[values_per_thread * 32];
-}
-"""
-
-private func nmlPreparedSource(_ source: String, pointers: [(String, String)]) -> String? {
-    var s = source
-    for (from, to) in pointers {
-        guard s.contains(from) else { return nil }
-        s = s.replacingOccurrences(of: from, with: to)
-    }
-    for (from, to) in [
-        ("nml_load_vector_safe<T, U, values_per_thread>(", "nml_prepared_vector_safe<U, values_per_thread>("),
-        ("nml_load_vector<T, U, values_per_thread>(", "nml_prepared_vector<U, values_per_thread>("),
-        ("x0 += block_size;", "x0 += PSTRIDE;"),
-        ("x1 += block_size;", "x1 += PSTRIDE;"),
-    ] {
-        s = s.replacingOccurrences(of: from, with: to)
-    }
-    guard !s.contains("nml_load_vector"), !s.contains("block_size;\n"),
-          !s.contains(" x + ") else { return nil }
-    return "  constexpr int PSTRIDE = 9 * 32;\n  constexpr int PTILES = (K / 8 + 31) / 32;\n" + s
-}
 
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = RPS;
@@ -404,25 +350,6 @@ private final class NemotronMoELeaderKernel: Sendable {
             outputNames: ["y"],
             source: nemotronMoELeaderSource,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
-    }
-}
-
-private final class NemotronMoELeaderPreparedKernels: Sendable {
-    static let shared = NemotronMoELeaderPreparedKernels()
-    let gateUp: MLXFast.MLXFastKernel?
-    private init() {
-        let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
-        gateUp = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
-            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
-             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
-            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
-             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
-        ]).map {
-            MLXFast.metalKernel(
-                name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
-                inputNames: ["w", "scales", "biases", "prepared", "inds"],
-                outputNames: ["y"], source: $0, header: header)
-        }
     }
 }
 
@@ -608,12 +535,10 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
-    /// Exact winning98/E03 geometry; disable to retain four outputs per SIMD.
+    /// NEMOTRON_MTP_MOE_NARROW=0 keeps four outputs per SIMD group in the
+    /// gate/up leader walk at every width (fkiene e03d9f16).
     static let narrowLeader =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
-    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
-        narrowLeader && rows == 3 ? 2 : 4
-    }
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -648,24 +573,13 @@ enum NemotronMoELeader {
 
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
+    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
+        narrowLeader && rows == 3 ? 2 : 4
+    }
+
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
-                      bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil) -> MLXArray {
+                      bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
-        if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
-           let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
-            let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
-                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
-            return kernel(
-                [bank.weight, bank.scales, bank.biases, packed, inds],
-                template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
-                           ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                           ("RELU2", relu2), ("RPS", rps)],
-                grid: (32, bank.n / rps, rows * topK),
-                threadGroup: (32, 2, 1),
-                outputShapes: [[rows * topK, bank.n]],
-                outputDTypes: [x.dtype])[0]
-        }
         return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
@@ -677,7 +591,6 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
-    static let preparedGateUp = true
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -698,7 +611,7 @@ enum NemotronMoELeader {
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil
+        _ mlp: NemotronHSwitchMLP
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -720,11 +633,9 @@ enum NemotronMoELeader {
         let xr = x.reshaped(rows, 2688)
         let act: MLXArray
         if fuseRelu2 {
-            act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                relu2: true, prepared: prepared)
+            act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false, relu2: true)
         } else {
-            let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                prepared: prepared)
+            let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false)
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
@@ -910,7 +821,7 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
 """)
 private final class NMLBalancePlan: Sendable {
     static let shared = NMLBalancePlan()
-    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan",
+    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan_tg",
         inputNames: ["inds"], outputNames: ["plan"], source: nmlBalancePlanSource)
     func make(_ ids: MLXArray, pairCost: Int = 1500) -> MLXArray {
         kernel([ids], template: [("PAIR_COST",pairCost), ("SOLO_COST",1000)],

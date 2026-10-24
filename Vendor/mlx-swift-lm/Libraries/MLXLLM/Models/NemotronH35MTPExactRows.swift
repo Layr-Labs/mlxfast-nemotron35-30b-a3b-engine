@@ -392,7 +392,7 @@ private let nemotronHeadPreparedQMVSource = """
   }
 """
 
-enum NemotronHeadPreparedActivation {
+private enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
         outputNames: ["prepared"], source: nemotronHeadPrepareSource,
@@ -455,41 +455,14 @@ enum NemotronHeadPreparedActivation {
         eval(outputs)
     }
 
-    static func prepareContiguousRows(_ x: MLXArray, pv: Int) -> MLXArray {
-        let rows = x.dim(0), k = x.dim(1)
-        return prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
-            grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]],
-            outputDTypes: [.float32])[0]
-    }
-
-    /// x: [rows, K] BF16. The lane-coalesced FP32 buffer the prepared QMV reads.
-    static func pack(_ x: MLXArray) -> MLXArray {
-        let rows = x.dim(0), k = x.dim(1)
-        let pv = k % 512 == 0 ? 16 : 8
-        return prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
-            grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
-    }
-
-    static func compatible(_ prepared: MLXArray?, rows: Int, k: Int) -> MLXArray? {
-        let pv = k % 512 == 0 ? 16 : 8
-        guard let prepared, prepared.dtype == .float32,
-              prepared.shape == [rows, (k / pv + 31) / 32, (pv + 1) * 32]
-        else { return nil }
-        return prepared
-    }
-
-    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
-                      prepared: MLXArray? = nil) -> MLXArray {
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
-        let packed = compatible(prepared, rows: rows, k: k)
-            ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+        let packed = prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+            outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+        return project([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
             grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -538,7 +511,6 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
     static let narrowEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
-
     /// DARKBLOOM_BONSAI_R8B=0 keeps the MTP wo projection and residual add
     /// as two launches. Otherwise the fused route engages only after the
     /// load-time bit check below matches the two-launch route.
@@ -648,8 +620,7 @@ enum NemotronMultiRowQMV {
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.
     /// Width one is used by the exact BF16 ReLU2 epilogue, not a GEMM.
-    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false,
-                      prepared: MLXArray? = nil) -> MLXArray? {
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false) -> MLXArray? {
         guard enabled, x.ndim == 2, (1...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
@@ -660,8 +631,7 @@ enum NemotronMultiRowQMV {
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
         if narrowEnabled && x.dim(0) == 3 && n >= 2688 {
-            let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2,
-                rps: 2, prepared: prepared)
+            let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2, rps: 2)
             guard NemotronMoELeader.selfTest else { return y }
             return nemotronBitwiseOrNaN(y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 2))
         }
@@ -1010,14 +980,12 @@ enum NemotronMTPRouterRows {
 /// A singleton leading weight axis prevents MLX's flatten-to-M optimization
 /// and therefore avoids qmv_wide's different accumulation. The underlying
 /// matrix/scales/offset storage is shared; no weight bank is duplicated.
-func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear,
-                           prepared: MLXArray? = nil) -> MLXArray {
+func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     guard NemotronMTPExecution.batchedM1, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 1,
         let q = linear as? QuantizedLinear, q.mode == .affine,
         q.scales.dtype == x.dtype, let biases = q.biases, biases.dtype == x.dtype
     else { return nemotronMTPMapRows(x) { linear($0) } }
-    if let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q,
-        prepared: prepared) {
+    if let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q) {
         var result = rows.reshaped(1, x.dim(1), q.weight.dim(0))
         if let bias = q.bias { result = result + bias }
         return result
@@ -1032,12 +1000,10 @@ func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear,
 }
 
 // The epilogue must first round to BF16, exactly as the separate projection.
-func nemotronMTPLinearRelu2Rows(_ x: MLXArray, _ linear: Linear,
-                              prepared: MLXArray? = nil) -> MLXArray {
+func nemotronMTPLinearRelu2Rows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     if NemotronMTPExecution.batchedM1, x.ndim == 3, x.dim(0) == 1,
        x.dim(1) >= 1, let q = linear as? QuantizedLinear, q.bias == nil,
-       let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q,
-           relu2: true, prepared: prepared) {
+       let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q, relu2: true) {
         return rows.reshaped(1, x.dim(1), q.weight.dim(0))
     }
     let projected = nemotronMTPLinearRows(x, linear)
@@ -1048,10 +1014,7 @@ func nemotronMTPLinearRelu2Rows(_ x: MLXArray, _ linear: Linear,
 // Target Q/K/V share one dispatch; every tile keeps the existing row body.
 // A tile is one threadgroup of 2 * RPS output rows: Q tiles, then K, then V.
 enum NemotronTargetQKV {
-    /// NEMOTRON_MTP_QKV_ACTPREP=0 keeps the fused launch on BF16 activations.
-    static let preparedEnabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QKV_ACTPREP"] != "0"
-    private static let tilePrefix = """
+    private static let source = """
       constexpr uint q_tiles = 4096 / (2 * RPS);
       constexpr uint kv_tiles = 256 / (2 * RPS);
       const uint tile = threadgroup_position_in_grid.y;
@@ -1064,21 +1027,11 @@ enum NemotronTargetQKV {
         const device T* biases = tile < q_tiles ? qb : (tile < q_tiles + kv_tiles ? kb : vb);
         device T* y = tile < q_tiles ? qy : (tile < q_tiles + kv_tiles ? ky : vy);
         const int N = tile < q_tiles ? 4096 : 256;
-    """
+    """ + nemotronMultiRowQMVSource + "\n}"
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_target_qkv_affine4_gs64",
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
-        outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronMultiRowQMVSource + "\n}",
-        header: nemotronMultiRowQMVHeader)
-    // newjordan's f0513638 prepared-activation QMV body behind the same tile
-    // prefix: the three verify rows are packed once per launch instead of
-    // once per output tile. Each Q/K/V row keeps the body's lane split, block
-    // order, qdot, affine update, simd_sum and BF16 store.
-    private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_target_qkv_prepared_affine4_gs64",
-        inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
-        outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronHeadPreparedQMVSource + "\n}",
-        header: nemotronMultiRowQMVHeader)
+        outputNames: ["qy", "ky", "vy"], source: source, header: nemotronMultiRowQMVHeader)
 
     /// Outputs per SIMD group for the fused Q/K/V launch: narrow at R = 3
     /// and 4 (M1 Max: -9 % and -12 %; R = 1 +7 %). Same kill switch as
@@ -1097,12 +1050,9 @@ enum NemotronTargetQKV {
         return [q.weight, q.scales, offsets]
     }
 
-    private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
-                                 prepared: Bool = false) -> [MLXArray] {
+    private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int) -> [MLXArray] {
         let rows = x.dim(1)
-        let activations = prepared ? NemotronHeadPreparedActivation.pack(x.reshaped(rows, 2688)) : x
-        return (prepared ? preparedKernel : kernel)(
-            weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
+        return kernel(weights + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", rps)],
             grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
@@ -1121,8 +1071,7 @@ enum NemotronTargetQKV {
               let v = buffers(value, rows: 256)
         else { return nil }
         let rps = resultsPerSimdgroup(rows: x.dim(1))
-        let prepared = preparedEnabled && rps == 2 && x.dim(1) == 3
-        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared)
+        var outputs = dispatch(q + k + v, x, rps: rps)
         if rps != 4, NemotronMoELeader.selfTest {
             let expected = dispatch(q + k + v, x, rps: 4)
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
@@ -1137,14 +1086,9 @@ enum NemotronTargetQKV {
              MLXArray.zeros([n, 42], dtype: .bfloat16),
              MLXArray.zeros([n, 42], dtype: .bfloat16)]
         }
-        var outputs = [3, 4].flatMap { rows in
+        return [3, 4].flatMap { rows in
             dispatch(weights, MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), rps: 2)
         }
-        if preparedEnabled {
-            outputs += dispatch(weights, MLXArray.zeros([1, 3, 2688], dtype: .bfloat16),
-                                rps: 2, prepared: true)
-        }
-        return outputs
     }
 }
 

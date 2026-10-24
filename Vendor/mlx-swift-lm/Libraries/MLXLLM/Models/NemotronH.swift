@@ -54,7 +54,11 @@ private func relu2(_ x: MLXArray) -> MLXArray {
 // MARK: - Target residual and next block normalization
 
 enum NemotronHResidualRMSNorm {
-    private static let source = """
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_rms_bf16",
+        inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: """
             constexpr uint n_reads = 4;
             const uint gid = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -91,79 +95,7 @@ enum NemotronHResidualRMSNorm {
                 normalized[offset + i] = weight[lid * n_reads + i]
                     * static_cast<T>(thread_x[i] * local_inv_mean[0]);
             }
-            """
-
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_rms_bf16",
-        inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
-        outputNames: ["residual", "normalized"],
-        source: source, ensureRowContiguous: true)
-
-    static let preparedMoEEnabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_RMS_PREPARED_MOE"] != "0"
-
-    private static func preparedSource() -> String {
-        let scratch = "threadgroup float local_inv_mean[1];"
-        let store = "normalized[offset + i] = weight[lid * n_reads + i]"
-        let product = "* static_cast<T>(thread_x[i] * local_inv_mean[0]);"
-        precondition(source.components(separatedBy: scratch).count == 2)
-        precondition(source.components(separatedBy: store).count == 2)
-        precondition(source.components(separatedBy: product).count == 2)
-        let s = source.replacingOccurrences(of: scratch,
-            with: scratch + "\nthreadgroup T rounded[2688];")
-            .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
-            .replacingOccurrences(of: product, with: product
-                + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
-        return s + """
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 336) {
-                const int chunk = int(lid);
-                float values[8];
-                float total = 0;
-                for (int i = 0; i < 8; i += 4) {
-                    total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
-                        + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
-                    values[i] = rounded[chunk * 8 + i];
-                    values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
-                    values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
-                    values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
-                }
-                const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
-                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
-                prepared[base + 8 * 32] = total;
-            }
-            """
-    }
-    private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_rms_prepared_moe_bf16",
-        inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
-        outputNames: ["residual", "normalized", "prepared"],
-        source: preparedSource(), ensureRowContiguous: true)
-
-    static func applyPrepared(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
-        -> (MLXArray, MLXArray, MLXArray)?
-    {
-        guard preparedMoEEnabled, NemotronMTPExecution.batchedM1,
-            NemotronMTPExecution.batchedNorm, NemotronMoELeader.enabled,
-            NemotronMoELeader.preparedGateUp,
-            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-            lhs.shape == [1, 3, 2688], rhs.shape == lhs.shape,
-            lhs.dtype == .bfloat16, rhs.dtype == .bfloat16,
-            type(of: norm) == RMSNorm.self,
-            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
-        else { return nil }
-        let outputs = preparedKernel([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
-            template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
-            outputDTypes: [.bfloat16, .bfloat16, .float32])
-        if NemotronMoELeader.selfTest, let expected = apply(lhs, rhs, norm: norm) {
-            return (nemotronBitwiseOrNaN(outputs[0], expected.0),
-                    nemotronBitwiseOrNaN(outputs[1], expected.1), outputs[2])
-        }
-        return (outputs[0], outputs[1], outputs[2])
-    }
+            """, ensureRowContiguous: true)
 
     static func apply(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
@@ -185,7 +117,11 @@ enum NemotronHResidualRMSNorm {
 // MARK: - MambaRMSNormGated
 
 private enum NemotronHGatedRMSKernel {
-    private static let source = """
+    nonisolated(unsafe) static let identity = MLXArray(1).asType(.bfloat16)
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
+        source: """
             uint gid = threadgroup_position_in_grid.x;
             uint lid = thread_position_in_threadgroup.x;
             uint simd_lane_id = thread_index_in_simdgroup;
@@ -230,46 +166,7 @@ private enum NemotronHGatedRMSKernel {
                 T weighted = weight[f * weight_strides[0]] * unweighted;
                 out[row * int64_t(x_shape[2]) + f] = weighted;
             }
-            """
-
-    nonisolated(unsafe) static let identity = MLXArray(1).asType(.bfloat16)
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_h_gated_rms",
-        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
-        source: source, ensureRowContiguous: false)
-    private static func preparedSource() -> String {
-        let scratch = "threadgroup float local_inv_mean[1];"
-        let store = "out[row * int64_t(x_shape[2]) + f] = weighted;"
-        precondition(source.components(separatedBy: scratch).count == 2)
-        precondition(source.components(separatedBy: store).count == 2)
-        return source.replacingOccurrences(of: scratch,
-            with: scratch + "\nthreadgroup T rounded[512];")
-            .replacingOccurrences(of: store, with: store + "\nrounded[lid * 4 + i] = weighted;")
-            + """
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 32) {
-                float values[16];
-                float total = 0;
-                for (int i = 0; i < 16; i += 4) {
-                    total += float(rounded[lid * 16 + i]) + float(rounded[lid * 16 + i + 1])
-                        + float(rounded[lid * 16 + i + 2]) + float(rounded[lid * 16 + i + 3]);
-                    values[i] = rounded[lid * 16 + i];
-                    values[i + 1] = rounded[lid * 16 + i + 1] / 16.0f;
-                    values[i + 2] = rounded[lid * 16 + i + 2] / 256.0f;
-                    values[i + 3] = rounded[lid * 16 + i + 3] / 4096.0f;
-                }
-                const int base = int(gid) * 17 * 32 + int(lid);
-                for (int i = 0; i < 16; i++) prepared[base + i * 32] = values[i];
-                prepared[base + 16 * 32] = total;
-            }
-            """
-    }
-    static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_gated_rms_prepared_output",
-        inputNames: ["x", "gate", "weight", "identity", "eps"],
-        outputNames: ["out", "prepared"], source: preparedSource(), ensureRowContiguous: false)
-
+            """, ensureRowContiguous: false)
 }
 
 class NemotronHRMSNormGated: Module {
@@ -282,30 +179,6 @@ class NemotronHRMSNormGated: Module {
         self.groupSize = groupSize
         self._weight.wrappedValue = MLXArray.ones([dimensions])
         super.init()
-    }
-
-    private static let preparedOutputEnabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_OUT"] != "0"
-
-    /// Native compact verify only. The original BF16 gate/norm/identity/weight
-    /// boundaries remain; preparation reads the final rounded BF16 values.
-    func preparedRows(_ x: MLXArray, gate: MLXArray) -> (MLXArray, MLXArray)? {
-        guard Self.preparedOutputEnabled, NemotronMTPExecution.batchedNorm,
-              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
-              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              type(of: self) == NemotronHRMSNormGated.self,
-              groupSize == 512, x.shape == [1, 3, 4096], gate.shape == x.shape,
-              weight.shape == [4096], x.dtype == .bfloat16,
-              gate.dtype == .bfloat16, weight.dtype == .bfloat16
-        else { return nil }
-        let outputs = NemotronHGatedRMSKernel.preparedKernel(
-            [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
-            template: [("T", DType.bfloat16)],
-            grid: (128 * 3 * 8, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: [x.shape, [3, 8, 17 * 32]], outputDTypes: [.bfloat16, .float32])
-        let normalized = NemotronMoELeader.selfTest
-            ? nemotronBitwiseOrNaN(outputs[0], callAsFunction(x, gate: gate)) : outputs[0]
-        return (normalized, outputs[1])
     }
 
     func callAsFunction(_ x: MLXArray, gate: MLXArray?) -> MLXArray {
@@ -3079,10 +2952,8 @@ private class NemotronHBlock: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
         preparedNorm: MLXArray? = nil,
-        preparedActivation: MLXArray? = nil,
-        nextNorm: RMSNorm? = nil,
-        nextPreparedMoE: Bool = false
-    ) -> (MLXArray, MLXArray?, MLXArray?) {
+        nextNorm: RMSNorm? = nil
+    ) -> (MLXArray, MLXArray?) {
         let hidden = preparedNorm
             ?? (captureMTP ? nemotronMTPNormRows(x) { norm($0) } : norm(x))
         let output: MLXArray
@@ -3112,17 +2983,12 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            output = captureMTP
-                ? moe.mtpForwardRows(hidden, prepared: preparedActivation) : moe(hidden)
-        }
-        if nextPreparedMoE, let nextNorm,
-           let triple = NemotronHResidualRMSNorm.applyPrepared(x, output, norm: nextNorm) {
-            return (triple.0, triple.1, triple.2)
+            output = captureMTP ? moe.mtpForwardRows(hidden) : moe(hidden)
         }
         if let nextNorm, let pair = NemotronHResidualRMSNorm.apply(x, output, norm: nextNorm) {
-            return (pair.0, pair.1, nil)
+            return (pair.0, pair.1)
         }
-        return (x + output, nil, nil)
+        return (x + output, nil)
     }
 }
 
@@ -3235,7 +3101,6 @@ private class NemotronHBackbone: Module {
         defer { observation?.end() }
         var hidden = embeddings(inputs)
         var preparedNorm: MLXArray? = nil
-        var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -3261,13 +3126,9 @@ private class NemotronHBackbone: Module {
                 recurrentState: recurrentState,
                 captureMTP: captureMTP,
                 preparedNorm: preparedNorm,
-                preparedActivation: preparedActivation,
-                nextNorm: nextNorm,
-                nextPreparedMoE: captureMTP && nextNorm != nil && next < layers.count
-                    && layers[next].blockType == .moe)
+                nextNorm: nextNorm)
             hidden = result.0
             preparedNorm = result.1
-            preparedActivation = result.2
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
@@ -3287,6 +3148,22 @@ private class NemotronHBackbone: Module {
     }
 }
 
+/// Holds one model's probed Mamba activation dtypes. Input-independent: the
+/// probe reads loaded parameter types only, never request tokens or state.
+private final class NemotronHActivationDTypeMemo: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved: [Int: DType]?
+
+    func value(_ resolve: () -> [Int: DType]) -> [Int: DType] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved { return resolved }
+        let value = resolve()
+        resolved = value
+        return value
+    }
+}
+
 // MARK: - Main Model (matches Python's Model class)
 
 public class NemotronHModel:
@@ -3297,6 +3174,7 @@ public class NemotronHModel:
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
+    private let recurrentActivationDTypes = NemotronHActivationDTypeMemo()
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -3372,12 +3250,19 @@ public class NemotronHModel:
         }
     }
 
+    /// The probe below depends only on loaded parameter types, which every
+    /// reader sees after load, so it runs once per model rather than once per
+    /// adapter (each engine build and each stepper).
+    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+        recurrentActivationDTypes.value { probeRecurrentActivationDTypes() }
+    }
+
     /// Resolve convolution-history widths from the loaded model itself.
     /// Quantized storage dtype is not the activation dtype, and retained
     /// fp32 parameters can promote later residuals. A lazy one-token graph
     /// through private caches exposes each Mamba layer's deterministic dtype
     /// without evaluating kernels or mutating request state.
-    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+    private func probeRecurrentActivationDTypes() -> [Int: DType] {
         let caches = newCache(parameters: nil)
         _ = backbone(
             MLXArray([0]).reshaped(1, 1),
@@ -3913,3 +3798,4 @@ public struct NemotronHConfiguration: Codable, Sendable {
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
 private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
+private let gauntletRedraw_a3ddc4a0_20261024T161719Z: Int = 0
