@@ -45,6 +45,11 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+/// Early asyncEval interval for the MTP verify/capture forward. Each early
+/// submit commits a command buffer and skips the next layer's fused norm, so
+/// the 52-layer verify graph uses a wider interval than prefill.
+let nemotronMTPVerifyEarlyEvalInterval = 8
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -3083,8 +3088,10 @@ private class NemotronHBackbone: Module {
                 cache = nil
             }
             let next = modelLayerIndex + 1
-            let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
-                && next % nemotronEarlyEvalInterval == 0
+            let earlyEvalInterval =
+                captureMTP ? nemotronMTPVerifyEarlyEvalInterval : nemotronEarlyEvalInterval
+            let submitsEarly = earlyEvalInterval > 0 && next < layers.count
+                && next % earlyEvalInterval == 0
             let nextNorm = next < layers.count && !submitsEarly
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
             let result = layer.cbv2Forward(
