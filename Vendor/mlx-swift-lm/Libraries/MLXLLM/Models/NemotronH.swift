@@ -1326,26 +1326,44 @@ private final class NemotronHPrefillKernels: Sendable {
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
-        // threads; thread (e, s) counts expert e in sub-range s, a serial
-        // exclusive scan over (e, s) gives each thread its first slot, and the
-        // second pass writes slots in ascending index order.
+        // threads; E workers per segment count each route once into a shared
+        // histogram. The original serial exclusive scan over (e, s) gives
+        // each scatter thread its first slot, preserving stable input order.
         countingSort = MLXFast.metalKernel(
             name: "nemotron_moe_counting_sort",
             inputNames: ["flat", "n", "tmax"], outputNames: ["order", "inv", "sorted", "tiles"],
             source: """
                 constexpr int S = THREADS / E;
                 threadgroup uint counts[THREADS];
+                threadgroup atomic_uint histogram[THREADS];
                 uint tid = thread_position_in_threadgroup.x;
                 uint e = tid / S;
                 uint s = tid % S;
                 int chunk = (n + S - 1) / S;
                 int lo = min(n, int(s) * chunk);
                 int hi = min(n, lo + chunk);
-                uint c = 0;
-                for (int i = lo; i < hi; ++i) {
-                    c += (flat[i] == e) ? 1u : 0u;
+                atomic_store_explicit(&histogram[tid], 0u, memory_order_relaxed);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Transpose only the count-phase work assignment: each of S
+                // input segments has E workers reading disjoint positions.
+                // The scatter below retains its original (expert, segment)
+                // assignment and increasing input order.
+                uint countSegment = tid / E;
+                uint countLane = tid % E;
+                int countLo = min(n, int(countSegment) * chunk);
+                int countHi = min(n, countLo + chunk);
+                for (int i = countLo + int(countLane); i < countHi; i += E) {
+                    uint expert = flat[i];
+                    if (expert < uint(E)) {
+                        atomic_fetch_add_explicit(
+                            &histogram[expert * S + countSegment], 1u, memory_order_relaxed);
+                    }
                 }
-                counts[tid] = c;
+                // All increments finish before any bin is loaded. The
+                // existing publication barrier then protects the plain uint
+                // counts consumed by the unchanged serial prefix scan.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                counts[tid] = atomic_load_explicit(&histogram[tid], memory_order_relaxed);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
                     uint acc = 0;
