@@ -75,9 +75,9 @@ final class NemotronH35MTPAttentionBlock: Module {
     /// Causal forward over several trusted (token, target hidden) rows at
     /// once, returning the projected K/V too. Projections use the multi-row
     /// exact qmv (per-row stock M=1 arithmetic); norms are row-local.
-    func pagedForwardRows(
+    func pagedAttentionInputs(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
-    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
+    ) -> (fused: MLXArray, merged: MLXArray, keys: MLXArray, values: MLXArray) {
         let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
@@ -91,7 +91,34 @@ final class NemotronH35MTPAttentionBlock: Module {
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+        return (fused, merged, keys, values)
+    }
+
+    func pagedForwardRows(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
+        let inputs = pagedAttentionInputs(hidden: hidden, embedding: embedding, cache: cache)
+        return (
+            inputs.fused + nemotronMTPLinearRows(inputs.merged, mixer.wo),
+            inputs.keys, inputs.values)
+    }
+
+    func appendTrustedKVRows(
+        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+    ) -> [MLXArray] {
+        let joined = concatenated([
+            nemotronMTPNormRows(embedding) { embeddingNorm($0) },
+            nemotronMTPNormRows(hidden) { hiddenNorm($0) },
+        ], axis: -1)
+        let x = nemotronMTPNormRows(nemotronMTPLinearRows(joined, projection)) { norm($0) }
+        let batch = x.dim(0), length = x.dim(1)
+        let keys = nemotronMTPLinearRows(x, mixer.wk)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        let values = nemotronMTPLinearRows(x, mixer.wv)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        return cache.appendTrusted(keys: keys, values: values)
     }
 }
 
@@ -225,6 +252,28 @@ final class NemotronH35MTPModule: Module {
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardRows(
+            hidden: hidden, embedding: embedding, cache: cache)
+    }
+
+    func pagedAttentionInputs(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (fused: MLXArray, merged: MLXArray, keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedAttentionInputs(
+            hidden: hidden, embedding: embedding, cache: cache)
+    }
+
+    func finishCommittedRow(fused: MLXArray, merged: MLXArray) -> MLXArray {
+        let attention = layers[0] as! NemotronH35MTPAttentionBlock
+        precondition(fused.ndim == 3 && fused.dim(0) == 1 && fused.dim(1) == 1)
+        precondition(merged.ndim == 3 && merged.dim(0) == 1 && merged.dim(1) == 1)
+        let projected = nemotronMTPLinearRows(merged, attention.mixer.wo)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(fused + projected)
+    }
+
+    func appendTrustedKVRows(
+        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+    ) -> [MLXArray] {
+        (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKVRows(
             hidden: hidden, embedding: embedding, cache: cache)
     }
 

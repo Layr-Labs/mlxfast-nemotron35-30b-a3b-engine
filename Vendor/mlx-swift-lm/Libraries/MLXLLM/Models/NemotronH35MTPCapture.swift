@@ -45,14 +45,35 @@ extension NemotronHMamba2Mixer {
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
-        let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
-        let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-            heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+        let convolution: MLXArray
+        let padded: MLXArray
+        let dt: MLXArray
+        let scanned: (output: MLXArray, finalState: MLXArray)
+        if let bias = conv1d.bias,
+            let fused = nemotronMTPSSMCompactFused(
+                oldState: convState, convInput: input, weight: conv1d.weight, bias: bias,
+                dtRaw: parts[2].reshaped(batch, length, numHeads), dtBias: dtBias,
+                dtMin: timeStepLimit.0, dtMax: timeStepLimit.1,
+                ALog: logA, D: skip, state: initialSSM,
+                heads: heads, headDim: dim, groups: groups, stateDim: state) {
+            convolution = fused.convolution
+            padded = fused.padded
+            dt = fused.dt
+            scanned = (fused.output, fused.finalState)
+        } else {
+            let packed = packedConv(convState, input)
+            convolution = packed.convolution
+            padded = packed.padded
+            dt = nemotronPrefillComputeDt(
+                parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+            scanned = nemotronMTPSSMCompact(
+                convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                heads: heads, headDim: dim, groups: groups, stateDim: state,
+                steps: length, writeOutput: true)
+        }
+        let result = scanned
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
@@ -197,6 +218,17 @@ extension NemotronH35Model {
                     state: state, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, steps: width - 1, writeOutput: false)
                 roots += [window.output, window.finalState, replay.finalState]
+                if let bias = mixer.conv1d.bias,
+                    let fused = nemotronMTPSSMCompactFused(
+                        oldState: MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+                        convInput: MLXArray.zeros([1, width, mixer.convDim], dtype: activationDType),
+                        weight: mixer.conv1d.weight, bias: bias,
+                        dtRaw: rawDt, dtBias: mixer.dtBias,
+                        dtMin: mixer.timeStepLimit.0, dtMax: mixer.timeStepLimit.1,
+                        ALog: mixer.aLog, D: mixer.D, state: state,
+                        heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
+                    roots += [fused.output, fused.finalState, fused.convolution, fused.padded, fused.dt]
+                }
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,
                     indices: [mixer.intermediateSize, mixer.intermediateSize + groups * stateDim],

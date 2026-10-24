@@ -109,7 +109,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
         /// Post-verify attention/KV only; finalize selects the one expert row.
-        var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
+        var speculation: (fused: MLXArray, merged: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
@@ -300,19 +300,30 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 asyncEval(primed)
                 s.roots = primed
             }
+            } else if kvOnlyHistory, !s.pendingTokens.isEmpty {
+            let ids = concatenated(s.pendingTokens, axis: 1)
+            let rows = concatenated(s.pendingHidden, axis: 1)
+            if ids.dim(1) >= 2 {
+                for start in stride(from: 0, to: ids.dim(1), by: 8) {
+                    let end = min(start + 8, ids.dim(1))
+                    s.roots += module.appendTrustedKVRows(
+                        hidden: rows[0..., start..<end, 0...],
+                        embedding: target.mtpEmbedding(ids[0..., start..<end]),
+                        cache: s.cache)
+                }
+            } else {
+                s.roots += module.appendTrustedKV(
+                    hidden: rows, embedding: target.mtpEmbedding(ids), cache: s.cache)
+            }
+            if !s.pendingTokens.isEmpty { asyncEval(s.roots) }
         } else {
             // Post-prefill accepted target rows retain one-token arithmetic.
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
                 for i in 0..<ids.dim(1) {
                     let hiddenRow = rows[0..., i..<(i + 1), 0...]
                     let embedding = target.mtpEmbedding(ids[0..., i..<(i + 1)])
-                    if kvOnlyHistory {
-                        s.roots += module.appendTrustedKV(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache)
-                    } else {
-                        s.roots.append(module.pagedForward(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache))
-                    }
+                    s.roots.append(module.pagedForward(
+                        hidden: hiddenRow, embedding: embedding, cache: s.cache))
                 }
             }
             // Start the trusted-history replay while the seed step is built.
@@ -341,7 +352,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // chained KV row even on full acceptance, then replay accepted inputs
         // using the verifier's true hidden states before the next round.
         let speculation = s.speculation.flatMap {
-            $0.attention.dim(1) == s.stagedInputCount + 1 && n < $0.attention.dim(1) ? $0 : nil
+            $0.fused.dim(1) == s.stagedInputCount + 1 && $0.merged.dim(1) == $0.fused.dim(1)
+                && n < $0.fused.dim(1) ? $0 : nil
         }
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
@@ -367,8 +379,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Build the ordinary one-token tail lazily. The existing prestage
         // submits it only when the engine has a continuing carry.
         s.nextFirstDraft = speculation.map { spec in
-            let out = module.finishPagedAttentionRow(
-                spec.attention[0..., n ..< (n + 1), 0...])
+            let out = module.finishCommittedRow(
+                fused: spec.fused[0..., n ..< (n + 1), 0...],
+                merged: spec.merged[0..., n ..< (n + 1), 0...])
             let ids = argMax(draftHead.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
             return (ids: ids, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
@@ -471,10 +484,10 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             cache.mtpSerializesRectangularAttention = false
             cache.mtpBatchesRectangularAttention = false
         }
-        let rows = module.pagedAttentionRows(
+        let rows = module.pagedAttentionInputs(
             hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
-        s.speculation = (attention: rows.output, keys: rows.keys, values: rows.values)
-        let roots = [rows.output] + s.cache.innerState()
+        s.speculation = (fused: rows.fused, merged: rows.merged, keys: rows.keys, values: rows.values)
+        let roots = [rows.fused, rows.merged] + s.cache.innerState()
         s.roots += roots
         asyncEval(roots)
     }

@@ -3367,7 +3367,10 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         // verify windows) keep every position.
         let length = hidden.dim(1)
         if hidden.dim(0) == 1, length > 128 {
-            let start = ((length - 1) / 64) * 64 - 64
+            let tile = 64
+            let last = ((length - 1) / tile) * tile
+            let rowsInLast = length - last
+            let start = rowsInLast > 32 ? last : last - tile
             return logits(hidden[0..., start..., 0...])
         }
         return logits(hidden)
