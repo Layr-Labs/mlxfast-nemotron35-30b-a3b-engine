@@ -91,6 +91,10 @@ final class NemotronH35MTPAttentionBlock: Module {
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        if let output = NemotronMultiRowQMV.applyAttentionOutputAdding(
+            merged, mixer.wo, residual: fused) {
+            return (output, keys, values)
+        }
         return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
     }
 }
