@@ -248,6 +248,198 @@ private let nemotronMultiRowQMVSource = """
   }
 """
 
+
+private let nemotronHeadPrepareSource = """
+  const int chunk = thread_position_in_grid.x;
+  const int row = thread_position_in_grid.y;
+  if (chunk >= K / PV) return;
+  float values[PV];
+  const float total = nmr_load_vector<T, float, PV>(x + row * K + chunk * PV, values);
+  const int tiles = (K / PV + 31) / 32;
+  const int base = (row * tiles + chunk / 32) * (PV + 1) * 32 + chunk % 32;
+  for (int i = 0; i < PV; i++) prepared[base + i * 32] = values[i];
+  prepared[base + PV * 32] = total;
+"""
+
+private let nemotronHeadPreparedQMVSource = """
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = RPS;
+  constexpr int packs_per_thread = FAST ? 2 : 1;
+  constexpr int pack_factor = 8;
+  constexpr int bytes_per_pack = 4;
+  constexpr int group_size = 64;
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  typedef float U;
+
+  const int in_vec_size = K;
+  const int out_vec_size = N;
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread U x_thread[R][values_per_thread];
+  thread U result[R][results_per_simdgroup];
+  for (int r = 0; r < R; r++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[r][row] = 0;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  const device T* sc = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bs = biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const int tiles = (in_vec_size / values_per_thread + 31) / 32;
+  device T* yp = y + out_row;
+
+  U sum[R];
+  int k = 0;
+  const int k_end = FAST ? in_vec_size : in_vec_size - block_size;
+  for (; k < k_end; k += block_size) {
+    for (int r = 0; r < R; r++) {
+      const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;
+      sum[r] = prepared[base + values_per_thread * 32];
+      for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = prepared[base + v * 32];
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = sc + row * in_vec_size_g;
+      const device T* bl = bs + row * in_vec_size_g;
+      U s = sl[0];
+      U b = bl[0];
+      // Decode packed integer coefficients once for all verification rows.
+      // Each row keeps its original i-order and affine accumulation.
+      thread U accum[R];
+      for (int r = 0; r < R; r++) accum[r] = 0;
+      const device uint16_t* words = (const device uint16_t*)wl;
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const U a = words[i] & 0x000f;
+        const U b1 = words[i] & 0x00f0;
+        const U c = words[i] & 0x0f00;
+        const U d = words[i] & 0xf000;
+        for (int r = 0; r < R; r++) {
+          accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+              + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+        }
+      }
+      for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    sc += block_size / group_size;
+    bs += block_size / group_size;
+
+  }
+  if (!FAST) {
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+        0,
+        values_per_thread);
+    if (remaining > 0) {
+      for (int r = 0; r < R; r++) {
+        const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;
+        sum[r] = prepared[base + values_per_thread * 32];
+        for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = v < remaining ? prepared[base + v * 32] : 0;
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T* sl = sc + row * in_vec_size_g;
+        const device T* bl = bs + row * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        // Decode packed integer coefficients once for all verification rows.
+        // Each row keeps its original i-order and affine accumulation.
+        thread U accum[R];
+        for (int r = 0; r < R; r++) accum[r] = 0;
+        const device uint16_t* words = (const device uint16_t*)wl;
+        for (int i = 0; i < remaining / 4; i++) {
+          const U a = words[i] & 0x000f;
+          const U b1 = words[i] & 0x00f0;
+          const U c = words[i] & 0x0f00;
+          const U d = words[i] & 0xf000;
+          for (int r = 0; r < R; r++) {
+            accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+                + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+          }
+        }
+        for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
+      }
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
+      }
+    }
+  }
+"""
+
+private enum NemotronHeadPreparedActivation {
+    static let prepare = MLXFast.metalKernel(
+        name: "nemotron_head_prepare_activation", inputNames: ["x"],
+        outputNames: ["prepared"], source: nemotronHeadPrepareSource,
+        header: nemotronMultiRowQMVHeader)
+    static let project = MLXFast.metalKernel(
+        name: "nemotron_head_prepared_qmv", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+        outputNames: ["y"], source: nemotronHeadPreparedQMVSource,
+        header: nemotronMultiRowQMVHeader)
+    // JIT each actual prepare K specialization and the two exact QMV
+    // epilogues before timed verification. N is a scalar, so eight rows of
+    // dummy weights cover the same project pipelines as the full matrices.
+    static func warm() {
+        var outputs: [MLXArray] = []
+        for k in [2688, 3712, 4096, 5376] {
+            let pv = k % 512 == 0 ? 16 : 8
+            let x = MLXArray.zeros([3, k], dtype: .bfloat16)
+            let w = MLXArray.zeros([8, k / 8], dtype: .uint32)
+            let s = MLXArray.zeros([8, k / 64], dtype: .bfloat16)
+            let packed = prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+                grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+            let args = NemotronMultiRowQMV.scalarPair(k, 8)
+            for relu2 in [false, true] {
+                outputs.append(project([w, s, s, packed[0], args.0, args.1],
+                    template: [("T", x.dtype), ("R", 3), ("FAST", k % 512 == 0),
+                               ("RELU2", relu2), ("RPS", 2)],
+                    grid: (32, 4, 1), threadGroup: (32, 2, 1),
+                    outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
+            }
+        }
+        eval(outputs)
+    }
+
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int) -> MLXArray {
+        let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        let pv = k % 512 == 0 ? 16 : 8
+        let packed = prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+            grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        return project([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+    }
+}
+
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
@@ -331,6 +523,11 @@ enum NemotronMultiRowQMV {
         let k = x.dim(1), n = q.weight.dim(0)
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
+        if narrowEnabled && x.dim(0) == 3 && n >= 2688 {
+            let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2, rps: 2)
+            guard NemotronMoELeader.selfTest else { return y }
+            return nemotronBitwiseOrNaN(y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 2))
+        }
         let rps = resultsPerSimdgroup(rows: x.dim(0), k: k, n: n)
         let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps)
         guard rps != 4, NemotronMoELeader.selfTest else { return y }
@@ -342,6 +539,7 @@ enum NemotronMultiRowQMV {
     /// timed window compiles one. Tiny dummy shapes; same template keys.
     static func warmNarrow() {
         guard enabled, narrowEnabled else { return }
+        NemotronHeadPreparedActivation.warm()
         var outputs: [MLXArray] = []
         for k in [512, 576] {
             let w = MLXArray.zeros([8, k / 8], dtype: .uint32)
