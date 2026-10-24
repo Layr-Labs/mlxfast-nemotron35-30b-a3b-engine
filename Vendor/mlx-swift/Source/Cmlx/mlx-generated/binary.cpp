@@ -1,3 +1,14 @@
+#include <cstdlib>
+
+namespace {
+
+[[maybe_unused]] const int commit_by_operation_count = [] {
+  setenv("MLX_MAX_MB_PER_BUFFER", "65536", 0);
+  return 0;
+}();
+
+}
+
 namespace mlx::core::metal {
 
 const char* binary() {

@@ -71,6 +71,9 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        // Target was bound and verified by the trusted target loader before
+        // this assistant loader receives it. No parameter is updated here.
+        nemotronPrepareZSkip(target)
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
@@ -264,6 +267,12 @@ extension NemotronH35MTPAssistant {
                 speculateAfterVerify(
                     targetTokens: packet[k ..< (k + width)].reshaped([1, width]),
                     targetHidden: verify.lastHidden, requestState: draftState)
+                // The device-picked first draft (gathered row, same tail) for
+                // the row this warm-up round confirms; finalize adopts it.
+                if CBv2MTPFirstDraftPrestage.deviceAccepted {
+                    speculateNextFirstDraft(
+                        acceptedDrafts: MLXArray([Int32(confirmed - 1)]), requestState: draftState)
+                }
             }
             let hostPacket = packet.asArray(Int32.self)
             _ = values.asArray(Float.self)
@@ -273,6 +282,7 @@ extension NemotronH35MTPAssistant {
                 if width > keep { row.rollback(width - keep) }
                 row.commitSpeculativeWrite()
             }
+            noteHostAcceptedDrafts(keep - 1, requestState: draftState)
             finalizeRound(
                 requestState: draftState, confirmedInputTokens: keep,
                 committedDraftTokens: window[0..., 1..<keep],
@@ -291,4 +301,75 @@ extension NemotronH35MTPAssistant {
         discardRound(requestState: draftState)
         Stream.gpu.synchronize()
     }
+}
+
+// Build only input-independent derived copies, after verified model loading and
+// before any stateless graph can capture a projection's implementation.
+private func nemotronPrepareZSkip(_ target: NemotronH35Model) {
+    guard NemotronZSkipBudget.enabled,
+          Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu else { return }
+    let start = ProcessInfo.processInfo.systemUptime
+    let budget = NemotronZSkipBudget()
+    // Published kernel GO v1: ONLY these actual backbone layers, weighted R=3.
+    // Fixed payoff order is independent of all prompts and activations.
+    let kernel: any NemotronZSkipKernel = NemotronZSkipQualifiedKernel(
+        provider: NemotronZSkipKMajorKernel(),
+        selected: [.routedWeighted: Set([3])], receiptVersion: "v1-layers1-3")
+    let selectedNames = ["backbone.layers.1.mixer", "backbone.layers.3.mixer"]
+    let available = Dictionary(uniqueKeysWithValues:
+        target.namedModules().filter { $0.1 is NemotronHMoE })
+    let modules: [(String, Module)] = selectedNames.compactMap { name in
+        guard let module = available[name] else {
+            NemotronZSkipBudget.log("FAIL layer=\(name) lookup; stock")
+            return nil
+        }
+        return (name, module)
+    }
+    var kept = 0
+    for (name, module) in modules {
+        guard let moe = module as? NemotronHMoE,
+              let bank = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+              bank.weight.shape == [128, 2688, 232],
+              bank.scales.shape == [128, 2688, 29], bank.biases.shape == bank.scales.shape
+        else { continue }
+        let mlp = moe.switchMLP
+        let stock = NemotronZSkipStock(weight: bank.weight, scales: bank.scales, biases: bank.biases,
+                                     k: bank.k, n: bank.n, experts: 128)
+        mlp.zskipDown = NemotronZSkipEntry.make(name: name, stock: stock, kernel: kernel, budget: budget) {
+            x, ids, scores, site, rows, topK in
+            switch site {
+            case .routedWeighted:
+                return NemotronMoELeader.applyWeighted(x, ids!, scores!, rows: rows, bank: bank)
+            case .routedLeader:
+                return NemotronMoELeader.apply(x, ids!, rows: rows, topK: topK, bank: bank, perSlot: true)
+            case .routedDraft:
+                return mlp.fc2(x.reshaped(1, rows, topK, 1, bank.k), ids!.reshaped(1, rows, topK),
+                               sortedIndices: false).reshaped(rows * topK, bank.n)
+            default: preconditionFailure("Unsupported routed ZSkip reference site")
+            }
+        }
+        if mlp.zskipDown != nil { kept += 1 }
+    }
+    // GO v1 has no qualified shared site: the selected provider rejects it
+    // before allocating any shared copy. The original path remains active.
+    for (name, module) in modules {
+        guard let moe = module as? NemotronHMoE, let shared = moe.sharedExperts,
+              let q = shared.downProj as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 464], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 58], q.scales.dtype == .bfloat16,
+              let biases = q.biases, biases.shape == q.scales.shape, biases.dtype == .bfloat16
+        else { continue }
+        let stock = NemotronZSkipStock(weight: q.weight, scales: q.scales, biases: biases,
+                                     k: 3712, n: 2688, experts: 1)
+        shared.zskipDown = NemotronZSkipEntry.make(name: name + ".shared", stock: stock,
+            kernel: kernel, budget: budget) { x, _, _, site, rows, _ in
+                if site == .sharedVerify {
+                    return nemotronMTPLinearRows(x.reshaped(1, rows, 3712), q).reshaped(rows, 2688)
+                }
+                return q(x.reshaped(1, rows, 3712)).reshaped(rows, 2688)
+            }
+    }
+    NemotronZSkipBudget.log("LOAD kernel=\(kernel.version) kept=\(kept) derived=\(budget.reserved) resident=\(budget.resident) margin=\(budget.margin) recommended=\(budget.recommended) added_seconds=\(ProcessInfo.processInfo.systemUptime - start) active=\(Memory.activeMemory) peak=\(Memory.peakMemory) wired_limit_mb=\(NemotronZSkipBudget.wiredLimitMB())")
+    Memory.clearCache()
 }
