@@ -131,8 +131,8 @@ extension NemotronHMoE {
 //
 // Stock verify runs one affine_gather_qmv threadgroup per (row, slot). Here the
 // first row that routed to an expert leads: it walks that expert's weights once
-// for itself and the next row that routed to it (runs capped at 2; a third
-// occurrence leads again). Later occurrences exit before any weight read. The
+// for itself and up to two later rows at width three. Other widths retain
+// pairs. Later occurrences exit before any weight read. The
 // leader keeps one accumulator, one K-loop order, one qdot and one closing
 // simd_sum per (output, row), copied from qmv_impl (K = 2688 / 1856 are not
 // multiples of 512, so stock dispatches gather_qmv, not gather_qmv_fast).
@@ -247,6 +247,7 @@ private func nmlPreparedSource(_ source: String, pointers: [(String, String)]) -
         ("nml_load_vector<T, U, values_per_thread>(", "nml_prepared_vector<U, values_per_thread>("),
         ("x0 += block_size;", "x0 += PSTRIDE;"),
         ("x1 += block_size;", "x1 += PSTRIDE;"),
+        ("x2 += block_size;", "x2 += PSTRIDE;"),
     ] {
         s = s.replacingOccurrences(of: from, with: to)
     }
@@ -277,13 +278,15 @@ private let nemotronMoELeaderSource = """
       before += inds[r * TOPK + j] == expert ? 1 : 0;
     }
   }
-  if ((before & 1) != 0) {
+  if ((R == 3 ? before : (before & 1)) != 0) {
     return;
   }
   int partner = -1;
+  int third = -1;
   for (int r = R - 1; r > row; r--) {
     for (int j = 0; j < TOPK; j++) {
       if (inds[r * TOPK + j] == expert) {
+        if (R == 3) { third = partner; }
         partner = r * TOPK + j;
       }
     }
@@ -337,6 +340,71 @@ private let nemotronMoELeaderSource = """
       result[r] = simd_sum(result[r]);
       if (simd_lid == 0) {
         y0[r] = nml_store<T, RELU2>(result[r]);
+      }
+    }
+  } else if (third >= 0) {
+    const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
+        simd_lid * values_per_thread;
+    const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +
+        simd_lid * values_per_thread;
+    device T* y1 = y + partner * N + out_row;
+    device T* y2 = y + third * N + out_row;
+    thread U x0_thread[values_per_thread];
+    thread U x1_thread[values_per_thread];
+    thread U x2_thread[values_per_thread];
+    thread U result0[results_per_simdgroup] = {0};
+    thread U result1[results_per_simdgroup] = {0};
+    thread U result2[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+        result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        result2[r] += nml_qdot<U, values_per_thread>(wl, x2_thread, s, b, sum2);
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+      x1 += block_size;
+      x2 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+      U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result0[r] += nml_qdot_safe<U, values_per_thread>(
+            wl, x0_thread, s, b, sum0, remaining);
+        result1[r] += nml_qdot_safe<U, values_per_thread>(
+            wl, x1_thread, s, b, sum1, remaining);
+        result2[r] += nml_qdot_safe<U, values_per_thread>(
+            wl, x2_thread, s, b, sum2, remaining);
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result0[r] = simd_sum(result0[r]);
+      result1[r] = simd_sum(result1[r]);
+      result2[r] = simd_sum(result2[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result0[r]);
+        y1[r] = nml_store<T, RELU2>(result1[r]);
+        y2[r] = nml_store<T, RELU2>(result2[r]);
       }
     }
   } else {
@@ -417,6 +485,8 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
             ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
              "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
         ]).map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
@@ -453,13 +523,15 @@ private let nemotronMoELeaderWeightedSource = """
         before += inds[r * TOPK + j] == expert ? 1 : 0;
       }
     }
-    if ((before & 1) != 0) {
+    if ((R == 3 ? before : (before & 1)) != 0) {
       continue;
     }
     int partner = -1;
+    int third = -1;
     for (int r = R - 1; r > row; r--) {
       for (int j = 0; j < TOPK; j++) {
         if (inds[r * TOPK + j] == expert) {
+          if (R == 3) { third = partner; }
           partner = r * TOPK + j;
         }
       }
@@ -512,6 +584,70 @@ private let nemotronMoELeaderWeightedSource = """
         if (simd_lid == 0) {
           const T h = nml_store<T, false>(result[r]);
           products[slot * results_per_simdgroup + r] = float(h) * scores[slot] + 0.0f;
+        }
+      }
+    } else if (third >= 0) {
+      const device T* x1 = x + partner * K + simd_lid * values_per_thread;
+      const device T* x2 = x + third * K + simd_lid * values_per_thread;
+      thread U x0_thread[values_per_thread];
+      thread U x1_thread[values_per_thread];
+      thread U x2_thread[values_per_thread];
+      thread U result0[results_per_simdgroup] = {0};
+      thread U result1[results_per_simdgroup] = {0};
+      thread U result2[results_per_simdgroup] = {0};
+      int k = 0;
+      for (; k < K - block_size; k += block_size) {
+        U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+        U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+        U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+        for (int r = 0; r < results_per_simdgroup; r++) {
+          auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+          const device T* sl = sc + r * in_vec_size_g;
+          const device T* bl = bs + r * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+          result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+          result2[r] += nml_qdot<U, values_per_thread>(wl, x2_thread, s, b, sum2);
+        }
+        ws += block_size / 2;
+        sc += block_size / 64;
+        bs += block_size / 64;
+        x0 += block_size;
+        x1 += block_size;
+        x2 += block_size;
+      }
+      const int remaining = clamp(
+          static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+      if (remaining > 0) {
+        U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+        U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+        U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+        for (int r = 0; r < results_per_simdgroup; r++) {
+          auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+          const device T* sl = sc + r * in_vec_size_g;
+          const device T* bl = bs + r * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          result0[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x0_thread, s, b, sum0, remaining);
+          result1[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x1_thread, s, b, sum1, remaining);
+          result2[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x2_thread, s, b, sum2, remaining);
+        }
+      }
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        result0[r] = simd_sum(result0[r]);
+        result1[r] = simd_sum(result1[r]);
+        result2[r] = simd_sum(result2[r]);
+        if (simd_lid == 0) {
+          const T h0 = nml_store<T, false>(result0[r]);
+          const T h1 = nml_store<T, false>(result1[r]);
+          const T h2 = nml_store<T, false>(result2[r]);
+          products[slot * results_per_simdgroup + r] = float(h0) * scores[slot] + 0.0f;
+          products[partner * results_per_simdgroup + r] = float(h1) * scores[partner] + 0.0f;
+          products[third * results_per_simdgroup + r] = float(h2) * scores[third] + 0.0f;
         }
       }
     } else {
@@ -569,7 +705,7 @@ private let nemotronMoELeaderWeightedSource = """
     }
   }
 
-  // Every original slot is written by its leader or by its one partner.
+  // Every original slot is written by its leader or by one of its partners.
   // All SIMD groups reach this barrier, including groups with no leader.
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid < R && simd_lid == 0) {
@@ -814,9 +950,10 @@ private let nmlBalancePlanSource = """
   const uint lane = thread_position_in_grid.x;
   threadgroup uint ids[18];
   threadgroup int lead[18];
+  threadgroup int third[18];
   threadgroup int leaders[18];
   threadgroup int costs[18];
-  threadgroup int tplan[36];
+  threadgroup int tplan[54];
   if (lane < 18) { ids[lane] = inds[lane]; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane < 18) {
@@ -827,27 +964,30 @@ private let nmlBalancePlanSource = """
     for (int r = 0; r < row; r++) {
       for (int j = 0; j < 6; j++) { before += ids[r*6+j] == expert ? 1 : 0; }
     }
-    int partner = -1;
+    int partner = -1, partner2 = -1;
     for (int r = 2; r > row; r--) {
       for (int j = 0; j < 6; j++) {
-        if (ids[r*6+j] == expert) { partner = r*6+j; }
+        if (ids[r*6+j] == expert) { partner2 = partner; partner = r*6+j; }
       }
     }
     // -2 marks a slot whose earlier occurrence leads it.
-    lead[slot] = (before & 1) != 0 ? -2 : partner;
+    lead[slot] = before != 0 ? -2 : partner;
+    third[slot] = partner2;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane == 0) {
     int counts[6] = {0}, loads[6] = {0}, original[6] = {0};
     int number = 0;
-    for (int i = 0; i < 36; i++) { tplan[i] = -1; }
+    for (int i = 0; i < 54; i++) { tplan[i] = -1; }
     for (int slot = 0; slot < 18; slot++) {
       const int partner = lead[slot];
       if (partner == -2) { continue; }
       leaders[number] = slot;
-      costs[number] = partner < 0 ? SOLO_COST : PAIR_COST;
+      costs[number] = partner < 0 ? SOLO_COST :
+          (third[slot] < 0 ? PAIR_COST : 2 * PAIR_COST - SOLO_COST);
       original[slot % 6] += costs[number];
       tplan[18+slot] = partner;
+      tplan[36+slot] = third[slot];
       number++;
     }
     // Stable largest-cost-first order; integer load, then group id break ties.
@@ -875,7 +1015,7 @@ private let nmlBalancePlanSource = """
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = lane; i < 36; i += 32) { plan[i] = tplan[i]; }
+  for (uint i = lane; i < 54; i += 32) { plan[i] = tplan[i]; }
 """
 private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacingOccurrences(
     of: """
@@ -888,13 +1028,15 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
         before += inds[r * TOPK + j] == expert ? 1 : 0;
       }
     }
-    if ((before & 1) != 0) {
+    if ((R == 3 ? before : (before & 1)) != 0) {
       continue;
     }
     int partner = -1;
+    int third = -1;
     for (int r = R - 1; r > row; r--) {
       for (int j = 0; j < TOPK; j++) {
         if (inds[r * TOPK + j] == expert) {
+          if (R == 3) { third = partner; }
           partner = r * TOPK + j;
         }
       }
@@ -906,6 +1048,7 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
     if (slot < 0) { continue; }
     const uint expert = inds[slot];
     const int partner = plan[18 + slot];
+    const int third = plan[36 + slot];
 
 """)
 private final class NMLBalancePlan: Sendable {
@@ -915,7 +1058,7 @@ private final class NMLBalancePlan: Sendable {
     func make(_ ids: MLXArray, pairCost: Int = 1500) -> MLXArray {
         kernel([ids], template: [("PAIR_COST",pairCost), ("SOLO_COST",1000)],
             grid: (32,1,1), threadGroup: (32,1,1),
-            outputShapes: [[36]], outputDTypes: [.int32])[0]
+            outputShapes: [[54]], outputDTypes: [.int32])[0]
     }
 }
 private final class NMLBalanceWeighted: Sendable {

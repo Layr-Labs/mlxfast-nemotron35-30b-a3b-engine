@@ -1417,7 +1417,7 @@ enum NemotronHeadScreen {
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        rowsPerSimdgroup: Int = 4, simdgroups: Int = 2
     ) -> Result {
         let scores = partialKernel(
             [weight, scales, biases, hidden, groups],
@@ -1426,7 +1426,7 @@ enum NemotronHeadScreen {
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32])[0]
         let chunks = rows / chunk
-        let selectGroups = 8
+        let selectGroups = 4
         let picked = selectKernel(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
