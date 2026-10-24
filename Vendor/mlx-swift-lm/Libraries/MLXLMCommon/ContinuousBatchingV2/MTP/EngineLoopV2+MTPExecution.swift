@@ -643,6 +643,10 @@ extension EngineLoopV2 {
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
+        if CBv2MTPPolicyPacket.enabled, let values = target.policyTopTwo?.values {
+            // Preserve float32 bits; a numeric cast would destroy margins.
+            packetParts.append(values.view(dtype: .int32).reshaped([-1]))
+        }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
