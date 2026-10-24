@@ -82,16 +82,43 @@ final class NemotronH35MTPAttentionBlock: Module {
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
         let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq)
+        // Reuse the accepted exact target-QKV operation for matching native
+        // assistant metadata. Cache writes and attention stay outside it.
+        let qkv: (MLXArray, MLXArray, MLXArray)
+        if ProcessInfo.processInfo.environment["NEMOTRON_MTP_ASSISTANT_FUSED_QKV"] != "0",
+           let projected = NemotronTargetQKV.apply(
+                x, query: mixer.wq, key: mixer.wk, value: mixer.wv, captureMTP: true) {
+            qkv = projected
+        } else {
+            qkv = (nemotronMTPLinearRows(x, mixer.wq),
+                   nemotronMTPLinearRows(x, mixer.wk),
+                   nemotronMTPLinearRows(x, mixer.wv))
+        }
+        let queries = qkv.0
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
+        let keys = qkv.1
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
+        let values = qkv.2
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        if let output = NemotronMultiRowQMV.applyAttentionOutputAdding(
+            merged, mixer.wo, residual: fused) {
+            return (output, keys, values)
+        }
         return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+    }
+
+    /// Populate only native R/template pipelines using loaded wo parameters.
+    /// All inputs are private throwaway arrays, outside request execution.
+    func warmAttentionOutputAdding() {
+        let outputs = (2...4).compactMap { rows in
+            NemotronMultiRowQMV.applyAttentionOutputAdding(
+                MLXArray.zeros([1, rows, 4096], dtype: .bfloat16), mixer.wo,
+                residual: MLXArray.zeros([1, rows, 2688], dtype: .bfloat16))
+        }
+        if !outputs.isEmpty { eval(outputs) }
     }
 }
 

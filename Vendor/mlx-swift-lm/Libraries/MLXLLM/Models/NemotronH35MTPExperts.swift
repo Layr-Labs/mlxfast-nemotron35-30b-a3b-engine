@@ -202,7 +202,7 @@ inline T nml_store(float v) {
 """
 
 private let nemotronMoELeaderSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -235,7 +235,7 @@ private let nemotronMoELeaderSource = """
     }
   }
 
-  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
@@ -535,6 +535,8 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
+    static let narrowLeader =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -567,16 +569,21 @@ enum NemotronMoELeader {
         return Bank(weight: weight, scales: scales, biases: biases, k: k, n: weight.dim(1))
     }
 
+    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
+        narrowLeader && rows == 3 ? 2 : 4
+    }
+
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
-        NemotronMoELeaderKernel.shared.kernel(
+        let rps = leaderResultsPerSimdgroup(rows: rows)
+        return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
-            grid: (32, bank.n / 4, rows * topK),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
