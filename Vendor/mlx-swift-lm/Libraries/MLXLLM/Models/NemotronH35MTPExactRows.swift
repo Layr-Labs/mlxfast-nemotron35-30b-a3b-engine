@@ -251,6 +251,7 @@ private let nemotronMultiRowQMVSource = """
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
+    let sharedDownAdding: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_multirow_qmv_affine4_gs64",
@@ -258,6 +259,16 @@ private final class NemotronMultiRowQMVKernel: Sendable {
             outputNames: ["y"],
             source: nemotronMultiRowQMVSource,
             header: nemotronMultiRowQMVHeader)
+        // Same qmv trace and BF16 narrowing; fold only the final typed add.
+        // The routed residual is the left operand, as in routed + shared.
+        let source = nemotronMultiRowQMVSource.replacingOccurrences(
+            of: "yp[r * out_vec_size + row] = h;",
+            with: "yp[r * out_vec_size + row] = residual[r * out_vec_size + out_row + row] + h;")
+        sharedDownAdding = MLXFast.metalKernel(
+            name: "nemotron_shared_down_qmv_add_affine4_gs64",
+            inputNames: ["residual", "w", "scales", "biases", "x", "K", "N"],
+            outputNames: ["y"], source: source,
+            header: nemotronMultiRowQMVHeader, ensureRowContiguous: true)
     }
 }
 
@@ -276,6 +287,41 @@ enum NemotronMultiRowQMV {
     }
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MULTIROW_QMV"] != "0"
+    static let sharedDownAdd =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_DOWN_ADD"] != "0"
+
+    // Metadata only. Native shared down is K3712 -> N2688, affine4/g64.
+    static func supportsSharedDownAdd(_ q: QuantizedLinear) -> Bool {
+        guard enabled, sharedDownAdd,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: q) == QuantizedLinear.self,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [2688, 464],
+              q.scales.dtype == .bfloat16, q.scales.shape == [2688, 58],
+              let biases = q.biases, biases.dtype == .bfloat16,
+              biases.shape == q.scales.shape else { return false }
+        return true
+    }
+
+    /// Both inputs are ordinary graph operands. Row-contiguous qualification
+    /// handles their strides; there is no alias or persistent request scratch.
+    static func applySharedDownAdding(
+        _ x: MLXArray, _ q: QuantizedLinear, residual: MLXArray
+    ) -> MLXArray? {
+        guard supportsSharedDownAdd(q), x.ndim == 2,
+              (1...4).contains(x.dim(0)), x.dim(1) == 3712, x.dtype == .bfloat16,
+              residual.shape == [x.dim(0), 2688], residual.dtype == x.dtype,
+              let biases = q.biases else { return nil }
+        let rows = x.dim(0)
+        let (k, n) = scalarPair(3712, 2688)
+        // Match routed + shared's input order. Scheduler overlap is still
+        // determined by MLX; the final qmv now depends on the routed result.
+        return NemotronMultiRowQMVKernel.shared.sharedDownAdding(
+            [residual, q.weight, q.scales, biases, x, k, n],
+            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false)],
+            grid: (32, 2688 / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, 2688]], outputDTypes: [x.dtype])[0]
+    }
 
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.

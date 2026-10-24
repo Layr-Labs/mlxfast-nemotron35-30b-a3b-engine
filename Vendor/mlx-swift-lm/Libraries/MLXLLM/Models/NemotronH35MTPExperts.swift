@@ -9,6 +9,28 @@ extension NemotronHMLP {
         let activated = nemotronMTPLinearRelu2Rows(x, upProj)
         return nemotronMTPLinearRows(activated, downProj)
     }
+
+    /// Native shared-expert down store: routed BF16 + rounded shared BF16.
+    /// Unsupported metadata keeps the caller's original separate add.
+    func mtpForwardRowsAdding(_ x: MLXArray, residual: MLXArray) -> MLXArray? {
+        guard NemotronMTPExecution.batchedM1, type(of: self) == NemotronHMLP.self,
+              x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
+              x.dim(2) == 2688, x.dtype == .bfloat16,
+              residual.shape == x.shape, residual.dtype == x.dtype,
+              let up = upProj as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+              up.mode == .affine, up.bits == 4, up.groupSize == 64, up.bias == nil,
+              up.weight.dtype == .uint32, up.weight.shape == [3712, 336],
+              up.scales.dtype == .bfloat16, up.scales.shape == [3712, 42],
+              let offsets = up.biases, offsets.dtype == .bfloat16,
+              offsets.shape == up.scales.shape,
+              let down = downProj as? QuantizedLinear,
+              NemotronMultiRowQMV.supportsSharedDownAdd(down) else { return nil }
+        let activated = nemotronMTPLinearRelu2Rows(x, upProj)
+        guard let result = NemotronMultiRowQMV.applySharedDownAdding(
+            activated.reshaped(x.dim(1), 3712), down,
+            residual: residual.reshaped(x.dim(1), 2688)) else { return nil }
+        return result.reshaped(1, x.dim(1), 2688)
+    }
 }
 
 /// Stateless graph cache only. Request KV, recurrent state, offsets and
@@ -108,7 +130,10 @@ extension NemotronHMoE {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
-        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x) }
+        if let sharedExperts {
+            if let fused = sharedExperts.mtpForwardRowsAdding(x, residual: y) { return fused }
+            y = y + sharedExperts.mtpForwardRows(x)
+        }
         return y
     }
 }
@@ -704,6 +729,13 @@ enum NemotronMoELeader {
                     down.weight.shape == [128, 2688, 232] {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down))
+                    if let shared = moe.sharedExperts {
+                        let input = MLXArray.zeros([1, rows, up.k], dtype: .bfloat16)
+                        let residual = MLXArray.zeros([1, rows, down.n], dtype: .bfloat16)
+                        if let fused = shared.mtpForwardRowsAdding(input, residual: residual) {
+                            outputs.append(fused)
+                        }
+                    }
                 }
             }
         }
