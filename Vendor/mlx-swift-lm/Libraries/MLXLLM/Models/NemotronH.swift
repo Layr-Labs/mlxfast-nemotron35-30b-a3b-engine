@@ -924,22 +924,13 @@ class NemotronHAttention: Module, NemotronHMixer {
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
-        captureMTP: Bool = false,
-        targetQKV: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(x, query: wq, key: wk, value: wv, captureMTP: captureMTP) {
-            projections = outputs
-        } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
-        }
-        let (q, k, v) = projections
+        let q = captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x)
+        let k = captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x)
+        let v = captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x)
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
@@ -987,7 +978,8 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(relu2(upProj(x)))
+        if let activated = NemotronPrefillSharedUp.apply(x, self) { return downProj(activated) }
+        return downProj(relu2(upProj(x)))
     }
 
     // Protocol conformance
@@ -1930,6 +1922,47 @@ struct BaseNAXFrag {
       typename DstPtrType,
       typename StrX,
       typename StrY,
+      typename LimX,
+      typename LimY,
+      typename OffX = Int<0>,
+      typename OffY = Int<0>>
+  METAL_FUNC static constexpr void store_safe(
+      const thread dtype_frag_t<T>& src,
+      DstPtrType dst,
+      StrX str_x,
+      StrY str_y,
+      LimX lim_x,
+      LimY lim_y,
+      OffX off_x = {},
+      OffY off_y = {}) {
+    using U = pointer_element_t<DstPtrType>;
+
+    const short2 sc = get_coord();
+    dst += sc.y * str_x + sc.x * str_y;
+    auto lx = lim_x - sc.y;
+    auto ly = lim_y - sc.x;
+
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < kElemRows; i++) {
+      const auto r = off_x + i * kElemRowsJump;
+      const auto c = off_y;
+
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < kElemCols; j++) {
+        if (r < lx && (c + j) < ly) {
+          dst[r * str_x + (c + j) * str_y] =
+              store_value<RELU2, U>(src[i * kElemCols + j]);
+        }
+      }
+    }
+  }
+
+  template <
+      bool RELU2 = false,
+      typename T,
+      typename DstPtrType,
+      typename StrX,
+      typename StrY,
       typename StartX,
       typename StopX,
       typename StartY,
@@ -2171,6 +2204,26 @@ struct NAXTile {
             Int<1>{},
             src_tile_dims.y,
             src_tile_dims.x,
+            idx_row * Int<kFragRows>{},
+            idx_col * Int<kFragCols>{});
+      });
+    });
+  }
+
+  template <bool RELU2 = false, typename U>
+  METAL_FUNC void store_safe(
+      device U* dst,
+      const int ld,
+      const short2 dst_tile_dims) const thread {
+    const_for_loop<0, kTileRows, 1>([&](auto idx_row) {
+      const_for_loop<0, kTileCols, 1>([&](auto idx_col) {
+        NAXFrag_t::template store_safe<RELU2>(
+            frag_at<idx_row.value, idx_col.value>(),
+            dst,
+            ld,
+            Int<1>{},
+            dst_tile_dims.y,
+            dst_tile_dims.x,
             idx_row * Int<kFragRows>{},
             idx_col * Int<kFragCols>{});
       });
@@ -2512,6 +2565,152 @@ struct QuantizedBlockLoader {
   }
 };
 
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2,
+    const bool RELU2 = false>
+METAL_FUNC void nemotron_shared_up_qmm_t_nax_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws,
+    const constant int& K,
+    const constant int& N,
+    const constant int& M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  (void)lid;
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  // Set the block
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  // Make the weight loader
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+
+  constexpr bool transpose_a = false;
+  constexpr bool transpose_b = true;
+
+  const short sgp_sm = min(int(SM), M - (y_row + tm));
+  const bool is_unaligned_sm = (sgp_sm != SM);
+
+  const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
+
+  const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
+  const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
+
+  using AccumType = float;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  x += tm * K;
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(x + kk1, K);
+          } else {
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+          }
+
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+
+          (void)compiler_barrier;
+        }
+
+        x += BK;
+        loader_w.next();
+      }
+
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kAlignedM.value && kAlignedN.value) {
+        Dtile.template store<RELU2>(y + tm * N + tn, N);
+      } else if (kAlignedM.value && sgp_sn == SN) {
+        Dtile.template store<RELU2>(y + tm * N + tn, N);
+      } else {
+        Dtile.template store_safe<RELU2>(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
+      }
+    });
+  });
+}
+
 // Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned
 // to expert runs. tiles[t] = (first sorted row, rows <= BM, expert). Every
 // tile holds exactly one expert segment, so the stock segment loop collapses
@@ -2775,6 +2974,39 @@ func nemotronRunGather(
         outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
 }
 
+enum NemotronPrefillSharedUp {
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_prefill_shared_up", inputNames: ["w", "scales", "biases", "x", "K", "N", "M"],
+        outputNames: ["y"],
+        source: """
+            threadgroup T Ws[64 * (64 + 16 / sizeof(T))];
+            nemotron_shared_up_qmm_t_nax_impl<T, 64, 4, true, 64, 64, 64, 2, 2, RELU2>(
+                w, scales, biases, x, y, Ws, K, N, M,
+                threadgroup_position_in_grid, thread_index_in_threadgroup,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            """, header: nemotronRunGatherHeader)
+
+    static func apply(_ x: MLXArray, _ mlp: NemotronHMLP, relu2: Bool = true) -> MLXArray? {
+        guard x.ndim == 3, x.dim(0) == 1, x.dim(1) > 64,
+            x.dim(1) <= Int(Int32.max), x.dim(2) == 2688, x.dtype == .bfloat16,
+            type(of: mlp) == NemotronHMLP.self,
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu, NemotronHPrefillX5.runGather,
+            let q = mlp.upProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+            q.mode == .affine, q.groupSize == 64, q.bits == 4, q.bias == nil,
+            q.weight.dtype == .uint32, q.weight.shape == [3712, 336],
+            q.scales.dtype == .bfloat16, q.scales.shape == [3712, 42],
+            let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [3712, 42],
+            MLX.maximum(x, MLXArray(0)).dtype == x.dtype
+        else { return nil }
+        let rows = x.dim(1)
+        return kernel(
+            [q.weight, q.scales, offsets, x, 2688, 3712, rows],
+            template: [("T", DType.bfloat16), ("RELU2", relu2)],
+            grid: (58 * 32, ((rows + 63) / 64) * 2, 2), threadGroup: (32, 2, 2),
+            outputShapes: [[1, rows, 3712]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
 // MARK: - MoE
 
 class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
@@ -2907,7 +3139,7 @@ private class NemotronHBlock: Module {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
             output = (mixer as! NemotronHAttention).cbv2Forward(
-                hidden, cache: attentionCache, captureMTP: captureMTP, targetQKV: true)
+                hidden, cache: attentionCache, captureMTP: captureMTP)
         case .mlp:
             precondition(
                 attentionCache == nil,
