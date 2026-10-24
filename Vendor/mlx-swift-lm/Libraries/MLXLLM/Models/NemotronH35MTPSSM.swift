@@ -152,7 +152,9 @@ func nemotronMTPSSMCompact(
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
                    ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
                    ("WO", writeOutput)],
-        grid: (32, headDim, heads), threadGroup: (32, 8, 1),
+        // Four independent SIMD rows per group; lane arithmetic and the
+        // global d_idx mapping are unchanged, including partial head rows.
+        grid: (32, headDim, heads), threadGroup: (32, 4, 1),
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])
     return (outputs[0], outputs[1])
