@@ -21,7 +21,8 @@ extension NemotronHMamba2Mixer {
             [batch, numHeads, headDim, ssmStateSize], dtype: .float32)
         if nemotronMTPCompactSSM && length > 1 {
             return mtpCompactForward(hiddenStates, modelLayerIndex: modelLayerIndex,
-                evaluation: evaluation, convState: convState, initialSSM: ssmState)
+                evaluation: evaluation, convState: convState, initialSSM: ssmState,
+                prefix: initial?.ssmContinuation as? NemotronMTPSSMPrefix)
         }
         let arrays = mtpCapturedArrays(hiddenStates, convState: convState, initialSSM: ssmState)
         do {
@@ -39,7 +40,8 @@ extension NemotronHMamba2Mixer {
     /// captured per-position state). Conv states are views of `padded`.
     func mtpCompactForward(
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
-        evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
+        evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray,
+        prefix: NemotronMTPSSMPrefix? = nil
     ) -> MLXArray {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
@@ -52,7 +54,12 @@ extension NemotronHMamba2Mixer {
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+            steps: length, writeOutput: true, prefix: prefix)
+        // This boundary has already been written by the consumer dispatch.
+        // New prefix recipes start here rather than nesting the old recipe.
+        let replayInitialSSM = result.replayedState ?? initialSSM
+        let boundaryRoots = result.replayedState.map { [$0] } ?? []
+        let boundaryBytes = result.replayedState?.nbytes ?? 0
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
@@ -61,17 +68,20 @@ extension NemotronHMamba2Mixer {
                 modelLayerIndex: modelLayerIndex, positions: length,
                 finalConv: padded[0..., length ..< (length + history), 0...],
                 finalSSM: result.finalState,
-                materializedByteCount: tapeBytes + result.finalState.nbytes,
+                materializedByteCount: tapeBytes + result.finalState.nbytes + boundaryBytes,
                 evaluationRoots: tape,
-                strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
-                strictReplayRetainedRoots: tape + [initialSSM],
+                strictReplayRetainedByteCount: tapeBytes + replayInitialSSM.nbytes,
+                strictReplayRetainedRoots: tape + [replayInitialSSM],
+                fullAcceptanceRetainedByteCount: boundaryBytes,
+                fullAcceptanceRetainedRoots: boundaryRoots,
                 replay: { keep in
-                    CBv2RecurrentLayerState(
+                    let prefix = NemotronMTPSSMPrefix(
+                        convolution: convolution, aLog: logA, D: skip, dt: dt,
+                        initialState: replayInitialSSM, heads: heads, headDim: dim,
+                        groups: groups, stateDim: state, steps: keep)
+                    return CBv2RecurrentLayerState(
                         conv: padded[0..., keep ..< (keep + history), 0...],
-                        ssm: nemotronMTPSSMCompact(
-                            convolution: convolution, ALog: logA, D: skip, dt: dt,
-                            state: initialSSM, heads: heads, headDim: dim, groups: groups,
-                            stateDim: state, steps: keep, writeOutput: false).finalState)
+                        ssm: prefix.materializedState(), ssmContinuation: prefix)
                 })
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
@@ -188,14 +198,18 @@ extension NemotronH35Model {
             let state = MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32)
             if nemotronMTPCompactSSM {
                 let dt = nemotronPrefillComputeDt(rawDt, mixer.dtBias, mixer.timeStepLimit)
-                let window = nemotronMTPSSMCompact(
-                    convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
-                    state: state, heads: heads, headDim: dim, groups: groups,
-                    stateDim: stateDim, steps: width, writeOutput: true)
                 let replay = nemotronMTPSSMCompact(
                     convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
                     state: state, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, steps: width - 1, writeOutput: false)
+                let prefix = NemotronMTPSSMPrefix(
+                    convolution: convolution, aLog: mixer.aLog, D: mixer.D, dt: dt,
+                    initialState: state, heads: heads, headDim: dim, groups: groups,
+                    stateDim: stateDim, steps: width - 1)
+                let window = nemotronMTPSSMCompact(
+                    convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
+                    state: replay.finalState, heads: heads, headDim: dim, groups: groups,
+                    stateDim: stateDim, steps: width, writeOutput: true, prefix: prefix)
                 roots += [window.output, window.finalState, replay.finalState]
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,

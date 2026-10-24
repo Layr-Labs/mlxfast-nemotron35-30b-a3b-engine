@@ -2,6 +2,7 @@
 // All prefix states are written in FP32; no parallel/prefill recurrence is used.
 import Foundation
 import MLX
+import MLXLMCommon
 
 private enum NemotronMTPSSMKernel {
     static let kernel = MLXFast.metalKernel(
@@ -76,6 +77,33 @@ func nemotronMTPSSMWindow(
 let nemotronMTPCompactSSM =
     ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_COMPACT_SSM"] != "0"
 
+/// A bounded exact prefix recipe. It owns the same tape and initial array
+/// charged by strictReplayRetainedRoots; it never contains another recipe.
+struct NemotronMTPSSMPrefix: CBv2RecurrentSSMContinuation {
+    let convolution: MLXArray
+    let aLog: MLXArray
+    let D: MLXArray
+    let dt: MLXArray
+    let initialState: MLXArray
+    let heads: Int
+    let headDim: Int
+    let groups: Int
+    let stateDim: Int
+    let steps: Int
+
+    func matches(heads: Int, headDim: Int, groups: Int, stateDim: Int, dtype: DType) -> Bool {
+        self.heads == heads && self.headDim == headDim && self.groups == groups
+            && self.stateDim == stateDim && convolution.dtype == dtype
+    }
+
+    func materializedState() -> MLXArray {
+        nemotronMTPSSMCompact(
+            convolution: convolution, ALog: aLog, D: D, dt: dt, state: initialState,
+            heads: heads, headDim: headDim, groups: groups, stateDim: stateDim,
+            steps: steps, writeOutput: false).finalState
+    }
+}
+
 // Compact verify window. Per position the recurrence text is identical to
 // `nemotron_mtp_ssm_window` (and therefore to the stock M=1 `ssm_kernel`):
 // same dA, dB_by_x, state and acc expressions in the same order. X, B and C
@@ -86,8 +114,9 @@ let nemotronMTPCompactSSM =
 private enum NemotronMTPCompactSSMKernel {
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_mtp_ssm_compact",
-        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
-        outputNames: ["out", "state_out"],
+        inputNames: ["conv", "A_log", "D", "dt", "state_in",
+                     "prefix_conv", "prefix_A_log", "prefix_dt", "prefix_length"],
+        outputNames: ["out", "state_out", "replayed_state"],
         source: """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
@@ -101,6 +130,32 @@ private enum NemotronMTPCompactSSMKernel {
                 auto s_idx = n_per_t * ds_idx + i;
                 if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
                 prior[i] = state_in[n * Dh * Ds + d_idx * Ds + s_idx];
+            }
+            if constexpr (WO) {
+                // Reproduce the committed prefix in registers, then continue
+                // into this verify. Save its exact boundary for a later
+                // strict commit so repeated rejection cannot chain recipes.
+                for (int t = 0; t < prefix_length; ++t) {
+                    auto x_ = static_cast<float>(prefix_conv[t * CD + n * Dh + d_idx]);
+                    auto B_ = prefix_conv + t * CD + BO + g_idx * Ds;
+                    auto dt_ = static_cast<float>(prefix_dt[t * H + n]);
+                    auto A = -fast::exp(static_cast<float>(prefix_A_log[h_idx]));
+                    auto dA = fast::exp(A * dt_);
+                    for (int i = 0; i < n_per_t; ++i) {
+                        auto s_idx = n_per_t * ds_idx + i;
+                        if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                        auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                        auto state = dA * prior[i] + dB_by_x;
+                        prior[i] = static_cast<U>(state);
+                    }
+                }
+                if (prefix_length > 0) {
+                    for (int i = 0; i < n_per_t; ++i) {
+                        auto s_idx = n_per_t * ds_idx + i;
+                        if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                        replayed_state[(n * Dh + d_idx) * Ds + s_idx] = prior[i];
+                    }
+                }
             }
             for (int t = 0; t < L; ++t) {
                 auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
@@ -138,22 +193,38 @@ private enum NemotronMTPCompactSSMKernel {
 func nemotronMTPSSMCompact(
     convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
     state: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int,
-    steps: Int, writeOutput: Bool
-) -> (output: MLXArray, finalState: MLXArray) {
+    steps: Int, writeOutput: Bool, prefix: NemotronMTPSSMPrefix? = nil
+) -> (output: MLXArray, finalState: MLXArray, replayedState: MLXArray?) {
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
     precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
+    let replay = prefix.flatMap {
+        writeOutput && $0.matches(heads: heads, headDim: headDim, groups: groups,
+                                  stateDim: stateDim, dtype: convolution.dtype) ? $0 : nil
+    }
+    let prefixLength = replay?.steps ?? 0
+    if let replay {
+        precondition((1...7).contains(prefixLength) && prefixLength <= replay.convolution.dim(1))
+        precondition(replay.dt.dtype == .float32
+            && replay.dt.shape == [1, replay.convolution.dim(1), heads])
+        precondition(replay.initialState.dtype == .float32
+            && replay.initialState.shape == [1, heads, headDim, stateDim])
+    }
     let outputs = NemotronMTPCompactSSMKernel.kernel(
-        [convolution, ALog, D, dt, state],
+        [convolution, ALog, D, dt, replay?.initialState ?? state,
+         replay?.convolution ?? convolution, replay?.aLog ?? ALog,
+         replay?.dt ?? dt, prefixLength],
         template: [("T", convolution.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
                    ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
                    ("WO", writeOutput)],
         grid: (32, headDim, heads), threadGroup: (32, 8, 1),
-        outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
-        outputDTypes: [convolution.dtype, .float32])
-    return (outputs[0], outputs[1])
+        outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1],
+                       [1, heads, headDim, stateDim],
+                       replay == nil ? [1] : [1, heads, headDim, stateDim]],
+        outputDTypes: [convolution.dtype, .float32, .float32])
+    return (outputs[0], outputs[1], replay == nil ? nil : outputs[2])
 }

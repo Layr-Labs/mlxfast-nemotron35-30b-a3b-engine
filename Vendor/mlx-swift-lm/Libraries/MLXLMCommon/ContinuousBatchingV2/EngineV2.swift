@@ -304,7 +304,12 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
                 && mtpDriver?.config.verificationMode != .serialTarget
                 && (model as? any CBv2RecurrentMTPSteppableModel)?.supportsCapturedVerifyWindow == true
             let extraGenerations: Int
-            if compactContinuationHeadroom {
+            if usesCompactRectangularReplay && recurrentDepth > 0
+                && recurrent.retainsFusedReplayBoundary {
+                // Old replay tape, exact consumer boundary, and final state
+                // can coexist. Reserve 5F, not the usual compact 4F.
+                extraGenerations = 2
+            } else if compactContinuationHeadroom {
                 // One strict-prefix tape can survive into its successor.
                 extraGenerations = 1
             } else if mtpDriver?.usesRequestStatefulDrafter == true && !usesCompactRectangularReplay {

@@ -129,9 +129,13 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     public static let maximumLiveGenerations = 3
 
     public let layers: [CBv2RecurrentLayerStateSpec]
+    /// A compact replay consumer may retain one exact boundary state in
+    /// addition to its final state. Admission must price that extra array.
+    public let retainsFusedReplayBoundary: Bool
 
-    public init(layers: [CBv2RecurrentLayerStateSpec]) {
+    public init(layers: [CBv2RecurrentLayerStateSpec], retainsFusedReplayBoundary: Bool = false) {
         self.layers = layers
+        self.retainsFusedReplayBoundary = retainsFusedReplayBoundary
     }
 
     /// Exact fixed bytes for one live request. Every multiplication and sum
@@ -201,13 +205,21 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     }
 }
 
+/// Immutable model-owned recipe for a lazy SSM state. The canonical `ssm`
+/// array remains authoritative for inspection, export and unsupported consumers.
+/// A compatible consumer may use this hint to avoid a materialized-state read.
+public protocol CBv2RecurrentSSMContinuation {}
+
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
     public let ssm: MLXArray?
+    public let ssmContinuation: (any CBv2RecurrentSSMContinuation)?
 
-    public init(conv: MLXArray?, ssm: MLXArray?) {
+    public init(conv: MLXArray?, ssm: MLXArray?,
+                ssmContinuation: (any CBv2RecurrentSSMContinuation)? = nil) {
         self.conv = conv
         self.ssm = ssm
+        self.ssmContinuation = ssmContinuation
     }
 }
 

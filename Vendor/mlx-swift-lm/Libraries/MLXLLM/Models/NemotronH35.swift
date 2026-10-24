@@ -86,6 +86,12 @@ public struct NemotronH35Configuration: Codable, Sendable {
 public final class NemotronH35Model: NemotronHModel {
     public let lightningConfiguration: NemotronH35Configuration
 
+    public override var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        let spec = super.cbv2RecurrentStateSpec
+        return CBv2RecurrentStateSpec(layers: spec.layers,
+            retainsFusedReplayBoundary: nemotronMTPCompactSSM)
+    }
+
     public override var cbv2Capabilities: CBv2ModelCapabilities {
         var capabilities = super.cbv2Capabilities
         capabilities.supportsRecurrentCheckpointReuse = true
