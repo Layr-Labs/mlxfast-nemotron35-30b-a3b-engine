@@ -617,7 +617,11 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        // With one row, column order already is the packet's row-major order.
+        // Avoid materializing a separate stack only to copy it into the packet.
+        // Keep the original path for batching and singleton tail rounds.
+        let stackedDraftIDs: MLXArray? = batch == 1 && k > 1
+            ? nil : stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -639,11 +643,20 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+        var packetParts: [MLXArray]
+        if let stackedDraftIDs {
+            packetParts = [stackedDraftIDs.reshaped([-1])]
+        } else {
+            packetParts = draftSteps
+        }
+        packetParts.append(target.scores.reshaped([-1]))
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
+        // Finalization reads the same immutable draft prefix after packet
+        // readback. This view owns its backing packet through normal MLX ARC.
+        let draftIDs = stackedDraftIDs ?? acceptancePacket[0..<k].reshaped([1, k])
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
