@@ -77,6 +77,21 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
+        let rows = pagedAttentionInputs(hidden: hidden, embedding: embedding, cache: cache)
+        return (rows.fused + nemotronMTPLinearRows(rows.merged, mixer.wo), rows.keys, rows.values)
+    }
+
+    /// The selected row uses the same ordinary M=1 projection as a draft step.
+    func finishAttentionRow(fused: MLXArray, merged: MLXArray) -> MLXArray {
+        precondition(fused.ndim == 3 && fused.dim(0) == 1 && fused.dim(1) == 1)
+        precondition(merged.ndim == 3 && merged.dim(0) == 1 && merged.dim(1) == 1)
+        return fused + nemotronMTPLinearRows(merged, mixer.wo)
+    }
+
+    /// Keep the full causal attention and K/V writes before host acceptance.
+    func pagedAttentionInputs(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (fused: MLXArray, merged: MLXArray, keys: MLXArray, values: MLXArray) {
         let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
@@ -90,7 +105,7 @@ final class NemotronH35MTPAttentionBlock: Module {
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+        return (fused, merged, keys, values)
     }
 }
 
@@ -143,6 +158,21 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
             hidden: hidden, embedding: embedding, cache: cache)
     }
+    /// Submit full-width attention inputs; defer only its output projection.
+    func pagedAttentionInputs(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (fused: MLXArray, merged: MLXArray, keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedAttentionInputs(
+            hidden: hidden, embedding: embedding, cache: cache)
+    }
+
+    /// One selected output projection followed by the unchanged ordinary tail.
+    func finishPagedAttentionRow(fused: MLXArray, merged: MLXArray) -> MLXArray {
+        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).finishAttentionRow(
+            fused: fused, merged: merged)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(attention)
+    }
+
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
