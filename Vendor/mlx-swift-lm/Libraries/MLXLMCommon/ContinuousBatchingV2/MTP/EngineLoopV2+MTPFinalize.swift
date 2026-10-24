@@ -390,6 +390,10 @@ extension EngineLoopV2 {
                     hidden: carryHidden!,
                     shortlist: carryShortlist,
                     previousTopTwoMargin: previousTopTwoMargin,
+                    adaptiveDepthConfident: Self.mtpAdaptiveDepthConfident(
+                        drafted: k, accepted: accepted, confirmed: confirmed,
+                        policyTopTwo: policyTopTwoHost, batchIndex: batchIndex,
+                        width: targetWidth),
                     needsHistoryTransition: mtp.tracksPersistentHistory,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
@@ -408,6 +412,27 @@ extension EngineLoopV2 {
         if anyRejected {
             eagerCompositionStale = true
         }
+    }
+
+    /// Adaptive-depth gate, evaluated from the round's existing host readback.
+    /// The next round keeps the declared maximum depth only when both shallow
+    /// drafts were committed and the target's top-two logit margin at the
+    /// second draft's position (column 1 of the verify window, i.e. the
+    /// prediction that scored draft 2) was decisive; otherwise it plans one row
+    /// less. `policyTopTwo` is the `[batch, 1+k, 2]` array finalize already read
+    /// for the carry margin, so this adds no GPU sync and no new array.
+    static func mtpAdaptiveDepthConfident(
+        drafted k: Int, accepted: Int, confirmed: Int,
+        policyTopTwo: [Float]?, batchIndex: Int, width: Int
+    ) -> Bool {
+        guard CBv2MTPAdaptiveDepth.enabled, k >= 2, width == 1 + k,
+            min(accepted, confirmed) >= 2, let values = policyTopTwo
+        else { return false }
+        let base = (batchIndex * width + 1) * 2
+        guard values.count > base + 1 else { return false }
+        let margin = Double(values[base] - values[base + 1])
+        guard margin.isFinite else { return false }
+        return margin >= CBv2MTPAdaptiveDepth.marginThreshold
     }
 }
 

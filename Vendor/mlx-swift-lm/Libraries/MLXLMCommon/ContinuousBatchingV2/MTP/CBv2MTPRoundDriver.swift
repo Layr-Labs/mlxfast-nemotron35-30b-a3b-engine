@@ -38,6 +38,14 @@ struct CBv2MTPCarry {
     /// finalized at the round's existing host readback and used only by the
     /// next adaptive depth decision.
     let previousTopTwoMargin: Double?
+    /// True when the round that produced this carry committed BOTH shallow
+    /// drafts and the target's top-two margin at the second draft's position
+    /// cleared `CBv2MTPAdaptiveDepth.marginThreshold`. Both inputs are host
+    /// values of the round's existing acceptance readback, so the gate costs
+    /// no GPU sync. Read only by the next plan (`beginMTPPlan`), which keeps
+    /// the declared maximum depth when it holds and plans one row less when it
+    /// does not.
+    let adaptiveDepthConfident: Bool
     /// True only for a verify-produced carry whose terminal transition was
     /// intentionally left outside committed assistant history.
     let needsHistoryTransition: Bool
@@ -483,6 +491,39 @@ final class CBv2MTPRoundDriver {
         metricsLock.unlock()
     }
 
+    // MARK: Adaptive-depth verification
+
+    /// The declared step-global depth (`nil` when the controller is
+    /// adaptive). The declaration is the maximum: adaptive depth only ever
+    /// plans at or below it, so no step exceeds the tree the leg declared.
+    var declaredPlanDepth: Int? { config.fixedDraftTokens }
+
+    /// The depth a step plans when its rows do not qualify for the declared
+    /// maximum — one row less. Zero when adaptive depth cannot narrow the
+    /// current plan (kill switch, adaptive controller, declared depth one, or
+    /// a plan already at or below the lowered width).
+    var loweredPlanDepth: Int {
+        guard CBv2MTPAdaptiveDepth.enabled, let declared = declaredPlanDepth,
+            declared > 1
+        else { return 0 }
+        let lowered = CBv2MTPAdaptiveDepth.loweredDepth(declared: declared)
+        guard lowered < min(planDecision.depth, declared) else { return 0 }
+        return lowered
+    }
+
+    /// True when this plan must verify one row fewer: some speculating row did
+    /// not finish its previous round with BOTH shallow drafts committed under
+    /// a decisive target margin (the carry flag, written at the round's
+    /// existing acceptance readback), or has no carry yet (a seed or a first
+    /// round). Anything less than full confidence plans the lowered width.
+    func shouldLowerPlanDepthForAdaptiveDepth(ids: [CBv2RequestID]) -> Bool {
+        guard loweredPlanDepth > 0, !ids.isEmpty else { return false }
+        for id in ids where carries[id]?.adaptiveDepthConfident != true {
+            return true
+        }
+        return false
+    }
+
     func markRound(_ id: CBv2RequestID, k: Int) { roundMarks[id] = k }
     func markSeed(_ id: CBv2RequestID) { seedMarks.insert(id) }
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
@@ -538,6 +579,7 @@ final class CBv2MTPRoundDriver {
     func storeCarry(
         id: CBv2RequestID, token: Int, hidden: MLXArray,
         shortlist: MLXArray? = nil, previousTopTwoMargin: Double? = nil,
+        adaptiveDepthConfident: Bool = false,
         needsHistoryTransition: Bool = false,
         tokensCount: Int, kvOffset: Int
     ) {
@@ -550,6 +592,7 @@ final class CBv2MTPRoundDriver {
         carries[id] = CBv2MTPCarry(
             token: token, hidden: hidden, shortlist: shortlist,
             previousTopTwoMargin: previousTopTwoMargin,
+            adaptiveDepthConfident: adaptiveDepthConfident,
             needsHistoryTransition: needsHistoryTransition,
             tokensCount: tokensCount, kvOffset: kvOffset)
     }

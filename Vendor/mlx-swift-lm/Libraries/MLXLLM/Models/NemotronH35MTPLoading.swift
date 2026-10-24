@@ -106,7 +106,13 @@ extension NemotronH35MTPAssistant {
             warmPostVerifySpeculation()
             return
         }
-        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 2
+        // Adaptive depth plans at or below the declared maximum depth, and the
+        // deepest round is the declared one: warm that verify width and, in the
+        // same load-time pass, every shallower width the gate can plan (the
+        // round list below walks them down to one), so no round pays a compile
+        // with the gate on or off.
+        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "")
+            ?? CBv2MTPAdaptiveDepth.declaredMaxDepth
         let depth = max(1, min(requested, maximumDraftTokens ?? 7, 7))
         let promptLength = max(8, Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PROMPT"] ?? "") ?? 488)
         let prefillLength = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PREFILL"] ?? "") ?? 1024

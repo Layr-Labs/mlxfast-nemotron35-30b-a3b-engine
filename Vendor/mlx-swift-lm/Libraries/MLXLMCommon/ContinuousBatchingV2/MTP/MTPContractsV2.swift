@@ -418,6 +418,43 @@ public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
     case automatic
 }
 
+/// Adaptive-depth verification: the DECLARED draft depth is the maximum a leg
+/// may draft, and a step plans one row less when the state its previous round
+/// already read back does not qualify.
+///
+/// A deterministic `fixedDraftTokens` leg therefore keeps its declared tree
+/// (`1 + k` verify columns) as the default for every step, and a step whose
+/// speculating rows did not commit both shallow drafts under a decisive target
+/// margin plans `k` columns instead. Both inputs are host values of the
+/// existing acceptance readback, so the gate costs no GPU sync and no step can
+/// ever exceed the declaration. NEMOTRON_MTP_ADAPTIVE=0 forces the plain
+/// declared-depth tree at every step.
+public enum CBv2MTPAdaptiveDepth {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ADAPTIVE"] != "0"
+    /// The depth `mtp-head.manifest.json` declares as the maximum
+    /// (`spec.num_speculative_tokens`), which the ranked run hands the engine
+    /// as `config.fixedDraftTokens`. The load-time shape warm-up reads this
+    /// constant because the model load happens before the wire spec exists;
+    /// keep it in step with the manifest. Warming the declared maximum covers
+    /// the lowered width too, so no step pays a compile.
+    public static let declaredMaxDepth = 3
+    /// The depth a non-qualifying step plans: one below the declared maximum,
+    /// and never below one (a one-draft declaration has no narrower round).
+    public static func loweredDepth(declared: Int) -> Int {
+        max(1, declared - 1)
+    }
+    /// Minimum target-logit top-two margin at the second draft's position.
+    /// Same units as the marginal policy's `previousTopTwoMargin` (raw target
+    /// logit difference, mapped through sigmoid(margin/2 or /3) there).
+    public static let marginThreshold: Double = {
+        guard let raw = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ADAPTIVE_MARGIN"],
+            let value = Double(raw), value.isFinite
+        else { return 2.0 }
+        return value
+    }()
+}
+
 /// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
 public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape

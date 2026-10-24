@@ -216,17 +216,44 @@ extension EngineLoopV2 {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
             }
         }
+        // Adaptive depth: the declaration is the MAXIMUM this leg drafts (4
+        // verify columns at depth 3), and every step plans it by default. A
+        // step plans one row less (3 columns) when some speculating row's
+        // previous round did not commit both shallow drafts under a decisive
+        // target margin. Runs after the depth clamps (a clamped step is never
+        // widened back) and before the budget checks (so the narrower width is
+        // what they charge).
+        if mtp.planDepth > 0,
+            mtp.shouldLowerPlanDepthForAdaptiveDepth(
+                ids: eligibleRows.map(\.id))
+        {
+            mtp.clampPlanDepth(
+                to: mtp.loweredPlanDepth, reason: "adaptive_depth")
+        }
         if mtp.planDepth > 0 {
             let eligibleIDs = Set(eligibleRows.map(\.id))
-            let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
-            let capacityTokens = rows.reduce(0) { total, rec in
-                let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
-                return total
-                    + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
+            func planFitsStep() -> (tokenBudget: Bool, kvHeadroom: Bool) {
+                let stepTokens = rows.count + eligibleRows.count * mtp.planDepth
+                let capacityTokens = rows.reduce(0) { total, rec in
+                    let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
+                    return total
+                        + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
+                }
+                return (
+                    stepTokens <= scheduler.config.maxBatchedTokensPerStep,
+                    capacity?.hasHeadroom(additionalTokens: capacityTokens) ?? true)
             }
-            if stepTokens > scheduler.config.maxBatchedTokensPerStep {
+            var fit = planFitsStep()
+            if (!fit.tokenBudget || !fit.kvHeadroom), mtp.loweredPlanDepth > 0 {
+                // The declared width does not fit this step: plan the narrower
+                // round instead of dropping speculation entirely.
+                mtp.clampPlanDepth(
+                    to: mtp.loweredPlanDepth, reason: "adaptive_depth_budget")
+                fit = planFitsStep()
+            }
+            if !fit.tokenBudget {
                 mtp.clampPlanDepth(to: 0, reason: "step_token_budget")
-            } else if !(capacity?.hasHeadroom(additionalTokens: capacityTokens) ?? true) {
+            } else if !fit.kvHeadroom {
                 mtp.clampPlanDepth(to: 0, reason: "step_kv_headroom")
             }
         }

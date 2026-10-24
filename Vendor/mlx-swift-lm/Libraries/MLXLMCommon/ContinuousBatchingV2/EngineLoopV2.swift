@@ -910,6 +910,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduler.speculationPlanner = { [unowned self] rec in
                 self.mtpPlanSpeculation(for: rec)
             }
+            // The projection bound is the declaration itself: adaptive depth
+            // only ever plans at or below it, so the bound never clips the
+            // planner and never charges a row the leg did not declare.
             scheduler.speculationDraftTokenUpperBound = max(
                 0,
                 mtp.config.fixedDraftTokens
