@@ -45,6 +45,14 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+/// Layers between early asyncEval calls on the MTP prefill path only. The seed
+/// window is the first request after the engine drains MLX's buffer cache, so a
+/// shorter chunk hands its transient live set back to that cache sooner.
+/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
+let nemotronPrefillEvalInterval =
+    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
+    ? nemotronEarlyEvalInterval : 2
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -298,6 +306,97 @@ enum NemotronHResidualRMSNorm {
             grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
         return (result[0], result[1])
+    }
+
+
+    private static func sumSource() -> String {
+        let add = "T sum = lhs[offset + i] + rhs[offset + i];"
+        precondition(source.components(separatedBy: add).count == 2)
+        return source.replacingOccurrences(of: add, with: "T part = rhs[offset + i] + shared[offset + i];\n"
+            + "                T sum = lhs[offset + i] + part;")
+    }
+    private static let sumKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_sum_rms_bf16",
+        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: sumSource(), ensureRowContiguous: true)
+
+    static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray)?
+    {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
+            rhs.shape == lhs.shape, shared.shape == lhs.shape, lhs.dtype == .bfloat16,
+            rhs.dtype == .bfloat16, shared.dtype == .bfloat16,
+            type(of: norm) == RMSNorm.self,
+            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let result = sumKernel([lhs, rhs, shared, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
+        let summed = lhs + (rhs + shared)
+        let ok = MLX.logicalAnd(
+            (result[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
+            (result[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
+        return (which(ok, result[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, result[1], MLXArray(Float.nan).asType(.bfloat16)))
+    }
+}
+
+
+enum NemotronHEmbeddingRows {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_EMBED"] != "0"
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_embedding_rows_affine4_gs64",
+        inputNames: ["ids", "w", "scales", "biases"], outputNames: ["out"],
+        source: """
+            const uint b = thread_position_in_grid.x;
+            const uint t = thread_position_in_grid.y;
+            int64_t id = int64_t(ids[t]);
+            if (id < 0) {
+                id += int64_t(V);
+            }
+            const device uint8_t* row = (const device uint8_t*)w + id * int64_t(BYTES);
+            const size_t oindex = size_t(b) * 2;
+            const size_t gindex = oindex / 64;
+            T scale = scales[id * int64_t(G) + int64_t(gindex)];
+            T bias = biases[id * int64_t(G) + int64_t(gindex)];
+            device T* o = out + size_t(t) * size_t(2 * BYTES) + oindex;
+            uint val = row[b];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 2; i++) {
+                uint8_t d;
+                d = (val >> (4 * i)) & 0x0f;
+                o[i] = scale * d + bias;
+            }
+            """, ensureRowContiguous: true)
+
+    static func apply(_ tokens: MLXArray, _ embedding: Embedding) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              tokens.ndim == 2, tokens.dim(0) == 1, (1...512).contains(tokens.dim(1)),
+              tokens.dtype == .int32 || tokens.dtype == .uint32,
+              type(of: embedding) == QuantizedEmbedding.self,
+              let q = embedding as? QuantizedEmbedding,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              let biases = q.biases, q.weight.dtype == .uint32, q.weight.ndim == 2,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        let vocabulary = q.weight.dim(0), words = q.weight.dim(1)
+        let dims = words * 8
+        guard dims % 64 == 0, q.scales.shape == [vocabulary, dims / 64],
+              biases.shape == q.scales.shape, (dims / 2) % 64 == 0
+        else { return nil }
+        let count = tokens.dim(1)
+        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
+            template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
+                       ("G", dims / 64)],
+            grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[1, count, dims]], outputDTypes: [.bfloat16])[0]
     }
 }
 
@@ -1217,7 +1316,10 @@ class NemotronHAttention: Module, NemotronHMixer {
         if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
            let outputs = NemotronTargetQKV.apply(
                x, query: wq, key: wk, value: wv, captureMTP: captureMTP, prepared: prepared) {
-            projections = outputs
+            projections = NemotronMoELeader.selfTest && length == 1
+                ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+                   nemotronBitwiseOrNaN(outputs.2, wv(x)))
+                : outputs
         } else {
             projections = (
                 captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
@@ -3432,7 +3534,8 @@ private class NemotronHBackbone: Module {
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3456,9 +3559,14 @@ private class NemotronHBackbone: Module {
                 cache = nil
             }
             let next = modelLayerIndex + 1
-            let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
+            // The layers that hand the fused residual+norm down are unchanged:
+            // they stay tied to the default spacing, so a different eval
+            // interval only adds boundaries and never alters the graph.
+            let suppressedNorm = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
-            let nextNorm = next < layers.count && !submitsEarly
+            let submitsEarly = earlyEvalInterval > 0 && next < layers.count
+                && next % earlyEvalInterval == 0
+            let nextNorm = next < layers.count && !suppressedNorm
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
             let result = layer.cbv2Forward(
                 hidden,
@@ -3478,7 +3586,7 @@ private class NemotronHBackbone: Module {
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
                 if inputs.dim(1) > 1 && !captureMTP {
-                    let group = (next - nemotronEarlyEvalInterval)..<next
+                    let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
                     // Engine prefill only (see `cbv2Hidden`). A chunk runs for
@@ -3740,7 +3848,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3750,7 +3859,7 @@ public class NemotronHModel:
         }
         return backbone.cbv2Forward(
             inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
-            recyclePrefillChunks: recyclePrefillChunks)
+            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.
@@ -3777,7 +3886,13 @@ public class NemotronHModel:
         return backbone.embeddings.asLinear(hidden)
     }
 
-    func mtpEmbedding(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }
+    func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {
+        guard let rows = NemotronHEmbeddingRows.apply(tokens, backbone.embeddings) else {
+            return backbone.embeddings(tokens)
+        }
+        guard NemotronMoELeader.selfTest else { return rows }
+        return nemotronBitwiseOrNaN(rows, backbone.embeddings(tokens))
+    }
 
     func mtpShortlistLogits(_ hidden: MLXArray, ids: MLXArray) -> MLXArray {
         if let head = lmHead {
