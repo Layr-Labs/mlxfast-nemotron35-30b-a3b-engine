@@ -14,6 +14,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     @ModuleInfo(key: "hnorm") var hiddenNorm: RMSNorm
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHAttention
+    private let frontGraphCache = NemotronH35MTPAttentionFrontCache()
 
     init(_ args: NemotronHConfiguration) {
         hiddenSize = args.hiddenSize
@@ -78,20 +79,106 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
-        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
-        let fused = nemotronMTPLinearRows(joined, projection)
-        let x = norm(fused)
-        let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq)
+        let front = frontGraphCache(hidden: hidden, embedding: embedding, owner: self)
+        let fused = front[0]
+        let batch = hidden.dim(0), length = hidden.dim(1)
+        let queries = front[1]
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
+        let keys = front[2]
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
+        let values = front[3]
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        if let output = NemotronMultiRowQMV.applyAttentionOutputAdding(
+            merged, mixer.wo, residual: fused) {
+            return (output, keys, values)
+        }
         return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+    }
+
+    /// The original stateless operations, including three separate Q/K/V
+    /// projections. No KV/cache handle or request offset enters this function.
+    fileprivate func uncompiledFront(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
+        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
+        let fused = nemotronMTPLinearRows(joined, projection)
+        let x = norm(fused)
+        return [fused, nemotronMTPLinearRows(x, mixer.wq),
+                nemotronMTPLinearRows(x, mixer.wk), nemotronMTPLinearRows(x, mixer.wv)]
+    }
+
+    /// Populate only native R/template pipelines using loaded wo parameters.
+    /// All inputs are private throwaway arrays, outside request execution.
+    func warmAttentionOutputAdding() {
+        let outputs = (2...4).compactMap { rows in
+            NemotronMultiRowQMV.applyAttentionOutputAdding(
+                MLXArray.zeros([1, rows, 4096], dtype: .bfloat16), mixer.wo,
+                residual: MLXArray.zeros([1, rows, 2688], dtype: .bfloat16))
+        }
+        if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
+/// Shape-specialized compilation of the assistant's stateless front only.
+/// Parameters are explicit compiler state; replacing any participating child
+/// retires the entry. Request values are dynamic inputs, never cached results.
+private final class NemotronH35MTPAttentionFrontCache {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_ATTENTION_FRONT"] != "0"
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func callAsFunction(
+        hidden: MLXArray, embedding: MLXArray, owner: NemotronH35MTPAttentionBlock
+    ) -> [MLXArray] {
+        guard Self.enabled, NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              hidden.ndim == 3, hidden.dim(0) == 1, (2...4).contains(hidden.dim(1)),
+              hidden.dim(2) == 2688, hidden.dtype == .bfloat16,
+              embedding.shape == hidden.shape, embedding.dtype == hidden.dtype,
+              let identity = Self.nativeIdentity(owner)
+        else { return owner.uncompiledFront(hidden: hidden, embedding: embedding) }
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.identity == identity { return entry }
+            let modules: [Module] = [owner.embeddingNorm, owner.hiddenNorm, owner.projection,
+                                     owner.norm, owner.mixer.wq, owner.mixer.wk, owner.mixer.wv]
+            let state = modules.flatMap { $0.innerState() }
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak owner] arrays in
+                guard let owner else { preconditionFailure("Released Nemotron MTP attention-front owner") }
+                return owner.uncompiledFront(hidden: arrays[0], embedding: arrays[1])
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        // Compiler locks are separate: retire an old entry after this lock.
+        let result = withExtendedLifetime(retired) { current.function([hidden, embedding]) }
+        // The array overload returns [] in an enclosing MLX error scope. Keep
+        // that scope's error intact and avoid indexing an empty result here.
+        return result.count == 4 ? result : owner.uncompiledFront(hidden: hidden, embedding: embedding)
+    }
+
+    private static func nativeIdentity(_ owner: NemotronH35MTPAttentionBlock) -> [ObjectIdentifier]? {
+        func linear(_ value: Linear) -> Bool {
+            type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
+        }
+        guard type(of: owner.embeddingNorm) == RMSNorm.self,
+              type(of: owner.hiddenNorm) == RMSNorm.self,
+              type(of: owner.norm) == RMSNorm.self,
+              type(of: owner.mixer) == NemotronHAttention.self,
+              linear(owner.projection), linear(owner.mixer.wq),
+              linear(owner.mixer.wk), linear(owner.mixer.wv) else { return nil }
+        let modules: [Module] = [owner, owner.embeddingNorm, owner.hiddenNorm, owner.projection,
+                                 owner.norm, owner.mixer, owner.mixer.wq, owner.mixer.wk, owner.mixer.wv]
+        return modules.map(ObjectIdentifier.init)
     }
 }
 

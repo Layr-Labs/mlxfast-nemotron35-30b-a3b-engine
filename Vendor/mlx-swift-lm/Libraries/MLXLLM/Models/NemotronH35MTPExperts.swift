@@ -202,7 +202,7 @@ inline T nml_store(float v) {
 """
 
 private let nemotronMoELeaderSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -235,7 +235,7 @@ private let nemotronMoELeaderSource = """
     }
   }
 
-  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
@@ -535,6 +535,8 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
+    static let narrowLeader =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -567,16 +569,21 @@ enum NemotronMoELeader {
         return Bank(weight: weight, scales: scales, biases: biases, k: k, n: weight.dim(1))
     }
 
+    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
+        narrowLeader && rows == 3 ? 2 : 4
+    }
+
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
-        NemotronMoELeaderKernel.shared.kernel(
+        let rps = leaderResultsPerSimdgroup(rows: rows)
+        return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
-            grid: (32, bank.n / 4, rows * topK),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
@@ -586,7 +593,12 @@ enum NemotronMoELeader {
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank) -> MLXArray {
-        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank) }
+        if rows == 3 {
+            if NMLInlineBalanceWeighted.enabled {
+                return NMLInlineBalanceWeighted.shared.run(x, inds, scores, bank)
+            }
+            return NMLBalanceWeighted.shared.run(x, inds, scores, bank)
+        }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
@@ -709,6 +721,110 @@ enum NemotronMoELeader {
             }
         }
         if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
+private let nmlInlineBalancePlanSource = """
+  int leaders[18], partners[18], costs[18];
+  int counts[6] = {0}, loads[6] = {0}, original[6] = {0};
+  int number = 0;
+  for (int i = 0; i < 36; i++) { plan[i] = -1; }
+  for (int slot = 0; slot < 18; slot++) {
+    const int row = slot / 6;
+    const uint expert = inds[slot];
+    int before = 0;
+    for (int r = 0; r < row; r++) {
+      for (int j = 0; j < 6; j++) { before += inds[r*6+j] == expert ? 1 : 0; }
+    }
+    if ((before & 1) != 0) { continue; }
+    int partner = -1;
+    for (int r = 2; r > row; r--) {
+      for (int j = 0; j < 6; j++) {
+        if (inds[r*6+j] == expert) { partner = r*6+j; }
+      }
+    }
+    leaders[number] = slot; partners[number] = partner;
+    costs[number] = partner < 0 ? SOLO_COST : PAIR_COST;
+    original[slot % 6] += costs[number];
+    plan[18+slot] = partner;
+    number++;
+  }
+  // Stable largest-cost-first order; integer load, then group id break ties.
+  for (int assigned = 0; assigned < number; assigned++) {
+    int best = -1;
+    for (int j = 0; j < number; j++) {
+      if (costs[j] >= 0 && (best < 0 || costs[j] > costs[best])) { best = j; }
+    }
+    int group = -1;
+    for (int g = 0; g < 6; g++) {
+      if (counts[g] < 3 && (group < 0 || loads[g] < loads[group])) { group = g; }
+    }
+    plan[group*3+counts[group]] = leaders[best];
+    counts[group]++; loads[group] += costs[best]; costs[best] = -1;
+  }
+  int oldMax = 0, newMax = 0;
+  for (int g = 0; g < 6; g++) { oldMax = max(oldMax,original[g]); newMax = max(newMax,loads[g]); }
+  if (oldMax <= newMax) {
+    for (int i = 0; i < 18; i++) { plan[i] = -1; }
+    for (int g = 0; g < 6; g++) { counts[g] = 0; }
+    for (int j = 0; j < number; j++) {
+      const int slot = leaders[j], g = slot % 6;
+      plan[g*3+counts[g]++] = slot;
+    }
+  }
+"""
+private let nmlInlineBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacingOccurrences(
+    of: """
+  for (int slot = simd_gid; slot < R * TOPK; slot += TOPK) {
+    const int row = slot / TOPK;
+    const uint expert = inds[slot];
+    int before = 0;
+    for (int r = 0; r < row; r++) {
+      for (int j = 0; j < TOPK; j++) {
+        before += inds[r * TOPK + j] == expert ? 1 : 0;
+      }
+    }
+    if ((before & 1) != 0) {
+      continue;
+    }
+    int partner = -1;
+    for (int r = R - 1; r > row; r--) {
+      for (int j = 0; j < TOPK; j++) {
+        if (inds[r * TOPK + j] == expert) {
+          partner = r * TOPK + j;
+        }
+      }
+    }
+
+""", with: """
+  threadgroup int plan[36];
+  if (simd_gid == 0 && simd_lid == 0) {
+\(nmlInlineBalancePlanSource)
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int job = 0; job < 3; job++) {
+    const int slot = plan[simd_gid * 3 + job];
+    if (slot < 0) { continue; }
+    const uint expert = inds[slot];
+    const int partner = plan[18 + slot];
+
+""")
+private final class NMLInlineBalanceWeighted: Sendable {
+    static let shared = NMLInlineBalanceWeighted()
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INLINE_BALANCE_PLAN"] != "0"
+    let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced_inplan",
+        inputNames: ["w","scales","biases","x","inds","scores"],
+        outputNames: ["y"], source: nmlInlineBalanceWeightedSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+        ensureRowContiguous: true)
+    func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
+             _ bank: NemotronMoELeader.Bank) -> MLXArray {
+        kernel([bank.weight,bank.scales,bank.biases,x,ids,scores],
+            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n),
+                       ("PAIR_COST",1500),("SOLO_COST",1000)],
+            grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+            outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
 }
 
