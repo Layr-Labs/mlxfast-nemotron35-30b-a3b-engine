@@ -70,7 +70,10 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        // The margin only feeds the marginal depth policy; a fixed depth never
+        // reads it, so skip that host copy.
+        let policyTopTwoHost =
+            mtp.usesMarginalPolicy ? verify.policyTopTwoValues?.asArray(Float.self) : nil
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
