@@ -408,6 +408,7 @@ private enum NemotronHeadPreparedActivation {
         var outputs: [MLXArray] = []
         for k in [2688, 3712, 4096, 5376] {
             let pv = k % 512 == 0 ? 16 : 8
+            let rps = k % 512 == 0 ? 2 : 4
             let x = MLXArray.zeros([3, k], dtype: .bfloat16)
             let w = MLXArray.zeros([8, k / 8], dtype: .uint32)
             let s = MLXArray.zeros([8, k / 64], dtype: .bfloat16)
@@ -418,8 +419,8 @@ private enum NemotronHeadPreparedActivation {
             for relu2 in [false, true] {
                 outputs.append(project([w, s, s, packed[0], args.0, args.1],
                     template: [("T", x.dtype), ("R", 3), ("FAST", k % 512 == 0),
-                               ("RELU2", relu2), ("RPS", 2)],
-                    grid: (32, 4, 1), threadGroup: (32, 2, 1),
+                               ("RELU2", relu2), ("RPS", rps)],
+                    grid: (32, 8 / rps, 1), threadGroup: (32, 2, 1),
                     outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
             }
         }
@@ -524,7 +525,10 @@ enum NemotronMultiRowQMV {
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
         if narrowEnabled && x.dim(0) == 3 && n >= 2688 {
-            let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2, rps: 2)
+            // Prepared PV=8 reduces register pressure enough to reuse four outputs.
+            // The PV=16 (FAST) path retains its two-output layout.
+            let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2,
+                rps: k % 512 == 0 ? 2 : 4)
             guard NemotronMoELeader.selfTest else { return y }
             return nemotronBitwiseOrNaN(y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 2))
         }
