@@ -1326,8 +1326,8 @@ private final class NemotronHPrefillKernels: Sendable {
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
-        // threads; thread (e, s) counts expert e in sub-range s, a serial
-        // exclusive scan over (e, s) gives each thread its first slot, and the
+        // threads; thread (e, s) counts expert e in sub-range s, a two-level
+        // integer SIMD scan gives each thread its first slot, and the
         // second pass writes slots in ascending index order.
         countingSort = MLXFast.metalKernel(
             name: "nemotron_moe_counting_sort",
@@ -1345,16 +1345,21 @@ private final class NemotronHPrefillKernels: Sendable {
                 for (int i = lo; i < hi; ++i) {
                     c += (flat[i] == e) ? 1u : 0u;
                 }
-                counts[tid] = c;
+                // The host always launches 1024 threads: 32 SIMD groups.
+                // Integer totals are bounded by n < 2^24 in the host guard.
+                static_assert(THREADS == 1024, "counting-sort scan width");
+                threadgroup uint simdOffsets[32];
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint localPrefix = simd_prefix_exclusive_sum(c);
+                if (lane == 31) { simdOffsets[sg] = localPrefix + c; }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (tid == 0) {
-                    uint acc = 0;
-                    for (int q = 0; q < THREADS; ++q) {
-                        uint v = counts[q];
-                        counts[q] = acc;
-                        acc += v;
-                    }
+                if (sg == 0) {
+                    uint total = simdOffsets[lane];
+                    simdOffsets[lane] = simd_prefix_exclusive_sum(total);
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                counts[tid] = simdOffsets[sg] + localPrefix;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
                     // Expert-run tiles of BMT rows: (first row, rows, expert).

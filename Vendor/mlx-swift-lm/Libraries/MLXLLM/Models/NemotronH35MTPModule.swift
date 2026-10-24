@@ -143,6 +143,22 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
             hidden: hidden, embedding: embedding, cache: cache)
     }
+    /// Keep the promoted full-width attention/KV arithmetic and its overlap.
+    func pagedAttentionRows(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardRows(
+            hidden: hidden, embedding: embedding, cache: cache)
+    }
+
+    /// Reuse the promoted row MoE and typed ReLU2 path for the selected row.
+    /// The inherited captured/synthetic warm-up calls this exact R=1 entry;
+    /// ordinary drafting and full-width attention are left unchanged.
+    func finishPagedAttentionRow(_ attention: MLXArray) -> MLXArray {
+        precondition(attention.ndim == 3 && attention.dim(0) == 1 && attention.dim(1) == 1)
+        return (layers[1] as! NemotronH35MTPExpertBlock).forwardRows(attention)
+    }
+
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
