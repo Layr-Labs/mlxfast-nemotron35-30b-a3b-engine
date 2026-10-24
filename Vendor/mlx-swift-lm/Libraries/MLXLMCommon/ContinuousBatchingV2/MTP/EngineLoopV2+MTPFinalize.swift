@@ -66,6 +66,7 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        CBv2MTPReadbackSpin.awaitAvailable(verify.acceptancePacket)
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost: [Float]?
@@ -119,6 +120,7 @@ extension EngineLoopV2 {
             }
 
             var accepted = 0
+            // mtpDeviceAcceptedDrafts repeats this walk on device.
             while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
@@ -214,9 +216,16 @@ extension EngineLoopV2 {
             // draft inputs and their trusted target hidden rows; every
             // speculative head suffix is discarded.
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            if let observer = mtp.drafter as? any CBv2MTPCommittedTokenObserving,
+                let state = metadata.assistantState
+            {
+                observer.observeCommittedTokens(kept, requestState: state)
+            }
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
+                (stateful as? any CBv2MTPDeviceAcceptedPrestaging)?.noteHostAcceptedDrafts(
+                    accepted, requestState: state)
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
@@ -422,6 +431,14 @@ extension EngineLoopV2 {
     }
 }
 
+/// Optional request-stateful drafter capability: the target tokens a request
+/// commits, on the host, in order (the prompt's chunks at prefill, then each
+/// round's confirmed tokens at finalize). Drafters may use them only to choose
+/// how they draft; the target still verifies every proposal.
+public protocol CBv2MTPCommittedTokenObserving: AnyObject {
+    func observeCommittedTokens(_ tokens: [Int], requestState: any CBv2MTPRequestState)
+}
+
 /// Optional request-stateful drafter capability: submit the next round's
 /// first draft from finalize, as soon as its carry (token, target hidden) is
 /// final. The drafter must hand that draft out only to the next first
@@ -452,6 +469,44 @@ extension CBv2MTPFirstDraftPrestaging {
     }
 }
 
+/// Optional: queue the next round's first draft right behind the verify, for
+/// the row the device picks from the acceptance packet, so the head does not
+/// wait for the host's finalize. The host still decides: finalize reports its
+/// own accept count, and the drafter adopts the queued draft only when that
+/// count selects the same row (otherwise it builds it as before).
+public protocol CBv2MTPDeviceAcceptedPrestaging: CBv2MTPFirstDraftPrestaging {
+    /// After `speculateAfterVerify`. acceptedDrafts: [1] int32, the leading
+    /// draft matches in the acceptance packet.
+    func speculateNextFirstDraft(acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState)
+    /// Before `finalizeRound`: the host walk's accept count.
+    func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState)
+}
+
+/// The acceptance readback polls the packet's completion event instead of
+/// sleeping in the event wait, so the engine thread resumes as soon as the
+/// verify's command buffer signals (kshitij-hash). Bounded: after 50 ms, or on
+/// any inspection error, the ordinary blocking read runs. Values are unchanged.
+/// CBV2_MTP_SPIN_READBACK=0 keeps the blocking wait.
+enum CBv2MTPReadbackSpin {
+    static let enabled =
+        ProcessInfo.processInfo.environment["CBV2_MTP_SPIN_READBACK"] != "0"
+    static let capSeconds = 0.05
+
+    static func awaitAvailable(_ packet: MLXArray) {
+        guard enabled else { return }
+        let start = CFAbsoluteTimeGetCurrent()
+        while true {
+            // An inspection error ends the poll; the blocking read reports it.
+            do {
+                if try packet.evaluatedBufferInfo() != nil { return }
+            } catch {
+                return
+            }
+            if CFAbsoluteTimeGetCurrent() - start > capSeconds { return }
+        }
+    }
+}
+
 public enum CBv2MTPFirstDraftPrestage {
     /// CBV2_MTP_PRESTAGE_FIRST_DRAFT=0 restores submission at round build.
     public static let enabled =
@@ -462,6 +517,9 @@ public enum CBv2MTPFirstDraftPrestage {
     /// NEMOTRON_MTP_PRESTAGE_SECOND=0 prestages only the first draft.
     public static let chained = enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_PRESTAGE_SECOND"] != "0"
+    /// CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT=0 restores host-selected tail submission.
+    public static let deviceAccepted = speculateAfterVerify
+        && ProcessInfo.processInfo.environment["CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT"] != "0"
 }
 
 extension EngineLoopV2 {
@@ -485,6 +543,25 @@ extension EngineLoopV2 {
                 targetTokens: targets[index ..< (index + 1)],
                 targetHidden: verify.lastHidden[index ..< (index + 1)],
                 requestState: state)
+            if CBv2MTPFirstDraftPrestage.deviceAccepted, verify.k > 0,
+                let deviceAccepted = speculator as? any CBv2MTPDeviceAcceptedPrestaging
+            {
+                deviceAccepted.speculateNextFirstDraft(
+                    acceptedDrafts: Self.mtpDeviceAcceptedDrafts(verify, row: index),
+                    requestState: state)
+            }
         }
+    }
+
+    /// The finalize accept walk on device, from the acceptance packet's own
+    /// draft and target ids: [1] int32. Must stay identical to the host walk
+    /// in `finalizeMTPRound`.
+    static func mtpDeviceAcceptedDrafts(_ verify: CBv2MTPRoundInFlight.Verify, row: Int) -> MLXArray {
+        let k = verify.k, width = k + 1, draftCount = verify.rows.count * k
+        let packet = verify.acceptancePacket
+        let drafts = packet[(row * k) ..< (row * k + k)]
+        let targets = packet[(draftCount + row * width) ..< (draftCount + row * width + k)]
+        let matches = (targets .== drafts).asType(.int32)
+        return cumprod(matches, axis: 0).sum(axis: 0, keepDims: true).asType(.int32)
     }
 }
