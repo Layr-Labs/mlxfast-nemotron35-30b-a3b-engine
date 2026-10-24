@@ -14,14 +14,18 @@ enum NemotronMTPExecution {
     static let windowSSM = enabledByDefault("DARKBLOOM_NEMOTRON35_MTP_WINDOW_SSM")
 }
 
-func nemotronMTPHeadRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
+/// `prepared`: x's K=2688 activation from the final norm_f join (else
+/// prepared here from x).
+func nemotronMTPHeadRows(_ x: MLXArray, _ linear: Linear,
+                         prepared: MLXArray? = nil) -> MLXArray {
     guard NemotronMTPExecution.exactMultirowHead, x.ndim == 3,
           x.dim(0) == 1, (2...8).contains(x.dim(1)), x.dim(2) == 2688,
           let q = linear as? QuantizedLinear, q.weight.dim(0) == 131072,
           q.groupSize == 64, q.bits == 4, q.mode == .affine,
           q.scales.dtype == x.dtype, q.biases?.dtype == x.dtype
     else { return nemotronMTPLinearRows(x, linear) }
-    if let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q) {
+    if let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q,
+                                            prepared: prepared) {
         var result = rows.reshaped(1, x.dim(1), q.weight.dim(0))
         if let bias = q.bias { result = result + bias }
         return result
@@ -1098,9 +1102,15 @@ enum NemotronTargetQKV {
     }
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
-                                 prepared: Bool = false) -> [MLXArray] {
+                                 prepared: Bool = false,
+                                 packed: MLXArray? = nil) -> [MLXArray] {
         let rows = x.dim(1)
-        let activations = prepared ? NemotronHeadPreparedActivation.pack(x.reshaped(rows, 2688)) : x
+        // `packed`: the same K=2688 (PV 8) layout `pack` writes, prepared by
+        // the preceding join from these exact BF16 rows.
+        let activations = prepared
+            ? (NemotronHeadPreparedActivation.compatible(packed, rows: rows, k: 2688)
+                ?? NemotronHeadPreparedActivation.pack(x.reshaped(rows, 2688)))
+            : x
         return (prepared ? preparedKernel : kernel)(
             weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -1111,7 +1121,8 @@ enum NemotronTargetQKV {
     }
 
     static func apply(
-        _ x: MLXArray, query: Linear, key: Linear, value: Linear, captureMTP: Bool
+        _ x: MLXArray, query: Linear, key: Linear, value: Linear, captureMTP: Bool,
+        prepared packed: MLXArray? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -1122,7 +1133,7 @@ enum NemotronTargetQKV {
         else { return nil }
         let rps = resultsPerSimdgroup(rows: x.dim(1))
         let prepared = preparedEnabled && rps == 2 && x.dim(1) == 3
-        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared)
+        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared, packed: packed)
         if rps != 4, NemotronMoELeader.selfTest {
             let expected = dispatch(q + k + v, x, rps: 4)
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }

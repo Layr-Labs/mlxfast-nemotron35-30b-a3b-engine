@@ -176,6 +176,10 @@ struct PagedKVSegmentLayout: Sendable {
 /// Exclusive staging or the engine queue owns cover/retirement mutations.
 /// Rebased segment wrappers share this evaluated allocation and one credit.
 /// Invalidating coverage never drops the array or refunds its native charge.
+/// NEMOTRON_PAGED_HOST_ZERO=0 zero-fills new segments on the default stream.
+let pagedSegmentHostZeroFill =
+    ProcessInfo.processInfo.environment["NEMOTRON_PAGED_HOST_ZERO"] != "0"
+
 final class PagedKVSegmentBacking {
     let array: MLXArray
     let allocatedBytes: Int
@@ -242,7 +246,7 @@ final class PagedKVSegment {
         self.pages = pages
         self.valueOffset = pages.count * key.kvHeads * pageSize * key.headDim
         self.byteCount = pages.count * layout.pageBytes
-        let allocationStream = StreamOrDevice.default
+        let allocationStream: StreamOrDevice = pagedSegmentHostZeroFill ? .cpu : .default
         let storage = try withError { fault in
             let array = MLXArray.zeros(
                 [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,

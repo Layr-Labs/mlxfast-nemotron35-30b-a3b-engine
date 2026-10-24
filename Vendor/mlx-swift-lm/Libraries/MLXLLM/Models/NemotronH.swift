@@ -165,6 +165,125 @@ enum NemotronHResidualRMSNorm {
         return (outputs[0], outputs[1], outputs[2])
     }
 
+    // MARK: Captured-verify plumbing (one launch per layer join)
+
+    /// NEMOTRON_MTP_FUSED_PLUMBING=0 restores the original captured verify
+    /// joins (stock add / stock rms at early-eval boundaries, separate
+    /// activation prepares, MoE shared add). Captured verify only.
+    static let fusedPlumbing =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FUSED_PLUMBING"] != "0"
+
+    /// `x + (y + s)`: the MoE's stock `y + shared` Add moves in front of the
+    /// residual Add; both stay separate BF16 roundings, in the same order.
+    private static func sumPreparedSource() -> String {
+        let add = "T sum = lhs[offset + i] + rhs[offset + i];"
+        let s = preparedSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        return s.replacingOccurrences(of: add, with: "T part = rhs[offset + i] + shared[offset + i];\n"
+            + "                T sum = lhs[offset + i] + part;")
+    }
+
+    /// Stock rms_single_row input (thread_x = x) with the prepared epilogue.
+    private static func normPreparedSource() -> String {
+        let add = "T sum = lhs[offset + i] + rhs[offset + i];"
+        let store = "residual[offset + i] = sum;"
+        let s = preparedSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        precondition(s.components(separatedBy: store).count == 2)
+        return s.replacingOccurrences(of: add, with: "T sum = lhs[offset + i];")
+            .replacingOccurrences(of: store, with: "")
+    }
+    private static let sumPreparedKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_sum_rms_prepared_bf16",
+        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: sumPreparedSource(), ensureRowContiguous: true)
+    private static let normPreparedKernel = MLXFast.metalKernel(
+        name: "nemotron_h_rms_prepared_bf16",
+        inputNames: ["lhs", "weight", "axis_size", "eps"],
+        outputNames: ["normalized", "prepared"],
+        source: normPreparedSource(), ensureRowContiguous: true)
+
+    /// Input-independent scalar kernel arguments, built once instead of per
+    /// call (same values and the same scalar kernel instantiation).
+    private static let scalarLock = NSLock()
+    nonisolated(unsafe) private static var axisScalar: MLXArray?
+    nonisolated(unsafe) private static var epsScalars: [UInt32: MLXArray] = [:]
+    private static func scalars(_ eps: Float) -> (MLXArray, MLXArray) {
+        scalarLock.lock(); defer { scalarLock.unlock() }
+        let axis = axisScalar ?? MLXArray(UInt32(2688))
+        axisScalar = axis
+        if let value = epsScalars[eps.bitPattern] { return (axis, value) }
+        let value = MLXArray(eps)
+        epsScalars[eps.bitPattern] = value
+        return (axis, value)
+    }
+
+    /// Configuration gate of the fused captured-verify joins (the consumers
+    /// read a prepared activation only on the narrow multi-row route).
+    static var plumbingAvailable: Bool {
+        fusedPlumbing && NemotronMTPExecution.batchedM1 && NemotronMTPExecution.batchedNorm
+            && NemotronMultiRowQMV.enabled && NemotronMultiRowQMV.narrowEnabled
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+    }
+
+    private static func plumbingRows(_ x: MLXArray, norm: RMSNorm) -> Bool {
+        plumbingAvailable
+            && x.shape == [1, 3, 2688] && x.dtype == .bfloat16
+            && type(of: norm) == RMSNorm.self
+            && norm.weight.shape == [2688] && norm.weight.dtype == .bfloat16
+    }
+
+    /// Captured verify join: (residual, normalized, prepared K=2688 rows).
+    /// `shared` non-nil computes residual = lhs + (rhs + shared).
+    static func applyPreparedRows(
+        _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard plumbingRows(lhs, norm: norm),
+              rhs.shape == lhs.shape, rhs.dtype == .bfloat16,
+              shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
+        else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let shapes = [lhs.shape, lhs.shape, [3, 11, 9 * 32]]
+        let outputs: [MLXArray]
+        if let shared {
+            outputs = sumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
+        } else {
+            outputs = preparedKernel([lhs, rhs, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
+        }
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
+        // Stock reference: MLX Add(s) then stock RMSNorm. Any bit difference
+        // poisons every output, the prepared activation included (consumers
+        // also re-check prepared against a self-prepared reference).
+        let summed = lhs + (shared.map { rhs + $0 } ?? rhs)
+        let ok = MLX.logicalAnd(
+            (outputs[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
+            (outputs[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
+        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[1], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[2], MLXArray(Float.nan)))
+    }
+
+    /// Captured verify entry norm: (normalized, prepared K=2688 rows).
+    static func normPreparedRows(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray)? {
+        guard plumbingRows(x, norm: norm) else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let outputs = normPreparedKernel([x, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [x.shape, [3, 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
+        let ok = (outputs[0].view(dtype: .uint16) .== norm(x).view(dtype: .uint16)).all()
+        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[1], MLXArray(Float.nan)))
+    }
+
     static func apply(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
     {
@@ -1089,13 +1208,15 @@ class NemotronHAttention: Module, NemotronHMixer {
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
         captureMTP: Bool = false,
-        targetQKV: Bool = false
+        targetQKV: Bool = false,
+        prepared: MLXArray? = nil
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
         let projections: (MLXArray, MLXArray, MLXArray)
         if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(x, query: wq, key: wk, value: wv, captureMTP: captureMTP) {
+           let outputs = NemotronTargetQKV.apply(
+               x, query: wq, key: wk, value: wv, captureMTP: captureMTP, prepared: prepared) {
             projections = outputs
         } else {
             projections = (
@@ -1147,6 +1268,10 @@ class NemotronHAttention: Module, NemotronHMixer {
 // MARK: - MLP
 
 class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
+    /// DARKBLOOM_NEMOTRON35_ORDINARY_R1_SHARED_UP=0 keeps stock up_proj + relu2.
+    private static let ordinaryR1SharedUp =
+        ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_ORDINARY_R1_SHARED_UP"] != "0"
+
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
@@ -1158,7 +1283,27 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(relu2(upProj(x)))
+        // Ordinary M=1 shared up (draft one-token tail): the multi-row QMV at
+        // R = 1 repeats stock qmv (K = 2688 is not qmv_fast) and its epilogue
+        // rounds to BF16 before the BF16 maximum/multiply, as stock relu2 does.
+        // Other geometries and unknown overrides retain the original entry.
+        if Self.ordinaryR1SharedUp, type(of: self) == NemotronHMLP.self,
+           type(of: upProj) == QuantizedLinear.self,
+           type(of: downProj) == QuantizedLinear.self,
+           x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+           NemotronMTPExecution.batchedM1,
+           let up = upProj as? QuantizedLinear, up.bias == nil,
+           up.weight.shape == [3712, 336], up.scales.shape == [3712, 42],
+           let offsets = up.biases, offsets.shape == [3712, 42],
+           Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+           var activated = NemotronMultiRowQMV.apply(
+               x.reshaped(1, 2688), up, relu2: true) {
+            if NemotronMoELeader.selfTest {
+                activated = nemotronBitwiseOrNaN(activated, relu2(upProj(x)).reshaped(1, 3712))
+            }
+            return downProj(activated.reshaped(1, 1, 3712))
+        }
+        return downProj(relu2(upProj(x)))
     }
 
     // Protocol conformance
@@ -3124,6 +3269,65 @@ private class NemotronHBlock: Module {
         }
         return (x + output, nil, nil)
     }
+
+    /// Captured verify block whose join with `nextNorm` (the next block's
+    /// norm, or norm_f after the last block) is one launch producing the
+    /// residual, the normalized rows and their prepared K=2688 activation.
+    /// The mixers consume `preparedActivation` instead of re-preparing.
+    func cbv2ForwardCapturedFused(
+        _ x: MLXArray,
+        modelLayerIndex: Int,
+        attentionCache: (any CBv2AttendingLayerCache)?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        preparedNorm: MLXArray?,
+        preparedActivation: MLXArray?,
+        nextNorm: RMSNorm
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        let hidden = preparedNorm ?? nemotronMTPNormRows(x) { norm($0) }
+        let prepared = preparedNorm == nil ? nil : preparedActivation
+        var output: MLXArray
+        var shared: MLXArray? = nil
+        switch blockType {
+        case .mamba:
+            precondition(
+                attentionCache == nil,
+                "NemotronH recurrent layer received attention KV")
+            output = (mixer as! NemotronHMamba2Mixer).cbv2ForwardCaptured(
+                hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
+                prepared: prepared)
+        case .attention:
+            guard let attentionCache else {
+                preconditionFailure("NemotronH attention layer is missing CBv2 cache")
+            }
+            output = (mixer as! NemotronHAttention).cbv2Forward(
+                hidden, cache: attentionCache, captureMTP: true, targetQKV: true,
+                prepared: prepared)
+        case .mlp:
+            precondition(
+                attentionCache == nil,
+                "NemotronH MLP layer received attention KV")
+            output = (mixer as! NemotronHMLP).mtpForwardRows(hidden)
+        case .moe:
+            precondition(
+                attentionCache == nil,
+                "NemotronH MoE layer received attention KV")
+            let moe = mixer as! NemotronHMoE
+            if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
+                output = parts.0
+                shared = parts.1
+            } else {
+                output = moe.mtpForwardRows(hidden, prepared: prepared)
+            }
+        }
+        if let triple = NemotronHResidualRMSNorm.applyPreparedRows(
+            x, output, shared: shared, norm: nextNorm) {
+            return (triple.0, triple.1, triple.2)
+        }
+        // Original arithmetic: stock shared Add, residual Add, stock RMSNorm.
+        if let shared { output = output + shared }
+        let residual = x + output
+        return (residual, nemotronMTPNormRows(residual) { nextNorm($0) }, nil)
+    }
 }
 
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
@@ -3298,6 +3502,67 @@ private class NemotronHBackbone: Module {
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
+    }
+
+    /// Captured verify forward ([1, 3] window) with one join launch per
+    /// layer: every residual add, block norm (including the early-eval
+    /// boundaries and norm_f) and K=2688 activation prepare share one kernel.
+    /// The same early asyncEval layers as `cbv2Forward`; the submitted root
+    /// is the join's residual output. Returns (norm_f rows, their prepared
+    /// activation for the head), or nil before building anything when the
+    /// window or weights are not the fused shape.
+    func cbv2ForwardCapturedFused(
+        _ inputs: MLXArray,
+        caches: [any CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (hidden: MLXArray, prepared: MLXArray?)? {
+        guard NemotronHResidualRMSNorm.plumbingAvailable,
+              inputs.shape == [1, 3], let first = layers.first,
+              type(of: first.norm) == RMSNorm.self, first.norm.weight.dtype == .bfloat16
+        else { return nil }
+        let observation = CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
+            : nil
+        defer { observation?.end() }
+        var hidden = embeddings(inputs)
+        let entry = NemotronHResidualRMSNorm.normPreparedRows(hidden, norm: first.norm)
+        var preparedNorm: MLXArray? = entry?.0
+        var preparedActivation: MLXArray? = entry?.1
+        var attentionIndex = 0
+        for (modelLayerIndex, layer) in layers.enumerated() {
+            let cache: (any CBv2AttendingLayerCache)?
+            if layer.blockType == .attention {
+                guard attentionIndex < caches.count else {
+                    preconditionFailure(
+                        "NemotronH CBv2 attention cache count is too small")
+                }
+                cache = caches[attentionIndex]
+                attentionIndex += 1
+            } else {
+                cache = nil
+            }
+            let next = modelLayerIndex + 1
+            let result = layer.cbv2ForwardCapturedFused(
+                hidden,
+                modelLayerIndex: modelLayerIndex,
+                attentionCache: cache,
+                recurrentState: recurrentState,
+                preparedNorm: preparedNorm,
+                preparedActivation: preparedActivation,
+                nextNorm: next < layers.count ? layers[next].norm : normF)
+            hidden = result.0
+            preparedNorm = result.1
+            preparedActivation = result.2
+            // Same submission layers as `cbv2Forward` (evaluation order only).
+            if nemotronEarlyEvalInterval > 0 && next < layers.count
+                && next % nemotronEarlyEvalInterval == 0 {
+                asyncEval(hidden)
+            }
+        }
+        precondition(
+            attentionIndex == caches.count,
+            "NemotronH CBv2 attention cache count is too large")
+        return (preparedNorm!, preparedActivation)
     }
 }
 
@@ -3486,6 +3751,23 @@ public class NemotronHModel:
         return backbone.cbv2Forward(
             inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
             recyclePrefillChunks: recyclePrefillChunks)
+    }
+
+    /// Captured verify only; nil (nothing built) unless the fused join applies.
+    func cbv2HiddenCapturedFused(
+        _ inputs: MLXArray,
+        caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (hidden: MLXArray, prepared: MLXArray?)? {
+        guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.shape == [1, 3] else { return nil }
+        let attending = caches.map { cache -> any CBv2AttendingLayerCache in
+            guard let attending = cache as? any CBv2AttendingLayerCache else {
+                preconditionFailure("NemotronH CBv2 target received legacy KV cache")
+            }
+            return attending
+        }
+        return backbone.cbv2ForwardCapturedFused(
+            inputs, caches: attending, recurrentState: recurrentState)
     }
 
     func logits(_ hidden: MLXArray) -> MLXArray {

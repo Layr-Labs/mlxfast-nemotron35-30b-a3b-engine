@@ -20,13 +20,21 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    private var entries: [Bool: Entry] = [:]
+    /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
+    private var entries: [Entry?] = [nil, nil, nil, nil]
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
     var callCount: Int { lock.withLock { calls } }
 
     func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, owner: NemotronHMoE) -> MLXArray {
+        let result = outputs(x, prepared: prepared, parts: false, owner: owner)
+        return result.isEmpty ? MLXArray(0) : result[0]
+    }
+
+    /// parts: [routed, shared] before their Add (owner must have shared experts).
+    func outputs(_ x: MLXArray, prepared: MLXArray?, parts: Bool,
+                 owner: NemotronHMoE) -> [MLXArray] {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
         // child identity cheaply, and collect array handles only on a miss.
@@ -36,26 +44,26 @@ final class NemotronH35MTPGraphCache {
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
+        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
-            if let entry = entries[usesPrepared], entry.identity == identity { return entry }
+            if let entry = entries[slot], entry.identity == identity { return entry }
             let state = parameters ?? owner.innerState()
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
-                return [owner.mtpForwardRowsUncompiled(arrays[0],
-                    prepared: usesPrepared ? arrays[1] : nil)]
+                return owner.mtpForwardRowsUncompiledOutputs(arrays[0],
+                    prepared: usesPrepared ? arrays[1] : nil, parts: parts)
             }
             let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
-            retired = entries[usesPrepared]
-            entries[usesPrepared] = replacement
+            retired = entries[slot]
+            entries[slot] = replacement
             generations += 1
             return replacement
         }
         // Destroy retired compiler entries outside this helper's lock; compiler
         // evaluation owns a separate global/per-function lock ordering.
-        let result = withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
-        return result.isEmpty ? MLXArray(0) : result[0]
+        return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
@@ -89,8 +97,28 @@ extension NemotronHMoE {
         return mtpForwardRowsUncompiled(x, prepared: prepared)
     }
 
+    /// Captured-verify join only: (routed, shared) before `routed + shared`,
+    /// which the join kernel then computes (same operand order, same BF16
+    /// rounding) ahead of the residual Add. The graph is otherwise unchanged.
+    func mtpForwardRowsParts(_ x: MLXArray, prepared: MLXArray? = nil) -> (MLXArray, MLXArray)? {
+        guard sharedExperts != nil, NemotronMTPExecution.batchedM1,
+              x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) else { return nil }
+        let outputs = NemotronMTPExecution.compiledMoE
+            ? mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true, owner: self)
+            : mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: true)
+        return outputs.count == 2 ? (outputs[0], outputs[1]) : nil
+    }
+
     func mtpForwardRowsUncompiled(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
-        guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
+        mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: false)[0]
+    }
+
+    /// [routed + shared], or [routed, shared] when `parts` (shared experts
+    /// present, batched M=1 route).
+    func mtpForwardRowsUncompiledOutputs(
+        _ x: MLXArray, prepared: MLXArray?, parts: Bool
+    ) -> [MLXArray] {
+        guard NemotronMTPExecution.batchedM1 else { return [nemotronMTPMapRows(x) { self($0) }] }
         let packed: MLXArray?
         if NemotronHResidualRMSNorm.preparedMoEEnabled, NemotronMoELeader.enabled,
            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -122,8 +150,9 @@ extension NemotronHMoE {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
-        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x, prepared: packed) }
-        return y
+        guard let sharedExperts else { return [y] }
+        let shared = sharedExperts.mtpForwardRows(x, prepared: packed)
+        return parts ? [y, shared] : [y + shared]
     }
 }
 
