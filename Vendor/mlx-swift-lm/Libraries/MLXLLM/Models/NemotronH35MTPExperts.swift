@@ -202,7 +202,7 @@ inline T nml_store(float v) {
 """
 
 private let nemotronMoELeaderSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -235,7 +235,7 @@ private let nemotronMoELeaderSource = """
     }
   }
 
-  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
@@ -357,7 +357,7 @@ private final class NemotronMoELeaderKernel: Sendable {
 // products after a shared-memory barrier. Each row has six distinct router
 // indices. Experts can repeat across rows, as in the accepted leader path.
 private let nemotronMoELeaderWeightedSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = WRPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -371,7 +371,7 @@ private let nemotronMoELeaderWeightedSource = """
   const int out_row = tid.x * results_per_simdgroup;
   threadgroup float products[R * TOPK * results_per_simdgroup];
 
-  for (int slot = simd_gid; slot < R * TOPK; slot += TOPK) {
+  for (int slot = simd_gid; slot < R * TOPK; slot += SG) {
     const int row = slot / TOPK;
     const uint expert = inds[slot];
     int before = 0;
@@ -535,6 +535,12 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
+    static let narrowLeader =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
+    static let slotParallelDown =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_SLOT_GROUPS"] != "0"
+    static let narrowWeightedDown =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_WEIGHTED_NARROW"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -567,16 +573,25 @@ enum NemotronMoELeader {
         return Bank(weight: weight, scales: scales, biases: biases, k: k, n: weight.dim(1))
     }
 
+    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
+        narrowLeader && rows == 3 ? 2 : 4
+    }
+
+    static func weightedSimdgroups(rows: Int) -> Int {
+        slotParallelDown && rows == 3 ? rows * 6 : 6
+    }
+
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
-        NemotronMoELeaderKernel.shared.kernel(
+        let rps = leaderResultsPerSimdgroup(rows: rows)
+        return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
-            grid: (32, bank.n / 4, rows * topK),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
@@ -586,12 +601,14 @@ enum NemotronMoELeader {
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank) -> MLXArray {
-        NemotronMoELeaderWeightedKernel.shared.kernel(
+        let groups = weightedSimdgroups(rows: rows)
+        let rps = narrowWeightedDown && rows == 3 ? 2 : 4
+        return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n)],
-            grid: (32 * (bank.n / 4), 6, 1),
-            threadGroup: (32, 6, 1),
+                       ("K", bank.k), ("N", bank.n), ("SG", groups), ("WRPS", rps)],
+            grid: (32 * (bank.n / rps), groups, 1),
+            threadGroup: (32, groups, 1),
             outputShapes: [[1, rows, bank.n]],
             outputDTypes: [x.dtype])[0]
     }
