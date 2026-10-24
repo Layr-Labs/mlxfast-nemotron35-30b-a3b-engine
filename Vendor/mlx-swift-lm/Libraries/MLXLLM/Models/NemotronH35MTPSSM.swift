@@ -95,6 +95,24 @@ private enum NemotronMTPCompactSSMKernel {
             constexpr int n_per_t = (Ds + 31) / 32;
             auto ds_idx = thread_position_in_threadgroup.x;
             auto d_idx = thread_position_in_grid.y;
+            // Head/step coefficients are identical for all eight d rows.
+            // One SIMD group evaluates the short coefficient table, then
+            // every existing state row consumes the same FP32 values.
+            threadgroup float sharedDT[SC ? L : 1];
+            threadgroup float sharedDA[SC ? L : 1];
+            if constexpr (SC) {
+                if (thread_position_in_threadgroup.y == 0) {
+                    for (int t = ds_idx; t < L; t += 32) {
+                        auto dt_ = static_cast<float>(dt[t * H + n]);
+                        auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                        auto dA = fast::exp(A * dt_);
+                        sharedDT[t] = dt_;
+                        sharedDA[t] = dA;
+                    }
+                }
+                // All threads arrive before any partial-Dh row can return.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
             if constexpr (Dh % 8 != 0) { if (d_idx >= Dh) return; }
             float prior[n_per_t];
             for (int i = 0; i < n_per_t; ++i) {
@@ -106,9 +124,16 @@ private enum NemotronMTPCompactSSMKernel {
                 auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
                 auto C_ = conv + t * CD + CO + g_idx * Ds;
                 auto B_ = conv + t * CD + BO + g_idx * Ds;
-                auto dt_ = static_cast<float>(dt[t * H + n]);
-                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
-                auto dA = fast::exp(A * dt_);
+                float dt_;
+                float dA;
+                if constexpr (SC) {
+                    dt_ = sharedDT[t];
+                    dA = sharedDA[t];
+                } else {
+                    dt_ = static_cast<float>(dt[t * H + n]);
+                    auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                    dA = fast::exp(A * dt_);
+                }
                 float acc = 0.0;
                 for (int i = 0; i < n_per_t; ++i) {
                     auto s_idx = n_per_t * ds_idx + i;
@@ -145,13 +170,16 @@ func nemotronMTPSSMCompact(
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
     precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
+    // The verified short-window shapes need at most 64 bytes of scratch.
+    // Preserve the original coefficient path for any wider generic caller.
+    let shareCoefficients = (1...8).contains(steps)
     let outputs = NemotronMTPCompactSSMKernel.kernel(
         [convolution, ALog, D, dt, state],
         template: [("T", convolution.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
                    ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
-                   ("WO", writeOutput)],
+                   ("WO", writeOutput), ("SC", shareCoefficients)],
         grid: (32, headDim, heads), threadGroup: (32, 8, 1),
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])
