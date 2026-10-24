@@ -1103,6 +1103,96 @@ enum NemotronHRouterSelection {
     }
 }
 
+enum NemotronHGroupedRouterScore {
+    static let scores = MLXFast.metalKernel(
+        name: "nemotron_h_router_group_scores",
+        inputNames: ["gates", "bias"],
+        outputNames: ["original", "corrected"],
+        source: """
+            const uint row = threadgroup_position_in_grid.y;
+            const uint id = thread_position_in_threadgroup.x;
+            const float g = float(gates[row * 128 + id]);
+            const float y = 1 / (1 + metal::exp(metal::abs(g)));
+            const float o = (g < 0) ? y : 1 - y;
+            original[row * 128 + id] = o;
+            corrected[row * 128 + id] = o + bias[id];
+            """,
+        header: NemotronHRouterSelection.sigmoidHeader,
+        ensureRowContiguous: true)
+
+    static let weights = MLXFast.metalKernel(
+        name: "nemotron_h_router_group_weights",
+        inputNames: ["original", "indices"],
+        outputNames: ["weights"],
+        source: """
+            const uint row = threadgroup_position_in_grid.y;
+            const uint lane = thread_position_in_threadgroup.x;
+            threadgroup float chosen[6];
+            if (lane < 6) {
+                chosen[lane] = original[row * 128 + indices[row * 128 + lane]];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane == 0) {
+                // row_reduce_small's value + total order from positive zero.
+                float total = 0.0f;
+                for (int slot = 0; slot < 6; ++slot) { total = chosen[slot] + total; }
+                const float denominator = total + 1e-20f;
+                for (int slot = 0; slot < 6; ++slot) {
+                    const float scaled = chosen[slot] / denominator;
+                    weights[row * 6 + slot] = scaled * 2.5f;
+                }
+            }
+            """,
+        ensureRowContiguous: true)
+
+    static func warm() {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return }
+        let gates = MLXArray.zeros([1, 1, 128], dtype: .bfloat16)
+        let bias = MLXArray.zeros([128], dtype: .float32)
+        guard let fused = apply(
+            gates: gates, eSCB: bias, topK: 6, nGroup: 8, topkGroup: 1,
+            routedScalingFactor: 2.5, normTopkProb: true),
+            let fusedWeights = selected(
+                original: fused.original,
+                indices: MLXArray.zeros([1, 1, 128], dtype: .int32))
+        else { return }
+        eval([fused.corrected, fusedWeights])
+    }
+
+    static func apply(
+        gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
+        routedScalingFactor: Float, normTopkProb: Bool
+    ) -> (original: MLXArray, corrected: MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
+            gates.dim(2) == 128, gates.dtype == .bfloat16,
+            eSCB.shape == [128], eSCB.dtype == .float32,
+            topK == 6, nGroup == 8, topkGroup == 1,
+            normTopkProb, routedScalingFactor == 2.5
+        else { return nil }
+        let rows = gates.dim(1)
+        let result = scores(
+            [gates, eSCB], grid: (128, rows, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, rows, 128], [1, rows, 128]],
+            outputDTypes: [.float32, .float32])
+        return (result[0], result[1])
+    }
+
+    static func selected(
+        original: MLXArray, indices: MLXArray
+    ) -> MLXArray? {
+        guard original.ndim == 3, original.dim(0) == 1, (1...8).contains(original.dim(1)),
+            original.dim(2) == 128, original.dtype == .float32,
+            indices.shape == original.shape, indices.dtype == .int32 || indices.dtype == .uint32
+        else { return nil }
+        let rows = original.dim(1)
+        return weights(
+            [original, indices], grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, rows, 6]], outputDTypes: [.float32])[0]
+    }
+}
+
 private func groupExpertSelect(
     gates: MLXArray,
     eSCB: MLXArray,  // e_score_correction_bias
@@ -1119,9 +1209,18 @@ private func groupExpertSelect(
     }
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
 
-    // Original scores using sigmoid
-    let origScores = sigmoid(gates.asType(.float32))
-    var scores = origScores + eSCB
+    let origScores: MLXArray
+    var scores: MLXArray
+    if let fused = NemotronHGroupedRouterScore.apply(
+        gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
+        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+    {
+        origScores = fused.original
+        scores = fused.corrected
+    } else {
+        origScores = sigmoid(gates.asType(.float32))
+        scores = origScores + eSCB
+    }
 
     // Group-based selection if n_group > 1
     if nGroup > 1 {
@@ -1147,8 +1246,13 @@ private func groupExpertSelect(
         scores = flattened(scores, start: -2, end: -1)
     }
 
-    // Get top-k experts
-    let inds = argPartition(-scores, kth: topK - 1, axis: -1)[.ellipsis, ..<topK]
+    let partition = argPartition(-scores, kth: topK - 1, axis: -1)
+    let inds = partition[.ellipsis, ..<topK]
+    if let fusedWeights = NemotronHGroupedRouterScore.selected(
+        original: origScores, indices: partition)
+    {
+        return (inds, fusedWeights)
+    }
     var finalScores = takeAlong(origScores, inds, axis: -1)
 
     // Normalize if needed

@@ -84,6 +84,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         let requested = maximumDraftTokens
             ?? Int(environment["DARKBLOOM_NEMOTRON35_MTP_MAX_DRAFT_TOKENS"] ?? "") ?? 7
         self.draftLimit = (1...7).contains(requested) ? requested : 7
+        NemotronHGroupedRouterScore.warm()
     }
 
     final class State: CBv2MTPRequestState {
