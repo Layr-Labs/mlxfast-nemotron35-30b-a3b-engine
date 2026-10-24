@@ -365,6 +365,12 @@ jobs:
           fi
           echo "reference workspace ok: ${MLXFAST_BASELINE_WORKSPACE} at ${want}, trusted CLI and worker staged with the metallib pair and transformed weights"
 
+      - name: Stop residents left by an earlier job (GPU lock, exact match)
+        # A cancelled job can leave its resident alive after the runner exits.
+        # The box-wide GPU lock proves whether cleanup can safely inspect all
+        # runner work trees before this job starts.
+        run: ./tools/stop-leaked-residents.sh --mode preflight
+
       - name: Ranked box preflight (staged assets, contract pins, no credential)
         # Items 2-5 of the fail-closed inventory in this file's header. Runs
         # before ./setup.sh, so a mis-staged box is refused before it spends
@@ -637,3 +643,12 @@ jobs:
           name: benchmark-results-${{ github.run_id }}
           path: score.json
           if-no-files-found: error
+
+      - name: Stop this job's residents (cleanup)
+        # Always try cleanup after the artifact step.
+        # Exit 3 defers cleanup to the next job's preflight.
+        if: always()
+        run: |
+          rc=0
+          ./tools/stop-leaked-residents.sh --mode cleanup || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]
