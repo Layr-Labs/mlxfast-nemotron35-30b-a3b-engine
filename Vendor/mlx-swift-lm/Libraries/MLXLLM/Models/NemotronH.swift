@@ -58,6 +58,129 @@ let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
 
+// MARK: - Weight anchors (decode-window custom kernels only)
+
+/// NEMOTRON_WEIGHT_ANCHOR: `0` binds the full quantized arrays everywhere;
+/// `draft` anchors single-row launches only (draft step, R=1 tails, head
+/// screen); `verify` anchors multi-row launches only (verify, post-verify
+/// rows); anything else anchors both.
+enum NemotronWeightAnchorScope {
+    static let mode = ProcessInfo.processInfo.environment["NEMOTRON_WEIGHT_ANCHOR"] ?? ""
+    static let enabled = mode != "0"
+    static func covers(rows: Int) -> Bool {
+        switch mode {
+        case "0": return false
+        case "draft": return rows == 1
+        case "verify": return rows > 1
+        default: return true
+        }
+    }
+
+    /// Multi-row anchors wait for the request's first finalized round, so
+    /// the seed window and the first verify round keep MLX's MB-driven
+    /// commits. NEMOTRON_WEIGHT_ANCHOR_AFTER_SEED=0 anchors from the first
+    /// round. Single-row (draft) launches are never gated. Request-lifecycle
+    /// flag only (reset per request, no cached content).
+    static let afterSeed =
+        ProcessInfo.processInfo.environment["NEMOTRON_WEIGHT_ANCHOR_AFTER_SEED"] != "0"
+    nonisolated(unsafe) static var verifyLive = true
+    static func beginRequest() { if afterSeed { verifyLive = false } }
+    static func seedDone() { verifyLive = true }
+    /// Compiled verify graphs bake their anchors at trace: one slot per state.
+    static var liveSlot: Int { verifyLive ? 1 : 0 }
+}
+
+/// spariev 5773a82c / fkiene 5176ffc4. MLX commits the open command buffer
+/// once the arrays first bound in it exceed its MB budget (50 MB on a Max),
+/// counting each input's own `data_size`, so one expert bank or head forced a
+/// commit after every kernel that bound it. The decode-window kernels index
+/// their weights from the base pointer with template shapes and never read an
+/// input's shape or strides, so an eight-element view at the same offset (a
+/// `device` binding: MLX passes inputs under eight elements as `constant`)
+/// binds the same buffer at the same address and reads the same bytes. Views
+/// are built once at load; an array that was not prepared is returned as is.
+/// `rows` is the launch's activation row count (scope selection only).
+func nemotronWeightAnchor(_ a: MLXArray, rows: Int) -> MLXArray {
+    guard NemotronWeightAnchorScope.covers(rows: rows),
+          rows == 1 || NemotronWeightAnchorScope.verifyLive else { return a }
+    return NemotronWeightAnchors.shared.anchor(a, rows: rows)
+}
+
+final class NemotronWeightAnchors: @unchecked Sendable {
+    static let shared = NemotronWeightAnchors()
+    private let lock = NSLock()
+    // Keyed by object identity; the entry retains the source so the
+    // identifier cannot be reused while the entry exists.
+    private var entries: [ObjectIdentifier: (source: MLXArray, anchor: MLXArray, singleRow: Bool)] =
+        [:]
+
+    /// A one-row launch binds an anchor only for arrays marked `singleRow`:
+    /// the MTP head's own weights and the target head / embedding tables
+    /// that only the draft's one-row kernels read here. Target weights at one
+    /// row (the non-captured stepper's Q/K/V and shared up) keep full bindings.
+    func anchor(_ a: MLXArray, rows: Int) -> MLXArray {
+        guard let entry = lock.withLock({ entries[ObjectIdentifier(a)] }),
+              rows > 1 || entry.singleRow else { return a }
+        return entry.anchor
+    }
+
+    /// Mark already-prepared arrays as eligible for one-row launches.
+    func allowSingleRow(_ arrays: [MLXArray]) {
+        lock.withLock {
+            for a in arrays {
+                if var entry = entries[ObjectIdentifier(a)] {
+                    entry.singleRow = true
+                    entries[ObjectIdentifier(a)] = entry
+                }
+            }
+        }
+    }
+
+    /// Only a row-contiguous array flattens to a view of its own buffer
+    /// (prepare_reshape: row_contiguous -> shared buffer, no copy); any other
+    /// layout would be copied whole, so it is never anchored. Size-1 dims are
+    /// ignored, as in MLX's own contiguity check.
+    private static func isRowContiguous(_ a: MLXArray) -> Bool {
+        var expected = 1
+        for (dim, stride) in zip(a.shape, a.strides).reversed() where dim != 1 {
+            if stride != expected { return false }
+            expected *= dim
+        }
+        return true
+    }
+
+    /// Input-independent, load-time: one view per row-contiguous weight,
+    /// scales and biases array of every quantized linear, expert bank and
+    /// embedding in `model`. Call sites decide what is anchored (decode-window
+    /// kernels only). Never copies: non-row-contiguous arrays are skipped.
+    func prepare(_ model: Module, singleRow: Bool) {
+        guard NemotronWeightAnchorScope.enabled else { return }
+        var built: [(MLXArray, MLXArray)] = []
+        var skipped = 0, bytes = 0
+        for module in model.modules() where module is QuantizedLinear
+            || module is QuantizedSwitchLinear || module is QuantizedEmbedding {
+            for (key, value) in module.parameters().flattened()
+            where ["weight", "scales", "biases"].contains(key) && value.size > 8 {
+                eval(value)
+                guard Self.isRowContiguous(value) else { skipped += 1; continue }
+                built.append((value, value.reshaped(-1)[0 ..< 8]))
+                bytes += value.nbytes
+            }
+        }
+        eval(built.map { $0.1 })
+        lock.withLock {
+            for (source, view) in built {
+                entries[ObjectIdentifier(source)] = (source, view, singleRow)
+            }
+        }
+        if ProcessInfo.processInfo.environment["NEMOTRON_WEIGHT_ANCHOR_LOG"] == "1" {
+            FileHandle.standardError.write(Data((
+                "nemotron weight anchors: \(built.count) anchored (\(bytes >> 20) MiB), "
+                    + "\(skipped) skipped (not row-contiguous)\n").utf8))
+        }
+    }
+}
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -397,7 +520,10 @@ enum NemotronHEmbeddingRows {
               biases.shape == q.scales.shape, (dims / 2) % 64 == 0
         else { return nil }
         let count = tokens.dim(1)
-        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
+        // Anchor only decode-window widths; the assistant's prompt ingestion
+        // (seed path) keeps the full bindings.
+        func bind(_ a: MLXArray) -> MLXArray { count <= 8 ? nemotronWeightAnchor(a, rows: count) : a }
+        return kernel([tokens.reshaped(count), bind(q.weight), bind(q.scales), bind(biases)],
             template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
                        ("G", dims / 64)],
             grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
@@ -3892,6 +4018,15 @@ public class NemotronHModel:
             return lmHead(hidden)
         }
         return backbone.embeddings.asLinear(hidden)
+    }
+
+    /// Weight, scales and biases of the target head and embedding tables:
+    /// the draft's one-row head screen and embedding rows read these.
+    var draftSharedTables: [MLXArray] {
+        [lmHead as Module?, backbone.embeddings as Module?].compactMap { $0 }.flatMap { module in
+            module.parameters().flattened()
+                .filter { ["weight", "scales", "biases"].contains($0.0) }.map { $0.1 }
+        }
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {

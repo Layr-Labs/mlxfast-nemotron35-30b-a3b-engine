@@ -71,6 +71,14 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        // Before the head-screen qualification, the attention-output-add bit
+        // check and every warm-up/compile trace, so those run the anchored
+        // bindings the timed window uses.
+        // One-row anchors: MTP head weights plus the target head/embedding
+        // tables the draft reads; never the target's stepper weights.
+        NemotronWeightAnchors.shared.prepare(target, singleRow: false)
+        NemotronWeightAnchors.shared.prepare(assistant.module, singleRow: true)
+        NemotronWeightAnchors.shared.allowSingleRow(target.draftSharedTables)
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)

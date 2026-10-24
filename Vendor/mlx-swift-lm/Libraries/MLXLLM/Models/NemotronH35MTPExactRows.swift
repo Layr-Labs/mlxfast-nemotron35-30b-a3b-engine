@@ -428,7 +428,8 @@ enum NemotronHeadPreparedActivation {
             grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
             outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+        return project([q.weight, q.scales, q.biases!].map { nemotronWeightAnchor($0, rows: 3) }
+            + [packed[0], args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
@@ -493,7 +494,8 @@ enum NemotronHeadPreparedActivation {
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+        return project([q.weight, q.scales, q.biases!].map { nemotronWeightAnchor($0, rows: rows) }
+            + [packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
             grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -581,8 +583,9 @@ enum NemotronMultiRowQMV {
         let rps = resultsPerSimdgroup(rows: rows, k: 4096, n: 2688)
         let (k, n) = scalarPair(4096, 2688)
         let y = NemotronMultiRowQMVKernel.shared.attentionOutputAdding(
-            [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
-             x.reshaped(rows, 4096), k, n],
+            [residual.reshaped(rows, 2688)]
+                + [q.weight, q.scales, offsets].map { nemotronWeightAnchor($0, rows: rows) }
+                + [x.reshaped(rows, 4096), k, n],
             template: [("T", x.dtype), ("R", rows), ("FAST", true),
                        ("RELU2", false), ("RPS", rps)],
             grid: (32, 2688 / rps, 1), threadGroup: (32, 2, 1),
@@ -640,7 +643,7 @@ enum NemotronMultiRowQMV {
         let rows = x.dim(0), k = x.dim(1), n = w.dim(0)
         let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
-            [w, scales, biases, x, kArray, nArray],
+            [w, scales, biases].map { nemotronWeightAnchor($0, rows: rows) } + [x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", relu2), ("RPS", rps)],
             grid: (32, n / rps, 1),
@@ -767,7 +770,8 @@ enum NemotronMultiRowQMVRowInputs {
         // The same outputs-per-SIMD-group the stacked call picks for (R, K, N).
         let rps = NemotronMultiRowQMV.resultsPerSimdgroup(rows: rows.count, k: k, n: n)
         return kernel(rows: rows.count)(
-            [q.weight, q.scales, biases] + rows + [kArray, nArray],
+            [q.weight, q.scales, biases].map { nemotronWeightAnchor($0, rows: rows.count) } + rows
+                + [kArray, nArray],
             template: [("T", DType.bfloat16), ("R", rows.count), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)],
             grid: (32, n / rps, 1),
@@ -1112,7 +1116,8 @@ enum NemotronTargetQKV {
                 ?? NemotronHeadPreparedActivation.pack(x.reshaped(rows, 2688)))
             : x
         return (prepared ? preparedKernel : kernel)(
-            weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
+            weights.map { nemotronWeightAnchor($0, rows: rows) }
+                + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", rps)],
             grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
@@ -1431,7 +1436,7 @@ enum NemotronHeadScreen {
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
         let scores = partialKernel(
-            [weight, scales, biases, hidden, groups],
+            [weight, scales, biases].map { nemotronWeightAnchor($0, rows: 1) } + [hidden, groups],
             template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
                        ("NSG", simdgroups)],
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
@@ -1439,7 +1444,7 @@ enum NemotronHeadScreen {
         let chunks = rows / chunk
         let selectGroups = 8
         let picked = selectKernel(
-            [scores, weight, scales, biases, hidden],
+            [scores] + [weight, scales, biases].map { nemotronWeightAnchor($0, rows: 1) } + [hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
             outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],

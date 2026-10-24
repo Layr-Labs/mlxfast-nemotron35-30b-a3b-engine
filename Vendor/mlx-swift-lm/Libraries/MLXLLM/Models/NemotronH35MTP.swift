@@ -373,7 +373,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         return s
     }
     public func makeRequestState() -> any CBv2MTPRequestState {
-        State(owner: ObjectIdentifier(self), normalBacklogLimit: draftLimit)
+        NemotronWeightAnchorScope.beginRequest()
+        return State(owner: ObjectIdentifier(self), normalBacklogLimit: draftLimit)
     }
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
@@ -514,6 +515,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { state(requestState).arrays }
     public func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
         committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {
+        NemotronWeightAnchorScope.seedDone()
         let s = state(requestState)
         precondition(s.stagedInputCount > 0 && (1...(s.stagedInputCount + 1)).contains(confirmedInputTokens))
         let n = committedDraftTokens.dim(1)

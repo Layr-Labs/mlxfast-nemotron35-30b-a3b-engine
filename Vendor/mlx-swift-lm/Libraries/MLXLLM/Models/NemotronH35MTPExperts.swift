@@ -20,8 +20,9 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
-    private var entries: [Entry?] = [nil, nil, nil, nil]
+    /// Slot = usesPrepared + 2 * parts + 4 * live weight anchors; every slot
+    /// is its own compiled graph.
+    private var entries: [Entry?] = Array(repeating: nil, count: 8)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
@@ -44,7 +45,7 @@ final class NemotronH35MTPGraphCache {
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
-        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
+        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0) + 4 * NemotronWeightAnchorScope.liveSlot
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -683,6 +684,10 @@ enum NemotronMoELeader {
         let biases: MLXArray
         let k: Int
         let n: Int
+        /// Kernel bindings: the load-time weight anchors (decode window only).
+        func anchored(rows: Int) -> [MLXArray] {
+            [weight, scales, biases].map { nemotronWeightAnchor($0, rows: rows) }
+        }
     }
 
     static func bank(_ layer: SwitchLinear, k: Int, dtype: DType) -> Bank? {
@@ -717,7 +722,7 @@ enum NemotronMoELeader {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
             return kernel(
-                [bank.weight, bank.scales, bank.biases, packed, inds],
+                bank.anchored(rows: rows) + [packed, inds],
                 template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                            ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                            ("RELU2", relu2), ("RPS", rps)],
@@ -727,7 +732,7 @@ enum NemotronMoELeader {
                 outputDTypes: [x.dtype])[0]
         }
         return NemotronMoELeaderKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds],
+            bank.anchored(rows: rows) + [x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                        ("RELU2", relu2), ("RPS", rps)],
@@ -744,7 +749,7 @@ enum NemotronMoELeader {
                               rows: Int, bank: Bank) -> MLXArray {
         if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank) }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+            bank.anchored(rows: rows) + [x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n)],
             grid: (32 * (bank.n / 4), 6, 1),
@@ -988,7 +993,7 @@ private final class NMLBalanceWeighted: Sendable {
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
              _ bank: NemotronMoELeader.Bank) -> MLXArray {
         let plan = NMLBalancePlan.shared.make(ids)
-        return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
+        return kernel(bank.anchored(rows: 3) + [x, ids, scores, plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]

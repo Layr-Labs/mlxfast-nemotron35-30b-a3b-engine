@@ -17,8 +17,9 @@ final class NemotronH35MTPCompactGraphCache {
     private static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
     private let lock = NSLock()
-    /// [plain, consuming a prepared in_proj activation]: separate graphs.
-    private var entries: [Entry?] = [nil, nil]
+    /// [plain, consuming a prepared in_proj activation] x [anchors not yet
+    /// live, live]: separate graphs.
+    private var entries: [Entry?] = [nil, nil, nil, nil]
 
     func callAsFunction(
         _ hidden: MLXArray, convState: MLXArray, initialSSM: MLXArray,
@@ -36,7 +37,7 @@ final class NemotronH35MTPCompactGraphCache {
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared)
         }
         let usesPrepared = prepared != nil
-        let slot = usesPrepared ? 1 : 0
+        let slot = (usesPrepared ? 1 : 0) + 2 * NemotronWeightAnchorScope.liveSlot
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             if let entry = entries[slot], entry.identity == identity { return entry }
