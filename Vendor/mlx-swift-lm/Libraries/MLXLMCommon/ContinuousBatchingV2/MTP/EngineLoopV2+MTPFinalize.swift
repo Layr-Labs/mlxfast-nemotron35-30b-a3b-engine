@@ -199,63 +199,6 @@ extension EngineLoopV2 {
                     accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
-            // Head work first. The assistant's finalize and the next round's
-            // first draft read only the accepted draft inputs and the
-            // verifier's hidden rows, never the target's committed recurrent
-            // state or KV, so submitting the draft before the target-side
-            // commit below (strict-prefix replay graphs on a partial
-            // acceptance, KV rollback, bookkeeping) lets the GPU run it while
-            // the host finishes. The assistant still receives only accepted
-            // draft inputs and their trusted target hidden rows; every
-            // speculative head suffix is discarded.
-            let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
-                let state = metadata.assistantState
-            {
-                stateful.finalizeRound(
-                    requestState: state,
-                    confirmedInputTokens: 1 + committedDraftCount,
-                    committedDraftTokens: verify.draftIDs[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount],
-                    committedTargetHidden: verify.lastHidden[
-                        batchIndex ..< batchIndex + 1,
-                        0 ..< committedDraftCount,
-                        0...])
-            }
-            var carryColumn = 0
-            var carryHidden: MLXArray?
-            var carryShortlist: MLXArray?
-            if finishReason == nil {
-                carryColumn = CBv2MTPHiddenIndex.carryColumn(
-                    targetOutputIndex: confirmed - 1, draftDepth: k)
-                // Shortlist coverage gate: hand the accepted position's
-                // target top-K ids to the next draft only when their
-                // probability mass (packet tail, parts-per-million) clears
-                // the threshold; otherwise the draft falls back to the full
-                // head for that round.
-                if let shortlistIDs = verify.shortlistIDs {
-                    let massBase = draftCount + verify.rows.count * targetWidth
-                    let mass = host[massBase + batchIndex * targetWidth + carryColumn]
-                    if mass >= Self.mtpShortlistMassThresholdPPM {
-                        carryShortlist = shortlistIDs[batchIndex, carryColumn]
-                    }
-                }
-                let hidden = verify.lastHidden[
-                    batchIndex ..< (batchIndex + 1),
-                    carryColumn ..< (carryColumn + 1), 0...]
-                carryHidden = hidden
-                // The acceptance packet was just read back, so the GPU is idle
-                // while the host finishes finalize and plans the next step:
-                // let the drafter submit the next round's first draft now.
-                if CBv2MTPFirstDraftPrestage.enabled, carryShortlist == nil,
-                    let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
-                    let state = metadata.assistantState
-                {
-                    prestager.prestageFirstDraft(
-                        token: kept[confirmed - 1], hidden: hidden, requestState: state)
-                }
-            }
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
                     // Capture-verify: one transaction spans the window. The
@@ -294,6 +237,24 @@ extension EngineLoopV2 {
                 anyRejected = true
             }
             for sequence in metadata.storageRows { sequence.commitSpeculativeWrite() }
+            let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+                let state = metadata.assistantState
+            {
+                // Target KV/recurrent truth is committed first. The assistant
+                // receives only accepted draft inputs and their trusted target
+                // hidden rows; every speculative head suffix is discarded.
+                stateful.finalizeRound(
+                    requestState: state,
+                    confirmedInputTokens: 1 + committedDraftCount,
+                    committedDraftTokens: verify.draftIDs[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount],
+                    committedTargetHidden: verify.lastHidden[
+                        batchIndex ..< batchIndex + 1,
+                        0 ..< committedDraftCount,
+                        0...])
+            }
             if rejected > 0 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
@@ -378,21 +339,47 @@ extension EngineLoopV2 {
                 // `finalize`, after this round). Lease expiry is evaluated
                 // centrally in `processLeaseExpiry` — identical typed-terminal
                 // semantics to the ordinary decode path.
-                // The carry and its first draft were prepared above.
-                let hiddenColumn = carryColumn
+                let hiddenColumn = CBv2MTPHiddenIndex.carryColumn(
+                    targetOutputIndex: confirmed - 1, draftDepth: k)
+                // Shortlist coverage gate: hand the accepted position's
+                // target top-K ids to the next draft only when their
+                // probability mass (packet tail, parts-per-million) clears
+                // the threshold; otherwise the draft falls back to the full
+                // head for that round.
+                var carryShortlist: MLXArray?
+                if let shortlistIDs = verify.shortlistIDs {
+                    let massBase = draftCount + verify.rows.count * targetWidth
+                    let mass = host[massBase + batchIndex * targetWidth + hiddenColumn]
+                    if mass >= Self.mtpShortlistMassThresholdPPM {
+                        carryShortlist = shortlistIDs[batchIndex, hiddenColumn]
+                    }
+                }
                 let previousTopTwoMargin: Double? = policyTopTwoHost.map { values in
                     let base =
                         (batchIndex * targetWidth + hiddenColumn) * 2
                     return Double(values[base] - values[base + 1])
                 }
+                let carryHidden = verify.lastHidden[
+                    batchIndex ..< (batchIndex + 1),
+                    hiddenColumn ..< (hiddenColumn + 1), 0...]
                 mtp.storeCarry(
                     id: id, token: kept[confirmed - 1],
-                    hidden: carryHidden!,
+                    hidden: carryHidden,
                     shortlist: carryShortlist,
                     previousTopTwoMargin: previousTopTwoMargin,
                     needsHistoryTransition: mtp.tracksPersistentHistory,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
+                // The acceptance packet was just read back, so the GPU is idle
+                // while the host finishes finalize and plans the next step:
+                // let the drafter submit the next round's first draft now.
+                if CBv2MTPFirstDraftPrestage.enabled, carryShortlist == nil,
+                    let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
+                    let state = metadata.assistantState
+                {
+                    prestager.prestageFirstDraft(
+                        token: kept[confirmed - 1], hidden: carryHidden, requestState: state)
+                }
             }
         }
 

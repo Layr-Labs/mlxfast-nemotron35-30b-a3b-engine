@@ -628,10 +628,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     let config: CBv2EngineLoopConfig
     let gauges: CBv2EngineGauges
 
-    /// User-interactive: the step thread wakes from each round's readback and
-    /// builds the next round while the GPU waits on it.
     private let engineQueue = DispatchQueue(
-        label: "com.eigen.cbv2.engine", qos: .userInteractive)
+        label: "com.eigen.cbv2.engine", qos: .userInitiated)
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
@@ -733,10 +731,6 @@ public final class EngineLoopV2: @unchecked Sendable {
     var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
     private var inFlight: CBv2InFlightStep?
     private var running = false
-    /// An idle re-poll is scheduled and no other step is queued. Engine-queue
-    /// confined; see `wakeIdleLoop`.
-    private var idleRecheckPending = false
-    private var idleRecheckGeneration = 0
     /// Nil in production. Configuration and records are engine-queue confined.
     var logitDiagnostic: CBv2LogitDiagnosticState?
     var attentionMetadata: CBv2AttentionMetadataState?
@@ -1476,7 +1470,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 } else if let adoption = prefixLookup.adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
-                wakeIdleLoop()
             } catch let error as CBv2SchedulerError {
                 releaseAbandonedAdoption(prefixLookup.adoption)
                 // Contract violation (duplicate live request id) — surfaced
@@ -2313,26 +2306,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func scheduleIdleRecheck() {
-        idleRecheckGeneration &+= 1
-        let generation = idleRecheckGeneration
-        idleRecheckPending = true
         engineQueue.asyncAfter(deadline: .now() + config.idleRecheckInterval) { [weak self] in
-            guard let self, self.idleRecheckPending,
-                self.idleRecheckGeneration == generation
-            else { return }
-            self.idleRecheckPending = false
-            self.engineStep()
+            self?.engineStep()
         }
-    }
-
-    /// `enqueue` admitted work while the loop sat in an idle re-poll: step
-    /// now instead of at the re-poll deadline. The superseded re-poll sees
-    /// the cleared flag (or a newer generation) and does nothing, so one
-    /// step chain remains. Engine-queue confined.
-    private func wakeIdleLoop() {
-        guard idleRecheckPending else { return }
-        idleRecheckPending = false
-        scheduleNextStep()
     }
 
     /// Model protocols remain nonthrowing. A paged cache records a typed fault
