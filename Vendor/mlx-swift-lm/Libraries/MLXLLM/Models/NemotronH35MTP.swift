@@ -108,9 +108,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
-        /// Post-verify head rows over (target token r, target hidden r).
-        var speculation: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
-        /// The accepted row of `speculation` after finalize (next first draft).
+        /// Post-verify attention/KV only; finalize selects the one expert row.
+        var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
+        /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
@@ -341,7 +341,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // chained KV row even on full acceptance, then replay accepted inputs
         // using the verifier's true hidden states before the next round.
         let speculation = s.speculation.flatMap {
-            $0.ids.dim(1) == s.stagedInputCount + 1 && n < $0.ids.dim(1) ? $0 : nil
+            $0.attention.dim(1) == s.stagedInputCount + 1 && n < $0.attention.dim(1) ? $0 : nil
         }
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
@@ -360,12 +360,19 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.started = true
         s.paged!.row.commitSpeculativeWrite()
         clearRound(s)
-        // Row n pairs the next seed (target token n) with the carry hidden:
-        // it is the next round's first draft, already computed.
+        // The engine has already read and reconciled exact target acceptance.
+        // Use the ACTUALLY committed prefix, including stop/length truncation.
+        // Slice a view with this host index: no device prefix scan or gather,
+        // no new readback, and no expert/head work for discarded rows.
+        // Build the ordinary one-token tail lazily. The existing prestage
+        // submits it only when the engine has a continuing carry.
         s.nextFirstDraft = speculation.map { spec in
-            (ids: spec.ids[0..., n], out: spec.out[0..., n ..< (n + 1), 0...],
-             keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
-             values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+            let out = module.finishPagedAttentionRow(
+                spec.attention[0..., n ..< (n + 1), 0...])
+            let ids = argMax(draftHead.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
+            return (ids: ids, out: out,
+                    keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
+                    values: spec.values[0..., 0..., n ..< (n + 1), 0...])
         }
     }
     public func discardRound(requestState: any CBv2MTPRequestState) {
@@ -411,9 +418,9 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
               hidden.shape == [1, 1, target.configuration.hiddenSize]
         else { return }
         if let next, s.pendingTokens.isEmpty {
-            // Post-verify speculation computed this draft (and the accepted
-            // replay) already: open the round and re-append its trusted K/V
-            // row inside the window, exactly where the first draft writes it.
+            // Attention/KV are already submitted; the selected one-token
+            // expert/head tail is lazy. Re-append its trusted K/V and submit
+            // the tail at this existing boundary inside the decode window.
             s.baseOffset = s.cacheOffset
             s.paged!.row.beginSpeculativeWrite()
             s.savedTokens = []; s.savedHidden = []; s.savedFrontier = s.frontier
@@ -436,11 +443,10 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     }
 
     /// Called right after the round's verify graph is submitted (before the
-    /// acceptance readback): one causal head forward over the k+1 rows
-    /// (target token r, target hidden r). Whatever the acceptance a turns out
-    /// to be, rows 0..<a are the accepted replay and row a is the next first
-    /// draft, so finalize keeps them and nothing waits on the host. Draft
-    /// values only; target work is unaffected.
+    /// acceptance readback): causal attention/KV over all k+1 row pairs.
+    /// Finalize retains the committed prefix and selects one row for the
+    /// ordinary one-token expert/head tail. This preserves attention overlap
+    /// without computing unused expert/head rows. Target work is unaffected.
     public func speculateAfterVerify(
         targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState
     ) {
@@ -465,12 +471,10 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             cache.mtpSerializesRectangularAttention = false
             cache.mtpBatchesRectangularAttention = false
         }
-        let rows = module.pagedForwardRows(
+        let rows = module.pagedAttentionRows(
             hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
-        let logits = draftHead.rowLogits(rows.output)
-        let ids = argMax(logits, axis: -1).asType(.int32)
-        s.speculation = (ids: ids, out: rows.output, keys: rows.keys, values: rows.values)
-        let roots = [ids, rows.output] + s.cache.innerState()
+        s.speculation = (attention: rows.output, keys: rows.keys, values: rows.values)
+        let roots = [rows.output] + s.cache.innerState()
         s.roots += roots
         asyncEval(roots)
     }
@@ -489,12 +493,12 @@ enum NemotronH35MTPSpeculation {
 extension NemotronH35MTPAssistant {
     /// Load-time JIT of the post-verify speculation path at every row width a
     /// round can request (2...4 = depth 1...3, tail-clamped rounds included):
-    /// the head's rows forward (multi-row qmv, column attention, compiled row
-    /// MoE trace + leader kernel, multi-row LM head rows, argmax), finalize's
-    /// row slices and prestage's re-append + handout. Runs the real entry
-    /// points on throwaway request state with zero inputs; values are
-    /// discarded. The one-token draft and the target paths are left to the
-    /// general warm-up.
+    /// attention rows, each host-selected row view, ordinary one-token expert
+    /// and LM head, finalize, re-append and handout. Partial/zero/full commits
+    /// exercise each slice offset. Runs real entry points on private zero
+    /// inputs; all request state is discarded before returning. This remains
+    /// at the inherited load-time call, before the final general warm-up and
+    /// Memory.clearCache(). No timed prompt or production result is reused.
     func warmPostVerifySpeculation() {
         guard NemotronH35MTPSpeculation.warmUp, kvOnlyHistory,
               CBv2MTPFirstDraftPrestage.speculateAfterVerify
@@ -509,43 +513,45 @@ extension NemotronH35MTPAssistant {
         // A decode-sized trusted history (kernel choice does not depend on it).
         let history = 600
         for width in 2 ... min(draftLimit + 1, 4) {
-            let requestState = makeRequestState()
-            defer { releaseRequestState(requestState) }
-            do {
-                try configureRequestState(requestState, maximumSequenceLength: history + 2 * width)
-            } catch { return }
-            let s = state(requestState)
-            eval(s.cache.appendTrusted(keys: kv(history), values: kv(history)))
-            s.started = true
-            // Open a round as draftStep does: trusted seed row, then the
-            // chained draft rows that speculation rolls back.
-            s.baseOffset = s.cacheOffset
-            s.paged!.row.beginSpeculativeWrite()
-            s.roots = s.cache.appendTrusted(keys: kv(1), values: kv(1))
-            s.trustedOffset = s.cacheOffset
-            if width > 2 { s.roots += s.cache.appendTrusted(keys: kv(width - 2), values: kv(width - 2)) }
-            s.stagedInputCount = width - 1
-            // The same views the engine hands over: a row of the flat int32
-            // acceptance packet and a row block of the verify hidden.
-            let drafts = width - 1
-            let packet = MLXArray.zeros([drafts + width], dtype: .int32)
-            let targets = packet[drafts ..< (drafts + width)].reshaped([1, width])
-            let hidden = MLXArray.zeros([1, width, a.hiddenSize], dtype: hiddenDType)
-            speculateAfterVerify(
-                targetTokens: targets[0 ..< 1], targetHidden: hidden[0 ..< 1],
-                requestState: requestState)
-            eval(evaluationTargets(for: requestState))
-            finalizeRound(
-                requestState: requestState, confirmedInputTokens: drafts + 1,
-                committedDraftTokens: MLXArray.zeros([1, drafts], dtype: .int32),
-                committedTargetHidden: hidden[0..., 0 ..< drafts, 0...])
-            let carry = hidden[0..., drafts ..< (drafts + 1), 0...]
-            prestageFirstDraft(token: 0, hidden: carry, requestState: requestState)
-            let first = draftStep(
-                tokens: MLXArray.zeros([1, 1], dtype: .int32), hidden: carry, shortlist: nil,
-                requestState: requestState)
-            eval([first.tokens, first.hidden] + evaluationTargets(for: requestState))
-            discardRound(requestState: requestState)
+            for accepted in 0 ..< width {
+                let requestState = makeRequestState()
+                defer { releaseRequestState(requestState) }
+                do {
+                    try configureRequestState(requestState, maximumSequenceLength: history + 2 * width)
+                } catch { return }
+                let s = state(requestState)
+                eval(s.cache.appendTrusted(keys: kv(history), values: kv(history)))
+                s.started = true
+                // Open a round as draftStep does: trusted seed row, then the
+                // chained draft rows that speculation rolls back.
+                s.baseOffset = s.cacheOffset
+                s.paged!.row.beginSpeculativeWrite()
+                s.roots = s.cache.appendTrusted(keys: kv(1), values: kv(1))
+                s.trustedOffset = s.cacheOffset
+                if width > 2 { s.roots += s.cache.appendTrusted(keys: kv(width - 2), values: kv(width - 2)) }
+                s.stagedInputCount = width - 1
+                // The same views the engine hands over: a row of the flat int32
+                // acceptance packet and a row block of the verify hidden.
+                let drafts = width - 1
+                let packet = MLXArray.zeros([drafts + width], dtype: .int32)
+                let targets = packet[drafts ..< (drafts + width)].reshaped([1, width])
+                let hidden = MLXArray.zeros([1, width, a.hiddenSize], dtype: hiddenDType)
+                speculateAfterVerify(
+                    targetTokens: targets[0 ..< 1], targetHidden: hidden[0 ..< 1],
+                    requestState: requestState)
+                eval(evaluationTargets(for: requestState))
+                finalizeRound(
+                    requestState: requestState, confirmedInputTokens: accepted + 1,
+                    committedDraftTokens: MLXArray.zeros([1, accepted], dtype: .int32),
+                    committedTargetHidden: hidden[0..., 0 ..< accepted, 0...])
+                let carry = hidden[0..., accepted ..< (accepted + 1), 0...]
+                prestageFirstDraft(token: 0, hidden: carry, requestState: requestState)
+                let first = draftStep(
+                    tokens: MLXArray.zeros([1, 1], dtype: .int32), hidden: carry, shortlist: nil,
+                    requestState: requestState)
+                eval([first.tokens, first.hidden] + evaluationTargets(for: requestState))
+                discardRound(requestState: requestState)
+            }
         }
     }
 }
