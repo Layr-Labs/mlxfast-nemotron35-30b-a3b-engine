@@ -301,6 +301,69 @@ enum NemotronHResidualRMSNorm {
     }
 }
 
+// MARK: - Draft embedding rows
+
+/// MTP draft-path quantized embedding: the stock `weight[ids]`,
+/// `scales[ids]`, `biases[ids]` gathers and affine_dequantize in one launch.
+/// One thread per packed byte, as affine_dequantize, and each element is its
+/// own `scale * d + bias` (T scale, T bias, uint8_t d) on the same byte,
+/// group scale and group bias, so every value is bitwise the stock graph.
+/// Indices wrap like MLX's gather (negative + V). NEMOTRON_MTP_DRAFT_EMBED=0
+/// keeps the stock gathers and dequantize.
+enum NemotronHEmbeddingRows {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_EMBED"] != "0"
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_embedding_rows_affine4_gs64",
+        inputNames: ["ids", "w", "scales", "biases"], outputNames: ["out"],
+        source: """
+            const uint b = thread_position_in_grid.x;
+            const uint t = thread_position_in_grid.y;
+            int64_t id = int64_t(ids[t]);
+            if (id < 0) {
+                id += int64_t(V);
+            }
+            const device uint8_t* row = (const device uint8_t*)w + id * int64_t(BYTES);
+            const size_t oindex = size_t(b) * 2;
+            const size_t gindex = oindex / 64;
+            T scale = scales[id * int64_t(G) + int64_t(gindex)];
+            T bias = biases[id * int64_t(G) + int64_t(gindex)];
+            device T* o = out + size_t(t) * size_t(2 * BYTES) + oindex;
+            uint val = row[b];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 2; i++) {
+                uint8_t d;
+                d = (val >> (4 * i)) & 0x0f;
+                o[i] = scale * d + bias;
+            }
+            """, ensureRowContiguous: true)
+
+    /// tokens [1, N] int32/uint32 → [1, N, dims], or nil for any other layout.
+    static func apply(_ tokens: MLXArray, _ embedding: Embedding) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              tokens.ndim == 2, tokens.dim(0) == 1, (1...512).contains(tokens.dim(1)),
+              tokens.dtype == .int32 || tokens.dtype == .uint32,
+              type(of: embedding) == QuantizedEmbedding.self,
+              let q = embedding as? QuantizedEmbedding,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              let biases = q.biases, q.weight.dtype == .uint32, q.weight.ndim == 2,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        let vocabulary = q.weight.dim(0), words = q.weight.dim(1)
+        let dims = words * 8
+        guard dims % 64 == 0, q.scales.shape == [vocabulary, dims / 64],
+              biases.shape == q.scales.shape, (dims / 2) % 64 == 0
+        else { return nil }
+        let count = tokens.dim(1)
+        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
+            template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
+                       ("G", dims / 64)],
+            grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[1, count, dims]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
 // MARK: - MambaRMSNormGated
 
 private enum NemotronHGatedRMSKernel {
@@ -356,14 +419,14 @@ private enum NemotronHGatedRMSKernel {
         name: "nemotron_h_gated_rms",
         inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
         source: source, ensureRowContiguous: false)
-    private static func preparedSource() -> String {
+    private static func preparedSource(emitNormalized: Bool = true) -> String {
         let scratch = "threadgroup float local_inv_mean[1];"
         let store = "out[row * int64_t(x_shape[2]) + f] = weighted;"
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         return source.replacingOccurrences(of: scratch,
             with: scratch + "\nthreadgroup T rounded[512];")
-            .replacingOccurrences(of: store, with: store + "\nrounded[lid * 4 + i] = weighted;")
+            .replacingOccurrences(of: store, with: (emitNormalized ? store : "") + "\nrounded[lid * 4 + i] = weighted;")
             + """
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -388,6 +451,10 @@ private enum NemotronHGatedRMSKernel {
         name: "nemotron_h_gated_rms_prepared_output",
         inputNames: ["x", "gate", "weight", "identity", "eps"],
         outputNames: ["out", "prepared"], source: preparedSource(), ensureRowContiguous: false)
+    static let preparedOnlyKernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms_prepared_only",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["prepared"],
+        source: preparedSource(emitNormalized: false), ensureRowContiguous: false)
 
 }
 
@@ -405,6 +472,38 @@ class NemotronHRMSNormGated: Module {
 
     private static let preparedOutputEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_OUT"] != "0"
+
+    private static let preparedOnlyEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_ONLY"] != "0"
+
+    /// The prepared QMV reads only `prepared`; omit the unused dense tensor.
+    /// Diagnostic self-tests retain the original dense path and comparisons.
+    func preparedProjection(_ x: MLXArray, gate: MLXArray, projection q: QuantizedLinear)
+        -> MLXArray?
+    {
+        guard Self.preparedOnlyEnabled,
+              !NemotronMoELeader.selfTest, Self.preparedOutputEnabled,
+              NemotronMTPExecution.batchedM1, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHRMSNormGated.self,
+              groupSize == 512, x.shape == [1, 3, 4096], gate.shape == x.shape,
+              weight.shape == [4096], x.dtype == .bfloat16,
+              gate.dtype == .bfloat16, weight.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16
+        else { return nil }
+        let prepared = NemotronHGatedRMSKernel.preparedOnlyKernel(
+            [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (128 * 3 * 8, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[3, 8, 17 * 32]], outputDTypes: [.float32])[0]
+        return NemotronHeadPreparedActivation.projectPrepared(
+            prepared, q, rows: 3, k: 4096, dtype: .bfloat16, relu2: false, rps: 2)
+            .reshaped(1, 3, 2688)
+    }
 
     /// Native compact verify only. The original BF16 gate/norm/identity/weight
     /// boundaries remain; preparation reads the final rounded BF16 values.
@@ -1040,7 +1139,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             recurrentState.count == batch,
             "NemotronH CBv2 recurrent row count mismatch")
 
-        let projected = inProj(hiddenStates)
+        let projected = NemotronSeedQMM.linear(hiddenStates, inProj)
         let splits = split(
             projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = splits[0]
@@ -1124,9 +1223,9 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // The fp32 recurrent accumulator is persistent state, not an
         // activation-width promotion. mlx-lm narrows SSM output back to the
         // input dtype before gated normalization and the output projection.
-        return outProj(norm(
+        return NemotronSeedQMM.linear(norm(
             y.asType(hiddenStates.dtype).flattened(start: 2),
-            gate: gate))
+            gate: gate), outProj)
     }
 
     // Protocol conformance
@@ -1220,9 +1319,9 @@ class NemotronHAttention: Module, NemotronHMixer {
             projections = outputs
         } else {
             projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
+                captureMTP ? nemotronMTPLinearRows(x, wq) : NemotronSeedQMM.linear(x, wq),
+                captureMTP ? nemotronMTPLinearRows(x, wk) : NemotronSeedQMM.linear(x, wk),
+                captureMTP ? nemotronMTPLinearRows(x, wv) : NemotronSeedQMM.linear(x, wv))
         }
         let (q, k, v) = projections
         let queries = q.reshaped(
@@ -1251,7 +1350,7 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : wo(merged)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo) : NemotronSeedQMM.linear(merged, wo)
     }
 
     // Protocol conformance
@@ -1303,7 +1402,7 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             }
             return downProj(activated.reshaped(1, 1, 3712))
         }
-        return downProj(relu2(upProj(x)))
+        return NemotronSeedQMM.linear(relu2(NemotronSeedQMM.linear(x, upProj)), downProj)
     }
 
     // Protocol conformance
@@ -1327,10 +1426,7 @@ enum NemotronHRouterSelection {
         }
         """
 
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_h_router_select",
-        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
-        source: """
+    private static let source = """
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             threadgroup float original[128];
@@ -1383,12 +1479,31 @@ enum NemotronHRouterSelection {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
-            """,
-        header: sigmoidHeader, ensureRowContiguous: true)
+            """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: source, header: sigmoidHeader, ensureRowContiguous: true)
+
+    /// Row-mask variant (`CBv2MTPRowMask`): output row r selects from the
+    /// gates of row source_rows[r]. The identity map is the kernel above
+    /// statement for statement; a masked row repeats row 0's selection, so it
+    /// keeps six distinct experts and adds no new expert reads.
+    private static func sourceRowsSource() -> String {
+        let read = "float(gates[row * 128 + id])"
+        precondition(source.components(separatedBy: read).count == 2)
+        return source.replacingOccurrences(
+            of: read, with: "float(gates[uint(source_rows[row]) * 128 + id])")
+    }
+    static let sourceRowsKernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select_source_rows",
+        inputNames: ["gates", "bias", "source_rows"], outputNames: ["indices", "weights"],
+        source: sourceRowsSource(), header: sigmoidHeader, ensureRowContiguous: true)
 
     static func apply(
         gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
-        routedScalingFactor: Float, normTopkProb: Bool
+        routedScalingFactor: Float, normTopkProb: Bool, sourceRows: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
@@ -1398,9 +1513,16 @@ enum NemotronHRouterSelection {
             normTopkProb, routedScalingFactor == 2.5
         else { return nil }
         let shape = [1, gates.dim(1), 6]
-        let result = kernel(
-            [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
-            outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        let result: [MLXArray]
+        if let sourceRows, sourceRows.shape == [gates.dim(1)], sourceRows.dtype == .int32 {
+            result = sourceRowsKernel(
+                [gates, eSCB, sourceRows], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+                outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        } else {
+            result = kernel(
+                [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+                outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        }
         return (result[0], result[1])
     }
 }
@@ -1412,11 +1534,13 @@ private func groupExpertSelect(
     nGroup: Int,
     topkGroup: Int,
     routedScalingFactor: Float,
-    normTopkProb: Bool
+    normTopkProb: Bool,
+    sourceRows: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
     if let selected = NemotronHRouterSelection.apply(
         gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
-        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb) {
+        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+        sourceRows: sourceRows) {
         return selected
     }
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
@@ -1504,12 +1628,15 @@ class NemotronHMoEGate: Module {
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
     /// The multi-row kernel repeats the M=1 gemv per row in one launch.
-    func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+    /// sourceRows: the verify row-mask map (`CBv2MTPRowMask`); a masked row
+    /// selects row 0's experts. nil selects every row from its own gates.
+    func mtpForwardRows(_ x: MLXArray, sourceRows: MLXArray? = nil) -> (MLXArray, MLXArray) {
         let gates = NemotronMTPRouterRows.gates(x, weight)
             ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
-            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+            sourceRows: sourceRows)
     }
 }
 
@@ -3111,6 +3238,322 @@ func nemotronRunGather(
         outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
 }
 
+// MARK: - Seed-prefill dense qmm (stock affine_qmm_t_nax, 128 rows per threadgroup)
+
+/// Stock qmm_t_nax_tgp_impl with three textual changes: the name, K/N/M by
+/// value instead of constant references, and the unaligned-M store through
+/// store_slice from (0, 0), which writes exactly the elements store_safe
+/// writes with the same cast. Instantiated with BM = 128, WM = 4, WN = 2:
+/// SM = BM / WM and SN = BN / WN stay 32, so every simdgroup computes the
+/// same 32 x 32 output tile with the same K loop, A loads, B fragment loads
+/// and NAX MMA sequence as the stock BM = 64, WM = 2 kernel; eight
+/// simdgroups instead of four share one dequantized weight tile.
+private let nemotronSeedQMMHeader = nemotronRunGatherHeader + #"""
+
+template <
+    typename T,
+    const int group_size,
+    const int bits,
+    const bool aligned_N,
+    const int BM = 64,
+    const int BK = 64,
+    const int BN = 64,
+    const int WM = 2,
+    const int WN = 2>
+METAL_FUNC void nemotron_seed_qmm_t_impl(
+    const device uint32_t* w,
+    const device T* scales,
+    const device T* biases,
+    const device T* x,
+    device T* y,
+    threadgroup T* Ws,
+    const int K,
+    const int N,
+    const int M,
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
+
+  (void)lid;
+
+  constexpr int pack_factor = get_pack_factor<bits, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      BN,
+      BK,
+      BK_padded,
+      1,
+      WM * WN * SIMD_SIZE,
+      group_size,
+      bits>;
+
+  // Set the block
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / group_size;
+  const int y_row = tid.y * BM;
+  const int y_col = tid.x * BN;
+
+  auto wl = (const device uint8_t*)w;
+
+  x += y_row * static_cast<int64_t>(K);
+  wl += y_col * K_w;
+  scales += y_col * K_g;
+  biases += y_col * K_g;
+  y += y_row * static_cast<int64_t>(N) + y_col;
+
+  // Make the weight loader
+  loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
+
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+
+  const short tm = SM * (simd_gid / WN);
+  const short tn = SN * (simd_gid % WN);
+
+  constexpr bool transpose_a = false;
+  constexpr bool transpose_b = true;
+
+  const short sgp_sm = min(int(SM), M - (y_row + tm));
+  const bool is_unaligned_sm = (sgp_sm != SM);
+
+  const short sgp_sn = aligned_N ? SN : min(int(SN), N - (y_col + tn));
+
+  const short tgp_bn = aligned_N ? BN : min(BN, int(N - (y_col)));
+  const bool is_unaligned_bn = aligned_N ? false : (tgp_bn != BN);
+
+  using AccumType = float;
+
+  NAXTile<AccumType, TM, TN> Dtile;
+  Dtile.clear();
+
+  x += tm * K;
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    dispatch_bool(aligned_N || !is_unaligned_bn, [&](auto kAlignedN) {
+      for (int k = 0; k < K; k += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (kAlignedN.value) {
+          loader_w.load_unsafe();
+        } else {
+          loader_w.load_safe(short2(BK, tgp_bn));
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (kAlignedM.value) {
+            Atile.load(x + kk1, K);
+          } else {
+            Atile.load_safe(x + kk1, K, short2(SK, sgp_sm));
+          }
+
+          Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<transpose_a>{},
+              Btile,
+              metal::bool_constant<transpose_b>{});
+
+          (void)compiler_barrier;
+        }
+
+        x += BK;
+        loader_w.next();
+      }
+
+      // Store results to device memory
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if constexpr (kAlignedM.value && kAlignedN.value) {
+        Dtile.store(y + tm * N + tn, N);
+      } else if (kAlignedM.value && sgp_sn == SN) {
+        Dtile.store(y + tm * N + tn, N);
+      } else {
+        Dtile.store_slice(y + tm * N + tn, N, short2(0, 0), short2(sgp_sn, sgp_sm));
+      }
+    });
+  });
+}
+
+"""#
+
+/// Engine seed prefill only (`cbv2ForwardWithHiddenForPrefill`, the scored
+/// seed). The teacher-forced timed prefill never sets `seedPrefill`, so it
+/// keeps the record's kernels. A projection takes the clone only where the
+/// stock op would run affine_qmm_t_nax with bm = 64 and only for a shape
+/// that matched the stock op bitwise at load, on this device, with real
+/// weights. NEMOTRON_SEED_QMM=0 keeps stock everywhere.
+enum NemotronSeedQMM {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM"] != "0"
+    /// Load-check test hook: "stock" stands the stock op in for the clone,
+    /// "mismatch" perturbs the candidate's bits (the clone's where NAX is
+    /// present, else the stock op's), which the check must reject. Routing
+    /// stays off under either.
+    static let qualifyTest = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_QUALIFY_TEST"]
+    static let nax = GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    /// The engine prefills a free run's seed in one forward.
+    static let seedRows = [488]
+    @TaskLocal static var seedPrefill = false
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var qualifiedKeys = Set<String>()
+    private static func isQualified(_ key: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return qualifiedKeys.contains(key)
+    }
+    private static func setQualified(_ keys: Set<String>) {
+        lock.lock(); qualifiedKeys = keys; lock.unlock()
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_seed_qmm_t",
+        inputNames: ["w", "scales", "biases", "x", "K", "N", "M"],
+        outputNames: ["y"],
+        source: """
+            threadgroup T Ws[64 * (64 + 16 / sizeof(T))];
+            nemotron_seed_qmm_t_impl<T, GS, BITS, true, 128, 64, 64, 4, 2>(
+                w, scales, biases, x, y, Ws, K, N, M,
+                threadgroup_position_in_grid, 0,
+                simdgroup_index_in_threadgroup,
+                thread_index_in_simdgroup);
+        """,
+        header: nemotronSeedQMMHeader)
+
+    /// Host mirror of QuantizedMatmul::eval_gpu for a 2-D transposed affine
+    /// weight: true only where it reaches qmm_nax with bm = 64 (M >= the
+    /// qmv batch limit, qmm_splitk falling back to qmm, NAX taking qmm).
+    static func stockTakesQmmNax(m: Int, n: Int, k: Int) -> Bool {
+        guard nax, m > 64, k % 64 == 0 else { return false }
+        let tiles = ((n + 31) / 32) * ((m + 31) / 32)
+        var splitK = min(max(1, 512 / tiles), k / 64)
+        while splitK > 1 && k % (splitK * 64) != 0 { splitK -= 1 }
+        return splitK <= 1
+    }
+
+    private static func key(_ q: QuantizedLinear, _ x: MLXArray, rows: Int) -> String {
+        "\(q.weight.dim(0))x\(x.dim(-1))/\(q.groupSize)/\(q.bits)/\(x.dtype)/\(rows)"
+    }
+
+    /// The operands the stock QuantizedLinear passes unchanged, or nil.
+    private static func operands(_ x: MLXArray, _ lin: Linear) -> (QuantizedLinear, MLXArray)? {
+        guard let q = lin as? QuantizedLinear, q.mode == .affine, q.bias == nil,
+              let biases = q.biases, q.bits == 4 || q.bits == 8, q.groupSize == 64,
+              x.dtype == .bfloat16 || x.dtype == .float16,
+              q.scales.dtype == x.dtype, biases.dtype == x.dtype,
+              q.weight.dtype == .uint32, q.weight.ndim == 2, x.ndim == 3, x.dim(0) == 1
+        else { return nil }
+        let n = q.weight.dim(0), k = x.dim(-1)
+        guard q.weight.dim(1) * 32 / q.bits == k, n % 64 == 0,
+              q.scales.shape == [n, k / 64], biases.shape == q.scales.shape
+        else { return nil }
+        return (q, biases)
+    }
+
+    private static func dispatch(_ x: MLXArray, _ q: QuantizedLinear, _ biases: MLXArray) -> MLXArray {
+        let n = q.weight.dim(0), k = x.dim(-1), m = x.size / k
+        let y = kernel(
+            [q.weight, q.scales, biases, x.reshaped(m, k), k, n, m],
+            template: [("T", x.dtype), ("GS", q.groupSize), ("BITS", q.bits)],
+            grid: ((n / 64) * 256, (m + 127) / 128, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[m, n]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(Array(x.shape.dropLast()) + [n])
+    }
+
+    /// `lin(x)`, through the clone on a qualified seed shape.
+    static func linear(_ x: MLXArray, _ lin: Linear) -> MLXArray {
+        guard seedPrefill, let ops = operands(x, lin) else { return lin(x) }
+        let m = x.size / x.dim(-1)
+        guard stockTakesQmmNax(m: m, n: ops.0.weight.dim(0), k: x.dim(-1)),
+              isQualified(key(ops.0, x, rows: m))
+        else { return lin(x) }
+        let y = dispatch(x, ops.0, ops.1)
+        return NemotronMoELeader.selfTest ? nemotronBitwiseOrNaN(y, lin(x)) : y
+    }
+
+    /// Load time, real weights: for each seed projection shape, run the stock
+    /// op and the clone on the same deterministic pseudo-random rows and
+    /// compare every output bit. Only matching shapes are routed; any
+    /// mismatch keeps the stock op for the whole process.
+    static func qualify(_ projections: [(String, Linear)]) {
+        setQualified([])
+        guard enabled, nax || qualifyTest != nil else {
+            FileHandle.standardError.write(Data(
+                "nemotron seed qmm: off (\(enabled ? "no NAX" : "disabled")), stock kept\n".utf8))
+            return
+        }
+        var passed = Set<String>()
+        var cases = 0
+        var failure: String?
+        let key0 = MLXRandom.key(0x5eed)
+        outer: for (index, entry) in projections.enumerated() {
+            let (name, lin) = entry
+            for rows in seedRows {
+                let k = lin.weight.dim(1) * 32 / ((lin as? QuantizedLinear)?.bits ?? 32)
+                let x = (MLXRandom.normal([1, rows, k], key: MLXRandom.split(key: key0, into: 64)[index])
+                    * 2).asType(.bfloat16)
+                guard let ops = operands(x, lin),
+                      stockTakesQmmNax(m: rows, n: ops.0.weight.dim(0), k: k) || qualifyTest != nil
+                else { continue }
+                let (q, biases) = ops
+                let equal: Bool
+                do {
+                    // A compile, pipeline or evaluation error keeps stock too.
+                    equal = try withError {
+                        let expected = lin(x)
+                        var candidate = nax && qualifyTest != "stock" ? dispatch(x, q, biases) : lin(x)
+                        if qualifyTest == "mismatch" {
+                            candidate = (candidate.view(dtype: .uint16) + MLXArray(UInt16(1)))
+                                .view(dtype: candidate.dtype)
+                        }
+                        let same = (candidate.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+                        eval(same)
+                        return same.item(Bool.self)
+                    }
+                } catch {
+                    failure = "\(name) \(key(q, x, rows: rows)): \(error)"
+                    break outer
+                }
+                cases += 1
+                guard equal else {
+                    failure = "\(name) \(key(q, x, rows: rows))"
+                    break outer
+                }
+                passed.insert(key(q, x, rows: rows))
+            }
+        }
+        if let failure {
+            FileHandle.standardError.write(Data(
+                "nemotron seed qmm: off (mismatch or error at \(failure)), stock kept\n".utf8))
+        } else if qualifyTest != nil {
+            FileHandle.standardError.write(Data(
+                "nemotron seed qmm: test \(qualifyTest!) passed \(cases) cases, routing off\n".utf8))
+        } else {
+            setQualified(passed)
+            FileHandle.standardError.write(Data(
+                "nemotron seed qmm: on (\(cases) cases bitwise equal: \(passed.sorted().joined(separator: ", ")))\n".utf8))
+        }
+    }
+}
+
 // MARK: - MoE
 
 class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
@@ -3434,6 +3877,12 @@ private class NemotronHBackbone: Module {
         captureMTP: Bool = false,
         recyclePrefillChunks: Bool = false
     ) -> MLXArray {
+        if recyclePrefillChunks, !captureMTP, !NemotronSeedQMM.seedPrefill {
+            return NemotronSeedQMM.$seedPrefill.withValue(true) {
+                cbv2Forward(inputs, caches: caches, recurrentState: recurrentState,
+                            captureMTP: captureMTP, recyclePrefillChunks: true)
+            }
+        }
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
             : nil
@@ -3770,6 +4219,26 @@ public class NemotronHModel:
             inputs, caches: attending, recurrentState: recurrentState)
     }
 
+    /// Load-time bitwise check of the seed-prefill qmm clone, one real layer
+    /// per projection kind (see `NemotronSeedQMM.qualify`).
+    func qualifySeedQMM() {
+        var projections: [(String, Linear)] = []
+        func add(_ name: String, _ lin: Linear) {
+            if !projections.contains(where: { $0.0 == name }) { projections.append((name, lin)) }
+        }
+        for layer in backbone.layers {
+            if let mamba = layer.mixer as? NemotronHMamba2Mixer {
+                add("in_proj", mamba.inProj); add("out_proj", mamba.outProj)
+            } else if let attention = layer.mixer as? NemotronHAttention {
+                add("q_proj", attention.wq); add("k_proj", attention.wk)
+                add("v_proj", attention.wv); add("o_proj", attention.wo)
+            } else if let shared = (layer.mixer as? NemotronHMoE)?.sharedExperts {
+                add("shared_up", shared.upProj); add("shared_down", shared.downProj)
+            }
+        }
+        NemotronSeedQMM.qualify(projections)
+    }
+
     func logits(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
             return lmHead(hidden)
@@ -3777,7 +4246,13 @@ public class NemotronHModel:
         return backbone.embeddings.asLinear(hidden)
     }
 
-    func mtpEmbedding(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }
+    func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {
+        guard let rows = NemotronHEmbeddingRows.apply(tokens, backbone.embeddings) else {
+            return backbone.embeddings(tokens)
+        }
+        guard NemotronMoELeader.selfTest else { return rows }
+        return nemotronBitwiseOrNaN(rows, backbone.embeddings(tokens))
+    }
 
     func mtpShortlistLogits(_ hidden: MLXArray, ids: MLXArray) -> MLXArray {
         if let head = lmHead {

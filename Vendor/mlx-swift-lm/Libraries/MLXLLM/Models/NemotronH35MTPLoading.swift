@@ -81,6 +81,7 @@ extension NemotronH35MTPAssistant {
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPAttentionDirect.warm(target)
+        target.qualifySeedQMM()
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -232,6 +233,13 @@ extension NemotronH35MTPAssistant {
                 hidden = result.hidden
             }
             let draftIDs = stacked(draftRows, axis: 1)
+            // Row-mask path (CBv2MTPRowMask): build the gate the drafts
+            // proposed and the source-row router / compiled MoE variants. The
+            // identity map leaves warm-up values unchanged.
+            let maskGate = CBv2MTPRowMask.takePending()
+            if let maskGate { eval(maskGate.sourceRows, maskGate.limit) }
+            let warmSourceRows = k == 2 && maskGate != nil
+                ? MLXArray([Int32(0), Int32(1), Int32(2)]) : nil
             for row in storageRows { row.beginSpeculativeWrite() }
             for cache in layerCaches {
                 cache.mtpSerializesRectangularAttention = true
@@ -239,8 +247,10 @@ extension NemotronH35MTPAssistant {
             }
             let window = concatenated([seed] + drafts, axis: 1)
             let evaluation = try recurrent.bind()
+            CBv2MTPRowMask.setActive(warmSourceRows)
             let verify = target.cbv2ForwardWithHiddenCaptured(
                 window, caches: caches, recurrentState: [evaluation], positionIds: nil)
+            CBv2MTPRowMask.setActive(nil)
             for cache in layerCaches {
                 cache.mtpSerializesRectangularAttention = false
                 cache.mtpBatchesRectangularAttention = false

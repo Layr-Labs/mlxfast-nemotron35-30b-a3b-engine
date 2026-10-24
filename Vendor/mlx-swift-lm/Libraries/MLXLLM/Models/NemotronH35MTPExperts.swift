@@ -20,20 +20,23 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
-    private var entries: [Entry?] = [nil, nil, nil, nil]
+    /// Slot = usesPrepared + 2 * parts + 4 * row-mask map; every slot is its
+    /// own compiled graph.
+    private var entries: [Entry?] = Array(repeating: nil, count: 8)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
     var callCount: Int { lock.withLock { calls } }
 
-    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, owner: NemotronHMoE) -> MLXArray {
-        let result = outputs(x, prepared: prepared, parts: false, owner: owner)
+    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, sourceRows: MLXArray? = nil,
+                        owner: NemotronHMoE) -> MLXArray {
+        let result = outputs(x, prepared: prepared, sourceRows: sourceRows, parts: false, owner: owner)
         return result.isEmpty ? MLXArray(0) : result[0]
     }
 
     /// parts: [routed, shared] before their Add (owner must have shared experts).
-    func outputs(_ x: MLXArray, prepared: MLXArray?, parts: Bool,
+    /// sourceRows: the verify row-mask map (`CBv2MTPRowMask`), a graph input.
+    func outputs(_ x: MLXArray, prepared: MLXArray?, sourceRows: MLXArray? = nil, parts: Bool,
                  owner: NemotronHMoE) -> [MLXArray] {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
@@ -44,7 +47,8 @@ final class NemotronH35MTPGraphCache {
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
-        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
+        let usesSourceRows = sourceRows != nil
+        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0) + (usesSourceRows ? 4 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -53,7 +57,8 @@ final class NemotronH35MTPGraphCache {
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 return owner.mtpForwardRowsUncompiledOutputs(arrays[0],
-                    prepared: usesPrepared ? arrays[1] : nil, parts: parts)
+                    prepared: usesPrepared ? arrays[1] : nil,
+                    sourceRows: usesSourceRows ? arrays[usesPrepared ? 2 : 1] : nil, parts: parts)
             }
             let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
             retired = entries[slot]
@@ -63,7 +68,8 @@ final class NemotronH35MTPGraphCache {
         }
         // Destroy retired compiler entries outside this helper's lock; compiler
         // evaluation owns a separate global/per-function lock ordering.
-        return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
+        let inputs = [x] + (prepared.map { [$0] } ?? []) + (sourceRows.map { [$0] } ?? [])
+        return withExtendedLifetime(retired) { current.function(inputs) }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
@@ -89,12 +95,22 @@ final class NemotronH35MTPGraphCache {
 }
 
 extension NemotronHMoE {
+    /// The verify row-mask map, only while the engine builds a matching
+    /// verify graph (CBv2MTPRowMask).
+    private func verifySourceRows(_ x: MLXArray) -> MLXArray? {
+        CBv2MTPRowMask.active.flatMap { rows in
+            x.ndim == 3 && rows.shape == [x.dim(1)] ? rows : nil
+        }
+    }
+
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
+        let sourceRows = verifySourceRows(x)
         if NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
             x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) {
-            return mtpCompiledRowsCache(x, prepared: prepared, owner: self)
+            return mtpCompiledRowsCache(x, prepared: prepared, sourceRows: sourceRows, owner: self)
         }
-        return mtpForwardRowsUncompiled(x, prepared: prepared)
+        return mtpForwardRowsUncompiledOutputs(
+            x, prepared: prepared, sourceRows: sourceRows, parts: false)[0]
     }
 
     /// Captured-verify join only: (routed, shared) before `routed + shared`,
@@ -103,9 +119,12 @@ extension NemotronHMoE {
     func mtpForwardRowsParts(_ x: MLXArray, prepared: MLXArray? = nil) -> (MLXArray, MLXArray)? {
         guard sharedExperts != nil, NemotronMTPExecution.batchedM1,
               x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) else { return nil }
+        let sourceRows = verifySourceRows(x)
         let outputs = NemotronMTPExecution.compiledMoE
-            ? mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true, owner: self)
-            : mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: true)
+            ? mtpCompiledRowsCache.outputs(
+                x, prepared: prepared, sourceRows: sourceRows, parts: true, owner: self)
+            : mtpForwardRowsUncompiledOutputs(
+                x, prepared: prepared, sourceRows: sourceRows, parts: true)
         return outputs.count == 2 ? (outputs[0], outputs[1]) : nil
     }
 
@@ -116,7 +135,7 @@ extension NemotronHMoE {
     /// [routed + shared], or [routed, shared] when `parts` (shared experts
     /// present, batched M=1 route).
     func mtpForwardRowsUncompiledOutputs(
-        _ x: MLXArray, prepared: MLXArray?, parts: Bool
+        _ x: MLXArray, prepared: MLXArray?, sourceRows: MLXArray? = nil, parts: Bool
     ) -> [MLXArray] {
         guard NemotronMTPExecution.batchedM1 else { return [nemotronMTPMapRows(x) { self($0) }] }
         let packed: MLXArray?
@@ -134,7 +153,7 @@ extension NemotronHMoE {
         let indices: MLXArray
         let scores: MLXArray
         if NemotronMTPExecution.batchedRouter {
-            let routed = gate.mtpForwardRows(x)
+            let routed = gate.mtpForwardRows(x, sourceRows: sourceRows)
             indices = routed.0
             scores = routed.1
         } else {

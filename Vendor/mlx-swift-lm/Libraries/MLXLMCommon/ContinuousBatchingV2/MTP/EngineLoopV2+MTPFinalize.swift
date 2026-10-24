@@ -115,6 +115,11 @@ extension EngineLoopV2 {
 
             var accepted = 0
             while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            // Masked verify rows computed with other rows' experts: never
+            // accept past them (CBv2MTPRowMask).
+            if let offset = verify.acceptLimitOffset {
+                accepted = min(accepted, max(0, Int(host[offset + batchIndex])))
+            }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
