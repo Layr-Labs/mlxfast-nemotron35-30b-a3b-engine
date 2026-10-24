@@ -1202,7 +1202,8 @@ class NemotronHMoEGate: Module {
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        let gates = NemotronMTPRouterRows.gates(x, weight)
+            ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
             routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
@@ -2850,10 +2851,18 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         }
 
         if let sharedExperts {
-            y = y + sharedExperts(x)
+            y = y + sharedExpertRows(sharedExperts, x)
         }
 
         return y
+    }
+
+    private func sharedExpertRows(_ mlp: NemotronHMLP, _ x: MLXArray) -> MLXArray {
+        guard x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)) else {
+            return mlp(x)
+        }
+        return nemotronMTPLinearRows(
+            nemotronMTPLinearRelu2Rows(x, mlp.upProj), mlp.downProj)
     }
 
     // Protocol conformance
@@ -3369,6 +3378,18 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         if hidden.dim(0) == 1, length > 128 {
             let start = ((length - 1) / 64) * 64 - 64
             return logits(hidden[0..., start..., 0...])
+        }
+        if hidden.dim(0) == 1, (2...8).contains(length),
+            let head = lmHead as? QuantizedLinear,
+            head.weight.dim(0) == configuration.vocabSize,
+            head.mode == .affine, head.bits == 4, head.groupSize == 64,
+            head.scales.dtype == hidden.dtype, head.biases?.dtype == hidden.dtype,
+            let rows = NemotronMultiRowQMV.apply(
+                hidden.reshaped(length, hidden.dim(2)), head)
+        {
+            var result = rows.reshaped(1, length, head.weight.dim(0))
+            if let bias = head.bias { result = result + bias }
+            return result
         }
         return logits(hidden)
     }
