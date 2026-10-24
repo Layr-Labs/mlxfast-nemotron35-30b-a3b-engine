@@ -11,6 +11,16 @@ import MLXNN
 /// quantized matrix is a strided view (no copy) that runs the same qmv kernel,
 /// so each kept logit equals the full head's. Held outside the module tree so
 /// it registers no parameters.
+/// Draft-confidence gate threshold (top-two logit margin of the first draft);
+/// nil = off. NEMOTRON_MTP_DRAFT_GATE_MARGIN overrides.
+/// Gate threshold fixed from public prompts only (pre-registered set 1.5 / 2 / 3).
+let nemotronMTPDraftGateDefault: Float? = 2.0
+let nemotronMTPDraftGateMargin: Float? = {
+    let raw = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_GATE_MARGIN"]
+    if raw == "off" { return nil }
+    return Float(raw ?? "") ?? nemotronMTPDraftGateDefault
+}()
+
 private final class NemotronMTPDraftHead {
     let target: NemotronHModel
 
@@ -41,6 +51,28 @@ private final class NemotronMTPDraftHead {
 
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
+    /// Greedy id plus the top-two logit margin among the exactly rescored
+    /// candidates (stock path: top two of the scored rows). The id is the
+    /// same array `greedy` returns.
+    func greedyWithMargin(_ hidden: MLXArray) -> (id: MLXArray, margin: MLXArray) {
+        guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
+              hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
+        else {
+            let row = logits(hidden)[0..., -1, 0...]
+            let top = MLX.sorted(row.asType(.float32).reshaped(-1))
+            let n = top.dim(0)
+            return (argMax(row, axis: -1).asType(.int32), top[n - 1] - top[n - 2])
+        }
+        let result = NemotronHeadScreen.run(
+            hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
+            groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
+            keep: screen.keep)
+        if NemotronHeadScreen.check { checkAgainstStock(hidden, result, screen) }
+        let top = MLX.sorted(result.candidateValues.asType(.float32).reshaped(-1))
+        let n = top.dim(0)
+        return (result.id, top[n - 1] - top[n - 2])
+    }
+
     func greedy(_ hidden: MLXArray) -> MLXArray {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
@@ -258,6 +290,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var roots: [MLXArray] = []
         var prestagedHidden: MLXArray?
         var prestagedResult: (tokens: MLXArray, hidden: MLXArray)?
+        var firstDraftMargin: MLXArray?
         /// The second draft chained on the prestaged first one; handed out
         /// only for the first draft's own `hidden` output object.
         var prestagedSecond: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
@@ -267,7 +300,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// Post-verify attention/KV only; finalize selects the one expert row.
         var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The single expert/head continuation selected at the existing host boundary.
-        var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
+        var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray, margin: MLXArray?)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -504,7 +537,14 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = draftHead.greedy(out)
+        let ids: MLXArray
+        if first && nemotronMTPDraftGateMargin != nil {
+            let pick = draftHead.greedyWithMargin(out)
+            ids = pick.id; s.firstDraftMargin = pick.margin
+        } else {
+            ids = draftHead.greedy(out)
+            if first { s.firstDraftMargin = nil }
+        }
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -512,6 +552,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { state(requestState).arrays }
+    public func firstDraftMargin(requestState: any CBv2MTPRequestState) -> MLXArray? {
+        state(requestState).firstDraftMargin
+    }
     public func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
         committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {
         let s = state(requestState)
@@ -550,10 +593,13 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.nextFirstDraft = speculation.map { spec in
             let out = module.finishPagedAttentionRow(
                 spec.attention[0..., n ..< (n + 1), 0...])
-            let ids = draftHead.greedy(out)
-            return (ids: ids, out: out,
+            let pick: (id: MLXArray, margin: MLXArray?) = nemotronMTPDraftGateMargin != nil
+                ? { let p = draftHead.greedyWithMargin(out); return (p.id, p.margin) }()
+                : (draftHead.greedy(out), nil)
+            return (ids: pick.id, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
-                    values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+                    values: spec.values[0..., 0..., n ..< (n + 1), 0...],
+                    margin: pick.margin)
         }
     }
     public func discardRound(requestState: any CBv2MTPRequestState) {
@@ -614,6 +660,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             asyncEval(s.roots)
             s.prestagedHidden = hidden
             s.prestagedResult = (tokens: next.ids, hidden: next.out)
+            s.firstDraftMargin = next.margin
             return
         }
         let result = draftStep(

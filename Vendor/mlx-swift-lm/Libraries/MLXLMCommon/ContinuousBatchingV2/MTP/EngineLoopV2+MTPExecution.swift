@@ -474,7 +474,7 @@ extension EngineLoopV2 {
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
-        let k = depths.first!
+        var k = depths.first!
         let batch = verifyRows.count
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
@@ -596,6 +596,29 @@ extension EngineLoopV2 {
                 draftSteps.append(stepTokens)
                 currentTokens = nextRows.map { $0.reshaped([1, 1]) }
                 currentHidden = nextHiddens
+                // Draft-confidence gate (depth two, one row): before staging
+                // the second draft, read the first draft's top-two margin. A
+                // low-confidence first draft ends drafting here, so the round
+                // is an ordinary depth-one round ([seed, draft1] verify, one
+                // staged assistant input). Per-row target arithmetic is the
+                // same at every verify width; only the width changes.
+                if draftIndex == 0, k == 2, batch == 1,
+                    let threshold = cbv2MTPDraftGateThreshold,
+                    let margin = stateful.firstDraftMargin(
+                        requestState: rowMetadata[0].assistantState!)
+                {
+                    let value = margin.item(Float.self)
+                    CBv2CoreInstrumentation.recordHostSync()
+                    CBv2MTPDraftGateStats.record(gated: value < threshold, margin: value)
+                    if value < threshold {
+                        // The plan advanced this row by 1 + 2 computed
+                        // positions; return the unverified third one now so
+                        // finalize's (1 + k) - confirmed rollback stays exact.
+                        scheduler.rollbackComputed(id: verifyRows[0].rec.id, tokens: 1)
+                        k = 1
+                        break
+                    }
+                }
             }
         } else {
             let prepared = mtp.drafter.prepare(rows: captures)
@@ -681,4 +704,24 @@ extension EngineLoopV2 {
         }
     }
 
+}
+
+/// Draft-confidence gate threshold mirrored for the engine (nil = off).
+let cbv2MTPDraftGateDefault: Float? = 2.0
+let cbv2MTPDraftGateThreshold: Float? = {
+    let raw = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_GATE_MARGIN"]
+    if raw == "off" { return nil }
+    return Float(raw ?? "") ?? cbv2MTPDraftGateDefault
+}()
+
+enum CBv2MTPDraftGateStats {
+    nonisolated(unsafe) static var rounds = 0
+    nonisolated(unsafe) static var gated = 0
+    static let log = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_GATE_LOG"] == "1"
+    static func record(gated g: Bool, margin: Float = .nan) {
+        rounds += 1; if g { gated += 1 }
+        if log && rounds % 200 == 0 {
+            FileHandle.standardError.write(Data("draft gate: \(gated)/\(rounds) rounds gated\n".utf8))
+        }
+    }
 }

@@ -379,6 +379,9 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Lazy float32 scalar: the current round's first draft top-two logit
+    /// margin, or nil when the drafter does not report one.
+    func firstDraftMargin(requestState: any CBv2MTPRequestState) -> MLXArray?
     /// Complete one staged round. The drafter stages the seed plus every
     /// proposal it consumes while chaining; `confirmedInputTokens` is the
     /// exact prefix of those inputs that became canonical target history.
@@ -395,6 +398,7 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 
 extension CBv2MTPRequestStatefulDrafter {
     public var draftShortlistSize: Int? { nil }
+    public func firstDraftMargin(requestState: any CBv2MTPRequestState) -> MLXArray? { nil }
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
     ) throws {}
