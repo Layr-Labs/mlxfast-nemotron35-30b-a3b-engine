@@ -1202,7 +1202,8 @@ class NemotronHMoEGate: Module {
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        let gates = NemotronMTPRouterRows.gates(x, weight)
+            ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
             routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
@@ -1305,6 +1306,26 @@ class NemotronHSwitchMLP: Module {
             outputShapes: [outShape], outputDTypes: [y.dtype])[0]
     }
 
+    func unsortedCombine(
+        _ y: MLXArray, _ indices: MLXArray, _ scores: MLXArray
+    ) -> MLXArray? {
+        let k = indices.dim(-1)
+        guard indices.size <= 64, (1...8).contains(k), scores.dtype == .float32,
+              scores.shape == indices.shape,
+              y.dtype == .bfloat16 || y.dtype == .float16,
+              y.dim(-1) == inputDims, y.size == indices.size * inputDims,
+              inputDims % 4 == 0
+        else { return nil }
+        let tokens = indices.size / k
+        var outShape = indices.shape
+        outShape[outShape.count - 1] = inputDims
+        return NemotronHPrefillKernels.shared.unsortedCombine(
+            [y, scores, inputDims],
+            template: [("T", y.dtype), ("K", k)],
+            grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0]
+    }
+
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
@@ -1337,6 +1358,7 @@ private final class NemotronHPrefillKernels: Sendable {
     let countingSort: MLXFast.MLXFastKernel
     let relu2: MLXFast.MLXFastKernel
     let combine: MLXFast.MLXFastKernel
+    let unsortedCombine: MLXFast.MLXFastKernel
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
@@ -1449,6 +1471,33 @@ private final class NemotronHPrefillKernels: Sendable {
                 float total[4];
                 for (int k = 0; k < K; ++k) {
                     uint src = inv[t * K + k];
+                    float s = scores[t * K + k];
+                    const device T* row = y + size_t(src) * N + c;
+                    for (int j = 0; j < 4; ++j) {
+                        float v = static_cast<float>(row[j]);
+                        float p = v * s;
+                        float a = p + 0.0f;
+                        if (k == 0) {
+                            total[j] = a;
+                        } else {
+                            total[j] = a + total[j];
+                        }
+                    }
+                }
+                device T* o = out + size_t(t) * N + c;
+                for (int j = 0; j < 4; ++j) {
+                    o[j] = static_cast<T>(total[j]);
+                }
+            """)
+        unsortedCombine = MLXFast.metalKernel(
+            name: "nemotron_moe_unsorted_combine",
+            inputNames: ["y", "scores", "N"], outputNames: ["out"],
+            source: """
+                uint c = thread_position_in_grid.x * 4;
+                uint t = thread_position_in_grid.y;
+                float total[4];
+                for (int k = 0; k < K; ++k) {
+                    uint src = t * K + k;
                     float s = scores[t * K + k];
                     const device T* row = y + size_t(src) * N + c;
                     for (int j = 0; j < 4; ++j) {
@@ -2846,7 +2895,11 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = fused
         } else {
             y = switchMLP(x, inds)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            if let combined = switchMLP.unsortedCombine(y, inds, scores) {
+                y = combined
+            } else {
+                y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            }
         }
 
         if let sharedExperts {
