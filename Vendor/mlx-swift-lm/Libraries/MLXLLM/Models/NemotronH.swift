@@ -101,6 +101,8 @@ enum NemotronHResidualRMSNorm {
 
     static let preparedMoEEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_RMS_PREPARED_MOE"] != "0"
+    static let preparedMambaInputEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_RMS_PREPARED_MAMBA_IN"] != "0"
 
     private static func preparedSource() -> String {
         let scratch = "threadgroup float local_inv_mean[1];"
@@ -3081,7 +3083,7 @@ private class NemotronHBlock: Module {
         preparedNorm: MLXArray? = nil,
         preparedActivation: MLXArray? = nil,
         nextNorm: RMSNorm? = nil,
-        nextPreparedMoE: Bool = false
+        nextPreparedProjection: Bool = false
     ) -> (MLXArray, MLXArray?, MLXArray?) {
         let hidden = preparedNorm
             ?? (captureMTP ? nemotronMTPNormRows(x) { norm($0) } : norm(x))
@@ -3093,7 +3095,8 @@ private class NemotronHBlock: Module {
                 "NemotronH recurrent layer received attention KV")
             let mamba = mixer as! NemotronHMamba2Mixer
             output = captureMTP
-                ? mamba.cbv2ForwardCaptured(hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+                ? mamba.cbv2ForwardCaptured(hidden, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState, preparedInput: preparedActivation)
                 : mamba.cbv2Forward(hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
         case .attention:
             guard let attentionCache else {
@@ -3115,7 +3118,7 @@ private class NemotronHBlock: Module {
             output = captureMTP
                 ? moe.mtpForwardRows(hidden, prepared: preparedActivation) : moe(hidden)
         }
-        if nextPreparedMoE, let nextNorm,
+        if nextPreparedProjection, let nextNorm,
            let triple = NemotronHResidualRMSNorm.applyPrepared(x, output, norm: nextNorm) {
             return (triple.0, triple.1, triple.2)
         }
@@ -3263,8 +3266,10 @@ private class NemotronHBackbone: Module {
                 preparedNorm: preparedNorm,
                 preparedActivation: preparedActivation,
                 nextNorm: nextNorm,
-                nextPreparedMoE: captureMTP && nextNorm != nil && next < layers.count
-                    && layers[next].blockType == .moe)
+                nextPreparedProjection: captureMTP && nextNorm != nil && next < layers.count
+                    && (layers[next].blockType == .moe
+                        || (layers[next].blockType == .mamba && nemotronMTPCompactSSM
+                            && NemotronHResidualRMSNorm.preparedMambaInputEnabled)))
             hidden = result.0
             preparedNorm = result.1
             preparedActivation = result.2
@@ -3287,6 +3292,20 @@ private class NemotronHBackbone: Module {
     }
 }
 
+private final class NemotronHActivationDTypeMemo: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved: [Int: DType]?
+
+    func value(_ resolve: () -> [Int: DType]) -> [Int: DType] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved { return resolved }
+        let value = resolve()
+        resolved = value
+        return value
+    }
+}
+
 // MARK: - Main Model (matches Python's Model class)
 
 public class NemotronHModel:
@@ -3297,6 +3316,7 @@ public class NemotronHModel:
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
+    private let recurrentActivationDTypes = NemotronHActivationDTypeMemo()
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -3372,12 +3392,16 @@ public class NemotronHModel:
         }
     }
 
+    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+        recurrentActivationDTypes.value { probeRecurrentActivationDTypes() }
+    }
+
     /// Resolve convolution-history widths from the loaded model itself.
     /// Quantized storage dtype is not the activation dtype, and retained
     /// fp32 parameters can promote later residuals. A lazy one-token graph
     /// through private caches exposes each Mamba layer's deterministic dtype
     /// without evaluating kernels or mutating request state.
-    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+    private func probeRecurrentActivationDTypes() -> [Int: DType] {
         let caches = newCache(parameters: nil)
         _ = backbone(
             MLXArray([0]).reshaped(1, 1),
