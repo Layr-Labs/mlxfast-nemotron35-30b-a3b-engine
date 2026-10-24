@@ -7,6 +7,83 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+enum NemotronMTPJoinedNorms {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOINED_NORMS"] != "0"
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_joined_rms_bf16",
+        inputNames: ["first", "second", "first_weight", "second_weight",
+                     "axis_size", "first_eps", "second_eps"],
+        outputNames: ["joined"],
+        source: """
+            constexpr uint n_reads = 4;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint row = gid / 2;
+            const uint half_index = gid % 2;
+            const device T* x = half_index == 0 ? first : second;
+            const device T* w = half_index == 0 ? first_weight : second_weight;
+            const float eps = half_index == 0 ? first_eps : second_eps;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[n_reads];
+            const size_t offset = size_t(row) * axis_size + lid * n_reads;
+            for (uint i = 0; i < n_reads; i++) {
+                thread_x[i] = x[offset + i];
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const size_t out_offset = (size_t(row) * 2 + half_index) * axis_size + lid * n_reads;
+            for (uint i = 0; i < n_reads; i++) {
+                joined[out_offset + i] = w[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+            }
+            """, ensureRowContiguous: true)
+
+    static func apply(_ first: MLXArray, _ firstNorm: RMSNorm,
+                      _ second: MLXArray, _ secondNorm: RMSNorm) -> MLXArray {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              first.ndim == 3, first.dim(0) == 1, first.dim(1) > 0, first.dim(2) == 2688,
+              second.shape == first.shape, first.dtype == .bfloat16, second.dtype == .bfloat16,
+              type(of: firstNorm) == RMSNorm.self, type(of: secondNorm) == RMSNorm.self,
+              firstNorm.weight.shape == [2688], firstNorm.weight.dtype == .bfloat16,
+              secondNorm.weight.shape == [2688], secondNorm.weight.dtype == .bfloat16
+        else { return concatenated([firstNorm(first), secondNorm(second)], axis: -1) }
+        let rows = first.dim(1)
+        return kernel([first, second, firstNorm.weight, secondNorm.weight,
+                       UInt32(2688), firstNorm.eps, secondNorm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, rows, 2 * 2688]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
+enum NemotronMTPDraftTail {
+    static let rowMoE =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_TAIL_ROW_MOE"] != "0"
+    static let residualNorm =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_TAIL_RESIDUAL_NORM"] != "0"
+}
+
 final class NemotronH35MTPAttentionBlock: Module {
     let hiddenSize: Int
     @ModuleInfo(key: "eh_proj") var projection: Linear
@@ -25,7 +102,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     private func fuse(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
-        projection(concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1))
+        projection(NemotronMTPJoinedNorms.apply(embedding, embeddingNorm, hidden, hiddenNorm))
     }
 
     func projectedKVDType(hiddenDType: DType) -> DType {
@@ -78,7 +155,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
-        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
+        let joined = NemotronMTPJoinedNorms.apply(embedding, embeddingNorm, hidden, hiddenNorm)
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
         let batch = x.dim(0), length = x.dim(1)
@@ -116,9 +193,14 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     // Keep the ordinary one-token operations: this cache does not switch to
-    // the separately specialized multi-row router or expert kernels.
     fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
-        finalNorm(x + mixer(norm(x)))
+        let y = NemotronMTPDraftTail.rowMoE
+            ? mixer.mtpForwardRowsUncompiled(norm(x)) : mixer(norm(x))
+        if NemotronMTPDraftTail.residualNorm,
+           let pair = NemotronHResidualRMSNorm.apply(x, y, norm: finalNorm) {
+            return pair.1
+        }
+        return finalNorm(x + y)
     }
 
     /// Row-batched twin of `callAsFunction` through the verify MoE row path.

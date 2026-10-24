@@ -45,6 +45,9 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+let nemotronFuseBoundaryNorms =
+    ProcessInfo.processInfo.environment["NEMOTRON_FUSE_BOUNDARY_NORMS"] != "0"
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -3087,8 +3090,11 @@ private class NemotronHBackbone: Module {
             let next = modelLayerIndex + 1
             let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
-            let nextNorm = next < layers.count && !submitsEarly
-                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+            let fusesNorm = (!captureMTP || NemotronMTPExecution.batchedNorm)
+                && (nemotronFuseBoundaryNorms || !submitsEarly)
+            let nextNorm: RMSNorm? = !fusesNorm ? nil
+                : next < layers.count ? layers[next].norm
+                : nemotronFuseBoundaryNorms ? normF : nil
             let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
@@ -3108,6 +3114,7 @@ private class NemotronHBackbone: Module {
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
+        if let preparedNorm { return preparedNorm }
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
     }
 }
@@ -3737,3 +3744,4 @@ public struct NemotronHConfiguration: Codable, Sendable {
     }
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
+private let gauntletRedraw_d1b44b3e_20261024T111718Z: Int = 0
