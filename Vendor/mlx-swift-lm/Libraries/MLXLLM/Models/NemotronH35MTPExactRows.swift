@@ -370,7 +370,7 @@ enum NemotronTargetQKV {
     ) -> (MLXArray, MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, x.dim(2) == 2688, x.dtype == .bfloat16,
-              x.dim(1) == 1 || (captureMTP && [3, 4].contains(x.dim(1))
+              x.dim(1) == 1 || (captureMTP && (2...4).contains(x.dim(1))
                 && NemotronMTPExecution.batchedM1 && NemotronMultiRowQMV.enabled),
               let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
               let v = buffers(value, rows: 256)
