@@ -26,16 +26,12 @@ private final class NemotronMTPDraftHead {
     }()
 
     func logits(_ hidden: MLXArray) -> MLXArray {
-        prefix?.callAsFunction(hidden) ?? target.logits(hidden)
+        if let prefix {
+            return NemotronMultiRowQMV.regularHeadR1(hidden, prefix) ?? prefix(hidden)
+        }
+        return target.logits(hidden)
     }
 
-    /// Multi-row twin for the post-verify head rows: the same prefix view
-    /// through the multi-row qmv, so each row's argmax matches the one-token
-    /// draft's over the same rows. The full-head chain is kept as fallback.
-    func rowLogits(_ rows: MLXArray) -> MLXArray {
-        if let prefix { return nemotronMTPLinearRows(rows, prefix) }
-        return target.lmHead.map { nemotronMTPHeadRows(rows, $0) } ?? target.logits(rows)
-    }
 }
 
 /// Request-local embedded assistant with native paged attention. Each draft
@@ -360,12 +356,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.started = true
         s.paged!.row.commitSpeculativeWrite()
         clearRound(s)
-        // The engine has already read and reconciled exact target acceptance.
-        // Use the ACTUALLY committed prefix, including stop/length truncation.
-        // Slice a view with this host index: no device prefix scan or gather,
-        // no new readback, and no expert/head work for discarded rows.
-        // Build the ordinary one-token tail lazily. The existing prestage
-        // submits it only when the engine has a continuing carry.
+        // The engine has already reconciled the actual committed prefix,
+        // including stop/length truncation. Select that row without a new
+        // readback. The existing prestage submits this ordinary one-token
+        // expert/head tail only when the engine has a continuing carry.
         s.nextFirstDraft = speculation.map { spec in
             let out = module.finishPagedAttentionRow(
                 spec.attention[0..., n ..< (n + 1), 0...])
@@ -442,11 +436,10 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         s.prestagedResult = result
     }
 
-    /// Called right after the round's verify graph is submitted (before the
-    /// acceptance readback): causal attention/KV over all k+1 row pairs.
-    /// Finalize retains the committed prefix and selects one row for the
-    /// ordinary one-token expert/head tail. This preserves attention overlap
-    /// without computing unused expert/head rows. Target work is unaffected.
+    /// Called after verify submission, before acceptance readback: causal
+    /// attention/KV over all k+1 row pairs. Finalize keeps the committed prefix
+    /// and selects one row for the ordinary expert/head tail. Draft proposals
+    /// may change from the row-batched route; target verification is unchanged.
     public func speculateAfterVerify(
         targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState
     ) {
@@ -491,20 +484,15 @@ enum NemotronH35MTPSpeculation {
 }
 
 extension NemotronH35MTPAssistant {
-    /// A private warm-up may replace one synthetic width with the same
-    /// post-verify entry over a real target verification graph. This guard
-    /// has the original warm-up policy and width cap, not a timed-phase gate.
-    func canWarmPostVerifySpeculation(width: Int) -> Bool {
-        NemotronH35MTPSpeculation.warmUp && kvOnlyHistory
-            && CBv2MTPFirstDraftPrestage.speculateAfterVerify
-            && (2 ... min(draftLimit + 1, 4)).contains(width)
-    }
-
-    /// Warm the remaining promoted synthetic widths exactly once each.
-    /// A width already attempted by the private general warm-up is omitted;
-    /// no extra request/cache transaction is added for row offsets.
-    func warmPostVerifySpeculation(skippingWidth: Int? = nil) {
-
+    /// Load-time JIT of the post-verify speculation path at every row width a
+    /// round can request (2...4 = depth 1...3, tail-clamped rounds included):
+    /// the head's rows forward (multi-row qmv, column attention, compiled row
+    /// MoE trace + leader kernel, multi-row LM head rows, argmax), finalize's
+    /// row slices and prestage's re-append + handout. Runs the real entry
+    /// points on throwaway request state with zero inputs; values are
+    /// discarded. The one-token draft and the target paths are left to the
+    /// general warm-up.
+    func warmPostVerifySpeculation() {
         guard NemotronH35MTPSpeculation.warmUp, kvOnlyHistory,
               CBv2MTPFirstDraftPrestage.speculateAfterVerify
         else { return }
@@ -518,7 +506,6 @@ extension NemotronH35MTPAssistant {
         // A decode-sized trusted history (kernel choice does not depend on it).
         let history = 600
         for width in 2 ... min(draftLimit + 1, 4) {
-            if width == skippingWidth { continue }
             let requestState = makeRequestState()
             defer { releaseRequestState(requestState) }
             do {
