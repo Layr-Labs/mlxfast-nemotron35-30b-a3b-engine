@@ -45,6 +45,11 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+/// A partial compact verify commits lazy per-layer recurrence replays. Queue
+/// those independent roots together before building the next verify graph.
+private let nemotronBatchReplayInputs =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_BATCH_REPLAY_INPUTS"] != "0"
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -3234,6 +3239,21 @@ private class NemotronHBackbone: Module {
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
             : nil
         defer { observation?.end() }
+        if nemotronBatchReplayInputs, captureMTP, nemotronMTPCompactSSM,
+            inputs.dim(0) == 1, inputs.dim(1) == 3
+        {
+            // The previous acceptance boundary has already selected these
+            // states. They do not depend on this forward's hidden activations;
+            // submit all Mamba recovery work while the host builds layer one.
+            // Full-acceptance states are already materialized, so this is then
+            // a no-op. No recurrence arithmetic or commit ownership changes.
+            let replayRoots = recurrentState.flatMap { evaluation in
+                layers.indices.compactMap { index in
+                    evaluation.inputState(modelLayerIndex: index)?.ssm
+                }
+            }
+            if !replayRoots.isEmpty { asyncEval(replayRoots) }
+        }
         var hidden = embeddings(inputs)
         var preparedNorm: MLXArray? = nil
         var preparedActivation: MLXArray? = nil
