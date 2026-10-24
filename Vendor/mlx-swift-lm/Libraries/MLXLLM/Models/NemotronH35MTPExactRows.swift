@@ -376,7 +376,7 @@ func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {
 private let nemotronMTPRouterRowsSource = """
   constexpr int BN = 8;
   constexpr int SN = 32;
-  constexpr int TM = 4;
+  constexpr int TM = 2;
   constexpr int TN = 4;
   constexpr int blockM = TM;
   constexpr int blockN = BN * SN * TN;
@@ -510,7 +510,7 @@ enum NemotronMTPRouterRows {
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
         var y = kernel([weight, x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows)],
-            grid: (32 * 32, 8, 1),
+            grid: (32 * (128 / 2), 8, 1),
             threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128]],
             outputDTypes: [x.dtype])[0]
