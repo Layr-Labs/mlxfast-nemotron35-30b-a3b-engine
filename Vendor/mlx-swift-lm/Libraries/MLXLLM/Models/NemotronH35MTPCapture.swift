@@ -164,8 +164,11 @@ extension NemotronHMamba2Mixer {
         let projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
-        let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let rawDt = parts[2].reshaped(batch, length, numHeads)
+        let (convolution, padded, dt) = packedConvDt(convState, input, rawDt) ?? {
+            let (convolution, padded) = packedConv(convState, input)
+            return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
+        }()
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(

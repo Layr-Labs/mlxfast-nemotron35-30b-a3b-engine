@@ -316,6 +316,8 @@ extension EngineLoopV2 {
                         + max(rec.request.maxTokens, 1))
             {
                 mtp.restoreAssistantState(state, for: rec.id)
+                (mtp.drafter as? any CBv2MTPCommittedTokenObserving)?
+                    .observeCommittedTokens(Array(slice.suffix(64)), requestState: state)
             }
             if visionChunk, let multimodal {
                 let forward = try multimodalChunkForward(
