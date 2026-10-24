@@ -579,6 +579,22 @@ final class CBv2MTPRoundDriver {
         return state
     }
 
+    /// Fixed-depth confidence gate. Below this target top-two margin at the
+    /// carry (finalized at the round's existing host readback) the chained
+    /// second draft is expected to cost more than it returns, so the round
+    /// verifies the prestaged first draft only. Lossless: verification is
+    /// unchanged, only the number of proposals shrinks.
+    static let fixedDepthMarginGate = 1.6
+
+    /// Depth for a fixed-depth request-stateful plan after the margin gate.
+    func fixedDepthGateDepth(for id: CBv2RequestID, offeredDepth: Int) -> Int {
+        guard usesRequestStatefulDrafter, config.fixedDraftTokens != nil, offeredDepth > 1,
+            let margin = carries[id]?.previousTopTwoMargin, margin.isFinite,
+            margin < Self.fixedDepthMarginGate
+        else { return offeredDepth }
+        return 1
+    }
+
     var usesMarginalPolicy: Bool {
         config.maxDraftTokens > 0
             && usesRequestStatefulDrafter && config.fixedDraftTokens == nil

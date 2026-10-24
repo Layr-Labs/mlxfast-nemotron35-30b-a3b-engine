@@ -206,6 +206,15 @@ extension EngineLoopV2 {
                 mtp.clampPlanDepth(to: marginalDepth, reason: "marginal_policy")
             }
         }
+        if mtp.planDepth > 1, !eligibleRows.isEmpty {
+            let gatedDepth =
+                eligibleRows.map { rec in
+                    mtp.fixedDepthGateDepth(for: rec.id, offeredDepth: mtp.planDepth)
+                }.max() ?? mtp.planDepth
+            if gatedDepth < mtp.planDepth {
+                mtp.clampPlanDepth(to: gatedDepth, reason: "margin_gate")
+            }
+        }
         if mtp.planDepth > 0 {
             let tailDepth = Self.mtpDepthWithinOutputBudget(
                 offeredDepth: mtp.planDepth,
