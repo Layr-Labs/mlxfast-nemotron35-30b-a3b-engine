@@ -1327,10 +1327,7 @@ enum NemotronHRouterSelection {
         }
         """
 
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_h_router_select",
-        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
-        source: """
+    private static let source = """
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             threadgroup float original[128];
@@ -1383,12 +1380,31 @@ enum NemotronHRouterSelection {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
-            """,
-        header: sigmoidHeader, ensureRowContiguous: true)
+            """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: source, header: sigmoidHeader, ensureRowContiguous: true)
+
+    /// Row-mask variant (`CBv2MTPRowMask`): output row r selects from the
+    /// gates of row source_rows[r]. The identity map is the kernel above
+    /// statement for statement; a masked row repeats row 0's selection, so it
+    /// keeps six distinct experts and adds no new expert reads.
+    private static func sourceRowsSource() -> String {
+        let read = "float(gates[row * 128 + id])"
+        precondition(source.components(separatedBy: read).count == 2)
+        return source.replacingOccurrences(
+            of: read, with: "float(gates[uint(source_rows[row]) * 128 + id])")
+    }
+    static let sourceRowsKernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select_source_rows",
+        inputNames: ["gates", "bias", "source_rows"], outputNames: ["indices", "weights"],
+        source: sourceRowsSource(), header: sigmoidHeader, ensureRowContiguous: true)
 
     static func apply(
         gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
-        routedScalingFactor: Float, normTopkProb: Bool
+        routedScalingFactor: Float, normTopkProb: Bool, sourceRows: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
@@ -1398,9 +1414,16 @@ enum NemotronHRouterSelection {
             normTopkProb, routedScalingFactor == 2.5
         else { return nil }
         let shape = [1, gates.dim(1), 6]
-        let result = kernel(
-            [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
-            outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        let result: [MLXArray]
+        if let sourceRows, sourceRows.shape == [gates.dim(1)], sourceRows.dtype == .int32 {
+            result = sourceRowsKernel(
+                [gates, eSCB, sourceRows], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+                outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        } else {
+            result = kernel(
+                [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+                outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        }
         return (result[0], result[1])
     }
 }
@@ -1412,11 +1435,13 @@ private func groupExpertSelect(
     nGroup: Int,
     topkGroup: Int,
     routedScalingFactor: Float,
-    normTopkProb: Bool
+    normTopkProb: Bool,
+    sourceRows: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
     if let selected = NemotronHRouterSelection.apply(
         gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
-        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb) {
+        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+        sourceRows: sourceRows) {
         return selected
     }
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
@@ -1504,12 +1529,15 @@ class NemotronHMoEGate: Module {
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
     /// The multi-row kernel repeats the M=1 gemv per row in one launch.
-    func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+    /// sourceRows: the verify row-mask map (`CBv2MTPRowMask`); a masked row
+    /// selects row 0's experts. nil selects every row from its own gates.
+    func mtpForwardRows(_ x: MLXArray, sourceRows: MLXArray? = nil) -> (MLXArray, MLXArray) {
         let gates = NemotronMTPRouterRows.gates(x, weight)
             ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
-            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+            sourceRows: sourceRows)
     }
 }
 
@@ -3431,8 +3459,7 @@ private class NemotronHBackbone: Module {
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3442,7 +3469,6 @@ private class NemotronHBackbone: Module {
         var preparedNorm: MLXArray? = nil
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
-        var submittedPrefillChunk: MLXArray? = nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3481,18 +3507,6 @@ private class NemotronHBackbone: Module {
                     let group = (next - nemotronEarlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
-                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
-                    // milliseconds while the host builds the next in well under
-                    // one, so without a wait the host encodes, and allocates,
-                    // every layer's intermediates before the first chunk
-                    // completes. Waiting on the previous chunk returns its
-                    // temporaries to MLX's buffer cache for the next chunk; this
-                    // chunk is already queued, so the GPU never waits on the
-                    // host. Evaluation order only; values are unchanged.
-                    if recyclePrefillChunks {
-                        if let previous = submittedPrefillChunk { eval(previous) }
-                        submittedPrefillChunk = hidden
-                    }
                 } else {
                     asyncEval(hidden)
                 }
@@ -3739,8 +3753,7 @@ public class NemotronHModel:
         _ inputs: MLXArray,
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3749,8 +3762,7 @@ public class NemotronHModel:
             return attending
         }
         return backbone.cbv2Forward(
-            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
-            recyclePrefillChunks: recyclePrefillChunks)
+            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.

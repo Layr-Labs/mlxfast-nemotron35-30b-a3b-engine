@@ -3,6 +3,34 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Confidence-gated trailing-row masking at depth 2 (`CBv2MTPRowMask`). Each
+/// draft's confidence is its softmax probability over the head screen's exact
+/// survivor logits, an upper bound on its full-vocabulary probability, so the
+/// gate errs towards keeping rows. Row 1 (and with it row 2) is masked when
+/// p1 < T1; row 2 alone when p1 * p2 < T2. NEMOTRON_MTP_ROW_MASK=0 keeps every
+/// row.
+enum NemotronMTPRowMaskPolicy {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROW_MASK"] != "0"
+    static let firstThreshold = threshold("NEMOTRON_MTP_ROW_MASK_T1", 0.30)
+    static let pairThreshold = threshold("NEMOTRON_MTP_ROW_MASK_T2", 0.35)
+
+    private static func threshold(_ name: String, _ fallback: Float) -> Float {
+        Float(ProcessInfo.processInfo.environment[name] ?? "") ?? fallback
+    }
+
+    /// p1, p2: scalar float32 draft confidences. Device-only; no host read.
+    static func gate(_ p1: MLXArray, _ p2: MLXArray) -> CBv2MTPRowMask.Gate {
+        let one = MLXArray(Int32(1))
+        let keep1 = one - (p1 .< MLXArray(firstThreshold)).asType(.int32)
+        let keep2 = keep1 * (one - ((p1 * p2) .< MLXArray(pairThreshold)).asType(.int32))
+        let sourceRows = concatenated(
+            [MLXArray([Int32(0)]), keep1.reshaped([1]), (keep2 * MLXArray(Int32(2))).reshaped([1])],
+            axis: 0)
+        return CBv2MTPRowMask.Gate(sourceRows: sourceRows, limit: (keep1 + keep2).reshaped([1]))
+    }
+}
+
 /// Drafts score only the first half of the target head's rows; the target
 /// still scores every emitted token over the full vocabulary. Ids below 1000
 /// are control tokens (both EOS ids included), 1000..<1256 the raw bytes, and
@@ -41,16 +69,22 @@ private final class NemotronMTPDraftHead {
 
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
-    func greedy(_ hidden: MLXArray) -> MLXArray {
+    func greedy(_ hidden: MLXArray) -> MLXArray { greedyScored(hidden).id }
+
+    /// The same draft id plus, on the screen path, its softmax probability
+    /// over the exact survivor logits (scalar float32, lazy). The id's graph
+    /// is unchanged; the stock-argmax fallback reports no confidence.
+    func greedyScored(_ hidden: MLXArray) -> (id: MLXArray, confidence: MLXArray?) {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
-        else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
+        else { return (argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32), nil) }
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
             keep: screen.keep)
         if NemotronHeadScreen.check { checkAgainstStock(hidden, result, screen) }
-        return result.id
+        let values = result.candidateValues
+        return (result.id, exp(values.max(keepDims: false) - values.logSumExp(keepDims: false)))
     }
 
     /// NEMOTRON_MTP_HEAD_SCREEN_CHECK=1 only: synchronous comparison with the
@@ -264,7 +298,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// Post-verify attention/KV only; finalize selects the one expert row.
         var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The single expert/head continuation selected at the existing host boundary.
-        var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
+        var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                             confidence: MLXArray?)?
+        /// This round's draft confidences in draft order (row-mask gate input).
+        var roundConfidence: [MLXArray?] = []
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -491,11 +528,25 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = draftHead.greedy(out)
+        let (ids, confidence) = draftHead.greedyScored(out)
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
+        if first { s.roundConfidence = [] }
+        s.roundConfidence.append(confidence)
+        proposeRowMask(s)
         return (ids, out)
+    }
+
+    /// Once both depth-2 drafts exist, hand the engine this round's row-mask
+    /// gate. Confidence reductions join the head's own submission (roots).
+    private func proposeRowMask(_ s: State) {
+        guard NemotronMTPRowMaskPolicy.enabled, s.roundConfidence.count == 2,
+              let p1 = s.roundConfidence[0], let p2 = s.roundConfidence[1]
+        else { return }
+        let gate = NemotronMTPRowMaskPolicy.gate(p1, p2)
+        s.roots.append(contentsOf: [gate.sourceRows, gate.limit])
+        CBv2MTPRowMask.propose(gate)
     }
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { state(requestState).arrays }
@@ -537,10 +588,11 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.nextFirstDraft = speculation.map { spec in
             let out = module.finishPagedAttentionRow(
                 spec.attention[0..., n ..< (n + 1), 0...])
-            let ids = draftHead.greedy(out)
+            let (ids, confidence) = draftHead.greedyScored(out)
             return (ids: ids, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
-                    values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+                    values: spec.values[0..., 0..., n ..< (n + 1), 0...],
+                    confidence: confidence)
         }
     }
     public func discardRound(requestState: any CBv2MTPRequestState) {
@@ -557,6 +609,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.prestagedHidden = nil; s.prestagedResult = nil; s.speculation = nil
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
+        s.roundConfidence = []
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
@@ -594,7 +647,8 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             s.savedTokens = []; s.savedHidden = []; s.savedFrontier = s.frontier
             s.frontier = nil
             s.roots = s.cache.appendTrusted(keys: next.keys, values: next.values)
-                + [next.ids, next.out]
+                + [next.ids, next.out] + (next.confidence.map { [$0] } ?? [])
+            s.roundConfidence = [next.confidence]
             s.stagedInputCount = 1
             s.trustedOffset = s.cacheOffset
             asyncEval(s.roots)

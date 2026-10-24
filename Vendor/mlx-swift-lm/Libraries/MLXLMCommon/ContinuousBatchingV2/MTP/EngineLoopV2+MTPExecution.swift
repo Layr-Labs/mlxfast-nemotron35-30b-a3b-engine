@@ -554,6 +554,8 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
+        // A row-mask gate belongs to the drafts built below and to no other round.
+        _ = CBv2MTPRowMask.takePending()
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
@@ -618,6 +620,9 @@ extension EngineLoopV2 {
             }
         }
         let draftIDs = stacked(draftSteps, axis: 1)
+        let rowGate = CBv2MTPRowMask.takePending().flatMap { gate in
+            k == 2 && batch == 1 && gate.sourceRows.shape == [k + 1] ? gate : nil
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -631,8 +636,12 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        // Target MoE layers read the gate's source rows while this graph is built.
+        CBv2MTPRowMask.setActive(rowGate?.sourceRows)
+        defer { CBv2MTPRowMask.setActive(nil) }
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp)
+        CBv2MTPRowMask.setActive(nil)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -642,6 +651,11 @@ extension EngineLoopV2 {
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
+        }
+        var acceptLimitOffset: Int?
+        if let rowGate {
+            acceptLimitOffset = packetParts.reduce(0) { $0 + $1.size }
+            packetParts.append(rowGate.limit.reshaped([-1]).asType(.int32))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
@@ -656,6 +670,7 @@ extension EngineLoopV2 {
             policyTopTwoValues: target.policyTopTwo?.values)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.acceptLimitOffset = acceptLimitOffset
         return result
     }
 
