@@ -582,6 +582,7 @@ private enum NemotronPackedConvKernel {
 }
 
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
+    let mtpCompactGraphCache = NemotronH35MTPCompactGraphCache()
     let numHeads: Int
     let hiddenSize: Int
     let ssmStateSize: Int

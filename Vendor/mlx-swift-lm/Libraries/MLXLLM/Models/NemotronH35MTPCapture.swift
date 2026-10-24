@@ -42,17 +42,11 @@ extension NemotronHMamba2Mixer {
         evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
     ) -> MLXArray {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
-        let projected = nemotronMTPLinearRows(hiddenStates, inProj)
-        let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
-        let gate = parts[0], input = parts[1]
-        let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let arrays = mtpCompactGraphCache([hiddenStates, convState, initialSSM], owner: self)
+        let convolution = arrays[1], padded = arrays[2], dt = arrays[3]
+        let finalSSM = arrays[4]
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
-        let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-            heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
@@ -60,8 +54,8 @@ extension NemotronHMamba2Mixer {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
                 finalConv: padded[0..., length ..< (length + history), 0...],
-                finalSSM: result.finalState,
-                materializedByteCount: tapeBytes + result.finalState.nbytes,
+                finalSSM: finalSSM,
+                materializedByteCount: tapeBytes + finalSSM.nbytes,
                 evaluationRoots: tape,
                 strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
                 strictReplayRetainedRoots: tape + [initialSSM],
@@ -76,6 +70,24 @@ extension NemotronHMamba2Mixer {
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
         }
+        return arrays[0]
+    }
+
+    /// Pure graph only: all request recurrent inputs are explicit arrays.
+    func mtpCompactArraysUncompiled(_ inputs: [MLXArray]) -> [MLXArray] {
+        let hiddenStates = inputs[0], convState = inputs[1], initialSSM = inputs[2]
+        let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
+        let projected = nemotronMTPLinearRows(hiddenStates, inProj)
+        let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        let gate = parts[0], input = parts[1]
+        let (convolution, padded) = packedConv(convState, input)
+        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
+        let (logA, skip) = (self.aLog, self.D)
+        let result = nemotronMTPSSMCompact(
+            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+            heads: heads, headDim: dim, groups: groups, stateDim: state,
+            steps: length, writeOutput: true)
         let y = result.output.reshaped(batch, length, heads * dim)
         let normalized = NemotronMTPExecution.batchedNorm
             ? norm(y, gate: gate)
@@ -83,7 +95,7 @@ extension NemotronHMamba2Mixer {
                 norm(y[0..., position..<(position + 1), 0...],
                      gate: gate[0..., position..<(position + 1), 0...])
             }, axis: 1)
-        return nemotronMTPLinearRows(normalized, outProj)
+        return [nemotronMTPLinearRows(normalized, outProj), convolution, padded, dt, result.finalState]
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -215,5 +227,33 @@ extension NemotronH35Model {
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
+    }
+}
+
+
+/// Cache parameter-bound functions, never request state, transactions or offsets.
+final class NemotronH35MTPCompactGraphCache {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entry: Entry?
+    func callAsFunction(_ arrays: [MLXArray], owner: NemotronHMamba2Mixer) -> [MLXArray] {
+        let identity = [owner.inProj, owner.outProj, owner.conv1d, owner.norm].map(ObjectIdentifier.init)
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.identity == identity { return entry }
+            let state = owner.innerState()
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] inputs in
+                guard let owner else { preconditionFailure("Released Nemotron compact graph owner") }
+                return owner.mtpCompactArraysUncompiled(inputs)
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        return withExtendedLifetime(retired) { current.function(arrays) }
     }
 }
