@@ -2,6 +2,7 @@
 // next-token embedding -> fusion -> attention -> MoE -> final norm.
 // Tensor contract cross-checked against NVIDIA's BF16 checkpoint and
 // jundot/omlx patches/mlx_lm_mtp/nemotron_h_model.py (2026-09-08).
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -13,6 +14,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     @ModuleInfo(key: "hnorm") var hiddenNorm: RMSNorm
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHAttention
+    private let projectionGraphCache = NemotronH35MTPProjectionGraphCache()
 
     init(_ args: NemotronHConfiguration) {
         hiddenSize = args.hiddenSize
@@ -43,8 +45,17 @@ final class NemotronH35MTPAttentionBlock: Module {
         hidden: MLXArray, embedding: MLXArray,
         cache: any CBv2AttendingLayerCache
     ) -> MLXArray {
-        let fused = fuse(hidden: hidden, embedding: embedding)
-        return fused + mixer.cbv2Forward(norm(fused), cache: cache)
+        // A custom attention subclass may override cbv2Forward itself.
+        guard type(of: mixer) == NemotronHAttention.self else {
+            let fused = fuse(hidden: hidden, embedding: embedding)
+            return fused + mixer.cbv2Forward(norm(fused), cache: cache)
+        }
+        let (fused, queries, keys, values) = projectedRows(
+            hidden: hidden, embedding: embedding, rowMode: false)
+        let attended = cache.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
+        let merged = attended.transposed(0, 2, 1, 3).reshaped(hidden.dim(0), hidden.dim(1), -1)
+        return fused + mixer.wo(merged)
     }
 
     /// Trusted target rows only need the head's K/V projections. Their
@@ -77,20 +88,107 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
-        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
-        let fused = nemotronMTPLinearRows(joined, projection)
-        let x = norm(fused)
-        let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq)
-            .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
-            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
-            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let (fused, queries, keys, values) = projectedRows(
+            hidden: hidden, embedding: embedding, rowMode: true)
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
-        let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
+        let merged = attended.transposed(0, 2, 1, 3).reshaped(hidden.dim(0), hidden.dim(1), -1)
         return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+    }
+
+    private func projectedRows(
+        hidden: MLXArray, embedding: MLXArray, rowMode: Bool
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        if NemotronH35MTPProjectionGraphCache.enabled,
+           hidden.ndim == 3, hidden.dim(0) == 1, (1...8).contains(hidden.dim(1)),
+           hidden.shape == embedding.shape {
+            return projectionGraphCache(hidden: hidden, embedding: embedding, rowMode: rowMode, owner: self)
+        }
+        return uncompiledProjectedRows(hidden: hidden, embedding: embedding, rowMode: rowMode)
+    }
+
+    // This is the original stateless projection work. The ordinary one-token
+    // path keeps stock linears; the row path keeps its exact M=1 row helpers.
+    fileprivate func uncompiledProjectedRows(
+        hidden: MLXArray, embedding: MLXArray, rowMode: Bool
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
+        let fused = rowMode ? nemotronMTPLinearRows(joined, projection) : projection(joined)
+        let x = norm(fused)
+        let batch = x.dim(0), length = x.dim(1)
+        let queries = (rowMode ? nemotronMTPLinearRows(x, mixer.wq) : mixer.wq(x))
+            .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let keys = (rowMode ? nemotronMTPLinearRows(x, mixer.wk) : mixer.wk(x))
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let values = (rowMode ? nemotronMTPLinearRows(x, mixer.wv) : mixer.wv(x))
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        return (fused, queries, keys, values)
+    }
+}
+
+/// The graph has two tensor inputs and only stateless projection outputs.
+/// Cache writes, attention, output projection and residual addition remain
+/// ordinary request-owned work outside this cache.
+private final class NemotronH35MTPProjectionGraphCache {
+    static let enabled = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NEMOTRON35_MTP_COMPILED_ATTENTION_PROJECTIONS"] != "0"
+
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    // Mode is independent of tensor width: a one-row call through the row
+    // entry must not borrow the ordinary projection function's trace.
+    private var entries: [Bool: Entry] = [:]
+
+    func callAsFunction(
+        hidden: MLXArray, embedding: MLXArray, rowMode: Bool,
+        owner: NemotronH35MTPAttentionBlock
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        // Known native modules have stable parameter array handles. Unknown
+        // subclasses retain their eager behavior instead of being captured.
+        guard let identity = Self.nativeIdentity(owner) else {
+            return owner.uncompiledProjectedRows(hidden: hidden, embedding: embedding, rowMode: rowMode)
+        }
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry = entries[rowMode], entry.identity == identity { return entry }
+            let state = owner.projection.innerState() + owner.embeddingNorm.innerState()
+                + owner.hiddenNorm.innerState() + owner.norm.innerState()
+                + owner.mixer.wq.innerState() + owner.mixer.wk.innerState() + owner.mixer.wv.innerState()
+            let function: @Sendable ([MLXArray]) -> [MLXArray] =
+                compile(inputs: [state]) { [weak owner] arguments in
+                    guard let owner else { preconditionFailure("Released Nemotron MTP projection owner") }
+                    let (fused, queries, keys, values) = owner.uncompiledProjectedRows(
+                        hidden: arguments[0], embedding: arguments[1], rowMode: rowMode)
+                    return [fused, queries, keys, values]
+                }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entries[rowMode]
+            entries[rowMode] = replacement
+            return replacement
+        }
+        // Retired compile closures have their own lock ordering and must be
+        // released after the cache lock, as in the existing MoE graph cache.
+        let results = withExtendedLifetime(retired) { current.function([hidden, embedding]) }
+        return (results[0], results[1], results[2], results[3])
+    }
+
+    private static func nativeIdentity(_ owner: NemotronH35MTPAttentionBlock) -> [ObjectIdentifier]? {
+        func linear(_ value: Linear) -> Bool {
+            type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
+        }
+        guard type(of: owner.embeddingNorm) == RMSNorm.self,
+              type(of: owner.hiddenNorm) == RMSNorm.self,
+              type(of: owner.norm) == RMSNorm.self,
+              type(of: owner.mixer) == NemotronHAttention.self,
+              linear(owner.projection), linear(owner.mixer.wq),
+              linear(owner.mixer.wk), linear(owner.mixer.wv) else { return nil }
+        let modules: [Module] = [owner, owner.projection, owner.embeddingNorm,
+                                 owner.hiddenNorm, owner.norm, owner.mixer,
+                                 owner.mixer.wq, owner.mixer.wk, owner.mixer.wv]
+        return modules.map(ObjectIdentifier.init)
     }
 }
 
@@ -98,6 +196,7 @@ final class NemotronH35MTPExpertBlock: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHMoE
     @ModuleInfo(key: "final_layernorm") var finalNorm: RMSNorm
+    private let oneTokenTailCache = NemotronH35MTPOneTokenTailCache()
 
     init(_ args: NemotronHConfiguration) {
         _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
@@ -105,11 +204,86 @@ final class NemotronH35MTPExpertBlock: Module {
         _finalNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray { finalNorm(x + mixer(norm(x))) }
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if NemotronMTPExecution.compiledMoE,
+           x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1 {
+            return oneTokenTailCache(x, owner: self)
+        }
+        return uncompiledOneTokenTail(x)
+    }
+
+    // Keep the ordinary one-token operations: this cache does not switch to
+    // the separately specialized multi-row router or expert kernels.
+    fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
+        finalNorm(x + mixer(norm(x)))
+    }
 
     /// Row-batched twin of `callAsFunction` through the verify MoE row path.
     func forwardRows(_ x: MLXArray) -> MLXArray {
         finalNorm(x + mixer.mtpForwardRows(norm(x)))
+    }
+}
+
+/// Cache only the assistant's stateless one-token expert tail. Attention,
+/// request state, KV writes, offsets and transactions remain outside the graph.
+private final class NemotronH35MTPOneTokenTailCache {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable (MLXArray) -> MLXArray
+    }
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func callAsFunction(_ x: MLXArray, owner: NemotronH35MTPExpertBlock) -> MLXArray {
+        // Native parameter wrappers keep their array objects when updated;
+        // capture those handles as compiler inputs, as the MoE row cache does.
+        // Child replacement invalidates the entry. Unknown child types use
+        // reflective module and parameter identities instead.
+        let nativeIdentity = Self.nativeIdentity(owner)
+        let parameters = nativeIdentity == nil ? owner.innerState() : nil
+        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
+            + (parameters ?? []).map(ObjectIdentifier.init))
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.identity == identity { return entry }
+            let state = parameters ?? owner.innerState()
+            let function: @Sendable (MLXArray) -> MLXArray = compile(inputs: [state]) { [weak owner] x in
+                guard let owner else { preconditionFailure("Released Nemotron MTP expert-tail owner") }
+                return owner.uncompiledOneTokenTail(x)
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        // The compiler has its own locks; retire old entries after releasing
+        // this cache lock, including when a module tree has been replaced.
+        return withExtendedLifetime(retired) { current.function(x) }
+    }
+
+    private static func nativeIdentity(_ owner: NemotronH35MTPExpertBlock) -> [ObjectIdentifier]? {
+        func linear(_ value: Linear) -> Bool {
+            type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
+        }
+        func switched(_ value: SwitchLinear) -> Bool {
+            type(of: value) == SwitchLinear.self || type(of: value) == QuantizedSwitchLinear.self
+        }
+        let mixer = owner.mixer
+        guard type(of: owner.norm) == RMSNorm.self,
+              type(of: owner.finalNorm) == RMSNorm.self,
+              type(of: mixer) == NemotronHMoE.self,
+              type(of: mixer.gate) == NemotronHMoEGate.self,
+              type(of: mixer.switchMLP) == NemotronHSwitchMLP.self,
+              switched(mixer.switchMLP.fc1), switched(mixer.switchMLP.fc2) else { return nil }
+        var modules: [Module] = [owner, owner.norm, mixer, owner.finalNorm,
+                                 mixer.gate, mixer.switchMLP,
+                                 mixer.switchMLP.fc1, mixer.switchMLP.fc2]
+        if let shared = mixer.sharedExperts {
+            guard type(of: shared) == NemotronHMLP.self,
+                  linear(shared.upProj), linear(shared.downProj) else { return nil }
+            modules += [shared, shared.upProj, shared.downProj]
+        }
+        return modules.map(ObjectIdentifier.init)
     }
 }
 
