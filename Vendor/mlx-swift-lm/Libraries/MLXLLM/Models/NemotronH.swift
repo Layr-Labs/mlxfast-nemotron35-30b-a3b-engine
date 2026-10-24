@@ -1375,6 +1375,8 @@ class NemotronHAttention: Module, NemotronHMixer {
 // MARK: - MLP
 
 class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
+    var zskipDown: NemotronZSkipEntry?
+
     /// DARKBLOOM_NEMOTRON35_ORDINARY_R1_SHARED_UP=0 keeps stock up_proj + relu2.
     private static let ordinaryR1SharedUp =
         ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_ORDINARY_R1_SHARED_UP"] != "0"
@@ -1407,6 +1409,10 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
                x.reshaped(1, 2688), up, relu2: true) {
             if NemotronMoELeader.selfTest {
                 activated = nemotronBitwiseOrNaN(activated, relu2(upProj(x)).reshaped(1, 3712))
+            }
+            if let y = zskipDown?.down(x: activated, site: .sharedDraft, rows: 1, topK: 1,
+                original: { self.downProj(activated.reshaped(1, 1, 3712)).reshaped(1, 2688) }) {
+                return y.reshaped(1, 1, 2688)
             }
             return downProj(activated.reshaped(1, 1, 3712))
         }
@@ -1623,6 +1629,8 @@ class NemotronHMoEGate: Module {
 // MARK: - SwitchMLP for NemotronH (uses relu2 instead of silu/glu)
 
 class NemotronHSwitchMLP: Module {
+    var zskipDown: NemotronZSkipEntry?
+
     @ModuleInfo(key: "fc1") var fc1: SwitchLinear
     @ModuleInfo(key: "fc2") var fc2: SwitchLinear
 
@@ -1730,7 +1738,18 @@ class NemotronHSwitchMLP: Module {
 
         var y = fc1(x, idx, sortedIndices: doSort)
         y = relu2(y)
-        y = fc2(y, idx, sortedIndices: doSort)
+        if !doSort, idx.ndim == 3, idx.dim(0) == 1, idx.dim(2) == 6,
+           (1...4).contains(idx.dim(1)), idx.dtype == .uint32,
+           Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+           let entry = zskipDown {
+            let activated = y
+            let rows = idx.dim(1)
+            if let result = entry.down(x: activated.reshaped(rows * 6, hiddenDims),
+                indices: idx.reshaped(rows * 6), site: .routedDraft, rows: rows,
+                original: { self.fc2(activated, idx, sortedIndices: false).reshaped(rows * 6, self.inputDims) }) {
+                y = result.reshaped(Array(activated.shape.dropLast()) + [inputDims])
+            } else { y = fc2(y, idx, sortedIndices: false) }
+        } else { y = fc2(y, idx, sortedIndices: doSort) }
 
         if doSort {
             y = scatterUnsort(x: y, invOrder: inverseOrder, shape: indices.shape)

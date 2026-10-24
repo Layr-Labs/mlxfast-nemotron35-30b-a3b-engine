@@ -7,6 +7,12 @@ extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
         let activated = nemotronMTPLinearRelu2Rows(x, upProj, prepared: prepared)
+        if x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)),
+           let y = zskipDown?.down(x: activated.reshaped(x.dim(1), activated.dim(2)),
+               site: .sharedVerify, rows: x.dim(1), topK: 1,
+               original: { nemotronMTPLinearRows(activated, self.downProj).reshaped(x.dim(1), 2688) }) {
+            return y.reshaped(1, x.dim(1), 2688)
+        }
         return nemotronMTPLinearRows(activated, downProj)
     }
 }
@@ -788,7 +794,10 @@ enum NemotronMoELeader {
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down)
+        var y = mlp.zskipDown?.down(x: act, indices: flat,
+            scores: scores.reshaped(rows * 6), site: .routedWeighted, rows: rows,
+            original: { applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down) })
+            ?? applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -821,7 +830,10 @@ enum NemotronMoELeader {
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true)
+        var y = mlp.zskipDown?.down(x: act, indices: flat, site: .routedLeader,
+            rows: rows, topK: topK,
+            original: { apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true) })
+            ?? apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true)
         if selfTest {
             // Stock route on the same inputs: gather_qmv fc1, relu2 ops, gather_qmv fc2.
             let xe = MLX.expandedDimensions(x, axes: [-2, -3])
