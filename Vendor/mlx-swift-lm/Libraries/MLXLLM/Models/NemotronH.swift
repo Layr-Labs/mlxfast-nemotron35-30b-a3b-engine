@@ -45,6 +45,41 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+let nemotronWeightAnchorEnabled =
+    ProcessInfo.processInfo.environment["NEMOTRON_WEIGHT_ANCHOR"] != "0"
+
+func nemotronWeightAnchor(_ a: MLXArray) -> MLXArray {
+    guard nemotronWeightAnchorEnabled, a.size > 8 else { return a }
+    return NemotronWeightAnchors.shared.anchor(a)
+}
+
+final class NemotronWeightAnchors: @unchecked Sendable {
+    static let shared = NemotronWeightAnchors()
+    private let lock = NSLock()
+    private var entries: [ObjectIdentifier: (source: MLXArray, anchor: MLXArray)] = [:]
+
+    func anchor(_ a: MLXArray) -> MLXArray {
+        if let hit = lock.withLock({ entries[ObjectIdentifier(a)] }) { return hit.anchor }
+        return a.reshaped(-1)[0 ..< 8]
+    }
+
+    func prepare(_ model: Module) {
+        guard nemotronWeightAnchorEnabled else { return }
+        var built: [(MLXArray, MLXArray)] = []
+        for module in model.modules()
+        where module is QuantizedLinear || module is QuantizedSwitchLinear {
+            for (key, value) in module.parameters().flattened()
+            where ["weight", "scales", "biases"].contains(key) && value.size > 8 {
+                built.append((value, value.reshaped(-1)[0 ..< 8]))
+            }
+        }
+        eval(built.map { $0.1 })
+        lock.withLock {
+            for (source, view) in built { entries[ObjectIdentifier(source)] = (source, view) }
+        }
+    }
+}
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))

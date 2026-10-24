@@ -183,6 +183,60 @@ inline U nml_qdot_safe(
   }
   return scale * accum + sum * bias;
 }
+
+// One load and one nibble decode of the packed word, then the same affine
+// product the two nml_qdot calls produced. Masked coefficients are exact in
+// fp32 (they are integers below 2^16). Accumulation order matches nml_qdot:
+// ((x0*a + x1*b) + x2*c) + x3*d, then scale * accum + sum * bias.
+template <typename U, int values_per_thread>
+inline void nml_qdot_pair(
+    const device uint8_t* w, const thread U* x0, const thread U* x1,
+    U scale, U bias, U sum0, U sum1,
+    thread U& value0, thread U& value1) {
+  U accum0 = 0;
+  U accum1 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint16_t word = ws[i];
+    const U a = static_cast<U>(word & 0x000f);
+    const U b = static_cast<U>(word & 0x00f0);
+    const U c = static_cast<U>(word & 0x0f00);
+    const U d = static_cast<U>(word & 0xf000);
+    accum0 +=
+        (x0[4 * i] * a + x0[4 * i + 1] * b +
+         x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+    accum1 +=
+        (x1[4 * i] * a + x1[4 * i + 1] * b +
+         x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+}
+
+template <typename U, int values_per_thread>
+inline void nml_qdot_pair_safe(
+    const device uint8_t* w, const thread U* x0, const thread U* x1,
+    U scale, U bias, U sum0, U sum1, int N,
+    thread U& value0, thread U& value1) {
+  U accum0 = 0;
+  U accum1 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (N / 4); i++) {
+    const uint16_t word = ws[i];
+    const U a = static_cast<U>(word & 0x000f);
+    const U b = static_cast<U>(word & 0x00f0);
+    const U c = static_cast<U>(word & 0x0f00);
+    const U d = static_cast<U>(word & 0xf000);
+    accum0 +=
+        (x0[4 * i] * a + x0[4 * i + 1] * b +
+         x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+    accum1 +=
+        (x1[4 * i] * a + x1[4 * i + 1] * b +
+         x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+}
 """
 
 // RELU2 epilogue = stock relu2 on the stored bf16 value, op for op as MLX's
@@ -303,8 +357,16 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
-        result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        if constexpr (PAIRDOT) {
+          U value0, value1;
+          nml_qdot_pair<U, values_per_thread>(
+              wl, x0_thread, x1_thread, s, b, sum0, sum1, value0, value1);
+          result0[r] += value0;
+          result1[r] += value1;
+        } else {
+          result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+          result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        }
       }
       ws += block_size / 2;
       sc += block_size / 64;
@@ -323,10 +385,18 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result0[r] += nml_qdot_safe<U, values_per_thread>(
-            wl, x0_thread, s, b, sum0, remaining);
-        result1[r] += nml_qdot_safe<U, values_per_thread>(
-            wl, x1_thread, s, b, sum1, remaining);
+        if constexpr (PAIRDOT) {
+          U value0, value1;
+          nml_qdot_pair_safe<U, values_per_thread>(
+              wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
+          result0[r] += value0;
+          result1[r] += value1;
+        } else {
+          result0[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x0_thread, s, b, sum0, remaining);
+          result1[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x1_thread, s, b, sum1, remaining);
+        }
       }
     }
     for (int r = 0; r < results_per_simdgroup; r++) {
@@ -345,7 +415,7 @@ private final class NemotronMoELeaderKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_moe_leader_qmv_affine4_gs64",
+            name: "nemotron_moe_leader_qmv_affine4_gs64_pairdot",
             inputNames: ["w", "scales", "biases", "x", "inds"],
             outputNames: ["y"],
             source: nemotronMoELeaderSource,
@@ -457,8 +527,16 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
-          result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+          if constexpr (PAIRDOT) {
+            U value0, value1;
+            nml_qdot_pair<U, values_per_thread>(
+                wl, x0_thread, x1_thread, s, b, sum0, sum1, value0, value1);
+            result0[r] += value0;
+            result1[r] += value1;
+          } else {
+            result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+            result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+          }
         }
         ws += block_size / 2;
         sc += block_size / 64;
@@ -477,10 +555,18 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result0[r] += nml_qdot_safe<U, values_per_thread>(
-              wl, x0_thread, s, b, sum0, remaining);
-          result1[r] += nml_qdot_safe<U, values_per_thread>(
-              wl, x1_thread, s, b, sum1, remaining);
+          if constexpr (PAIRDOT) {
+            U value0, value1;
+            nml_qdot_pair_safe<U, values_per_thread>(
+                wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
+            result0[r] += value0;
+            result1[r] += value1;
+          } else {
+            result0[r] += nml_qdot_safe<U, values_per_thread>(
+                wl, x0_thread, s, b, sum0, remaining);
+            result1[r] += nml_qdot_safe<U, values_per_thread>(
+                wl, x1_thread, s, b, sum1, remaining);
+          }
         }
       }
       for (int r = 0; r < results_per_simdgroup; r++) {
@@ -516,7 +602,7 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_moe_leader_weighted_qmv_affine4_gs64",
+            name: "nemotron_moe_leader_weighted_qmv_affine4_gs64_pairdot",
             inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
             outputNames: ["y"],
             source: nemotronMoELeaderWeightedSource,
@@ -537,6 +623,8 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
+    static let pairDot =
+        ProcessInfo.processInfo.environment["NEMOTRON_MOE_PAIR_DOT"] != "0"
 
     struct Bank {
         let weight: MLXArray
@@ -572,10 +660,11 @@ enum NemotronMoELeader {
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
         NemotronMoELeaderKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds],
+            [nemotronWeightAnchor(bank.weight), nemotronWeightAnchor(bank.scales),
+             nemotronWeightAnchor(bank.biases), x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
+                       ("RELU2", relu2), ("PAIRDOT", pairDot)],
             grid: (32, bank.n / 4, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
@@ -587,9 +676,10 @@ enum NemotronMoELeader {
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank) -> MLXArray {
         NemotronMoELeaderWeightedKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+            [nemotronWeightAnchor(bank.weight), nemotronWeightAnchor(bank.scales),
+             nemotronWeightAnchor(bank.biases), x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n)],
+                       ("K", bank.k), ("N", bank.n), ("PAIRDOT", pairDot)],
             grid: (32 * (bank.n / 4), 6, 1),
             threadGroup: (32, 6, 1),
             outputShapes: [[1, rows, bank.n]],

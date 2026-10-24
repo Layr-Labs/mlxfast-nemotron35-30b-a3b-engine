@@ -293,7 +293,8 @@ enum NemotronMultiRowQMV {
         let fast = k % 512 == 0
         let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
-            [q.weight, q.scales, biases, x, kArray, nArray],
+            [nemotronWeightAnchor(q.weight), nemotronWeightAnchor(q.scales),
+             nemotronWeightAnchor(biases), x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", fast), ("RELU2", relu2)],
             grid: (32, n / 4, 1),
             threadGroup: (32, 2, 1),
