@@ -302,6 +302,188 @@ enum NemotronMultiRowQMV {
     }
 }
 
+// Multi-row BF16 router projection. Stock `matmul(x_row, weight.T)` at M=1,
+// N=128, K=2688 takes gemv_axbpy's non-transposed-matrix branch (K >= 16 * N),
+// i.e. gemv_bfloat16_bm1_bn8_sm1_sn32_tm4_tn4: 8 simdgroups split K in
+// 1024-wide blocks, each lane owns 4 output rows x 4 columns, then a
+// simd_shuffle_down tree and a simdgroup-ordered threadgroup sum. This body is
+// GEMVKernel::run for those parameters with the vector side repeated per row,
+// so every row is bitwise equal to its own M=1 gemv. Each weight tile is
+// loaded once for all rows instead of once per row.
+private let nemotronMTPRouterRowsSource = """
+  constexpr int BN = 8;
+  constexpr int SN = 32;
+  constexpr int TM = 4;
+  constexpr int TN = 4;
+  constexpr int blockM = TM;
+  constexpr int blockN = BN * SN * TN;
+  typedef float AccT;
+  threadgroup AccT tgp_memory[R * BN * (blockM + TM)];
+
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const int in_vec_size = K;
+  const int out_vec_size = N;
+
+  thread AccT result[R][TM];
+  thread T inter[TN];
+  thread AccT v_coeff[R][TN];
+  for (int r = 0; r < R; r++) {
+    for (int tm = 0; tm < TM; tm++) {
+      result[r][tm] = 0;
+    }
+  }
+
+  const int sgN = int(simd_gid);
+  const int simdN = SN * int(simd_gid);
+  int bn = (simdN + int(simd_lid)) * TN;
+  // The shape guard sends N % 4 == 0 only, so no tail tile is ever shifted.
+  const int out_row = int(tid.x) * blockM;
+  const device T* mat = w + size_t(out_row) * in_vec_size;
+
+  constexpr const uniform<int> loop_stride = make_uniform(blockN);
+  const uniform<int> in_size = make_uniform(in_vec_size);
+  const uniform<int> n_iter = in_size / loop_stride;
+  const uniform<int> last_iter = loop_stride * n_iter;
+  const uniform<int> leftover = in_size - last_iter;
+
+  for (int i = 0; i < n_iter; ++i) {
+    for (int r = 0; r < R; r++) {
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[r][tn] = static_cast<AccT>(x[r * in_vec_size + bn + tn]);
+      }
+    }
+    int mat_offset = 0;
+    for (int tm = 0; tm < TM; tm++) {
+      for (int tn = 0; tn < TN; tn++) {
+        inter[tn] = mat[mat_offset + bn + tn];
+      }
+      // One weight load, the same per-row tn-order accumulation as stock.
+      for (int r = 0; r < R; r++) {
+        for (int tn = 0; tn < TN; tn++) {
+          result[r][tm] += inter[tn] * v_coeff[r][tn];
+        }
+      }
+      mat_offset += in_vec_size;
+    }
+    bn += blockN;
+  }
+
+  if (leftover > 0) {
+    // GEMVKernel::load_safe: whole in-range quads, zero-filled otherwise.
+    const bool whole = bn + TN <= in_size;
+    for (int r = 0; r < R; r++) {
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[r][tn] = (whole || bn + tn < in_size)
+            ? static_cast<AccT>(x[r * in_vec_size + bn + tn]) : AccT(0);
+      }
+    }
+    for (int tm = 0; tm < TM; tm++) {
+      for (int tn = 0; tn < TN; tn++) {
+        inter[tn] = (whole || bn + tn < in_size)
+            ? mat[tm * in_vec_size + bn + tn] : T(0);
+      }
+      for (int r = 0; r < R; r++) {
+        for (int tn = 0; tn < TN; tn++) {
+          result[r][tm] += inter[tn] * v_coeff[r][tn];
+        }
+      }
+    }
+  }
+
+  for (int r = 0; r < R; r++) {
+    for (int tm = 0; tm < TM; tm++) {
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+      }
+    }
+  }
+
+  if (simd_lid == 0) {
+    for (int r = 0; r < R; r++) {
+      for (int tm = 0; tm < TM; tm++) {
+        tgp_memory[(r * BN + sgN) * (blockM + TM) + tm] = result[r][tm];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgN == 0 && simd_lid == 0) {
+    for (int r = 0; r < R; r++) {
+      // Stock order: result += simdgroup 1, then 2, ... then 7.
+      for (int sgn = 1; sgn < BN; sgn++) {
+        for (int tm = 0; tm < TM; tm++) {
+          result[r][tm] += tgp_memory[(r * BN + sgn) * (blockM + TM) + tm];
+        }
+      }
+      for (int tm = 0; tm < TM; tm++) {
+        y[r * out_vec_size + out_row + tm] = static_cast<T>(result[r][tm]);
+      }
+    }
+  }
+"""
+
+enum NemotronMTPRouterRows {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_ROWS"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_router_rows_gemv_bf16",
+        inputNames: ["w", "x", "K", "N"],
+        outputNames: ["y"],
+        source: nemotronMTPRouterRowsSource)
+
+    /// x: [1, R, 2688] bf16, weight: [128, 2688] bf16. Returns the gates
+    /// [1, R, 128], or nil for any shape the stock gemv parameters above do
+    /// not describe (the caller then keeps one M=1 matmul per row).
+    static func gates(_ x: MLXArray, _ weight: MLXArray) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)),
+              x.dim(2) == 2688, x.dtype == .bfloat16,
+              weight.dtype == .bfloat16, weight.shape == [128, 2688],
+              rowMajor.contains(ObjectIdentifier(weight))
+        else { return nil }
+        let rows = x.dim(1)
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
+        var y = kernel([weight, x, kArray, nArray],
+            template: [("T", x.dtype), ("R", rows)],
+            grid: (32 * 32, 8, 1),
+            threadGroup: (32, 8, 1),
+            outputShapes: [[1, rows, 128]],
+            outputDTypes: [x.dtype])[0]
+        if NemotronMoELeader.selfTest {
+            let expected = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+            let ok = (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+            y = which(ok, y, MLXArray(Float.nan).asType(y.dtype))
+        }
+        return y
+    }
+
+    // Router weights whose loaded layout is row-major [128, 2688]: there the
+    // reference matmul(row, weight.T) takes the non-transposed gemv this kernel
+    // repeats. Another layout makes MLX pick gemv_t, whose order differs, so
+    // only weights verified here at load take the fast path. Filled once by
+    // warm(), before any compile trace, from the frozen loaded weights.
+    nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
+
+    /// Record row-major router weights, then compile every pipeline the
+    /// verify window can request (R = 1...4) at load.
+    static func warm(_ model: Module) {
+        guard enabled else { return }
+        let routers = model.modules().compactMap { $0 as? NemotronHMoEGate }
+        for gate in routers {
+            eval(gate.weight)
+            if gate.weight.strides == [2688, 1] { rowMajor.insert(ObjectIdentifier(gate.weight)) }
+        }
+        guard let gate = routers.first(where: { rowMajor.contains(ObjectIdentifier($0.weight)) })
+        else { return }
+        let outputs = (1...4).compactMap { rows in
+            gates(MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), gate.weight)
+        }
+        if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
 /// Put verification tokens on the native *batch* axis, keeping matrix M=1.
 /// A singleton leading weight axis prevents MLX's flatten-to-M optimization
 /// and therefore avoids qmv_wide's different accumulation. The underlying
@@ -382,5 +564,206 @@ enum NemotronTargetQKV {
             outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
             outputDTypes: [x.dtype, x.dtype, x.dtype])
         return (outputs[0], outputs[1], outputs[2])
+    }
+}
+
+// Draft-only approximate screening; target logits and acceptance remain authoritative.
+// All scratch arrays are fresh graph outputs; no request or weight value cache.
+enum NemotronNativeDraftScreen {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SCREEN"] != "0"
+    nonisolated(unsafe) private static let offsets = MLXArray((0..<32).map { Int32($0 * 2048) }).reshaped(32, 1)
+
+    private static let groupKernel = MLXFast.metalKernel(
+        name: "nemotron_native_draft_group_mask",
+        inputNames: ["x"],
+        outputNames: ["mask"],
+        source: """
+          const uint g = thread_position_in_grid.x;
+          threadgroup float energy[42];
+          threadgroup uint first_group;
+          if (g < 42) {
+            float v = 0;
+            for (int j = 0; j < 64; ++j) {
+              float a = static_cast<float>(x[g * 64 + j]);
+              v += a * a;
+            }
+            energy[g] = metal::isnan(v) ? 0.0f : v;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (g == 0) {
+            float best = -metal::numeric_limits<float>::infinity();
+            uint first = 0;
+            for (uint start = 0; start <= 21; ++start) {
+              float total = 0;
+              for (uint j = 0; j < 21; ++j) total += energy[start + j];
+              if (total > best) { best = total; first = start; }
+            }
+            first_group = first;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (g < 42) mask[g] = (g >= first_group && g < first_group + 21) ? uint(1) : uint(0);
+        """)
+
+    private static let screenKernel = MLXFast.metalKernel(
+        name: "nemotron_native_draft_partial_scores",
+        inputNames: ["w", "scales", "biases", "x", "mask", "K", "N"],
+        outputNames: ["scores"],
+        source: """
+          constexpr int values_per_thread = 8;
+          constexpr int results_per_simdgroup = 4;
+          constexpr int block_size = 256;
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint lane = thread_index_in_simdgroup;
+          const int out_row = int(threadgroup_position_in_grid.y) * 8 + int(sg) * 4;
+          if (out_row >= N) return;
+          const int row_bytes = K / 2;
+          const int groups = K / 64;
+          const device uint8_t* weights = (const device uint8_t*)w;
+          float result[4] = {0, 0, 0, 0};
+          float values[8];
+          int k = 0;
+          for (; k < K - block_size; k += block_size) {
+            const int col = k + int(lane) * values_per_thread;
+            if (mask[col / 64] != 0) {
+              float sum = nmr_load_vector<T, float, 8>(x + col, values);
+              for (int row = 0; row < 4; ++row) {
+                const int token = out_row + row;
+                const device uint8_t* word = weights + token * row_bytes + col / 2;
+                float scale = static_cast<float>(scales[token * groups + col / 64]);
+                float bias = static_cast<float>(biases[token * groups + col / 64]);
+                result[row] += nmr_qdot<float, 8>(word, values, scale, bias, sum);
+              }
+            }
+          }
+          const int col = k + int(lane) * values_per_thread;
+          const int remaining = clamp(int(K - col), 0, values_per_thread);
+          if (remaining > 0 && mask[min(col / 64, groups - 1)] != 0) {
+            float sum = nmr_load_vector_safe<T, float, 8>(x + col, values, remaining);
+            for (int row = 0; row < 4; ++row) {
+              const int token = out_row + row;
+              const device uint8_t* word = weights + token * row_bytes + col / 2;
+              float scale = static_cast<float>(scales[token * groups + col / 64]);
+              float bias = static_cast<float>(biases[token * groups + col / 64]);
+              result[row] += nmr_qdot_safe<float, 8>(word, values, scale, bias, sum, remaining);
+            }
+          }
+          for (int row = 0; row < 4; ++row) {
+            float v = simd_sum(result[row]);
+            if (lane == 0) {
+              scores[out_row + row] = v;
+            }
+          }
+        """,
+        header: nemotronMultiRowQMVHeader)
+
+    private static let rescoreKernel = MLXFast.metalKernel(
+        name: "nemotron_native_draft_rescore",
+        inputNames: ["w", "scales", "biases", "x", "ids", "K", "N"],
+        outputNames: ["logits"],
+        source: """
+          constexpr int values_per_thread = 8;
+          constexpr int results_per_simdgroup = 4;
+          constexpr int block_size = 256;
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint lane = thread_index_in_simdgroup;
+          const int out_row = int(threadgroup_position_in_grid.y) * 8 + int(sg) * 4;
+          if (out_row >= N) return;
+          const int row_bytes = K / 2;
+          const int groups = K / 64;
+          const device uint8_t* weights = (const device uint8_t*)w;
+          float result[4] = {0, 0, 0, 0};
+          float values[8];
+          int k = 0;
+          for (; k < K - block_size; k += block_size) {
+            const int col = k + int(lane) * values_per_thread;
+              float sum = nmr_load_vector<T, float, 8>(x + col, values);
+              for (int row = 0; row < 4; ++row) {
+                const int token = int(ids[out_row + row]);
+                const device uint8_t* word = weights + token * row_bytes + col / 2;
+                float scale = static_cast<float>(scales[token * groups + col / 64]);
+                float bias = static_cast<float>(biases[token * groups + col / 64]);
+                result[row] += nmr_qdot<float, 8>(word, values, scale, bias, sum);
+              }
+          }
+          const int col = k + int(lane) * values_per_thread;
+          const int remaining = clamp(int(K - col), 0, values_per_thread);
+          if (remaining > 0) {
+            float sum = nmr_load_vector_safe<T, float, 8>(x + col, values, remaining);
+            for (int row = 0; row < 4; ++row) {
+              const int token = int(ids[out_row + row]);
+              const device uint8_t* word = weights + token * row_bytes + col / 2;
+              float scale = static_cast<float>(scales[token * groups + col / 64]);
+              float bias = static_cast<float>(biases[token * groups + col / 64]);
+              result[row] += nmr_qdot_safe<float, 8>(word, values, scale, bias, sum, remaining);
+            }
+          }
+          for (int row = 0; row < 4; ++row) {
+            float v = simd_sum(result[row]);
+            if (lane == 0) {
+              logits[out_row + row] = static_cast<T>(v);
+            }
+          }
+        """,
+        header: nemotronMultiRowQMVHeader)
+
+    private static let pickKernel = MLXFast.metalKernel(
+        name: "nemotron_native_draft_pick",
+        inputNames: ["logits", "ids"],
+        outputNames: ["out"],
+        source: """
+          const uint tid = thread_position_in_threadgroup.x;
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint lane = thread_index_in_simdgroup;
+          threadgroup float group_values[8];
+          threadgroup int group_ids[8];
+          float best = -metal::numeric_limits<float>::infinity();
+          int best_id = 2147483647;
+          for (uint i = tid; i < 2048; i += 256) {
+            float value = static_cast<float>(logits[i]);
+            int token = ids[i];
+            if (value > best || (value == best && token < best_id)) {
+              best = value;
+              best_id = token;
+            }
+          }
+          float maximum = simd_max(best);
+          int lowest = simd_min(best == maximum ? best_id : 2147483647);
+          if (lane == 0) { group_values[sg] = maximum; group_ids[sg] = lowest; }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg == 0) {
+            float value = lane < 8 ? group_values[min(lane, uint(7))] : -metal::numeric_limits<float>::infinity();
+            int token = lane < 8 ? group_ids[min(lane, uint(7))] : 2147483647;
+            float maximum = simd_max(value);
+            int lowest = simd_min(value == maximum ? token : 2147483647);
+            if (lane == 0) out[0] = lowest == 2147483647 ? 0 : lowest;
+          }
+        """)
+
+    /// Return draft IDs only; nil preserves the old half-head logits+argmax.
+    static func greedy(_ hidden: MLXArray, _ head: QuantizedLinear) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+            StreamOrDevice.default == .gpu, type(of: head) == QuantizedLinear.self,
+            hidden.shape == [1, 1, 2688], hidden.dtype == .bfloat16,
+            head.mode == .affine, head.bits == 4, head.groupSize == 64, head.bias == nil,
+            head.weight.shape == [65536, 336], head.weight.dtype == .uint32,
+            head.scales.shape == [65536, 42], head.scales.dtype == .bfloat16,
+            let biases = head.biases, biases.shape == [65536, 42], biases.dtype == .bfloat16
+        else { return nil }
+        let x = hidden.reshaped(2688)
+        let mask = groupKernel([x], grid: (64, 1, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[42]], outputDTypes: [.uint32])[0]
+        let (k, n) = NemotronMultiRowQMV.scalarPair(2688, 65536)
+        let scores = screenKernel([head.weight, head.scales, biases, x, mask, k, n],
+            template: [("T", DType.bfloat16)], grid: (32, 65536 / 4, 1),
+            threadGroup: (32, 2, 1), outputShapes: [[65536]], outputDTypes: [.float32])[0]
+        let partition = argPartition(-scores.reshaped(32, 2048), kth: 63, axis: -1)
+        let candidates = (partition[0..., 0..<64].asType(.int32) + offsets).reshaped(2048)
+        let (_, count) = NemotronMultiRowQMV.scalarPair(2688, 2048)
+        let logits = rescoreKernel([head.weight, head.scales, biases, x, candidates, k, count],
+            template: [("T", DType.bfloat16)], grid: (32, 2048 / 4, 1),
+            threadGroup: (32, 2, 1), outputShapes: [[2048]], outputDTypes: [.bfloat16])[0]
+        return pickKernel([logits, candidates], grid: (256, 1, 1),
+            threadGroup: (256, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
     }
 }

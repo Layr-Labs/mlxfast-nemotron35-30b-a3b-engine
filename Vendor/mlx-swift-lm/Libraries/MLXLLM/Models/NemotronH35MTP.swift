@@ -29,9 +29,14 @@ private final class NemotronMTPDraftHead {
         prefix?.callAsFunction(hidden) ?? target.logits(hidden)
     }
 
-    /// Multi-row twin for the post-verify head rows: the same prefix view
-    /// through the multi-row qmv, so each row's argmax matches the one-token
-    /// draft's over the same rows. The full-head chain is kept as fallback.
+    func greedy(_ hidden: MLXArray) -> MLXArray {
+        if let prefix, let ids = NemotronNativeDraftScreen.greedy(hidden, prefix) { return ids }
+        return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32)
+    }
+
+    /// Raw multi-row logits remain available from the unchanged prefix.
+    /// The draft-only screened greedy wrapper may propose another ID.
+    /// Target logits and full-vocabulary verification do not use screening.
     func rowLogits(_ rows: MLXArray) -> MLXArray {
         if let prefix { return nemotronMTPLinearRows(rows, prefix) }
         return target.lmHead.map { nemotronMTPHeadRows(rows, $0) } ?? target.logits(rows)
@@ -49,6 +54,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     private let kvOnlyHistory: Bool
     private let primePromptHistory: Bool
     private let draftLimit: Int
+    func warmNativeDraftScreen() {
+        guard let prefix = draftHead.prefix else { return }
+        if let ids = NemotronNativeDraftScreen.greedy(
+            MLXArray.zeros([1, 1, 2688], dtype: .bfloat16), prefix) { eval(ids) }
+    }
+
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
         ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_CAPTURE_VERIFY"] != "0"
@@ -323,7 +334,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = argMax(draftHead.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
+        let ids = draftHead.greedy(out)
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -369,7 +380,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.nextFirstDraft = speculation.map { spec in
             let out = module.finishPagedAttentionRow(
                 spec.attention[0..., n ..< (n + 1), 0...])
-            let ids = argMax(draftHead.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
+            let ids = draftHead.greedy(out)
             return (ids: ids, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
                     values: spec.values[0..., 0..., n ..< (n + 1), 0...])

@@ -75,6 +75,8 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronMoELeader.warm(target)
+        NemotronMTPRouterRows.warm(target)
+        warmNativeDraftScreen()
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
