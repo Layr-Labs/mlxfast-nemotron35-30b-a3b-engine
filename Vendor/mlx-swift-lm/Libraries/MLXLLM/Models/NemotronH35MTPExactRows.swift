@@ -261,6 +261,23 @@ private final class NemotronMultiRowQMVKernel: Sendable {
     }
 }
 
+private final class NemotronMultiRowQMVAddKernel: Sendable {
+    static let shared = NemotronMultiRowQMVAddKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        let store = "yp[r * out_vec_size + row] = h;"
+        precondition(nemotronMultiRowQMVSource.components(separatedBy: store).count == 2)
+        kernel = MLXFast.metalKernel(
+            name: "nemotron_multirow_qmv_affine4_gs64_add",
+            inputNames: ["w", "scales", "biases", "x", "K", "N", "addend"],
+            outputNames: ["y"],
+            source: nemotronMultiRowQMVSource.replacingOccurrences(
+                of: store,
+                with: "yp[r * out_vec_size + row] = addend[r * out_vec_size + out_row + row] + h;"),
+            header: nemotronMultiRowQMVHeader)
+    }
+}
+
 enum NemotronMultiRowQMV {
     /// Input-independent int32 scalar arguments, built once per (K, N)
     /// instead of twice per call. Same values as the implicit Int conversion.
@@ -276,11 +293,14 @@ enum NemotronMultiRowQMV {
     }
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MULTIROW_QMV"] != "0"
+    static let addEpilogue =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MULTIROW_QMV_ADD"] != "0"
 
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.
     /// Width one is used by the exact BF16 ReLU2 epilogue, not a GEMM.
-    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false) -> MLXArray? {
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false,
+                      addend: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.ndim == 2, (1...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
@@ -292,9 +312,22 @@ enum NemotronMultiRowQMV {
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
         let fast = k % 512 == 0
         let (kArray, nArray) = scalarPair(k, n)
+        let template: [(String, any KernelTemplateArg)] =
+            [("T", x.dtype), ("R", rows), ("FAST", fast), ("RELU2", relu2)]
+        if let addend {
+            guard addEpilogue, !relu2, addend.shape == [rows, n], addend.dtype == x.dtype
+            else { return nil }
+            return NemotronMultiRowQMVAddKernel.shared.kernel(
+                [q.weight, q.scales, biases, x, kArray, nArray, addend],
+                template: template,
+                grid: (32, n / 4, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [[rows, n]],
+                outputDTypes: [x.dtype])[0]
+        }
         return NemotronMultiRowQMVKernel.shared.kernel(
             [q.weight, q.scales, biases, x, kArray, nArray],
-            template: [("T", x.dtype), ("R", rows), ("FAST", fast), ("RELU2", relu2)],
+            template: template,
             grid: (32, n / 4, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]],
@@ -505,6 +538,19 @@ func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
         .reshaped(1, count, q.weight.dim(0))
     if let bias = q.bias { result = result + bias }
     return result
+}
+
+func nemotronMTPLinearRowsAdding(_ x: MLXArray, _ linear: Linear, _ addend: MLXArray) -> MLXArray {
+    if NemotronMTPExecution.batchedM1, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 1,
+       let q = linear as? QuantizedLinear, q.bias == nil, q.mode == .affine,
+       q.scales.dtype == x.dtype, let biases = q.biases, biases.dtype == x.dtype,
+       addend.shape == [1, x.dim(1), q.weight.dim(0)], addend.dtype == x.dtype,
+       let rows = NemotronMultiRowQMV.apply(
+           x.reshaped(x.dim(1), x.dim(2)), q,
+           addend: addend.reshaped(x.dim(1), q.weight.dim(0))) {
+        return rows.reshaped(1, x.dim(1), q.weight.dim(0))
+    }
+    return addend + nemotronMTPLinearRows(x, linear)
 }
 
 // The epilogue must first round to BF16, exactly as the separate projection.

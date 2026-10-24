@@ -9,6 +9,12 @@ extension NemotronHMLP {
         let activated = nemotronMTPLinearRelu2Rows(x, upProj)
         return nemotronMTPLinearRows(activated, downProj)
     }
+
+    func mtpForwardRowsAdding(_ x: MLXArray, _ addend: MLXArray) -> MLXArray {
+        guard NemotronMTPExecution.batchedM1 else { return addend + mtpForwardRows(x) }
+        let activated = nemotronMTPLinearRelu2Rows(x, upProj)
+        return nemotronMTPLinearRowsAdding(activated, downProj, addend)
+    }
 }
 
 /// Stateless graph cache only. Request KV, recurrent state, offsets and
@@ -108,7 +114,7 @@ extension NemotronHMoE {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
-        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x) }
+        if let sharedExperts { y = sharedExperts.mtpForwardRowsAdding(x, y) }
         return y
     }
 }

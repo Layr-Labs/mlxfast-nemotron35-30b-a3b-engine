@@ -561,13 +561,45 @@ func nemotronDecodeSSM(
 }
 
 // MARK: - Mamba2Mixer
+let nemotronPackedConvDt =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_PACKED_CONV_DT"] != "0"
 
 private enum NemotronPackedConvKernel {
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_packed_conv_silu",
         inputNames: ["oldState", "input", "weight", "bias"],
         outputNames: ["out", "padded"],
-        source: """
+        source: source, ensureRowContiguous: false)
+
+    static let dtKernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_dt",
+        inputNames: ["oldState", "input", "weight", "bias", "dtRaw", "dtBias", "dtMin", "dtMax"],
+        outputNames: ["out", "padded", "dt"],
+        source: source + "\n" + """
+            if (channel < H) {
+                float sum = static_cast<float>(
+                        dtRaw[position * dtRaw_strides[1] + channel * dtRaw_strides[2]])
+                    + static_cast<float>(dtBias[channel * dtBias_strides[0]]);
+                float zero = 0.0f;
+                float added;
+                if (metal::isnan(sum) || metal::isnan(zero)) {
+                    added = metal::numeric_limits<float>::quiet_NaN();
+                } else {
+                    constexpr float inf = metal::numeric_limits<float>::infinity();
+                    float maxval = metal::max(sum, zero);
+                    float minval = metal::min(sum, zero);
+                    added = (minval == -inf || maxval == inf)
+                        ? maxval
+                        : (maxval + log1p(metal::exp(minval - maxval)));
+                }
+                float lo = dtMin[0];
+                float hi = dtMax[0];
+                float lower = metal::isnan(added) ? added : (added > lo ? added : lo);
+                dt[position * H + channel] = metal::isnan(lower) ? lower : (lower < hi ? lower : hi);
+            }
+            """, ensureRowContiguous: false)
+
+    static let source = """
             int64_t channel = int64_t(thread_position_in_grid.x);
             int64_t position = int64_t(thread_position_in_grid.y);
             padded[(position + 3) * C + channel] =
@@ -592,7 +624,7 @@ private enum NemotronPackedConvKernel {
             auto y = 1 / (1 + metal::exp(metal::abs(x)));
             T sigmoid = x < 0 ? y : 1 - y;
             out[position * C + channel] = x * sigmoid;
-            """, ensureRowContiguous: false)
+            """
 }
 
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
@@ -681,6 +713,34 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             outputShapes: [[1, length, convDim], [1, length + 3, convDim]],
             outputDTypes: [.bfloat16, .bfloat16])
         return (arrays[0], arrays[1])
+    }
+
+    func packedConvAndDt(_ oldState: MLXArray, _ input: MLXArray, _ dtRaw: MLXArray)
+        -> (convolution: MLXArray, padded: MLXArray, dt: MLXArray) {
+        let length = input.dim(1)
+        guard nemotronPackedConvDt, convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, (1...8).contains(length),
+            input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
+            conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
+            conv1d.padding == 0, let bias = conv1d.bias,
+            bias.dtype == .bfloat16, bias.shape == [convDim],
+            numHeads <= convDim, dtRaw.shape == [1, length, numHeads], dtRaw.dtype == .bfloat16,
+            dtBias.shape == [numHeads],
+            [DType.bfloat16, .float16, .float32].contains(dtBias.dtype),
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else {
+            let (convolution, padded) = packedConv(oldState, input)
+            return (convolution, padded, nemotronPrefillComputeDt(dtRaw, dtBias, timeStepLimit))
+        }
+        let arrays = NemotronPackedConvKernel.dtKernel(
+            [oldState, input, conv1d.weight, bias, dtRaw, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads)],
+            grid: (convDim, length, 1), threadGroup: (min(convDim, 256), 1, 1),
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+        return (arrays[0], arrays[1], arrays[2])
     }
 
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
