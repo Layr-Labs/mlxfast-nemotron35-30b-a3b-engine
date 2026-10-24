@@ -1160,6 +1160,8 @@ enum NemotronTargetQKV {
 enum NemotronHeadScreen {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN"] != "0"
     static let check = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_CHECK"] == "1"
+    static let tree = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_TREE"] != "0"
+    static let prepared = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_PREP"] != "0"
     static let width = 2688
     static let wordsPerRow = 336
     static let groupsPerRow = 42
@@ -1168,7 +1170,8 @@ enum NemotronHeadScreen {
 
     // One simdgroup scores RPS rows. Lane l owns half-groups l, l + 32, ...
     // (32 values = one uint4 of packed words) of the selected groups.
-    private static let partialSource = """
+    private static let partialSource = partialPrologue + "\n" + partialRows
+    private static let partialPrologue = """
       // S <= 16: lane l owns half-group l (32 values, 16 bytes).
       constexpr int KW = 336;
       constexpr int KG = 42;
@@ -1196,6 +1199,8 @@ enum NemotronHeadScreen {
         xv[i + 2] = x2 / 256.0f;
         xv[i + 3] = x3 / 4096.0f;
       }
+    """
+    private static let partialRows = """
       _Pragma("clang loop unroll(full)")
       for (int r = 0; r < RPS; r++) {
         const int row = row0 + r;
@@ -1220,12 +1225,64 @@ enum NemotronHeadScreen {
       }
     """
 
+    // Per-draft activation preparation (NEMOTRON_MTP_HEAD_SCREEN_PREP): one
+    // simdgroup runs partialPrologue's own per-lane arithmetic once and stores
+    // lane l's 32 scaled coefficients at prep[i * 32 + l] and its 32-value sum
+    // (the same eight ordered four-value additions) at prep[1024 + l]. The
+    // prepared partial kernel loads them instead of recomputing them for
+    // every RPS rows; its row loop is partialRows unchanged.
+    static let prepValues = 32 * 32 + 32
+    private static let prepSource = """
+      constexpr int VPL = 32;
+      constexpr int H = 2 * S;
+      const int lane = int(thread_index_in_simdgroup);
+      const bool on = lane < H;
+      const int g = on ? int(groups[lane >> 1]) : 0;
+      const int part = lane & 1;
+      const device T* xp = x + g * 64 + part * 32;
+      float xs = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < VPL; i += 4) {
+        const float x0 = on ? float(xp[i]) : 0.0f;
+        const float x1 = on ? float(xp[i + 1]) : 0.0f;
+        const float x2 = on ? float(xp[i + 2]) : 0.0f;
+        const float x3 = on ? float(xp[i + 3]) : 0.0f;
+        xs += x0 + x1 + x2 + x3;
+        prep[i * 32 + lane] = x0;
+        prep[(i + 1) * 32 + lane] = x1 / 16.0f;
+        prep[(i + 2) * 32 + lane] = x2 / 256.0f;
+        prep[(i + 3) * 32 + lane] = x3 / 4096.0f;
+      }
+      prep[VPL * 32 + lane] = xs;
+    """
+    private static let preparedPartialSource = """
+      // S <= 16: lane l owns half-group l; its coefficients come from prep.
+      constexpr int KW = 336;
+      constexpr int KG = 42;
+      constexpr int VPL = 32;
+      constexpr int H = 2 * S;
+      const int lane = int(thread_index_in_simdgroup);
+      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
+      const int row0 = sg * RPS;
+      const bool on = lane < H;
+      const int g = on ? int(groups[lane >> 1]) : 0;
+      const int part = lane & 1;
+      const int woff = g * 8 + part * 4;
+      float xv[VPL];
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < VPL; i++) {
+        xv[i] = prep[i * 32 + lane];
+      }
+      const float xs = prep[VPL * 32 + lane];
+    """ + "\n" + partialRows
+
     // One threadgroup per CH-row chunk. Simdgroup 0 keeps the top C partial
     // scores (ties: lowest id); then NSG
     // simdgroups rescore 4 kept rows each with the stock non-fast qmv per-row
     // body (K = 2688: ten 256-blocks plus a 128-value tail), as
     // nemotronMultiRowQMVSource does for R = 1, and round to T.
-    private static let selectSource = """
+    private static let selectSource = selectPrologue + "\n" + selectScan + "\n" + selectRescore
+    private static let selectPrologue = """
       constexpr int P1 = CH / 32;
       constexpr int RPSG = 4;
       constexpr int in_vec_size = 2688;
@@ -1241,6 +1298,8 @@ enum NemotronHeadScreen {
       const int base = chunk * CH;
       threadgroup int cand[C];
       threadgroup float cval[C];
+    """
+    private static let selectScan = """
       // Simdgroup 0 keeps the chunk's top C partial scores (larger score,
       // then lower id); lane l holds the P1 contiguous rows l * P1 + i.
       if (sgid == 0) {
@@ -1274,6 +1333,8 @@ enum NemotronHeadScreen {
           }
         }
       }
+    """
+    private static let selectRescore = """
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
       const device uint8_t* wbytes = (const device uint8_t*)w;
@@ -1372,6 +1433,82 @@ enum NemotronHeadScreen {
       }
     """
 
+    // NEMOTRON_MTP_HEAD_SCREEN_TREE: selectScan's picks without the winning
+    // lane's full rescan. Each lane keeps a tournament tree over its P1
+    // entries (heap node n of lane l at tw[n * 32 + l], leaf i at node
+    // P1 + i, -1 = taken). A node holds the lowest local index of the largest
+    // untaken score in its subtree (right child only when strictly larger),
+    // which is exactly the scan's pick, so after a pick only the leaf's
+    // log2(P1) ancestors are replayed. The cross-lane reduction, the picks'
+    // order and the rescore are unchanged. A lane holding a NaN score keeps
+    // the scan (NaN comparisons are not transitive, so a tree could differ).
+    private static let selectTree = """
+      threadgroup float tv[P1 * 32];
+      threadgroup int tw[2 * P1 * 32];
+      if (sgid == 0) {
+        const device float* sp = scores + base + lane * P1;
+        bool scan = false;
+        for (int i = 0; i < P1; i++) {
+          const float s = sp[i];
+          tv[i * 32 + lane] = s;
+          scan = scan || (as_type<uint>(s) & 0x7fffffffu) > 0x7f800000u;
+          tw[(P1 + i) * 32 + lane] = i;
+        }
+        for (int n = P1 - 1; n >= 1; n--) {
+          const int a = tw[(2 * n) * 32 + lane];
+          const int b = tw[(2 * n + 1) * 32 + lane];
+          tw[n * 32 + lane] = tv[b * 32 + lane] > tv[a * 32 + lane] ? b : a;
+        }
+        ulong taken = 0;
+        float bv = -INFINITY;
+        int bi = -1;
+        if (scan) {
+          for (int i = 0; i < P1; i++) {
+            if (bi < 0 || tv[i * 32 + lane] > bv) { bv = tv[i * 32 + lane]; bi = i; }
+          }
+        } else {
+          bi = tw[32 + lane];
+          bv = tv[bi * 32 + lane];
+        }
+        for (int c = 0; c < C; c++) {
+          float mv = bv;
+          int mi = bi < 0 ? 0x7fffffff : lane * P1 + bi;
+          for (ushort off = 16; off > 0; off >>= 1) {
+            const float ov = simd_shuffle_xor(mv, off);
+            const int oi = simd_shuffle_xor(mi, off);
+            if (oi != 0x7fffffff && (mi == 0x7fffffff || ov > mv || (ov == mv && oi < mi))) {
+              mv = ov; mi = oi;
+            }
+          }
+          if (lane == 0) cand[c] = base + mi;
+          if (mi / P1 == lane) {
+            const int j = mi - lane * P1;
+            if (scan) {
+              taken |= (1ul << ulong(j));
+              bv = -INFINITY;
+              bi = -1;
+              for (int i = 0; i < P1; i++) {
+                if (((taken >> ulong(i)) & 1ul) == 0 && (bi < 0 || tv[i * 32 + lane] > bv)) {
+                  bv = tv[i * 32 + lane]; bi = i;
+                }
+              }
+            } else {
+              tw[(P1 + j) * 32 + lane] = -1;
+              for (int n = (P1 + j) >> 1; n >= 1; n >>= 1) {
+                const int a = tw[(2 * n) * 32 + lane];
+                const int b = tw[(2 * n + 1) * 32 + lane];
+                tw[n * 32 + lane] = a < 0 ? b
+                    : (b < 0 ? a : (tv[b * 32 + lane] > tv[a * 32 + lane] ? b : a));
+              }
+              bi = tw[32 + lane];
+              bv = bi < 0 ? -INFINITY : tv[bi * 32 + lane];
+            }
+          }
+        }
+      }
+    """
+    private static let selectTreeSource = selectPrologue + "\n" + selectTree + "\n" + selectRescore
+
     private static let finalSource = """
       const int lane = int(thread_index_in_simdgroup);
       float mv = -INFINITY;
@@ -1402,6 +1539,18 @@ enum NemotronHeadScreen {
         inputNames: ["scores", "w", "scales", "biases", "x"],
         outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
         source: selectSource, header: nemotronMultiRowQMVHeader)
+    private static let selectTreeKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_select_tree_affine4_gs64",
+        inputNames: ["scores", "w", "scales", "biases", "x"],
+        outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
+        source: selectTreeSource, header: nemotronMultiRowQMVHeader)
+    private static let prepKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_prep",
+        inputNames: ["x", "groups"], outputNames: ["prep"], source: prepSource)
+    private static let preparedPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_prepared_affine4_gs64",
+        inputNames: ["w", "scales", "biases", "prep", "groups"],
+        outputNames: ["scores"], source: preparedPartialSource)
     private static let finalKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_final",
         inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
@@ -1419,15 +1568,28 @@ enum NemotronHeadScreen {
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
-        let scores = partialKernel(
-            [weight, scales, biases, hidden, groups],
-            template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
-                       ("NSG", simdgroups)],
-            grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        let scores: MLXArray
+        if prepared {
+            let prep = prepKernel(
+                [hidden, groups], template: [("T", hidden.dtype), ("S", groupCount)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[prepValues]], outputDTypes: [.float32])[0]
+            scores = preparedPartialKernel(
+                [weight, scales, biases, prep, groups],
+                template: [("S", groupCount), ("RPS", rowsPerSimdgroup), ("NSG", simdgroups)],
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        } else {
+            scores = partialKernel(
+                [weight, scales, biases, hidden, groups],
+                template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
+                           ("NSG", simdgroups)],
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        }
         let chunks = rows / chunk
         let selectGroups = 8
-        let picked = selectKernel(
+        let picked = (tree ? selectTreeKernel : selectKernel)(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),

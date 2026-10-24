@@ -172,7 +172,8 @@ private final class NemotronMTPDraftHead {
         }
         screen = plan
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
-            + " qualified (synthetic agreement \(agree)/4)")
+            + " qualified (synthetic agreement \(agree)/4),"
+            + " tree \(NemotronHeadScreen.tree ? "on" : "off"), prep \(NemotronHeadScreen.prepared ? "on" : "off")")
     }
 
     /// Multi-row twin for the post-verify head rows: the same prefix view

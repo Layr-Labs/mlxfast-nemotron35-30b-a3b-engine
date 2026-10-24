@@ -429,8 +429,10 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
 // Keep the accepted leader/partner QMV trace, then reduce each token's six
 // products after a shared-memory barrier. Each row has six distinct router
 // indices. Experts can repeat across rows, as in the accepted leader path.
+// RPS is the number of output columns each threadgroup owns (grid N / RPS).
+// Every SIMD group still owns its whole slot over all K for each of them.
 private let nemotronMoELeaderWeightedSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -686,7 +688,7 @@ enum NemotronMoELeader {
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n)],
+                       ("K", bank.k), ("N", bank.n), ("RPS", 4)],
             grid: (32 * (bank.n / 4), 6, 1),
             threadGroup: (32, 6, 1),
             outputShapes: [[1, rows, bank.n]],
@@ -920,6 +922,12 @@ private final class NMLBalancePlan: Sendable {
 }
 private final class NMLBalanceWeighted: Sendable {
     static let shared = NMLBalanceWeighted()
+    /// Output columns per threadgroup for the balanced R = 3 FC2: two
+    /// doubles the threadgroups (N / 2 = 1344) and halves each one's columns.
+    /// Each column keeps its lane-to-K split, qdot order, BF16 store, score
+    /// multiply and ordered six-slot sum. NEMOTRON_MTP_FC2_NARROW=0 keeps four.
+    static let resultsPerSimdgroup =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_NARROW"] == "0" ? 4 : 2
     let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced",
         inputNames: ["w","scales","biases","x","inds","scores","plan"],
         outputNames: ["y"], source: nmlBalanceWeightedSource,
@@ -929,8 +937,9 @@ private final class NMLBalanceWeighted: Sendable {
              _ bank: NemotronMoELeader.Bank) -> MLXArray {
         let plan = NMLBalancePlan.shared.make(ids)
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
-            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
-            grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n),
+                       ("RPS",Self.resultsPerSimdgroup)],
+            grid: (32*(bank.n/Self.resultsPerSimdgroup),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
 }
