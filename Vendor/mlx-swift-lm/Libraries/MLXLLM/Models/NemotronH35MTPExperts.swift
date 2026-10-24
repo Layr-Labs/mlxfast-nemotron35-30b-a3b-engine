@@ -907,7 +907,9 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
     const uint expert = inds[slot];
     const int partner = plan[18 + slot];
 
-""")
+""").replacingOccurrences(
+    of: "constexpr int results_per_simdgroup = 4;",
+    with: "constexpr int results_per_simdgroup = 2;")
 private final class NMLBalancePlan: Sendable {
     static let shared = NMLBalancePlan()
     let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan",
@@ -930,7 +932,7 @@ private final class NMLBalanceWeighted: Sendable {
         let plan = NMLBalancePlan.shared.make(ids)
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
-            grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+            grid: (32*(bank.n/2),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
 }
