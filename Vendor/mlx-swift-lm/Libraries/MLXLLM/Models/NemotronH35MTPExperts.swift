@@ -6,9 +6,8 @@ import MLXNN
 extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
-        let up = nemotronMTPLinearRows(x, upProj)
-        let activated = maximum(up, MLXArray(0))
-        return nemotronMTPLinearRows(activated * activated, downProj)
+        let activated = nemotronMTPLinearRelu2Rows(x, upProj)
+        return nemotronMTPLinearRows(activated, downProj)
     }
 }
 

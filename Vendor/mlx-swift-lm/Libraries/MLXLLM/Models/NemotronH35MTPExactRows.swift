@@ -174,9 +174,22 @@ private let nemotronMultiRowQMVSource = """
       const device T* bl = bs + row * in_vec_size_g;
       U s = sl[0];
       U b = bl[0];
-      for (int r = 0; r < R; r++) {
-        result[r][row] += nmr_qdot<U, values_per_thread>(wl, x_thread[r], s, b, sum[r]);
+      // Decode packed integer coefficients once for all verification rows.
+      // Each row keeps its original i-order and affine accumulation.
+      thread U accum[R];
+      for (int r = 0; r < R; r++) accum[r] = 0;
+      const device uint16_t* words = (const device uint16_t*)wl;
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const U a = words[i] & 0x000f;
+        const U b1 = words[i] & 0x00f0;
+        const U c = words[i] & 0x0f00;
+        const U d = words[i] & 0xf000;
+        for (int r = 0; r < R; r++) {
+          accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+              + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+        }
       }
+      for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
     }
     ws += block_size * bytes_per_pack / pack_factor;
     sc += block_size / group_size;
@@ -199,10 +212,22 @@ private let nemotronMultiRowQMVSource = """
         const device T* bl = bs + row * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        for (int r = 0; r < R; r++) {
-          result[r][row] += nmr_qdot_safe<U, values_per_thread>(
-              wl, x_thread[r], s, b, sum[r], remaining);
+        // Decode packed integer coefficients once for all verification rows.
+        // Each row keeps its original i-order and affine accumulation.
+        thread U accum[R];
+        for (int r = 0; r < R; r++) accum[r] = 0;
+        const device uint16_t* words = (const device uint16_t*)wl;
+        for (int i = 0; i < remaining / 4; i++) {
+          const U a = words[i] & 0x000f;
+          const U b1 = words[i] & 0x00f0;
+          const U c = words[i] & 0x0f00;
+          const U d = words[i] & 0xf000;
+          for (int r = 0; r < R; r++) {
+            accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+                + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+          }
         }
+        for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
       }
     }
   }
@@ -211,7 +236,13 @@ private let nemotronMultiRowQMVSource = """
     for (int r = 0; r < R; r++) {
       U v = simd_sum(result[r][row]);
       if (simd_lid == 0) {
-        yp[r * out_vec_size + row] = static_cast<T>(v);
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
       }
     }
   }
@@ -248,8 +279,9 @@ enum NemotronMultiRowQMV {
 
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.
-    static func apply(_ x: MLXArray, _ q: QuantizedLinear) -> MLXArray? {
-        guard enabled, x.ndim == 2, (2...8).contains(x.dim(0)),
+    /// Width one is used by the exact BF16 ReLU2 epilogue, not a GEMM.
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false) -> MLXArray? {
+        guard enabled, x.ndim == 2, (1...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
               q.scales.dtype == x.dtype, biases.dtype == x.dtype,
@@ -262,7 +294,7 @@ enum NemotronMultiRowQMV {
         let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
             [q.weight, q.scales, biases, x, kArray, nArray],
-            template: [("T", x.dtype), ("R", rows), ("FAST", fast)],
+            template: [("T", x.dtype), ("R", rows), ("FAST", fast), ("RELU2", relu2)],
             grid: (32, n / 4, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]],
@@ -291,6 +323,18 @@ func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
         .reshaped(1, count, q.weight.dim(0))
     if let bias = q.bias { result = result + bias }
     return result
+}
+
+// The epilogue must first round to BF16, exactly as the separate projection.
+func nemotronMTPLinearRelu2Rows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
+    if NemotronMTPExecution.batchedM1, x.ndim == 3, x.dim(0) == 1,
+       x.dim(1) >= 1, let q = linear as? QuantizedLinear, q.bias == nil,
+       let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q, relu2: true) {
+        return rows.reshaped(1, x.dim(1), q.weight.dim(0))
+    }
+    let projected = nemotronMTPLinearRows(x, linear)
+    let positive = maximum(projected, MLXArray(0))
+    return positive * positive
 }
 
 // Target Q/K/V share one dispatch; every tile keeps the existing row body.
@@ -333,7 +377,7 @@ enum NemotronTargetQKV {
         else { return nil }
         let rows = x.dim(1)
         let outputs = kernel(q + k + v + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
-            template: [("T", x.dtype), ("R", rows), ("FAST", false)],
+            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false)],
             grid: (32, 1152, 1), threadGroup: (32, 2, 1),
             outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
             outputDTypes: [x.dtype, x.dtype, x.dtype])
