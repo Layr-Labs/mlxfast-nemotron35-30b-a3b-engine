@@ -86,7 +86,6 @@ final class CBv2MTPRoundInFlight {
         let rows: [VerifyRow]
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
         /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million.
         /// One `asArray` at finalize reads everything, preserving the single
         /// host-sync boundary.
         let acceptancePacket: MLXArray
@@ -103,9 +102,6 @@ final class CBv2MTPRoundInFlight {
         /// Serial recurrent target generations in target-column order. Empty
         /// for attention-only targets.
         let recurrentEvaluations: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
-        /// Lazy exact Qwen policy top-two values [B, 1+k, 2], float32.
-        /// IDs feed greedy scoring on device; values are read only after the
-        /// existing acceptance-packet fence.
         let policyTopTwoValues: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
@@ -152,6 +148,11 @@ final class CBv2MTPRoundInFlight {
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
     }
+}
+
+enum CBv2MTPPolicyPacket {
+    static let enabled =
+        ProcessInfo.processInfo.environment["CBV2_MTP_PACK_POLICY_VALUES"] != "0"
 }
 
 /// A seed step belongs to the row cohort it prepared, not to the depth that
