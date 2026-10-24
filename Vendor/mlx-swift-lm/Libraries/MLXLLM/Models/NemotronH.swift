@@ -361,6 +361,11 @@ enum NemotronHPrefillX5 {
     static let runGather = enabled && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
 }
 
+
+enum NemotronPrefillConv1 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_CONV1"] != "0"
+}
+
 // MARK: - Multi-token SSM scan (copy of SSM.swift ssmAttn, fewer copies)
 
 /// tril(CB_g * exp(S), 0) with CB broadcast over the R heads of its group:
@@ -687,6 +692,85 @@ func nemotronDecodeSSM(
     return (outputs[0], outputs[1])
 }
 
+
+private final class NemotronPrefillConvKernels: Sendable {
+    static let shared = NemotronPrefillConvKernels()
+    let convSilu: MLXFast.MLXFastKernel
+    private init() {
+        convSilu = MLXFast.metalKernel(
+            name: "nemotron_prefill_conv_bias_silu",
+            inputNames: ["s", "x", "w", "bias"], outputNames: ["out"],
+            source: """
+                constexpr int TT = 8;
+                const uint c = thread_position_in_grid.x;
+                const int t0 = int(thread_position_in_grid.y) * TT;
+                const uint bb = thread_position_in_grid.z;
+                const int n = x_shape[1];
+                if (c >= CH || t0 >= n) {
+                    return;
+                }
+                T wv[K];
+                for (int i = 0; i < K; ++i) {
+                    wv[i] = w[c * w_strides[0] + i * w_strides[1]];
+                }
+                const T bc = bias[c * bias_strides[0]];
+                T v[TT + K - 1];
+                for (int q = 0; q < TT + K - 1; ++q) {
+                    const int p = min(t0 + q, n + K - 2);
+                    v[q] = p < K - 1
+                        ? s[bb * s_strides[0] + p * s_strides[1] + c * s_strides[2]]
+                        : x[bb * x_strides[0] + (p - (K - 1)) * x_strides[1] + c * x_strides[2]];
+                }
+                for (int j = 0; j < TT; ++j) {
+                    const int t = t0 + j;
+                    float acc = 0.0;
+                    for (int i = 0; i < K; ++i) {
+                        acc += static_cast<float>(v[j + i]) * wv[i];
+                    }
+                    const T cv = static_cast<T>(acc);
+                    const T bv = cv + bc;
+                    const T sg = nemotron_prefill_conv_sigmoid(bv);
+                    if (t < n) {
+                        out[(size_t(bb) * n + t) * CH + c] = bv * sg;
+                    }
+                }
+            """,
+            header: """
+                template <typename T>
+                inline T nemotron_prefill_conv_sigmoid(T x) {
+                    auto y = 1 / (1 + metal::exp(metal::abs(x)));
+                    return (x < 0) ? y : 1 - y;
+                }
+                """,
+            ensureRowContiguous: false)
+    }
+}
+
+func nemotronPrefillConvSilu(
+    _ conv: Conv1d, state: MLXArray, input: MLXArray
+) -> MLXArray? {
+    guard NemotronPrefillConv1.enabled, let bias = conv.bias,
+        input.ndim == 3, state.ndim == 3, conv.weight.ndim == 3
+    else { return nil }
+    let channels = input.dim(2)
+    let taps = conv.weight.dim(1)
+    let rows = input.dim(1)
+    guard rows > 8, taps > 1, channels > 0,
+        input.dtype == .bfloat16 || input.dtype == .float16,
+        state.dtype == input.dtype, conv.weight.dtype == input.dtype,
+        bias.dtype == input.dtype,
+        conv.weight.shape == [channels, taps, 1], bias.shape == [channels],
+        conv.groups == channels, conv.stride == 1, conv.padding == 0, conv.dilation == 1,
+        state.shape == [input.dim(0), taps - 1, channels]
+    else { return nil }
+    return NemotronPrefillConvKernels.shared.convSilu(
+        [state, input, conv.weight, bias],
+        template: [("T", input.dtype), ("K", taps), ("CH", channels)],
+        grid: (channels, (rows + 7) / 8, input.dim(0)),
+        threadGroup: (min(256, channels), 1, 1),
+        outputShapes: [input.shape], outputDTypes: [input.dtype])[0]
+}
+
 // MARK: - Mamba2Mixer
 
 private enum NemotronPackedConvKernel {
@@ -846,6 +930,20 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             }
         }
 
+        let convRows = convInput.dim(1)
+        if convRows > 8, convRows >= convKernelSize - 1,
+            let fused = nemotronPrefillConvSilu(conv1d, state: convState!, input: convInput) {
+            if let cache {
+                let start = convRows - (convKernelSize - 1)
+                let rows = convInput[0..., start ..< convRows, 0...]
+                cache[0] = NemotronRequestConvHistory.copy(
+                    [rows], template: [("N", rows.dim(1)), ("C", convDim)],
+                    grid: (convDim, rows.dim(1), convInput.dim(0)), threadGroup: (256, 1, 1),
+                    outputShapes: [rows.shape], outputDTypes: [rows.dtype])[0]
+            }
+            return fused
+        }
+
         let (convOutput, padded) = packedConv(convState!, convInput)
 
         if let cache {
@@ -950,9 +1048,22 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let ssmState =
             ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
-        let (convOutput, padded) = packedConv(convState, convInput)
-        let end = padded.dim(1)
-        let history = padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        let prefillRows = convInput.dim(1)
+        let fusedConv: MLXArray? = prefillRows > 8 && prefillRows >= convKernelSize - 1
+            ? nemotronPrefillConvSilu(conv1d, state: convState, input: convInput)
+            : nil
+        let convOutput: MLXArray
+        let history: MLXArray
+        if let fusedConv {
+            convOutput = fusedConv
+            history = convInput[
+                0..., (prefillRows - (convKernelSize - 1)) ..< prefillRows, 0...]
+        } else {
+            let packed = packedConv(convState, convInput)
+            let end = packed.padded.dim(1)
+            convOutput = packed.convolution
+            history = packed.padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        }
         let nextConvState: MLXArray
         if hiddenStates.dim(1) > 8 {
             nextConvState = NemotronRequestConvHistory.copy(

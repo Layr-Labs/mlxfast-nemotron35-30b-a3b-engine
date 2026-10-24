@@ -310,6 +310,13 @@ extension NemotronH35Model {
             MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
+        if NemotronPrefillConv1.enabled,
+            let prefillConv = nemotronPrefillConvSilu(
+                mixer.conv1d,
+                state: MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+                input: MLXArray.zeros([1, 16, mixer.convDim], dtype: activationDType)) {
+            roots.append(prefillConv)
+        }
         if !roots.isEmpty { eval(roots) }
     }
 }

@@ -197,6 +197,71 @@ inline U nml_qdot_safe(
   }
   return scale * accum + sum * bias;
 }
+
+// DECODE1: the leader's two rows share one weight word, so decode each packed
+// int16 word into fp32 coefficients once and accumulate every row from the
+// decoded tile. Each row keeps its own i-order and its own affine expression,
+// so a row's bits are the double-call path's bits exactly.
+template <typename U, int values_per_thread>
+inline void nml_decode_words(const device uint8_t* w, thread U* w_thread) {
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const U a = ws[i] & 0x000f;
+    const U b = ws[i] & 0x00f0;
+    const U c = ws[i] & 0x0f00;
+    const U d = ws[i] & 0xf000;
+    w_thread[4 * i] = a;
+    w_thread[4 * i + 1] = b;
+    w_thread[4 * i + 2] = c;
+    w_thread[4 * i + 3] = d;
+  }
+}
+
+template <typename U, int values_per_thread>
+inline void nml_decode_words_safe(
+    const device uint8_t* w, thread U* w_thread, int N) {
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (N / 4); i++) {
+    const U a = ws[i] & 0x000f;
+    const U b = ws[i] & 0x00f0;
+    const U c = ws[i] & 0x0f00;
+    const U d = ws[i] & 0xf000;
+    w_thread[4 * i] = a;
+    w_thread[4 * i + 1] = b;
+    w_thread[4 * i + 2] = c;
+    w_thread[4 * i + 3] = d;
+  }
+}
+
+template <typename U, int values_per_thread>
+inline U nml_qdot_words(
+    const thread U* w_thread, const thread U* x_thread, U scale, U bias,
+    U sum) {
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    accum +=
+        (x_thread[4 * i] * w_thread[4 * i] +
+         x_thread[4 * i + 1] * w_thread[4 * i + 1] +
+         x_thread[4 * i + 2] * w_thread[4 * i + 2] +
+         x_thread[4 * i + 3] * w_thread[4 * i + 3]);
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename U, int values_per_thread>
+inline U nml_qdot_words_safe(
+    const thread U* w_thread, const thread U* x_thread, U scale, U bias,
+    U sum, int N) {
+  U accum = 0;
+  for (int i = 0; i < (N / 4); i++) {
+    accum +=
+        (x_thread[4 * i] * w_thread[4 * i] +
+         x_thread[4 * i + 1] * w_thread[4 * i + 1] +
+         x_thread[4 * i + 2] * w_thread[4 * i + 2] +
+         x_thread[4 * i + 3] * w_thread[4 * i + 3]);
+  }
+  return scale * accum + sum * bias;
+}
 """
 
 // RELU2 epilogue = stock relu2 on the stored bf16 value, op for op as MLX's
@@ -345,6 +410,7 @@ private let nemotronMoELeaderSource = """
     device T* y1 = y + partner * N + out_row;
     thread U x0_thread[values_per_thread];
     thread U x1_thread[values_per_thread];
+    thread U w_thread[values_per_thread];
     thread U result0[results_per_simdgroup] = {0};
     thread U result1[results_per_simdgroup] = {0};
     int k = 0;
@@ -357,8 +423,16 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
-        result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        if (DECODE1) {
+          nml_decode_words<U, values_per_thread>(wl, w_thread);
+          result0[r] += nml_qdot_words<U, values_per_thread>(
+              w_thread, x0_thread, s, b, sum0);
+          result1[r] += nml_qdot_words<U, values_per_thread>(
+              w_thread, x1_thread, s, b, sum1);
+        } else {
+          result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+          result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        }
       }
       ws += block_size / 2;
       sc += block_size / 64;
@@ -377,10 +451,18 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result0[r] += nml_qdot_safe<U, values_per_thread>(
-            wl, x0_thread, s, b, sum0, remaining);
-        result1[r] += nml_qdot_safe<U, values_per_thread>(
-            wl, x1_thread, s, b, sum1, remaining);
+        if (DECODE1) {
+          nml_decode_words_safe<U, values_per_thread>(wl, w_thread, remaining);
+          result0[r] += nml_qdot_words_safe<U, values_per_thread>(
+              w_thread, x0_thread, s, b, sum0, remaining);
+          result1[r] += nml_qdot_words_safe<U, values_per_thread>(
+              w_thread, x1_thread, s, b, sum1, remaining);
+        } else {
+          result0[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x0_thread, s, b, sum0, remaining);
+          result1[r] += nml_qdot_safe<U, values_per_thread>(
+              wl, x1_thread, s, b, sum1, remaining);
+        }
       }
     }
     for (int r = 0; r < results_per_simdgroup; r++) {
@@ -518,6 +600,7 @@ private let nemotronMoELeaderWeightedSource = """
       const device T* x1 = x + partner * K + simd_lid * values_per_thread;
       thread U x0_thread[values_per_thread];
       thread U x1_thread[values_per_thread];
+      thread U w_thread[values_per_thread];
       thread U result0[results_per_simdgroup] = {0};
       thread U result1[results_per_simdgroup] = {0};
       int k = 0;
@@ -530,8 +613,16 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
-          result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+          if (DECODE1) {
+            nml_decode_words<U, values_per_thread>(wl, w_thread);
+            result0[r] += nml_qdot_words<U, values_per_thread>(
+                w_thread, x0_thread, s, b, sum0);
+            result1[r] += nml_qdot_words<U, values_per_thread>(
+                w_thread, x1_thread, s, b, sum1);
+          } else {
+            result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
+            result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+          }
         }
         ws += block_size / 2;
         sc += block_size / 64;
@@ -550,10 +641,18 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result0[r] += nml_qdot_safe<U, values_per_thread>(
-              wl, x0_thread, s, b, sum0, remaining);
-          result1[r] += nml_qdot_safe<U, values_per_thread>(
-              wl, x1_thread, s, b, sum1, remaining);
+          if (DECODE1) {
+            nml_decode_words_safe<U, values_per_thread>(wl, w_thread, remaining);
+            result0[r] += nml_qdot_words_safe<U, values_per_thread>(
+                w_thread, x0_thread, s, b, sum0, remaining);
+            result1[r] += nml_qdot_words_safe<U, values_per_thread>(
+                w_thread, x1_thread, s, b, sum1, remaining);
+          } else {
+            result0[r] += nml_qdot_safe<U, values_per_thread>(
+                wl, x0_thread, s, b, sum0, remaining);
+            result1[r] += nml_qdot_safe<U, values_per_thread>(
+                wl, x1_thread, s, b, sum1, remaining);
+          }
         }
       }
       for (int r = 0; r < results_per_simdgroup; r++) {
@@ -603,6 +702,21 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
 /// the benchd token gate fails loudly unless every row is bitwise stock.
 let nemotronKernelSelfTestBuild = false
 
+private final class NMLDecode1State: @unchecked Sendable {
+    private let lock = NSLock()
+    private var ok = false
+    private var tested = false
+    var passed: Bool { lock.withLock { ok } }
+    func claim() -> Bool {
+        lock.withLock {
+            if tested { return false }
+            tested = true
+            return true
+        }
+    }
+    func mark(_ value: Bool) { lock.withLock { ok = value } }
+}
+
 enum NemotronMoELeader {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
@@ -616,6 +730,10 @@ enum NemotronMoELeader {
     }
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
+    static let decode1Switch =
+        ProcessInfo.processInfo.environment["NEMOTRON_MOE_LEADER_DECODE1"] != "0"
+    private static let decode1State = NMLDecode1State()
+    static var decode1: Bool { decode1Switch && decode1State.passed }
 
     struct Bank {
         let weight: MLXArray
@@ -650,7 +768,7 @@ enum NemotronMoELeader {
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil) -> MLXArray {
+                      prepared: MLXArray? = nil, decode: Bool? = nil) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
@@ -660,7 +778,8 @@ enum NemotronMoELeader {
                 [bank.weight, bank.scales, bank.biases, packed, inds],
                 template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                            ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                           ("RELU2", relu2), ("RPS", rps)],
+                           ("RELU2", relu2), ("RPS", rps),
+                           ("DECODE1", decode ?? decode1)],
                 grid: (32, bank.n / rps, rows * topK),
                 threadGroup: (32, 2, 1),
                 outputShapes: [[rows * topK, bank.n]],
@@ -670,7 +789,8 @@ enum NemotronMoELeader {
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2), ("RPS", rps)],
+                       ("RELU2", relu2), ("RPS", rps),
+                       ("DECODE1", decode ?? decode1)],
             grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
@@ -681,12 +801,15 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank) -> MLXArray {
-        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank) }
+                              rows: Int, bank: Bank,
+                              decode: Bool? = nil) -> MLXArray {
+        let hoist = decode ?? decode1
+        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank,
+                                                            decode: hoist) }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n)],
+                       ("K", bank.k), ("N", bank.n), ("DECODE1", hoist)],
             grid: (32 * (bank.n / 4), 6, 1),
             threadGroup: (32, 6, 1),
             outputShapes: [[1, rows, bank.n]],
@@ -781,6 +904,10 @@ enum NemotronMoELeader {
     /// Compile every pipeline the verify window can request (R = 1...4) at load.
     static func warm(_ model: Module) {
         guard enabled else { return }
+        if decode1Switch, Device.defaultDevice().deviceType == .gpu,
+           decode1State.claim() {
+            decode1State.mark(proveDecode1())
+        }
         var outputs: [MLXArray] = []
         var seen = Set<[Int]>()
         for module in model.modules() {
@@ -807,6 +934,50 @@ enum NemotronMoELeader {
             }
         }
         if !outputs.isEmpty { eval(outputs) }
+    }
+
+    static func proveDecode1() -> Bool {
+        var seed: UInt32 = 0x5EED_1D0C
+        func step() -> UInt32 {
+            seed = seed &* 1_664_525 &+ 1_013_904_223
+            return seed >> 8
+        }
+        let experts = 16, n = 64, k = 2688, rows = 3, topK = 6
+        let weight = MLXArray((0..<(experts * n * (k / 8))).map { _ in step() })
+            .reshaped([experts, n, k / 8])
+        func affineTable() -> MLXArray {
+            let count = experts * n * (k / 64)
+            let values = (0..<count).map { _ in
+                Float(Int(step() % 4096) - 2048) / 8192
+            }
+            return MLXArray(values).reshaped([experts, n, k / 64])
+                .asType(.bfloat16)
+        }
+        func rowsOf(_ count: Int) -> MLXArray {
+            MLXArray((0..<(count * k)).map { _ in
+                Float(Int(step() % 4096) - 2048) / 2048
+            }).reshaped([count, k]).asType(.bfloat16)
+        }
+        let bank = Bank(weight: weight, scales: affineTable(), biases: affineTable(),
+                        k: k, n: n)
+        let x3 = rowsOf(rows)
+        let x18 = rowsOf(rows * topK)
+        let scores = MLXArray((0..<(rows * topK)).map { _ in Float(step() % 1024) / 1024 })
+        let inds = MLXArray(([0, 1, 2, 3, 4, 5] + [6, 7, 8, 9, 10, 11]
+            + [0, 1, 2, 3, 4, 5]).map { UInt32($0) })
+        func sameBits(_ lhs: MLXArray, _ rhs: MLXArray) -> Bool {
+            (lhs.view(dtype: .uint16) .== rhs.view(dtype: .uint16)).all()
+                .item(Bool.self)
+        }
+        let upStock = apply(x3, inds, rows: rows, topK: topK, bank: bank,
+                            perSlot: false, decode: false)
+        let upHoist = apply(x3, inds, rows: rows, topK: topK, bank: bank,
+                            perSlot: false, decode: true)
+        let downStock = applyWeighted(x18, inds, scores, rows: rows, bank: bank,
+                                      decode: false)
+        let downHoist = applyWeighted(x18, inds, scores, rows: rows, bank: bank,
+                                      decode: true)
+        return sameBits(upStock, upHoist) && sameBits(downStock, downHoist)
     }
 }
 
@@ -926,10 +1097,11 @@ private final class NMLBalanceWeighted: Sendable {
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
-             _ bank: NemotronMoELeader.Bank) -> MLXArray {
+             _ bank: NemotronMoELeader.Bank, decode: Bool) -> MLXArray {
         let plan = NMLBalancePlan.shared.make(ids)
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
-            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
+            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n),
+                       ("DECODE1",decode)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
