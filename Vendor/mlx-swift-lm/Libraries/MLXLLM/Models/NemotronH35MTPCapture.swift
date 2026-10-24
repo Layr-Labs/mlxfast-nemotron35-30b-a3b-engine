@@ -54,8 +54,32 @@ final class NemotronH35MTPCompactGraphCache {
             return owner.mtpCompactArrays(hidden, convState: convState, initialSSM: initialSSM)
         }
         guard NemotronMoELeader.selfTest else { return result }
-        let expected = owner.mtpCompactArrays(hidden, convState: convState, initialSSM: initialSSM)
-        return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
+        let expected = owner.mtpCompactArrays(hidden, convState: convState,
+            initialSSM: initialSSM, prepareDecay: false)
+        let times = NemotronMTPDTDecay.unpack(result[3], width: hidden.dim(1), heads: 64)
+        let actualDT = times.dt
+        var stateOK = (actualDT.view(dtype: .uint32) .== expected[3].view(dtype: .uint32)).all()
+        if let decay = times.decay {
+            // Exercise every strict prefix against the original recurrence,
+            // using each route's own dt/conv and the same current input state.
+            for keep in 1..<hidden.dim(1) {
+                let actual = nemotronMTPSSMCompact(
+                    convolution: result[2], ALog: owner.aLog, D: owner.D, dt: actualDT,
+                    state: initialSSM, heads: 64, headDim: 64, groups: 8, stateDim: 128,
+                    steps: keep, writeOutput: false, preparedDecay: decay).finalState
+                let baseline = nemotronMTPSSMCompact(
+                    convolution: expected[2], ALog: owner.aLog, D: owner.D, dt: expected[3],
+                    state: initialSSM, heads: 64, headDim: 64, groups: 8, stateDim: 128,
+                    steps: keep, writeOutput: false).finalState
+                stateOK = logicalAnd(stateOK,
+                    (actual.view(dtype: .uint32) .== baseline.view(dtype: .uint32)).all())
+            }
+        }
+        return (0..<5).map { index in
+            if index == 3 { return result[index] }
+            let checked = nemotronBitwiseOrNaN(result[index], expected[index])
+            return which(stateOK, checked, MLXArray(Float.nan).asType(checked.dtype))
+        }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
@@ -111,11 +135,13 @@ extension NemotronHMamba2Mixer {
         let length = hiddenStates.dim(1)
         let arrays = mtpCompactGraphCache(
             hiddenStates, convState: convState, initialSSM: initialSSM, owner: self)
-        let (padded, convolution, dt, finalSSM) = (arrays[1], arrays[2], arrays[3], arrays[4])
+        let (padded, convolution, timeInfo, finalSSM) = (arrays[1], arrays[2], arrays[3], arrays[4])
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
+        let times = NemotronMTPDTDecay.unpack(timeInfo, width: length, heads: heads)
+        let dt = times.dt, decay = times.decay
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
-        let tape = [padded, convolution, dt]
+        let tape = [padded, convolution, timeInfo]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
         do {
             try evaluation.stagePrefixReplay(
@@ -132,7 +158,8 @@ extension NemotronHMamba2Mixer {
                         ssm: nemotronMTPSSMCompact(
                             convolution: convolution, ALog: logA, D: skip, dt: dt,
                             state: initialSSM, heads: heads, headDim: dim, groups: groups,
-                            stateDim: state, steps: keep, writeOutput: false).finalState)
+                            stateDim: state, steps: keep, writeOutput: false,
+                            preparedDecay: decay).finalState)
                 })
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
@@ -143,20 +170,26 @@ extension NemotronHMamba2Mixer {
     /// Original numerical graph, with request state supplied as dynamic arrays.
     /// Return its replay tape explicitly; staging/commit stay outside compile.
     func mtpCompactArrays(
-        _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray
+        _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
+        prepareDecay: Bool = true
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
-        let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let rawDT = parts[2].reshaped(batch, length, numHeads)
+        let native = prepareDecay && numHeads == 64 && headDim == 64 && numGroups == 8
+            && ssmStateSize == 128 && convDim == 6144 && hiddenStates.dtype == .bfloat16
+        let (convolution, padded, timeInfo) = mtpPackedConvAndTime(
+            convState, input, rawDT: rawDT, prepareDecay: native)
+        let times = NemotronMTPDTDecay.unpack(timeInfo, width: length, heads: numHeads)
+        let dt = times.dt, decay = times.decay
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+            steps: length, writeOutput: true, preparedDecay: decay)
         let y = result.output.reshaped(batch, length, heads * dim)
         let normalized: MLXArray
         let prepared: MLXArray?
@@ -179,7 +212,7 @@ extension NemotronHMamba2Mixer {
             prepared = nil
         }
         return [nemotronMTPLinearRows(normalized, outProj, prepared: prepared),
-                padded, convolution, dt, result.finalState]
+                padded, convolution, timeInfo, result.finalState]
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -283,15 +316,24 @@ extension NemotronH35Model {
             let rawDt = MLXArray.zeros([1, width, heads], dtype: activationDType)
             let state = MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32)
             if nemotronMTPCompactSSM {
-                let dt = nemotronPrefillComputeDt(rawDt, mixer.dtBias, mixer.timeStepLimit)
+                let packed = mixer.mtpPackedConvAndTime(
+                    MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+                    MLXArray.zeros([1, width, mixer.convDim], dtype: activationDType),
+                    rawDT: rawDt, prepareDecay: true)
+                let convolution = packed.convolution, timeInfo = packed.timeInfo
+                roots.append(packed.padded)
+                let times = NemotronMTPDTDecay.unpack(timeInfo, width: width, heads: heads)
+                let dt = times.dt
                 let window = nemotronMTPSSMCompact(
                     convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
                     state: state, heads: heads, headDim: dim, groups: groups,
-                    stateDim: stateDim, steps: width, writeOutput: true)
+                    stateDim: stateDim, steps: width, writeOutput: true,
+                    preparedDecay: times.decay)
                 let replay = nemotronMTPSSMCompact(
                     convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
                     state: state, heads: heads, headDim: dim, groups: groups,
-                    stateDim: stateDim, steps: width - 1, writeOutput: false)
+                    stateDim: stateDim, steps: width - 1, writeOutput: false,
+                    preparedDecay: times.decay)
                 roots += [window.output, window.finalState, replay.finalState]
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,

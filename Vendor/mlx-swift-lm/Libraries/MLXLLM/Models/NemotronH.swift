@@ -689,12 +689,8 @@ func nemotronDecodeSSM(
 
 // MARK: - Mamba2Mixer
 
-private enum NemotronPackedConvKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_packed_conv_silu",
-        inputNames: ["oldState", "input", "weight", "bias"],
-        outputNames: ["out", "padded"],
-        source: """
+enum NemotronPackedConvKernel {
+    static let source = """
             int64_t channel = int64_t(thread_position_in_grid.x);
             int64_t position = int64_t(thread_position_in_grid.y);
             padded[(position + 3) * C + channel] =
@@ -719,7 +715,13 @@ private enum NemotronPackedConvKernel {
             auto y = 1 / (1 + metal::exp(metal::abs(x)));
             T sigmoid = x < 0 ? y : 1 - y;
             out[position * C + channel] = x * sigmoid;
-            """, ensureRowContiguous: false)
+            """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu",
+        inputNames: ["oldState", "input", "weight", "bias"],
+        outputNames: ["out", "padded"],
+        source: source, ensureRowContiguous: false)
 }
 
 
