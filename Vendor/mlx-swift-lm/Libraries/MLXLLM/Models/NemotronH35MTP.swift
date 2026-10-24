@@ -323,16 +323,31 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             let pageTokens = CBv2PagedDefaults.pageSize
             let pages = (maximumSequenceLength + pageTokens - 1) / pageTokens
             let pageBytes = 2 * kind.kvHeads * kind.headDim * pageTokens * elementBytes
-            // One poison page is unavailable to requests; retain another page
-            // of rounding slack so the request's admitted bound is realizable.
-            let capacity = max(pageBytes * (pages + 2), 1) + 4 * 1024 * 1024
+            // One request owns this pool. Reserve one complete size-class
+            // segment, including its poison page, instead of evaluating and
+            // synchronizing each binary-remainder segment separately.
+            var storagePages = 1
+            while storagePages < pages {
+                let (next, overflow) = storagePages.multipliedReportingOverflow(by: 2)
+                guard !overflow else {
+                    throw CBv2KVError.backendIneligible(reason: "MTP segment bound overflow")
+                }
+                storagePages = next
+            }
+            let (storageLength, lengthOverflow) = storagePages.multipliedReportingOverflow(by: pageTokens)
+            let (withPoison, pageOverflow) = storagePages.addingReportingOverflow(1)
+            let (storageBytes, byteOverflow) = withPoison.multipliedReportingOverflow(by: pageBytes)
+            guard !lengthOverflow, !pageOverflow, !byteOverflow else {
+                throw CBv2KVError.backendIneligible(reason: "MTP backing geometry overflow")
+            }
+            let capacity = try Memory.allocationFootprintUpperBound(byteCount: storageBytes)
             backend = try PagedKVBackend(layerKinds: [kind], config: .init(
                 capacityBytes: capacity, dtype: dtype, maxPrefillChunk: 512,
-                nominalMaxSequenceLength: maximumSequenceLength,
-                segmentSizeBytes: min(capacity, 4 * 1024 * 1024),
+                nominalMaxSequenceLength: storageLength,
+                segmentSizeBytes: storageBytes,
                 layerDTypes: [dtype]))
             let state = try backend.makeSequenceState(
-                layerKinds: [kind], promptLength: 0, maxLength: maximumSequenceLength)
+                layerKinds: [kind], promptLength: 0, maxLength: storageLength)
             row = state[0] as! PagedSequenceKV
             cache = backend.makeLayerCaches()[0]
             cache.setRows([row])
