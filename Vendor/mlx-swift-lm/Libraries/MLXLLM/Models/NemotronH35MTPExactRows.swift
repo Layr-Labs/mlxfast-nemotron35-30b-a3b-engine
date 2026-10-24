@@ -122,7 +122,7 @@ inline U nmr_qdot_safe(
 
 private let nemotronMultiRowQMVSource = """
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int packs_per_thread = FAST ? 2 : 1;
   constexpr int pack_factor = 8;
   constexpr int bytes_per_pack = 4;
@@ -276,6 +276,47 @@ enum NemotronMultiRowQMV {
     }
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MULTIROW_QMV"] != "0"
+    /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
+    static let narrowEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
+
+    /// Outputs per SIMD group for one verify width and (K, N). Two outputs
+    /// halve each threadgroup's rows and double the threadgroups; each output
+    /// keeps its lane split over K, block order, qdot, affine step and closing
+    /// simd_sum, so only the output-to-SIMD-group mapping changes. A fixed
+    /// table from an M1 Max per-shape microbenchmark (dependent chains, 24
+    /// weight copies per shape): two outputs won on every listed shape at
+    /// R = 3 (the depth-2 verify and post-verify width) and lost on most at
+    /// R = 1 and 2, so only R = 3 and 4 narrow. Never a run-time timing pick.
+    static func resultsPerSimdgroup(rows: Int, k: Int, n: Int) -> Int {
+        guard narrowEnabled else { return 4 }
+        switch rows {
+        case 3: return narrowShapes.contains([k, n]) ? 2 : 4
+        // R = 4 out_proj / o_proj / wo (4096 -> 2688) measured flat.
+        case 4: return narrowShapes.contains([k, n]) && [k, n] != [4096, 2688] ? 2 : 4
+        default: return 4
+        }
+    }
+    /// [K, N]: Mamba out_proj, attention o_proj and MTP wo; shared expert up
+    /// and down; MTP eh_proj, wq, wk/wv; Mamba in_proj; draft and target head.
+    private static let narrowShapes: Set<[Int]> = [
+        [4096, 2688], [2688, 3712], [3712, 2688], [5376, 2688], [2688, 4096],
+        [2688, 256], [2688, 10304], [2688, 65536], [2688, 131072],
+    ]
+
+    private static func dispatch(_ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
+                                 _ x: MLXArray, relu2: Bool, rps: Int) -> MLXArray {
+        let rows = x.dim(0), k = x.dim(1), n = w.dim(0)
+        let (kArray, nArray) = scalarPair(k, n)
+        return NemotronMultiRowQMVKernel.shared.kernel(
+            [w, scales, biases, x, kArray, nArray],
+            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, n / rps, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [[rows, n]],
+            outputDTypes: [x.dtype])[0]
+    }
 
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.
@@ -287,19 +328,41 @@ enum NemotronMultiRowQMV {
               q.scales.dtype == x.dtype, biases.dtype == x.dtype,
               q.weight.ndim == 2, q.weight.dtype == .uint32
         else { return nil }
-        let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        let k = x.dim(1), n = q.weight.dim(0)
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
-        let fast = k % 512 == 0
-        let (kArray, nArray) = scalarPair(k, n)
-        return NemotronMultiRowQMVKernel.shared.kernel(
-            [q.weight, q.scales, biases, x, kArray, nArray],
-            template: [("T", x.dtype), ("R", rows), ("FAST", fast), ("RELU2", relu2)],
-            grid: (32, n / 4, 1),
-            threadGroup: (32, 2, 1),
-            outputShapes: [[rows, n]],
-            outputDTypes: [x.dtype])[0]
+        let rps = resultsPerSimdgroup(rows: x.dim(0), k: k, n: n)
+        let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps)
+        guard rps != 4, NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(
+            y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 4))
     }
+
+    /// JIT every narrow pipeline (R = 3, 4; FAST; RELU2) at load, so no
+    /// timed window compiles one. Tiny dummy shapes; same template keys.
+    static func warmNarrow() {
+        guard enabled, narrowEnabled else { return }
+        var outputs: [MLXArray] = []
+        for k in [512, 576] {
+            let w = MLXArray.zeros([8, k / 8], dtype: .uint32)
+            let s = MLXArray.zeros([8, k / 64], dtype: .bfloat16)
+            for rows in [3, 4] {
+                let x = MLXArray.zeros([rows, k], dtype: .bfloat16)
+                for relu2 in [false, true] {
+                    outputs.append(dispatch(w, s, s, x, relu2: relu2, rps: 2))
+                }
+            }
+        }
+        outputs += NemotronTargetQKV.warmNarrow()
+        eval(outputs)
+    }
+}
+
+/// Self-test select: `y` where it is bitwise equal to `expected`, else NaN
+/// everywhere, so the token gate fails loudly on any difference.
+func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {
+    let ok = (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+    return which(ok, y, MLXArray(Float.nan).asType(y.dtype))
 }
 
 // Multi-row BF16 router projection. Stock `matmul(x_row, weight.T)` at M=1,
@@ -520,22 +583,33 @@ func nemotronMTPLinearRelu2Rows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
 }
 
 // Target Q/K/V share one dispatch; every tile keeps the existing row body.
+// A tile is one threadgroup of 2 * RPS output rows: Q tiles, then K, then V.
 enum NemotronTargetQKV {
     private static let source = """
+      constexpr uint q_tiles = 4096 / (2 * RPS);
+      constexpr uint kv_tiles = 256 / (2 * RPS);
       const uint tile = threadgroup_position_in_grid.y;
-      const uint local_tile = tile < 512 ? tile : (tile < 544 ? tile - 512 : tile - 544);
+      const uint local_tile = tile < q_tiles ? tile
+          : (tile < q_tiles + kv_tiles ? tile - q_tiles : tile - q_tiles - kv_tiles);
       {
         const uint3 threadgroup_position_in_grid = uint3(0, local_tile, 0);
-        const device uint32_t* w = tile < 512 ? qw : (tile < 544 ? kw : vw);
-        const device T* scales = tile < 512 ? qs : (tile < 544 ? ks : vs);
-        const device T* biases = tile < 512 ? qb : (tile < 544 ? kb : vb);
-        device T* y = tile < 512 ? qy : (tile < 544 ? ky : vy);
-        const int N = tile < 512 ? 4096 : 256;
+        const device uint32_t* w = tile < q_tiles ? qw : (tile < q_tiles + kv_tiles ? kw : vw);
+        const device T* scales = tile < q_tiles ? qs : (tile < q_tiles + kv_tiles ? ks : vs);
+        const device T* biases = tile < q_tiles ? qb : (tile < q_tiles + kv_tiles ? kb : vb);
+        device T* y = tile < q_tiles ? qy : (tile < q_tiles + kv_tiles ? ky : vy);
+        const int N = tile < q_tiles ? 4096 : 256;
     """ + nemotronMultiRowQMVSource + "\n}"
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_target_qkv_affine4_gs64",
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
         outputNames: ["qy", "ky", "vy"], source: source, header: nemotronMultiRowQMVHeader)
+
+    /// Outputs per SIMD group for the fused Q/K/V launch: narrow at R = 3
+    /// and 4 (M1 Max: -9 % and -12 %; R = 1 +7 %). Same kill switch as
+    /// NemotronMultiRowQMV.
+    static func resultsPerSimdgroup(rows: Int) -> Int {
+        NemotronMultiRowQMV.narrowEnabled && (rows == 3 || rows == 4) ? 2 : 4
+    }
 
     private static func buffers(_ linear: Linear, rows: Int) -> [MLXArray]? {
         guard type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear,
@@ -545,6 +619,16 @@ enum NemotronTargetQKV {
               let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [rows, 42]
         else { return nil }
         return [q.weight, q.scales, offsets]
+    }
+
+    private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int) -> [MLXArray] {
+        let rows = x.dim(1)
+        return kernel(weights + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
+            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
+                       ("RPS", rps)],
+            grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
 
     static func apply(
@@ -557,13 +641,25 @@ enum NemotronTargetQKV {
               let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
               let v = buffers(value, rows: 256)
         else { return nil }
-        let rows = x.dim(1)
-        let outputs = kernel(q + k + v + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
-            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false)],
-            grid: (32, 1152, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
-            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        let rps = resultsPerSimdgroup(rows: x.dim(1))
+        var outputs = dispatch(q + k + v, x, rps: rps)
+        if rps != 4, NemotronMoELeader.selfTest {
+            let expected = dispatch(q + k + v, x, rps: 4)
+            outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
+        }
         return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// Narrow pipelines for the widths that use them (R = 3, 4).
+    static func warmNarrow() -> [MLXArray] {
+        let weights = [4096, 256, 256].flatMap { n in
+            [MLXArray.zeros([n, 336], dtype: .uint32),
+             MLXArray.zeros([n, 42], dtype: .bfloat16),
+             MLXArray.zeros([n, 42], dtype: .bfloat16)]
+        }
+        return [3, 4].flatMap { rows in
+            dispatch(weights, MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), rps: 2)
+        }
     }
 }
 

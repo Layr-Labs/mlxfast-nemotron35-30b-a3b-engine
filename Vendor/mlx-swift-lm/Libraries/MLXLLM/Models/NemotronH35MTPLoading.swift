@@ -77,6 +77,7 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
+        NemotronMultiRowQMV.warmNarrow()
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
