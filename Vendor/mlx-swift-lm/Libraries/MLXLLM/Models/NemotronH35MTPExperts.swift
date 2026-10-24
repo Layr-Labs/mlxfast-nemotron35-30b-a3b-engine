@@ -7,6 +7,12 @@ extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
         let activated = nemotronMTPLinearRelu2Rows(x, upProj, prepared: prepared)
+        if x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)),
+           let y = zskipDown?.down(x: activated.reshaped(x.dim(1), activated.dim(2)),
+               site: .sharedVerify, rows: x.dim(1), topK: 1,
+               original: { nemotronMTPLinearRows(activated, self.downProj).reshaped(x.dim(1), 2688) }) {
+            return y.reshaped(1, x.dim(1), 2688)
+        }
         return nemotronMTPLinearRows(activated, downProj)
     }
 }
@@ -466,18 +472,27 @@ private final class NemotronMoELeaderKernel: Sendable {
 private final class NemotronMoELeaderPreparedKernels: Sendable {
     static let shared = NemotronMoELeaderPreparedKernels()
     let gateUp: MLXFast.MLXFastKernel?
+    let gateUpAndPlan: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
-        gateUp = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
+        let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
             ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
             ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
              "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
-        ]).map {
+        ])
+        gateUp = preparedSource.map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0, header: header)
+        }
+        gateUpAndPlan = preparedSource.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_prepared_fc1_with_balance_plan",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
+                header: header)
         }
     }
 }
@@ -738,11 +753,47 @@ enum NemotronMoELeader {
     }
 
     static let preparedGateUp = true
+    static let fuseBalancePlan =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
+
+    /// The ordinary prepared R3/top-six FC1 arithmetic plus the original
+    /// integer FC2 plan, emitted by just the first leader/output tile.
+    /// Both outputs are fresh current-call arrays; no planner state persists.
+    static func applyWithBalancePlan(
+        _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
+        prepared: MLXArray?
+    ) -> (activation: MLXArray, plan: MLXArray)? {
+        guard fuseBalancePlan, preparedGateUp,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
+              let kernel = NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let rps = leaderResultsPerSimdgroup(rows: 3)
+        let result = kernel([bank.weight, bank.scales, bank.biases, packed, inds],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+            outputShapes: [[18, bank.n], [36]], outputDTypes: [x.dtype, .int32])
+        guard selfTest else { return (result[0], result[1]) }
+        let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
+            perSlot: false, relu2: relu2, prepared: packed)
+        let referencePlan = NMLBalancePlan.shared.make(inds)
+        let ok = MLX.logicalAnd(
+            (result[0].view(dtype: .uint16) .== expected.view(dtype: .uint16)).all(),
+            (result[1] .== referencePlan).all())
+        return (which(ok, result[0], MLXArray(Float.nan).asType(x.dtype)),
+            which(ok, result[1], referencePlan))
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank) -> MLXArray {
-        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank) }
+                              rows: Int, bank: Bank, plan: MLXArray? = nil) -> MLXArray {
+        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
@@ -779,16 +830,30 @@ enum NemotronMoELeader {
         let flat = indices.reshaped(rows * 6)
         let xr = x.reshaped(rows, 2688)
         let act: MLXArray
+        let balancePlan: MLXArray?
         if fuseRelu2 {
-            act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                relu2: true, prepared: prepared)
+            if rows == 3, let fused = applyWithBalancePlan(
+                xr, flat, bank: up, relu2: true, prepared: prepared) {
+                act = fused.activation
+                balancePlan = fused.plan
+            } else {
+                act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
+                    relu2: true, prepared: prepared)
+                balancePlan = nil
+            }
         } else {
             let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
                 prepared: prepared)
             let a = maximum(h, MLXArray(0))
             act = a * a
+            balancePlan = nil
         }
-        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down)
+        var y = mlp.zskipDown?.down(x: act, indices: flat,
+            scores: scores.reshaped(rows * 6), site: .routedWeighted, rows: rows,
+            original: { applyWeighted(act, flat, scores.reshaped(rows * 6),
+                rows: rows, bank: down, plan: balancePlan) })
+            ?? applyWeighted(act, flat, scores.reshaped(rows * 6),
+                rows: rows, bank: down, plan: balancePlan)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -821,7 +886,10 @@ enum NemotronMoELeader {
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true)
+        var y = mlp.zskipDown?.down(x: act, indices: flat, site: .routedLeader,
+            rows: rows, topK: topK,
+            original: { apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true) })
+            ?? apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true)
         if selfTest {
             // Stock route on the same inputs: gather_qmv fc1, relu2 ops, gather_qmv fc2.
             let xe = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -854,15 +922,20 @@ enum NemotronMoELeader {
                 let values: [UInt32] = (0..<(rows * topK)).map { UInt32($0 % topK) }
                 let inds = MLXArray(values)
                 let x = MLXArray.zeros([rows, up.k], dtype: .bfloat16)
-                let h = apply(x, inds, rows: rows, topK: topK, bank: up, perSlot: false,
-                              relu2: fuseRelu2)
+                let fused = rows == 3 && topK == 6
+                    ? applyWithBalancePlan(x, inds, bank: up, relu2: fuseRelu2, prepared: nil) : nil
+                let h = fused?.activation
+                    ?? apply(x, inds, rows: rows, topK: topK, bank: up, perSlot: false,
+                             relu2: fuseRelu2)
+                if let fused { outputs.append(fused.plan) }
                 if rows > 1 {
                     outputs.append(apply(h, inds, rows: rows, topK: topK, bank: down, perSlot: true))
                 }
                 if topK == 6, up.weight.shape == [128, 1856, 336],
                     down.weight.shape == [128, 2688, 232] {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
-                    outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down))
+                    outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down,
+                        plan: fused?.plan))
                 }
             }
         }
@@ -986,11 +1059,35 @@ private final class NMLBalanceWeighted: Sendable {
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
-             _ bank: NemotronMoELeader.Bank) -> MLXArray {
-        let plan = NMLBalancePlan.shared.make(ids)
+             _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
+        let plan = plan ?? NMLBalancePlan.shared.make(ids)
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
+}
+
+
+/// Reuse the entire accepted prepared FC1 body verbatim. The extra work runs
+/// in exactly one complete 64-thread TG: row-zero/slot-zero is always a leader,
+/// so its original follower return cannot skip the plan. FC2 already depends
+/// on FC1; reading the plan adds no dependency on a different producer.
+private func nmlFC1WithBalancePlanSource(_ preparedFC1: String) -> String {
+    let lane = "const uint lane = thread_position_in_grid.x;"
+    let store = "for (uint i = lane; i < 36; i += 32)"
+    precondition(nmlBalancePlanSource.components(separatedBy: lane).count == 2)
+    precondition(nmlBalancePlanSource.components(separatedBy: store).count == 2)
+    let plan = nmlBalancePlanSource
+        .replacingOccurrences(of: lane, with: "const uint lane = simd_lid + 32 * simd_gid;")
+        .replacingOccurrences(of: store, with: "for (uint i = lane; i < 36; i += 64)")
+    return preparedFC1 + """
+
+      // tid is a TG coordinate, so both SIMD groups take this branch together.
+      if (tid.y == 0 && tid.z == 0) {
+        constexpr int PAIR_COST = 1500;
+        constexpr int SOLO_COST = 1000;
+        \(plan)
+      }
+    """
 }
