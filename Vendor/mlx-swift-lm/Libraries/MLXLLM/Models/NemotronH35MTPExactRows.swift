@@ -392,7 +392,7 @@ private let nemotronHeadPreparedQMVSource = """
   }
 """
 
-private enum NemotronHeadPreparedActivation {
+enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
         outputNames: ["prepared"], source: nemotronHeadPrepareSource,
@@ -424,6 +424,14 @@ private enum NemotronHeadPreparedActivation {
             }
         }
         eval(outputs)
+    }
+
+    static func prepareRows(_ x: MLXArray, pv: Int) -> MLXArray {
+        let rows = x.dim(0), k = x.dim(1)
+        return prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+            grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]],
+            outputDTypes: [.float32])[0]
     }
 
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int) -> MLXArray {

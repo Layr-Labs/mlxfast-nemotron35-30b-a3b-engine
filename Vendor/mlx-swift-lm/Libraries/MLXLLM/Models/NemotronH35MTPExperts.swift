@@ -201,6 +201,46 @@ inline T nml_store(float v) {
 }
 """
 
+private let nemotronMoELeaderPreparedHeader = """
+template <typename U, int values_per_thread>
+inline U nml_prepared_vector(const device float* p, thread U* x_thread) {
+  for (int i = 0; i < values_per_thread; i++) {
+    x_thread[i] = p[i * 32];
+  }
+  return p[values_per_thread * 32];
+}
+
+template <typename U, int values_per_thread>
+inline U nml_prepared_vector_safe(const device float* p, thread U* x_thread, int N) {
+  for (int i = 0; i < N; i++) {
+    x_thread[i] = p[i * 32];
+  }
+  for (int i = N; i < values_per_thread; i++) {
+    x_thread[i] = 0;
+  }
+  return p[values_per_thread * 32];
+}
+"""
+
+private func nmlPreparedSource(_ source: String, pointers: [(String, String)]) -> String? {
+    var s = source
+    for (from, to) in pointers {
+        guard s.contains(from) else { return nil }
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    for (from, to) in [
+        ("nml_load_vector_safe<T, U, values_per_thread>(", "nml_prepared_vector_safe<U, values_per_thread>("),
+        ("nml_load_vector<T, U, values_per_thread>(", "nml_prepared_vector<U, values_per_thread>("),
+        ("x0 += block_size;", "x0 += PSTRIDE;"),
+        ("x1 += block_size;", "x1 += PSTRIDE;"),
+    ] {
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    guard !s.contains("nml_load_vector"), !s.contains("block_size;\n"),
+          !s.contains(" x + ") else { return nil }
+    return "  constexpr int PSTRIDE = 9 * 32;\n  constexpr int PTILES = (K / 8 + 31) / 32;\n" + s
+}
+
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -350,6 +390,38 @@ private final class NemotronMoELeaderKernel: Sendable {
             outputNames: ["y"],
             source: nemotronMoELeaderSource,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+    }
+}
+
+private final class NemotronMoELeaderPreparedKernels: Sendable {
+    static let shared = NemotronMoELeaderPreparedKernels()
+    let gateUp: MLXFast.MLXFastKernel?
+    let balancedDown: MLXFast.MLXFastKernel?
+    private init() {
+        let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
+        gateUp = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
+            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ]).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0, header: header)
+        }
+        balancedDown = nmlPreparedSource(nmlBalanceWeightedSource, pointers: [
+            ("const device T* x0 = x + slot * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + slot * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + partner * K + simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + partner * (PTILES * PSTRIDE) + simd_lid;"),
+        ]).map {
+            MLXFast.metalKernel(
+                name: "nml_fc2_original_jobs_balanced_prepared",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "scores", "plan"],
+                outputNames: ["y"], source: $0, header: header,
+                ensureRowContiguous: true)
+        }
     }
 }
 
@@ -571,7 +643,20 @@ enum NemotronMoELeader {
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
-        NemotronMoELeaderKernel.shared.kernel(
+        if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
+           let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
+            let prepared = NemotronHeadPreparedActivation.prepareRows(x, pv: 8)
+            return kernel(
+                [bank.weight, bank.scales, bank.biases, prepared, inds],
+                template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
+                           ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
+                           ("RELU2", relu2)],
+                grid: (32, bank.n / 4, rows * topK),
+                threadGroup: (32, 2, 1),
+                outputShapes: [[rows * topK, bank.n]],
+                outputDTypes: [x.dtype])[0]
+        }
+        return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
@@ -581,6 +666,9 @@ enum NemotronMoELeader {
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
     }
+
+    static let preparedGateUp = true
+    static let preparedBalancedDown = true
 
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
@@ -813,6 +901,14 @@ private final class NMLBalanceWeighted: Sendable {
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
              _ bank: NemotronMoELeader.Bank) -> MLXArray {
         let plan = NMLBalancePlan.shared.make(ids)
+        if NemotronMoELeader.preparedBalancedDown, bank.k % 64 == 0, bank.k % 512 != 0,
+           let prepared = NemotronMoELeaderPreparedKernels.shared.balancedDown {
+            let packed = NemotronHeadPreparedActivation.prepareRows(x, pv: 8)
+            return prepared([bank.weight,bank.scales,bank.biases,packed,ids,scores,plan],
+                template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
+                grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+                outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
+        }
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
