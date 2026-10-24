@@ -20,20 +20,23 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
-    private var entries: [Entry?] = [nil, nil, nil, nil]
+    /// Slot = usesPrepared + 2 * parts + 4 * row-mask map; every slot is its
+    /// own compiled graph.
+    private var entries: [Entry?] = Array(repeating: nil, count: 8)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
     var callCount: Int { lock.withLock { calls } }
 
-    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, owner: NemotronHMoE) -> MLXArray {
-        let result = outputs(x, prepared: prepared, parts: false, owner: owner)
+    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, sourceRows: MLXArray? = nil,
+                        owner: NemotronHMoE) -> MLXArray {
+        let result = outputs(x, prepared: prepared, sourceRows: sourceRows, parts: false, owner: owner)
         return result.isEmpty ? MLXArray(0) : result[0]
     }
 
     /// parts: [routed, shared] before their Add (owner must have shared experts).
-    func outputs(_ x: MLXArray, prepared: MLXArray?, parts: Bool,
+    /// sourceRows: the verify row-mask map (`CBv2MTPRowMask`), a graph input.
+    func outputs(_ x: MLXArray, prepared: MLXArray?, sourceRows: MLXArray? = nil, parts: Bool,
                  owner: NemotronHMoE) -> [MLXArray] {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
@@ -44,7 +47,8 @@ final class NemotronH35MTPGraphCache {
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
-        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
+        let usesSourceRows = sourceRows != nil
+        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0) + (usesSourceRows ? 4 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -53,7 +57,8 @@ final class NemotronH35MTPGraphCache {
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 return owner.mtpForwardRowsUncompiledOutputs(arrays[0],
-                    prepared: usesPrepared ? arrays[1] : nil, parts: parts)
+                    prepared: usesPrepared ? arrays[1] : nil,
+                    sourceRows: usesSourceRows ? arrays[usesPrepared ? 2 : 1] : nil, parts: parts)
             }
             let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
             retired = entries[slot]
@@ -63,7 +68,8 @@ final class NemotronH35MTPGraphCache {
         }
         // Destroy retired compiler entries outside this helper's lock; compiler
         // evaluation owns a separate global/per-function lock ordering.
-        return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
+        let inputs = [x] + (prepared.map { [$0] } ?? []) + (sourceRows.map { [$0] } ?? [])
+        return withExtendedLifetime(retired) { current.function(inputs) }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
@@ -89,12 +95,22 @@ final class NemotronH35MTPGraphCache {
 }
 
 extension NemotronHMoE {
+    /// The verify row-mask map, only while the engine builds a matching
+    /// verify graph (CBv2MTPRowMask).
+    private func verifySourceRows(_ x: MLXArray) -> MLXArray? {
+        CBv2MTPRowMask.active.flatMap { rows in
+            x.ndim == 3 && rows.shape == [x.dim(1)] ? rows : nil
+        }
+    }
+
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
+        let sourceRows = verifySourceRows(x)
         if NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
             x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) {
-            return mtpCompiledRowsCache(x, prepared: prepared, owner: self)
+            return mtpCompiledRowsCache(x, prepared: prepared, sourceRows: sourceRows, owner: self)
         }
-        return mtpForwardRowsUncompiled(x, prepared: prepared)
+        return mtpForwardRowsUncompiledOutputs(
+            x, prepared: prepared, sourceRows: sourceRows, parts: false)[0]
     }
 
     /// Captured-verify join only: (routed, shared) before `routed + shared`,
@@ -103,9 +119,12 @@ extension NemotronHMoE {
     func mtpForwardRowsParts(_ x: MLXArray, prepared: MLXArray? = nil) -> (MLXArray, MLXArray)? {
         guard sharedExperts != nil, NemotronMTPExecution.batchedM1,
               x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) else { return nil }
+        let sourceRows = verifySourceRows(x)
         let outputs = NemotronMTPExecution.compiledMoE
-            ? mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true, owner: self)
-            : mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: true)
+            ? mtpCompiledRowsCache.outputs(
+                x, prepared: prepared, sourceRows: sourceRows, parts: true, owner: self)
+            : mtpForwardRowsUncompiledOutputs(
+                x, prepared: prepared, sourceRows: sourceRows, parts: true)
         return outputs.count == 2 ? (outputs[0], outputs[1]) : nil
     }
 
@@ -116,7 +135,7 @@ extension NemotronHMoE {
     /// [routed + shared], or [routed, shared] when `parts` (shared experts
     /// present, batched M=1 route).
     func mtpForwardRowsUncompiledOutputs(
-        _ x: MLXArray, prepared: MLXArray?, parts: Bool
+        _ x: MLXArray, prepared: MLXArray?, sourceRows: MLXArray? = nil, parts: Bool
     ) -> [MLXArray] {
         guard NemotronMTPExecution.batchedM1 else { return [nemotronMTPMapRows(x) { self($0) }] }
         let packed: MLXArray?
@@ -134,7 +153,7 @@ extension NemotronHMoE {
         let indices: MLXArray
         let scores: MLXArray
         if NemotronMTPExecution.batchedRouter {
-            let routed = gate.mtpForwardRows(x)
+            let routed = gate.mtpForwardRows(x, sourceRows: sourceRows)
             indices = routed.0
             scores = routed.1
         } else {
@@ -144,7 +163,7 @@ extension NemotronHMoE {
         }
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed) {
+            x, indices, scores, switchMLP, prepared: packed, sourceRows: sourceRows) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
@@ -727,7 +746,8 @@ enum NemotronMoELeader {
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil
+        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil,
+        sourceRows: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -747,6 +767,25 @@ enum NemotronMoELeader {
         let rows = x.dim(1)
         let flat = indices.reshaped(rows * 6)
         let xr = x.reshaped(rows, 2688)
+        // The acceptance packet already clamps to this current-call prefix.
+        // Inactive suffix rows cannot be committed or influence earlier rows.
+        // Exclude their routed jobs instead of merely reusing row-zero IDs.
+        if rows == 3, let sourceRows,
+           var masked = NMLMaskedVerifyRouted.shared.run(
+                xr, flat, scores.reshaped(rows * 6), sourceRows,
+                prepared: prepared, up: up, down: down) {
+            if selfTest {
+                let original = mlp(x, indices)
+                let expected = (original * scores[.ellipsis, .newAxis])
+                    .sum(axis: -2).asType(original.dtype)
+                let active = sourceRows.reshaped(1, rows, 1)
+                    .== MLXArray([Int32(0), 1, 2]).reshaped(1, rows, 1)
+                let checked = which(active, expected, MLXArray.zeros(expected.shape, dtype: expected.dtype))
+                let ok = (masked.view(dtype: .uint16) .== checked.view(dtype: .uint16)).all()
+                masked = which(ok, masked, MLXArray(Float.nan).asType(masked.dtype))
+            }
+            return masked
+        }
         let act: MLXArray
         if fuseRelu2 {
             act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
@@ -832,6 +871,15 @@ enum NemotronMoELeader {
                     down.weight.shape == [128, 2688, 232] {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down))
+                    if rows == 3 {
+                        let maps: [[Int32]] = [[0, 1, 2], [0, 1, 0], [0, 0, 0]]
+                        for map in maps {
+                            if let masked = NMLMaskedVerifyRouted.shared.run(
+                                x, inds, scores, MLXArray(map), prepared: nil, up: up, down: down) {
+                                outputs.append(masked)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -961,5 +1009,140 @@ private final class NMLBalanceWeighted: Sendable {
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
+    }
+}
+
+/// Current verify-prefix specialization. Original unmasked sources remain
+/// intact; derivatives change job ownership and inactive stores only. The
+/// caller admits the exact native R3 banks before reaching this helper.
+private final class NMLMaskedVerifyRouted: Sendable {
+    static let shared = NMLMaskedVerifyRouted()
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_PREFIX_SKIP"] != "0"
+
+    private let rawUp: MLXFast.MLXFastKernel?
+    private let preparedUp: MLXFast.MLXFastKernel?
+    private let plan: MLXFast.MLXFastKernel?
+    private let weighted: MLXFast.MLXFastKernel?
+
+    /// A source drift disables this specialization instead of silently
+    /// retaining only part of the ownership change.
+    private static func replacing(_ source: String, _ edits: [(String, String)]) -> String? {
+        var value = source
+        for (before, after) in edits {
+            guard value.contains(before) else { return nil }
+            value = value.replacingOccurrences(of: before, with: after)
+        }
+        return value
+    }
+
+    private init() {
+        let header = nemotronMoELeaderHeader + nemotronMoELeaderStore
+        let upSource = Self.replacing(nemotronMoELeaderSource, [
+            ("  const int row = slot / TOPK;\n", """
+              const int row = slot / TOPK;
+              if (sourceRows[row] != row) {
+                const int out_row = tid.y * (2 * results_per_simdgroup)
+                    + simd_gid * results_per_simdgroup;
+                if (simd_lid == 0) {
+                  for (int r = 0; r < results_per_simdgroup; r++) {
+                    y[slot * N + out_row + r] = static_cast<T>(0);
+                  }
+                }
+                return;
+              }
+
+            """),
+            ("before += inds[r * TOPK + j] == expert ? 1 : 0;",
+             "before += (sourceRows[r] == r && inds[r * TOPK + j] == expert) ? 1 : 0;"),
+            ("if (inds[r * TOPK + j] == expert) {",
+             "if (sourceRows[r] == r && inds[r * TOPK + j] == expert) {"),
+        ])
+        rawUp = upSource.map {
+            MLXFast.metalKernel(name: "nml_prefix_r3_up",
+                inputNames: ["w", "scales", "biases", "x", "inds", "sourceRows"],
+                outputNames: ["y"], source: $0, header: header)
+        }
+        preparedUp = upSource.flatMap {
+            nmlPreparedSource($0, pointers: [
+                ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+                 "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+                ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+                 "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ])
+        }.map {
+            MLXFast.metalKernel(name: "nml_prefix_r3_up_prepared",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "sourceRows"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoELeaderPreparedHeader)
+        }
+        plan = Self.replacing(nmlBalancePlanSource, [
+            ("before += ids[r*6+j] == expert ? 1 : 0;",
+             "before += (sourceRows[r] == r && ids[r*6+j] == expert) ? 1 : 0;"),
+            ("if (ids[r*6+j] == expert) { partner = r*6+j; }",
+             "if (sourceRows[r] == r && ids[r*6+j] == expert) { partner = r*6+j; }"),
+            ("lead[slot] = (before & 1) != 0 ? -2 : partner;",
+             "lead[slot] = (sourceRows[row] != row || (before & 1) != 0) ? -2 : partner;"),
+        ]).map {
+            MLXFast.metalKernel(name: "nml_prefix_r3_fc2_plan",
+                inputNames: ["inds", "sourceRows"], outputNames: ["plan"], source: $0)
+        }
+        weighted = Self.replacing(nmlBalanceWeightedSource, [
+            ("      const int base = simd_gid * TOPK * results_per_simdgroup + r;", """
+                  // Inactive products have no producer. Do not read them.
+                  // Every SIMD group has already reached the original barrier.
+                  if (sourceRows[simd_gid] != int(simd_gid)) {
+                    y[simd_gid * N + out_row + r] = static_cast<T>(0);
+                    continue;
+                  }
+                  const int base = simd_gid * TOPK * results_per_simdgroup + r;
+            """),
+        ]).map {
+            MLXFast.metalKernel(name: "nml_prefix_r3_fc2_balanced",
+                inputNames: ["w", "scales", "biases", "x", "inds", "scores", "plan", "sourceRows"],
+                outputNames: ["y"], source: $0, header: header, ensureRowContiguous: true)
+        }
+    }
+
+    func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
+             _ sourceRows: MLXArray, prepared: MLXArray?,
+             up: NemotronMoELeader.Bank, down: NemotronMoELeader.Bank) -> MLXArray? {
+        guard Self.enabled, x.shape == [3, 2688], x.dtype == .bfloat16,
+              up.k == 2688, up.n == 1856, down.k == 1856, down.n == 2688,
+              up.weight.shape == [128, 1856, 336], down.weight.shape == [128, 2688, 232],
+              ids.shape == [18], ids.dtype == .uint32,
+              scores.shape == [18], scores.dtype == .float32,
+              sourceRows.shape == [3], sourceRows.dtype == .int32,
+              let rawUp, let plan, let weighted else { return nil }
+        let rps = NemotronMoELeader.leaderResultsPerSimdgroup(rows: 3)
+        let upTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", x.dtype), ("R", 3), ("TOPK", 6), ("K", up.k), ("N", up.n),
+            ("XSLOT", false), ("RELU2", NemotronMoELeader.fuseRelu2), ("RPS", rps),
+        ]
+        let h: MLXArray
+        if NemotronMoELeader.preparedGateUp, let preparedUp {
+            let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: up.k)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+            h = preparedUp([up.weight, up.scales, up.biases, packed, ids, sourceRows],
+                template: upTemplate, grid: (32, up.n / rps, 18),
+                threadGroup: (32, 2, 1), outputShapes: [[18, up.n]], outputDTypes: [x.dtype])[0]
+        } else {
+            h = rawUp([up.weight, up.scales, up.biases, x, ids, sourceRows],
+                template: upTemplate, grid: (32, up.n / rps, 18),
+                threadGroup: (32, 2, 1), outputShapes: [[18, up.n]], outputDTypes: [x.dtype])[0]
+        }
+        let activation: MLXArray
+        if NemotronMoELeader.fuseRelu2 { activation = h }
+        else {
+            let a = maximum(h, MLXArray(0))
+            activation = a * a
+        }
+        let jobs = plan([ids, sourceRows], template: [("PAIR_COST", 1500), ("SOLO_COST", 1000)],
+            grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[36]], outputDTypes: [.int32])[0]
+        return weighted([down.weight, down.scales, down.biases, activation, ids, scores, jobs, sourceRows],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6), ("K", down.k), ("N", down.n)],
+            grid: (32 * (down.n / 4), 6, 1), threadGroup: (32, 6, 1),
+            outputShapes: [[1, 3, down.n]], outputDTypes: [x.dtype])[0]
     }
 }

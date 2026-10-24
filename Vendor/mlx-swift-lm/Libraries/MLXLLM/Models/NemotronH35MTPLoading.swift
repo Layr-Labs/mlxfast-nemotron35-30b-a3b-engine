@@ -70,21 +70,25 @@ extension NemotronH35MTPAssistant {
             scaled.contains(path) ? base.perLayerQuantization?.quantization(layer: "mtp." + path)?.asTuple : nil
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
-        eval(assistant.module)
-        assistant.prepareDraftHeadScreen()
-        target.warmMTPSSMKernels(
-            activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
-        // Load-time JIT of the exact verify kernels (kernel agent hook).
-        NemotronMoELeader.warm(target)
-        NemotronMTPRouterRows.warm(target)
-        NemotronMultiRowQMV.warmNarrow()
-        NemotronMultiRowQMV.verifyAttentionOutputAdding(
-            (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
-        NemotronMTPAttentionDirect.warm(target)
-        // The general pass replaces one synthetic post-verify warm-up with
-        // its real captured rows, then warms only the remaining widths.
-        // Keep last: it ends with Memory.clearCache().
-        assistant.warmUpExactShapes()
+        // Same work and load-time boundary; only the execution thread changes.
+        // Native compile traces are thread-local and must survive engine creation.
+        assistant.cbv2EngineThread.sync {
+            eval(assistant.module)
+            assistant.prepareDraftHeadScreen()
+            target.warmMTPSSMKernels(
+                activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
+            // Load-time JIT of the exact verify kernels (kernel agent hook).
+            NemotronMoELeader.warm(target)
+            NemotronMTPRouterRows.warm(target)
+            NemotronMultiRowQMV.warmNarrow()
+            NemotronMultiRowQMV.verifyAttentionOutputAdding(
+                (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
+            NemotronMTPAttentionDirect.warm(target)
+            // The general pass replaces one synthetic post-verify warm-up with
+            // its real captured rows, then warms only the remaining widths.
+            // Keep last: it ends with Memory.clearCache().
+            assistant.warmUpExactShapes()
+        }
         return assistant
     }
 }
@@ -95,9 +99,9 @@ extension NemotronH35MTPAssistant {
 // trace of every MoE layer's verify graph per row count, and pipeline-state
 // creation. Everything here runs on THROWAWAY state: a private contiguous KV
 // backend + layer caches, a private recurrent request state and a private
-// assistant request state, all released before returning. Only process-wide
-// caches keyed by graph/shape are populated (kernel libraries, pipelines,
-// compiled graphs), and those produce the same arithmetic whoever fills them.
+// assistant request state, all released before returning. Kernel libraries and
+// pipelines are process-wide; native compile graphs are thread-local. Run on
+// the assistant's engine thread so both kinds of cache are available to decode.
 // The allocator's free-buffer cache is then dropped (Memory.clearCache()).
 extension NemotronH35MTPAssistant {
     func warmUpExactShapes() {
@@ -232,6 +236,13 @@ extension NemotronH35MTPAssistant {
                 hidden = result.hidden
             }
             let draftIDs = stacked(draftRows, axis: 1)
+            // Row-mask path (CBv2MTPRowMask): build the gate the drafts
+            // proposed and the source-row router / compiled MoE variants. The
+            // identity map leaves warm-up values unchanged.
+            let maskGate = CBv2MTPRowMask.takePending()
+            if let maskGate { eval(maskGate.sourceRows, maskGate.limit) }
+            let warmSourceRows = k == 2 && maskGate != nil
+                ? MLXArray([Int32(0), Int32(1), Int32(2)]) : nil
             for row in storageRows { row.beginSpeculativeWrite() }
             for cache in layerCaches {
                 cache.mtpSerializesRectangularAttention = true
@@ -239,8 +250,10 @@ extension NemotronH35MTPAssistant {
             }
             let window = concatenated([seed] + drafts, axis: 1)
             let evaluation = try recurrent.bind()
+            CBv2MTPRowMask.setActive(warmSourceRows)
             let verify = target.cbv2ForwardWithHiddenCaptured(
                 window, caches: caches, recurrentState: [evaluation], positionIds: nil)
+            CBv2MTPRowMask.setActive(nil)
             for cache in layerCaches {
                 cache.mtpSerializesRectangularAttention = false
                 cache.mtpBatchesRectangularAttention = false

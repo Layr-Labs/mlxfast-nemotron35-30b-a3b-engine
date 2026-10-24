@@ -603,9 +603,9 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
 // MARK: - EngineLoopV2
 
 /// The engine thread. All scheduler and MLX mutations happen on
-/// `engineQueue` (serial, self-rescheduling — the EngineCore idiom that
-/// keeps the GPU pipeline full with only GCD dispatch overhead between
-/// steps). Cross-thread surface: `requestCancel`, `setPaused`, stream
+/// `engineQueue` (serial, self-rescheduling). An opted-in drafter keeps its
+/// loader warm-up and these steps on one dedicated OS thread; other drafters
+/// retain the GCD queue. Cross-thread surface: `requestCancel`, `setPaused`, stream
 /// registration, and the watchdog — all lock-protected.
 public final class EngineLoopV2: @unchecked Sendable {
     let scheduler: SchedulerV2
@@ -630,8 +630,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     /// User-interactive: the step thread wakes from each round's readback and
     /// builds the next round while the GPU waits on it.
-    private let engineQueue = DispatchQueue(
-        label: "com.eigen.cbv2.engine", qos: .userInteractive)
+    private let engineQueue: CBv2EngineExecutor
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
@@ -901,6 +900,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.nominalFullKVBytesPerToken =
             nominalFullKVBytesPerToken ?? resolvedPrefixCapability.fullKVBytesPerToken
         self.mtp = mtp
+        self.engineQueue = CBv2EngineExecutor(
+            pinned: (mtp?.drafter as? any CBv2EngineThreadProviding)?.cbv2EngineThread)
         self.config = config
         self.gauges = gauges
         // MTP: the scheduler consults the loop for 1+k decode assignments.

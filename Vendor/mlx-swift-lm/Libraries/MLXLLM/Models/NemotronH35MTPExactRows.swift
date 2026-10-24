@@ -486,17 +486,25 @@ enum NemotronHeadPreparedActivation {
 
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
                       prepared: MLXArray? = nil) -> MLXArray {
-        let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        let rows = x.dim(0), k = x.dim(1)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
             ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+        return projectPrepared(packed, q, rows: rows, k: k, dtype: x.dtype, relu2: relu2, rps: rps)
+    }
+
+    /// Same prepared QMV, without requiring an unused dense activation input.
+    static func projectPrepared(_ prepared: MLXArray, _ q: QuantizedLinear,
+                                rows: Int, k: Int, dtype: DType, relu2: Bool, rps: Int) -> MLXArray {
+        precondition(compatible(prepared, rows: rows, k: k) != nil)
+        let n = q.weight.dim(0)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed, args.0, args.1],
-            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
+        return project([q.weight, q.scales, q.biases!, prepared, args.0, args.1],
+            template: [("T", dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
             grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+            outputShapes: [[rows, n]], outputDTypes: [dtype])[0]
     }
 }
 
@@ -1404,6 +1412,67 @@ enum NemotronHeadScreen {
       }
     """
 
+    // The screen already holds each chunk's exact BF16 survivor logits in
+    // cval and computes their maximum. Reuse that same SIMD group for the
+    // chunk's stable softmax mass instead of launching max/logSumExp/exp
+    // graphs over all survivors. The original score/rescore and argmax
+    // statements are byte-for-byte retained in this derived source.
+    private static func selectConfidenceSource() -> String {
+        let store = """
+            if (lane == 0) {
+              best_val[chunk] = mv;
+              best_id[chunk] = mi;
+            }
+        """
+        let replacement = """
+            float mass = 0.0f;
+            for (int s2 = lane; s2 < C; s2 += 32) {
+              mass += exp(cval[s2] - mv);
+            }
+            mass = simd_sum(mass);
+            if (lane == 0) {
+              best_val[chunk] = mv;
+              best_id[chunk] = mi;
+              best_mass[chunk] = mass;
+            }
+        """
+        precondition(selectSource.components(separatedBy: store).count == 2)
+        return selectSource.replacingOccurrences(of: store, with: replacement)
+    }
+
+    // Keep the original id reduction, then combine stable per-chunk masses.
+    // Confidence is a draft scheduling heuristic, not a target probability:
+    // reciprocal(sum(exp(v - globalMax))) has a different FP32 reduction
+    // tree from MLX logSumExp. Boundary mask choices may differ. Both paths
+    // preserve the exact draft id and the target-confirmed prefix invariant.
+    private static let finalConfidenceSource = finalSource + "\n" + """
+      float mass = 0.0f;
+      for (int c = lane; c < NCH; c += 32) {
+        mass += best_mass[c] * exp(best_val[c] - mv);
+      }
+      mass = simd_sum(mass);
+      if (lane == 0) {
+        confidence[0] = isfinite(mv) && mass > 0.0f && isfinite(mass)
+            ? 1.0f / mass : NAN;
+      }
+    """
+
+    // On the second draft, its current first-draft confidence is an
+    // explicit input. Emit the row map and accept limit from this existing
+    // final launch, avoiding a separate policy gate dispatch.
+    private static let finalMaskGateSource = finalConfidenceSource + "\n" + """
+      if (lane == 0) {
+        const float probability = isfinite(mv) && mass > 0.0f && isfinite(mass)
+            ? 1.0f / mass : NAN;
+        const int keep1 = !(first_confidence[0] < thresholds[0]);
+        const int keep2 = keep1 && !(first_confidence[0] * probability < thresholds[1]);
+        source_rows[0] = 0;
+        source_rows[1] = keep1;
+        source_rows[2] = 2 * keep2;
+        accept_limit[0] = keep1 + keep2;
+      }
+    """
+
     private static let partialKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_partial_affine4_gs64",
         inputNames: ["w", "scales", "biases", "x", "groups"],
@@ -1417,7 +1486,26 @@ enum NemotronHeadScreen {
         name: "nemotron_head_screen_final",
         inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
 
+    private static let selectConfidenceKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_select_confidence_affine4_gs64",
+        inputNames: ["scores", "w", "scales", "biases", "x"],
+        outputNames: ["cand_ids", "cand_vals", "best_val", "best_id", "best_mass"],
+        source: selectConfidenceSource(), header: nemotronMultiRowQMVHeader)
+    private static let finalConfidenceKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_final_confidence",
+        inputNames: ["best_val", "best_id", "best_mass"],
+        outputNames: ["out", "confidence"], source: finalConfidenceSource)
+
+    private static let finalMaskGateKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_final_confidence_mask_gate",
+        inputNames: ["best_val", "best_id", "best_mass", "first_confidence", "thresholds"],
+        outputNames: ["out", "confidence", "source_rows", "accept_limit"],
+        source: finalMaskGateSource)
+
     struct Result {
+        let sourceRows: MLXArray?
+        let acceptLimit: MLXArray?
+        let confidence: MLXArray?
         let id: MLXArray
         let scores: MLXArray
         let candidateIds: MLXArray
@@ -1428,7 +1516,9 @@ enum NemotronHeadScreen {
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2,
+        collectConfidence: Bool = false,
+        firstConfidence: MLXArray? = nil, maskThresholds: MLXArray? = nil
     ) -> Result {
         let scores = partialKernel(
             [weight, scales, biases, hidden, groups],
@@ -1438,16 +1528,51 @@ enum NemotronHeadScreen {
             outputShapes: [[rows]], outputDTypes: [.float32])[0]
         let chunks = rows / chunk
         let selectGroups = 8
-        let picked = selectKernel(
+        let picked = (collectConfidence ? selectConfidenceKernel : selectKernel)(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
-            outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
-            outputDTypes: [.int32, .float32, .float32, .int32])
-        let id = finalKernel(
-            [picked[2], picked[3]], template: [("NCH", chunks)],
-            grid: (32, 1, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.int32])[0]
-        return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+            outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]]
+                + (collectConfidence ? [[chunks]] : []),
+            outputDTypes: [.int32, .float32, .float32, .int32]
+                + (collectConfidence ? [.float32] : []))
+        let id: MLXArray
+        let confidence: MLXArray?
+        let sourceRows: MLXArray?
+        let acceptLimit: MLXArray?
+        if collectConfidence, let firstConfidence, let maskThresholds,
+           firstConfidence.size == 1, firstConfidence.dtype == .float32,
+           maskThresholds.shape == [2], maskThresholds.dtype == .float32 {
+            let result = finalMaskGateKernel(
+                [picked[2], picked[3], picked[4], firstConfidence.reshaped([1]), maskThresholds],
+                template: [("NCH", chunks)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[1], [1], [3], [1]],
+                outputDTypes: [.int32, .float32, .int32, .int32])
+            id = result[0]
+            confidence = result[1]
+            sourceRows = result[2]
+            acceptLimit = result[3]
+        } else if collectConfidence {
+            let result = finalConfidenceKernel(
+                [picked[2], picked[3], picked[4]], template: [("NCH", chunks)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[1], [1]], outputDTypes: [.int32, .float32])
+            id = result[0]
+            confidence = result[1]
+            sourceRows = nil
+            acceptLimit = nil
+        } else {
+            id = finalKernel(
+                [picked[2], picked[3]], template: [("NCH", chunks)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32])[0]
+            confidence = nil
+            sourceRows = nil
+            acceptLimit = nil
+        }
+        return Result(sourceRows: sourceRows, acceptLimit: acceptLimit,
+                      confidence: confidence, id: id, scores: scores,
+                      candidateIds: picked[0], candidateValues: picked[1])
     }
 }

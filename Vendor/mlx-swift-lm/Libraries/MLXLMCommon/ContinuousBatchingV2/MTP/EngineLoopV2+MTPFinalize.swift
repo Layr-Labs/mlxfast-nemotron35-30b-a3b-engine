@@ -61,8 +61,9 @@ extension EngineLoopV2 {
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
-        // finalize adds up to three syncs to the step's one (seed policy
-        // margin above, acceptance packet, verify policy margin). Serial
+        // finalize adds up to two syncs to the step's one (seed policy
+        // margin above and acceptance packet, including verify policy bits).
+        // The diagnostic fallback reads verify policy separately. Serial
         // target verification adds one blocking eval per column at launch
         // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
@@ -70,8 +71,15 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
-        if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        let policyTopTwoHost: [Float]?
+        if CBv2MTPPolicyPacket.enabled {
+            policyTopTwoHost = verify.policyTopTwoValues.map { values in
+                host.suffix(values.size).map { Float(bitPattern: UInt32(bitPattern: $0)) }
+            }
+        } else {
+            policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+            if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -115,6 +123,11 @@ extension EngineLoopV2 {
 
             var accepted = 0
             while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            // Masked verify rows computed with other rows' experts: never
+            // accept past them (CBv2MTPRowMask).
+            if let offset = verify.acceptLimitOffset {
+                accepted = min(accepted, max(0, Int(host[offset + batchIndex])))
+            }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,

@@ -16,6 +16,46 @@
 import Foundation
 import MLX
 
+// MARK: - Trailing-row masking
+
+/// Confidence-gated trailing-row masking for one depth-2, batch-1 verify.
+/// The drafter proposes a gate once both drafts exist; the engine takes it
+/// for that round only, keeps `active` set while it builds the target verify
+/// graph, and appends `limit` to the acceptance packet. A masked row selects
+/// row 0's route; prefix-aware MoE kernels can omit its routed jobs entirely.
+/// Finalize stops the accept walk at `limit`, so a masked row is never emitted
+/// or committed, and unmasked rows keep their M=1 arithmetic. Engine-thread
+/// confined; fallback MoE kernels may still compute the discarded suffix.
+public enum CBv2MTPRowMask {
+    public struct Gate {
+        /// [1 + k] int32: the row whose router gates each verify row selects from.
+        public let sourceRows: MLXArray
+        /// [1] int32: drafts the accept walk may accept (k = no mask).
+        public let limit: MLXArray
+        public init(sourceRows: MLXArray, limit: MLXArray) {
+            self.sourceRows = sourceRows
+            self.limit = limit
+        }
+    }
+
+    nonisolated(unsafe) private static var pending: Gate?
+    nonisolated(unsafe) public private(set) static var active: MLXArray?
+
+    public static func propose(_ gate: Gate) { pending = gate }
+    public static func takePending() -> Gate? {
+        defer { pending = nil }
+        return pending
+    }
+    public static func setActive(_ sourceRows: MLXArray?) { active = sourceRows }
+}
+
+/// Coalesce only host readback; target and acceptance arithmetic are retained.
+/// Set CBV2_MTP_PACK_POLICY_VALUES=0 for the separate-readback fallback.
+enum CBv2MTPPolicyPacket {
+    static let enabled =
+        ProcessInfo.processInfo.environment["CBV2_MTP_PACK_POLICY_VALUES"] != "0"
+}
+
 // MARK: - Drafter carry
 
 /// One row's drafter carry: the newest confirmed-but-unfed token (the round
@@ -87,6 +127,9 @@ final class CBv2MTPRoundInFlight {
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
         /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
         /// all [B, 1+k] shortlist probability masses in parts-per-million.
+        /// Optional per-row prefix limits follow, at `acceptLimitOffset`.
+        /// Policy values [B, 1+k, 2] are last when packing is enabled,
+        /// viewed as int32 bits without a numeric conversion.
         /// One `asArray` at finalize reads everything, preserving the single
         /// host-sync boundary.
         let acceptancePacket: MLXArray
@@ -109,6 +152,9 @@ final class CBv2MTPRoundInFlight {
         let policyTopTwoValues: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Packet index of the per-row accept limits (`CBv2MTPRowMask`), nil
+        /// when the round ran unmasked.
+        var acceptLimitOffset: Int?
 
     }
 

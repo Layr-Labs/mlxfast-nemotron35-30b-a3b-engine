@@ -301,6 +301,69 @@ enum NemotronHResidualRMSNorm {
     }
 }
 
+// MARK: - Draft embedding rows
+
+/// MTP draft-path quantized embedding: the stock `weight[ids]`,
+/// `scales[ids]`, `biases[ids]` gathers and affine_dequantize in one launch.
+/// One thread per packed byte, as affine_dequantize, and each element is its
+/// own `scale * d + bias` (T scale, T bias, uint8_t d) on the same byte,
+/// group scale and group bias, so every value is bitwise the stock graph.
+/// Indices wrap like MLX's gather (negative + V). NEMOTRON_MTP_DRAFT_EMBED=0
+/// keeps the stock gathers and dequantize.
+enum NemotronHEmbeddingRows {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_EMBED"] != "0"
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_embedding_rows_affine4_gs64",
+        inputNames: ["ids", "w", "scales", "biases"], outputNames: ["out"],
+        source: """
+            const uint b = thread_position_in_grid.x;
+            const uint t = thread_position_in_grid.y;
+            int64_t id = int64_t(ids[t]);
+            if (id < 0) {
+                id += int64_t(V);
+            }
+            const device uint8_t* row = (const device uint8_t*)w + id * int64_t(BYTES);
+            const size_t oindex = size_t(b) * 2;
+            const size_t gindex = oindex / 64;
+            T scale = scales[id * int64_t(G) + int64_t(gindex)];
+            T bias = biases[id * int64_t(G) + int64_t(gindex)];
+            device T* o = out + size_t(t) * size_t(2 * BYTES) + oindex;
+            uint val = row[b];
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 2; i++) {
+                uint8_t d;
+                d = (val >> (4 * i)) & 0x0f;
+                o[i] = scale * d + bias;
+            }
+            """, ensureRowContiguous: true)
+
+    /// tokens [1, N] int32/uint32 → [1, N, dims], or nil for any other layout.
+    static func apply(_ tokens: MLXArray, _ embedding: Embedding) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              tokens.ndim == 2, tokens.dim(0) == 1, (1...512).contains(tokens.dim(1)),
+              tokens.dtype == .int32 || tokens.dtype == .uint32,
+              type(of: embedding) == QuantizedEmbedding.self,
+              let q = embedding as? QuantizedEmbedding,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              let biases = q.biases, q.weight.dtype == .uint32, q.weight.ndim == 2,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        let vocabulary = q.weight.dim(0), words = q.weight.dim(1)
+        let dims = words * 8
+        guard dims % 64 == 0, q.scales.shape == [vocabulary, dims / 64],
+              biases.shape == q.scales.shape, (dims / 2) % 64 == 0
+        else { return nil }
+        let count = tokens.dim(1)
+        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
+            template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
+                       ("G", dims / 64)],
+            grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[1, count, dims]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
 // MARK: - MambaRMSNormGated
 
 private enum NemotronHGatedRMSKernel {
@@ -356,14 +419,14 @@ private enum NemotronHGatedRMSKernel {
         name: "nemotron_h_gated_rms",
         inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
         source: source, ensureRowContiguous: false)
-    private static func preparedSource() -> String {
+    private static func preparedSource(emitNormalized: Bool = true) -> String {
         let scratch = "threadgroup float local_inv_mean[1];"
         let store = "out[row * int64_t(x_shape[2]) + f] = weighted;"
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         return source.replacingOccurrences(of: scratch,
             with: scratch + "\nthreadgroup T rounded[512];")
-            .replacingOccurrences(of: store, with: store + "\nrounded[lid * 4 + i] = weighted;")
+            .replacingOccurrences(of: store, with: (emitNormalized ? store : "") + "\nrounded[lid * 4 + i] = weighted;")
             + """
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -388,6 +451,10 @@ private enum NemotronHGatedRMSKernel {
         name: "nemotron_h_gated_rms_prepared_output",
         inputNames: ["x", "gate", "weight", "identity", "eps"],
         outputNames: ["out", "prepared"], source: preparedSource(), ensureRowContiguous: false)
+    static let preparedOnlyKernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms_prepared_only",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["prepared"],
+        source: preparedSource(emitNormalized: false), ensureRowContiguous: false)
 
 }
 
@@ -405,6 +472,38 @@ class NemotronHRMSNormGated: Module {
 
     private static let preparedOutputEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_OUT"] != "0"
+
+    private static let preparedOnlyEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_ONLY"] != "0"
+
+    /// The prepared QMV reads only `prepared`; omit the unused dense tensor.
+    /// Diagnostic self-tests retain the original dense path and comparisons.
+    func preparedProjection(_ x: MLXArray, gate: MLXArray, projection q: QuantizedLinear)
+        -> MLXArray?
+    {
+        guard Self.preparedOnlyEnabled,
+              !NemotronMoELeader.selfTest, Self.preparedOutputEnabled,
+              NemotronMTPExecution.batchedM1, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHRMSNormGated.self,
+              groupSize == 512, x.shape == [1, 3, 4096], gate.shape == x.shape,
+              weight.shape == [4096], x.dtype == .bfloat16,
+              gate.dtype == .bfloat16, weight.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16
+        else { return nil }
+        let prepared = NemotronHGatedRMSKernel.preparedOnlyKernel(
+            [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (128 * 3 * 8, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[3, 8, 17 * 32]], outputDTypes: [.float32])[0]
+        return NemotronHeadPreparedActivation.projectPrepared(
+            prepared, q, rows: 3, k: 4096, dtype: .bfloat16, relu2: false, rps: 2)
+            .reshaped(1, 3, 2688)
+    }
 
     /// Native compact verify only. The original BF16 gate/norm/identity/weight
     /// boundaries remain; preparation reads the final rounded BF16 values.
@@ -1327,10 +1426,7 @@ enum NemotronHRouterSelection {
         }
         """
 
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_h_router_select",
-        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
-        source: """
+    private static let source = """
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             threadgroup float original[128];
@@ -1383,12 +1479,31 @@ enum NemotronHRouterSelection {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
-            """,
-        header: sigmoidHeader, ensureRowContiguous: true)
+            """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: source, header: sigmoidHeader, ensureRowContiguous: true)
+
+    /// Row-mask variant (`CBv2MTPRowMask`): output row r selects from the
+    /// gates of row source_rows[r]. The identity map is the kernel above
+    /// statement for statement; a masked row repeats row 0's selection, so it
+    /// keeps six distinct experts and adds no new expert reads.
+    private static func sourceRowsSource() -> String {
+        let read = "float(gates[row * 128 + id])"
+        precondition(source.components(separatedBy: read).count == 2)
+        return source.replacingOccurrences(
+            of: read, with: "float(gates[uint(source_rows[row]) * 128 + id])")
+    }
+    static let sourceRowsKernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select_source_rows",
+        inputNames: ["gates", "bias", "source_rows"], outputNames: ["indices", "weights"],
+        source: sourceRowsSource(), header: sigmoidHeader, ensureRowContiguous: true)
 
     static func apply(
         gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
-        routedScalingFactor: Float, normTopkProb: Bool
+        routedScalingFactor: Float, normTopkProb: Bool, sourceRows: MLXArray? = nil
     ) -> (MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             gates.ndim == 3, gates.dim(0) == 1, (1...8).contains(gates.dim(1)),
@@ -1398,9 +1513,16 @@ enum NemotronHRouterSelection {
             normTopkProb, routedScalingFactor == 2.5
         else { return nil }
         let shape = [1, gates.dim(1), 6]
-        let result = kernel(
-            [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
-            outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        let result: [MLXArray]
+        if let sourceRows, sourceRows.shape == [gates.dim(1)], sourceRows.dtype == .int32 {
+            result = sourceRowsKernel(
+                [gates, eSCB, sourceRows], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+                outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        } else {
+            result = kernel(
+                [gates, eSCB], grid: (32, gates.dim(1), 1), threadGroup: (32, 1, 1),
+                outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        }
         return (result[0], result[1])
     }
 }
@@ -1412,11 +1534,13 @@ private func groupExpertSelect(
     nGroup: Int,
     topkGroup: Int,
     routedScalingFactor: Float,
-    normTopkProb: Bool
+    normTopkProb: Bool,
+    sourceRows: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
     if let selected = NemotronHRouterSelection.apply(
         gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
-        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb) {
+        routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+        sourceRows: sourceRows) {
         return selected
     }
     let (bsz, seqLen) = (gates.dim(0), gates.dim(1))
@@ -1504,12 +1628,15 @@ class NemotronHMoEGate: Module {
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
     /// The multi-row kernel repeats the M=1 gemv per row in one launch.
-    func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+    /// sourceRows: the verify row-mask map (`CBv2MTPRowMask`); a masked row
+    /// selects row 0's experts. nil selects every row from its own gates.
+    func mtpForwardRows(_ x: MLXArray, sourceRows: MLXArray? = nil) -> (MLXArray, MLXArray) {
         let gates = NemotronMTPRouterRows.gates(x, weight)
             ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
-            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb,
+            sourceRows: sourceRows)
     }
 }
 
@@ -3777,7 +3904,13 @@ public class NemotronHModel:
         return backbone.embeddings.asLinear(hidden)
     }
 
-    func mtpEmbedding(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }
+    func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {
+        guard let rows = NemotronHEmbeddingRows.apply(tokens, backbone.embeddings) else {
+            return backbone.embeddings(tokens)
+        }
+        guard NemotronMoELeader.selfTest else { return rows }
+        return nemotronBitwiseOrNaN(rows, backbone.embeddings(tokens))
+    }
 
     func mtpShortlistLogits(_ hidden: MLXArray, ids: MLXArray) -> MLXArray {
         if let head = lmHead {
