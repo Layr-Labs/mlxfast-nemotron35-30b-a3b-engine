@@ -122,7 +122,15 @@ extension NemotronHMoE {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
-        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x, prepared: packed) }
+        if let sharedExperts {
+            if NemotronMTPExecution.batchedM1, NemotronSharedExpertAdding.engaged {
+                let activated = nemotronMTPLinearRelu2Rows(x, sharedExperts.upProj, prepared: packed)
+                y = NemotronSharedExpertAdding.apply(activated, sharedExperts.downProj, routed: y)
+                    ?? y + nemotronMTPLinearRows(activated, sharedExperts.downProj)
+            } else {
+                y = y + sharedExperts.mtpForwardRows(x, prepared: packed)
+            }
+        }
         return y
     }
 }

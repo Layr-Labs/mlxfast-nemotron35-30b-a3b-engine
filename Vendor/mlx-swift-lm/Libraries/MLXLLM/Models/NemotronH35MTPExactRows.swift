@@ -496,6 +496,76 @@ enum NemotronHeadPreparedActivation {
     }
 }
 
+enum NemotronSharedExpertAdding {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MOE_SHARED_ADD_EPILOGUE"] != "0"
+    nonisolated(unsafe) private static var verified = false
+    static var engaged: Bool { verified }
+
+    private static let kernel: MLXFast.MLXFastKernel = {
+        let store = "yp[r * out_vec_size + row] = h;"
+        precondition(nemotronHeadPreparedQMVSource.components(separatedBy: store).count == 2)
+        return MLXFast.metalKernel(
+            name: "nemotron_moe_shared_down_add_prepared_affine4_gs64",
+            inputNames: ["residual", "w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y"],
+            source: nemotronHeadPreparedQMVSource.replacingOccurrences(
+                of: store,
+                with: "yp[r * out_vec_size + row] = residual[r * out_vec_size + out_row + row] + h;"),
+            header: nemotronMultiRowQMVHeader, ensureRowContiguous: true)
+    }()
+
+    static func apply(_ activated: MLXArray, _ down: Linear, routed: MLXArray) -> MLXArray? {
+        guard verified else { return nil }
+        return fused(activated, down, routed: routed)
+    }
+
+    private static func fused(_ activated: MLXArray, _ down: Linear, routed: MLXArray) -> MLXArray? {
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              activated.ndim == 3, activated.dim(0) == 1, activated.dim(1) == 3,
+              activated.dtype == .bfloat16,
+              type(of: down) == QuantizedLinear.self, let q = down as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.ndim == 2, q.weight.dtype == .uint32,
+              q.scales.dtype == .bfloat16, let offsets = q.biases,
+              offsets.dtype == .bfloat16, offsets.shape == q.scales.shape
+        else { return nil }
+        let k = activated.dim(2), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, n >= 2688, n % 4 == 0, q.weight.dim(1) * 8 == k,
+              q.scales.shape == [n, k / 64],
+              routed.shape == [1, 3, n], routed.dtype == .bfloat16
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.pack(activated.reshaped(3, k))
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(k, n)
+        let y = kernel(
+            [routed.reshaped(3, n), q.weight, q.scales, offsets, packed, kArray, nArray],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+                       ("RELU2", false), ("RPS", 2)],
+            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, n]], outputDTypes: [.bfloat16])[0]
+        guard NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(y, routed + nemotronMTPLinearRows(activated, down))
+    }
+
+    static func verify(_ model: Module) {
+        verified = false
+        guard let moe = model.modules().lazy.compactMap({ $0 as? NemotronHMoE }).first,
+              let shared = moe.sharedExperts,
+              let q = shared.downProj as? QuantizedLinear else { return }
+        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        let activated = MLX.abs(MLXRandom.normal(
+            [1, 3, k], dtype: .bfloat16, key: MLXRandom.key(0x5ead)))
+        let routed = MLXRandom.normal(
+            [1, 3, n], dtype: .bfloat16, scale: 4, key: MLXRandom.key(0x5eae))
+        guard let fusedOutput = fused(activated, shared.downProj, routed: routed) else { return }
+        let expected = routed + nemotronMTPLinearRows(activated, shared.downProj)
+        let same = fusedOutput.view(dtype: .uint16) .== expected.view(dtype: .uint16)
+        verified = same.all().item(Bool.self)
+    }
+}
+
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
