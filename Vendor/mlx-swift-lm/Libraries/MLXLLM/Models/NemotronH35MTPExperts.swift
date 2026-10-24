@@ -354,9 +354,6 @@ private final class NemotronMoELeaderKernel: Sendable {
     }
 }
 
-// Keep the accepted leader/partner QMV trace, then reduce each token's six
-// products after a shared-memory barrier. Each row has six distinct router
-// indices. Experts can repeat across rows, as in the accepted leader path.
 private let nemotronMoELeaderWeightedSource = """
   constexpr int results_per_simdgroup = 4;
   constexpr int values_per_thread = 8;
@@ -384,9 +381,12 @@ private let nemotronMoELeaderWeightedSource = """
     if ((before & 1) != 0) {
       continue;
     }
+    // Next later occurrence, not the last. Runs stay length 2: a third
+    // occurrence has an even `before` and leads again. Taking the last
+    // match drops the middle row whenever one expert is routed three times.
     int partner = -1;
-    for (int r = R - 1; r > row; r--) {
-      for (int j = 0; j < TOPK; j++) {
+    for (int r = row + 1; r < R && partner < 0; r++) {
+      for (int j = 0; j < TOPK && partner < 0; j++) {
         if (inds[r * TOPK + j] == expert) {
           partner = r * TOPK + j;
         }
@@ -583,8 +583,6 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
-    /// Same leader pairs as apply(), with separate FP32 products and the
-    /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank) -> MLXArray {
         NemotronMoELeaderWeightedKernel.shared.kernel(
@@ -597,9 +595,6 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
-    /// The router produces six distinct indices per token. Keep its original
-    /// slot order and the accepted cross-row leader pairs. Row-contiguous
-    /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
         _ mlp: NemotronHSwitchMLP
@@ -680,7 +675,6 @@ enum NemotronMoELeader {
         return y.reshaped(1, rows, topK, down.n)
     }
 
-    /// Compile every pipeline the verify window can request (R = 1...4) at load.
     static func warm(_ model: Module) {
         guard enabled else { return }
         var outputs: [MLXArray] = []

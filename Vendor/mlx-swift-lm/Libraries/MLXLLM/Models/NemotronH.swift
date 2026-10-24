@@ -45,13 +45,15 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+let nemotronFusedBoundaryNorm =
+    ProcessInfo.processInfo.environment["NEMOTRON_FUSED_BOUNDARY_NORM"] != "0"
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
     return y * y
 }
 
-// MARK: - Target residual and next block normalization
 
 enum NemotronHResidualRMSNorm {
     private static let kernel = MLXFast.metalKernel(
@@ -924,22 +926,18 @@ class NemotronHAttention: Module, NemotronHMixer {
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
-        captureMTP: Bool = false,
-        targetQKV: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(x, query: wq, key: wk, value: wv, captureMTP: captureMTP) {
-            projections = outputs
+        let (q, k, v): (MLXArray, MLXArray, MLXArray)
+        if let fused = captureMTP ? nemotronMTPQKVRows(x, wq, wk, wv) : nil {
+            (q, k, v) = fused
         } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
+            q = captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x)
+            k = captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x)
+            v = captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x)
         }
-        let (q, k, v) = projections
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
@@ -2907,7 +2905,7 @@ private class NemotronHBlock: Module {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
             output = (mixer as! NemotronHAttention).cbv2Forward(
-                hidden, cache: attentionCache, captureMTP: captureMTP, targetQKV: true)
+                hidden, cache: attentionCache, captureMTP: captureMTP)
         case .mlp:
             precondition(
                 attentionCache == nil,
@@ -3053,8 +3051,11 @@ private class NemotronHBackbone: Module {
             let next = modelLayerIndex + 1
             let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
-            let nextNorm = next < layers.count && !submitsEarly
-                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+            let fusedNorm: RMSNorm? = nemotronFusedBoundaryNorm
+                ? (next < layers.count ? layers[next].norm : normF)
+                : (next < layers.count && !submitsEarly ? layers[next].norm : nil)
+            let nextNorm = (!captureMTP || NemotronMTPExecution.batchedNorm)
+                ? fusedNorm : nil
             let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
@@ -3071,6 +3072,7 @@ private class NemotronHBackbone: Module {
                 asyncEval(hidden)
             }
         }
+        if let preparedNorm { return preparedNorm }
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")

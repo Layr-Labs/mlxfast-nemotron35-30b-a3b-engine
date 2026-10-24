@@ -61,7 +61,7 @@ func nemotronMTPSSMWindow(
     precondition(dt.shape == [1, length, heads])
     let kernel = NemotronMTPSSMKernel.kernel
     let outputs = kernel(
-        [hiddenStates, ALog, B, C, D, nemotronPrefillComputeDt(dt, dtBias, timeStepLimit), state],
+        [hiddenStates, ALog, B, C, D, computeDt(dt, dtBias, timeStepLimit), state],
         template: [("T", hiddenStates.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", length)],

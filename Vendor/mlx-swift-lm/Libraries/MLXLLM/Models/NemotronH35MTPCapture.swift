@@ -46,7 +46,7 @@ extension NemotronHMamba2Mixer {
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let dt = computeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
@@ -187,7 +187,7 @@ extension NemotronH35Model {
             let rawDt = MLXArray.zeros([1, width, heads], dtype: activationDType)
             let state = MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32)
             if nemotronMTPCompactSSM {
-                let dt = nemotronPrefillComputeDt(rawDt, mixer.dtBias, mixer.timeStepLimit)
+                let dt = computeDt(rawDt, mixer.dtBias, mixer.timeStepLimit)
                 let window = nemotronMTPSSMCompact(
                     convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
                     state: state, heads: heads, headDim: dim, groups: groups,
