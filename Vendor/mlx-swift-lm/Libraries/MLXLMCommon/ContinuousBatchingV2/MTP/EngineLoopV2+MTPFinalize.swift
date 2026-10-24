@@ -37,8 +37,10 @@ extension EngineLoopV2 {
 
         // The ordinary finalize loop has confirmed each seed row's bonus.
         if let seedHidden = round.seedHidden {
-            let seedPolicyTopTwo =
-                round.seedPolicyTopTwoValues?.asArray(Float.self)
+            // Fixed depth never consumes the adaptive margin. Keep GPU roots
+            // and top-two token IDs intact; skip only the unused host copy.
+            let seedPolicyTopTwo = mtp.config.fixedDraftTokens == nil
+                ? round.seedPolicyTopTwoValues?.asArray(Float.self) : nil
             if seedPolicyTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
@@ -62,7 +64,8 @@ extension EngineLoopV2 {
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
         // finalize adds up to three syncs to the step's one (seed policy
-        // margin above, acceptance packet, verify policy margin). Serial
+        // margin above, acceptance packet, verify policy margin). Policy
+        // margin copies are needed only when depth is adaptive. Serial
         // target verification adds one blocking eval per column at launch
         // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
@@ -70,7 +73,8 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        let policyTopTwoHost = mtp.config.fixedDraftTokens == nil
+            ? verify.policyTopTwoValues?.asArray(Float.self) : nil
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
