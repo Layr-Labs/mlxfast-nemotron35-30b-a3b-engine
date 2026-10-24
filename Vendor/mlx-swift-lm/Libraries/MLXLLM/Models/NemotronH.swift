@@ -53,6 +53,25 @@ private func relu2(_ x: MLXArray) -> MLXArray {
 
 // MARK: - Target residual and next block normalization
 
+/// Immutable scalar kernel inputs shared across layers and requests. Only the
+/// exact common bit patterns use these buffers; other configurations retain
+/// their own scalar conversion. No weights or request tensors are cached.
+enum NemotronScalarInputs {
+    nonisolated(unsafe) static let hiddenWidth = MLXArray(UInt32(2688))
+    nonisolated(unsafe) static let zero = MLXArray(Float(0))
+    nonisolated(unsafe) static let infinity = MLXArray(Float.infinity)
+    nonisolated(unsafe) static let normEpsilon = MLXArray(Float(1e-5))
+
+    static func float(_ value: Float) -> MLXArray {
+        switch value.bitPattern {
+        case Float(0).bitPattern: return zero
+        case Float.infinity.bitPattern: return infinity
+        case Float(1e-5).bitPattern: return normEpsilon
+        default: return MLXArray(value)
+        }
+    }
+}
+
 enum NemotronHResidualRMSNorm {
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_h_residual_rms_bf16",
@@ -106,7 +125,8 @@ enum NemotronHResidualRMSNorm {
             type(of: norm) == RMSNorm.self,
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
-        let result = kernel([lhs, rhs, norm.weight, UInt32(lhs.dim(2)), norm.eps],
+        let result = kernel([lhs, rhs, norm.weight, NemotronScalarInputs.hiddenWidth,
+                             NemotronScalarInputs.float(norm.eps)],
             template: [("T", DType.bfloat16)],
             grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
@@ -188,7 +208,7 @@ class NemotronHRMSNormGated: Module {
             x.dtype == .bfloat16, gate.dtype == .bfloat16, weight.dtype == .bfloat16
         {
             return NemotronHGatedRMSKernel.kernel(
-                [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+                [x, gate, weight, NemotronHGatedRMSKernel.identity, NemotronScalarInputs.float(eps)],
                 template: [("T", DType.bfloat16)],
                 grid: (128 * x.dim(1) * (x.dim(2) / 512), 1, 1),
                 threadGroup: (128, 1, 1), outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
@@ -415,7 +435,8 @@ func nemotronPrefillComputeDt(
     // Keep the native Float32 cast, bias promotion, softplus and clip order.
     // All values are dynamic inputs; no model or request state is captured.
     return nemotronCompiledPrefillDt([
-        dt, dtBias, MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)])[0]
+        dt, dtBias, NemotronScalarInputs.float(timeStepLimit.0),
+        NemotronScalarInputs.float(timeStepLimit.1)])[0]
 }
 
 /// Bitwise copy of `ssmAttn` (SSM.swift, not editable) for L > 1 with a
