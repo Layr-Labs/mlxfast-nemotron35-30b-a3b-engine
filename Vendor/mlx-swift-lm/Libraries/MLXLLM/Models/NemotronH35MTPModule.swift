@@ -78,6 +78,45 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
+        let rows = pagedAttentionInputs(hidden: hidden, embedding: embedding, cache: cache)
+        return (rows.fused + nemotronMTPLinearRows(rows.merged, mixer.wo), rows.keys, rows.values)
+    }
+
+    /// Keep full-width causal attention/KV; native rows defer only wo.
+    /// Unsupported projections retain the original full-width result.
+    func pagedAttentionForSelection(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (attention: MLXArray, merged: MLXArray?, keys: MLXArray, values: MLXArray) {
+        let rows = pagedAttentionInputs(hidden: hidden, embedding: embedding, cache: cache)
+        let length = rows.fused.dim(1)
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            NemotronMTPExecution.batchedM1, NemotronMultiRowQMV.enabled,
+            type(of: mixer) == NemotronHAttention.self,
+            type(of: mixer.wo) == QuantizedLinear.self,
+            rows.fused.shape == [1, length, 2688], rows.fused.dtype == .bfloat16,
+            rows.merged.shape == [1, length, 4096], rows.merged.dtype == .bfloat16,
+            (2...8).contains(length), let q = mixer.wo as? QuantizedLinear,
+            q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+            q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+            let biases = q.biases, biases.shape == [2688, 64], biases.dtype == .bfloat16
+        else {
+            return (rows.fused + nemotronMTPLinearRows(rows.merged, mixer.wo), nil,
+                    rows.keys, rows.values)
+        }
+        return (rows.fused, rows.merged, rows.keys, rows.values)
+    }
+
+    func finishSelectedAttentionRow(fused: MLXArray, merged: MLXArray) -> MLXArray {
+        precondition(fused.shape == [1, 1, 2688] && merged.shape == [1, 1, 4096])
+        // R1 uses the existing ordinary projection, preserving its typed
+        // output boundary before the separate residual addition.
+        return fused + nemotronMTPLinearRows(merged, mixer.wo)
+    }
+
+    private func pagedAttentionInputs(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (fused: MLXArray, merged: MLXArray, keys: MLXArray, values: MLXArray) {
         let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
@@ -91,7 +130,7 @@ final class NemotronH35MTPAttentionBlock: Module {
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+        return (fused, merged, keys, values)
     }
 }
 
@@ -226,6 +265,24 @@ final class NemotronH35MTPModule: Module {
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardRows(
             hidden: hidden, embedding: embedding, cache: cache)
+    }
+
+    func pagedAttentionForSelection(
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+    ) -> (attention: MLXArray, merged: MLXArray?, keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedAttentionForSelection(
+            hidden: hidden, embedding: embedding, cache: cache)
+    }
+
+    func finishSelectedAttentionRow(_ attention: MLXArray, merged: MLXArray?) -> MLXArray {
+        let completed: MLXArray
+        if let merged {
+            completed = (layers[0] as! NemotronH35MTPAttentionBlock).finishSelectedAttentionRow(
+                fused: attention, merged: merged)
+        } else {
+            completed = attention
+        }
+        return finishPagedAttentionRow(completed)
     }
 
     /// Same expert entry as pagedForward's ordinary one-token draft. Avoid a
