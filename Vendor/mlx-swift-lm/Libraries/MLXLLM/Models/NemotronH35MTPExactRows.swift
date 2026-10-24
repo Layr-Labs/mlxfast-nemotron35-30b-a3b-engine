@@ -393,6 +393,12 @@ private let nemotronHeadPreparedQMVSource = """
 """
 
 enum NemotronHeadPreparedActivation {
+    /// Additional width admission for the depth-three, four-row verify reserve.
+    static let fourRowsEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREPARED_R4"] != "0"
+    static func supportsRows(_ rows: Int) -> Bool {
+        rows == 3 || (fourRowsEnabled && rows == 4)
+    }
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
         outputNames: ["prepared"], source: nemotronHeadPrepareSource,
@@ -401,55 +407,63 @@ enum NemotronHeadPreparedActivation {
         name: "nemotron_head_prepared_qmv", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
         outputNames: ["y"], source: nemotronHeadPreparedQMVSource,
         header: nemotronMultiRowQMVHeader)
-    private static func rowSource() -> String {
+    private static func rowSource(rows: Int) -> String {
         let address = "x + row * K + chunk * PV"
         precondition(nemotronHeadPrepareSource.components(separatedBy: address).count == 2)
-        return "const device T* xr[3] = {x0, x1, x2};\n" +
+        let names = (0..<rows).map { "x\($0)" }.joined(separator: ", ")
+        return "const device T* xr[\(rows)] = {\(names)};\n" +
             nemotronHeadPrepareSource.replacingOccurrences(
                 of: address, with: "xr[row] + chunk * PV")
     }
     private static let prepareRows = MLXFast.metalKernel(
         name: "nemotron_prepare_activation_query_rows3",
         inputNames: ["x0", "x1", "x2"], outputNames: ["prepared"],
-        source: rowSource(), header: nemotronMultiRowQMVHeader)
+        source: rowSource(rows: 3), header: nemotronMultiRowQMVHeader)
+    private static let prepareRows4 = MLXFast.metalKernel(
+        name: "nemotron_prepare_activation_query_rows4",
+        inputNames: ["x0", "x1", "x2", "x3"], outputNames: ["prepared"],
+        source: rowSource(rows: 4), header: nemotronMultiRowQMVHeader)
 
     /// Feed the winner's prepared projection directly from the serialized
     /// SDPA rows. Same preparation arithmetic; only the source address moves.
     static func applyRows(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray {
-        precondition(rows.count == 3)
+        precondition(supportsRows(rows.count))
         let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
-        let packed = prepareRows(rows,
+        let producer = rows.count == 3 ? prepareRows : prepareRows4
+        let packed = producer(rows,
             template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
-            grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+            grid: (k / pv, rows.count, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[rows.count, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         return project([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
-            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+            template: [("T", DType.bfloat16), ("R", rows.count), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
+            outputShapes: [[rows.count, n]], outputDTypes: [.bfloat16])[0]
     }
     // JIT each actual prepare K specialization and the two exact QMV
     // epilogues before timed verification. N is a scalar, so eight rows of
     // dummy weights cover the same project pipelines as the full matrices.
     static func warm() {
         var outputs: [MLXArray] = []
-        for k in [2688, 3712, 4096, 5376] {
-            let pv = k % 512 == 0 ? 16 : 8
-            let x = MLXArray.zeros([3, k], dtype: .bfloat16)
-            let w = MLXArray.zeros([8, k / 8], dtype: .uint32)
-            let s = MLXArray.zeros([8, k / 64], dtype: .bfloat16)
-            let packed = prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
-                grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
-                outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
-            let args = NemotronMultiRowQMV.scalarPair(k, 8)
-            for relu2 in [false, true] {
-                outputs.append(project([w, s, s, packed[0], args.0, args.1],
-                    template: [("T", x.dtype), ("R", 3), ("FAST", k % 512 == 0),
-                               ("RELU2", relu2), ("RPS", 2)],
-                    grid: (32, 4, 1), threadGroup: (32, 2, 1),
-                    outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
+        for rows in [3, 4] where supportsRows(rows) {
+            for k in [2688, 3712, 4096, 5376] {
+                let pv = k % 512 == 0 ? 16 : 8
+                let x = MLXArray.zeros([rows, k], dtype: .bfloat16)
+                let w = MLXArray.zeros([8, k / 8], dtype: .uint32)
+                let s = MLXArray.zeros([8, k / 64], dtype: .bfloat16)
+                let packed = prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+                    grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
+                    outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+                let args = NemotronMultiRowQMV.scalarPair(k, 8)
+                for relu2 in [false, true] {
+                    outputs.append(project([w, s, s, packed[0], args.0, args.1],
+                        template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
+                                   ("RELU2", relu2), ("RPS", 2)],
+                        grid: (32, 4, 1), threadGroup: (32, 2, 1),
+                        outputShapes: [[rows, 8]], outputDTypes: [x.dtype])[0])
+                }
             }
         }
         eval(outputs)
@@ -659,7 +673,7 @@ enum NemotronMultiRowQMV {
         let k = x.dim(1), n = q.weight.dim(0)
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
-        if narrowEnabled && x.dim(0) == 3 && n >= 2688 {
+        if narrowEnabled && NemotronHeadPreparedActivation.supportsRows(x.dim(0)) && n >= 2688 {
             let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2,
                 rps: 2, prepared: prepared)
             guard NemotronMoELeader.selfTest else { return y }
@@ -756,7 +770,8 @@ enum NemotronMultiRowQMVRowInputs {
               q.scales.dtype == .bfloat16, biases.dtype == .bfloat16,
               rows.allSatisfy({ $0.dtype == .bfloat16 && $0.size == k })
         else { return nil }
-        if NemotronMultiRowQMV.narrowEnabled, rows.count == 3, n >= 2688 {
+        if NemotronMultiRowQMV.narrowEnabled,
+           NemotronHeadPreparedActivation.supportsRows(rows.count), n >= 2688 {
             return NemotronHeadPreparedActivation.applyRows(rows, q)
         }
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(k, n)
@@ -1121,7 +1136,8 @@ enum NemotronTargetQKV {
               let v = buffers(value, rows: 256)
         else { return nil }
         let rps = resultsPerSimdgroup(rows: x.dim(1))
-        let prepared = preparedEnabled && rps == 2 && x.dim(1) == 3
+        let prepared = preparedEnabled && rps == 2
+            && NemotronHeadPreparedActivation.supportsRows(x.dim(1))
         var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared)
         if rps != 4, NemotronMoELeader.selfTest {
             let expected = dispatch(q + k + v, x, rps: 4)
@@ -1141,8 +1157,10 @@ enum NemotronTargetQKV {
             dispatch(weights, MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), rps: 2)
         }
         if preparedEnabled {
-            outputs += dispatch(weights, MLXArray.zeros([1, 3, 2688], dtype: .bfloat16),
-                                rps: 2, prepared: true)
+            for rows in [3, 4] where NemotronHeadPreparedActivation.supportsRows(rows) {
+                outputs += dispatch(weights, MLXArray.zeros([1, rows, 2688], dtype: .bfloat16),
+                                    rps: 2, prepared: true)
+            }
         }
         return outputs
     }
@@ -1417,7 +1435,7 @@ enum NemotronHeadScreen {
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        rowsPerSimdgroup: Int = 4, simdgroups: Int = 2
     ) -> Result {
         let scores = partialKernel(
             [weight, scales, biases, hidden, groups],
@@ -1426,7 +1444,7 @@ enum NemotronHeadScreen {
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32])[0]
         let chunks = rows / chunk
-        let selectGroups = 8
+        let selectGroups = 4
         let picked = selectKernel(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],

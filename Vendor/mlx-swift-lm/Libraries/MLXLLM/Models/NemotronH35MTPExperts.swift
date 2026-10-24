@@ -94,10 +94,11 @@ extension NemotronHMoE {
         let packed: MLXArray?
         if NemotronHResidualRMSNorm.preparedMoEEnabled, NemotronMoELeader.enabled,
            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-           NemotronMoELeader.preparedGateUp, x.shape == [1, 3, 2688], x.dtype == .bfloat16 {
+           NemotronMoELeader.preparedGateUp, x.ndim == 3, x.dim(0) == 1, x.dim(2) == 2688,
+           NemotronHeadPreparedActivation.supportsRows(x.dim(1)), x.dtype == .bfloat16 {
             // Share one dynamic operand buffer with both routed and shared up.
-            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
-                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
+            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: x.dim(1), k: 2688)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(x.dim(1), 2688), pv: 8)
         } else {
             packed = nil
         }
@@ -652,7 +653,8 @@ enum NemotronMoELeader {
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
                       prepared: MLXArray? = nil) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
-        if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
+        if preparedGateUp, NemotronHeadPreparedActivation.supportsRows(rows),
+           !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)

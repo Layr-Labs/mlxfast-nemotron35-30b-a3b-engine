@@ -46,7 +46,7 @@ final class NemotronH35MTPAttentionBlock: Module {
         cache: any CBv2AttendingLayerCache
     ) -> MLXArray {
         let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
-        return front[0] + mixer.cbv2Forward(front[1], cache: cache)
+        return front[0] + mixer.cbv2Forward(front[1], cache: cache, targetQKV: true)
     }
 
     fileprivate func uncompiledDraftFront(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
@@ -88,11 +88,15 @@ final class NemotronH35MTPAttentionBlock: Module {
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
         let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq)
+        let projections = NemotronTargetQKV.apply(
+            x, query: mixer.wq, key: mixer.wk, value: mixer.wv, captureMTP: true)
+            ?? (nemotronMTPLinearRows(x, mixer.wq), nemotronMTPLinearRows(x, mixer.wk),
+                nemotronMTPLinearRows(x, mixer.wv))
+        let queries = projections.0
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
+        let keys = projections.1
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
+        let values = projections.2
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
         let attended = cache.updateAndAttend(
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)

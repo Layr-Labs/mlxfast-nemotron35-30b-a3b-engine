@@ -148,15 +148,16 @@ enum NemotronHResidualRMSNorm {
             NemotronMTPExecution.batchedNorm, NemotronMoELeader.enabled,
             NemotronMoELeader.preparedGateUp,
             Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-            lhs.shape == [1, 3, 2688], rhs.shape == lhs.shape,
+            lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(2) == 2688,
+            NemotronHeadPreparedActivation.supportsRows(lhs.dim(1)), rhs.shape == lhs.shape,
             lhs.dtype == .bfloat16, rhs.dtype == .bfloat16,
             type(of: norm) == RMSNorm.self,
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
         let outputs = preparedKernel([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
             template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
+            grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape, [lhs.dim(1), 11, 9 * 32]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         if NemotronMoELeader.selfTest, let expected = apply(lhs, rhs, norm: norm) {
             return (nemotronBitwiseOrNaN(outputs[0], expected.0),
@@ -294,15 +295,16 @@ class NemotronHRMSNormGated: Module {
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               type(of: self) == NemotronHRMSNormGated.self,
-              groupSize == 512, x.shape == [1, 3, 4096], gate.shape == x.shape,
+              groupSize == 512, x.ndim == 3, x.dim(0) == 1, x.dim(2) == 4096,
+              NemotronHeadPreparedActivation.supportsRows(x.dim(1)), gate.shape == x.shape,
               weight.shape == [4096], x.dtype == .bfloat16,
               gate.dtype == .bfloat16, weight.dtype == .bfloat16
         else { return nil }
         let outputs = NemotronHGatedRMSKernel.preparedKernel(
             [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
             template: [("T", DType.bfloat16)],
-            grid: (128 * 3 * 8, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: [x.shape, [3, 8, 17 * 32]], outputDTypes: [.bfloat16, .float32])
+            grid: (128 * x.dim(1) * 8, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [x.shape, [x.dim(1), 8, 17 * 32]], outputDTypes: [.bfloat16, .float32])
         let normalized = NemotronMoELeader.selfTest
             ? nemotronBitwiseOrNaN(outputs[0], callAsFunction(x, gate: gate)) : outputs[0]
         return (normalized, outputs[1])
