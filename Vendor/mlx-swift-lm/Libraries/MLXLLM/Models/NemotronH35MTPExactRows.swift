@@ -291,7 +291,7 @@ enum NemotronMultiRowQMV {
     static func resultsPerSimdgroup(rows: Int, k: Int, n: Int) -> Int {
         guard narrowEnabled else { return 4 }
         switch rows {
-        case 3: return narrowShapes.contains([k, n]) ? 2 : 4
+        case 3: return narrowShapes.contains([k, n]) ? 1 : 4
         // R = 4 out_proj / o_proj / wo (4096 -> 2688) measured flat.
         case 4: return narrowShapes.contains([k, n]) && [k, n] != [4096, 2688] ? 2 : 4
         default: return 4
@@ -349,7 +349,7 @@ enum NemotronMultiRowQMV {
             for rows in [3, 4] {
                 let x = MLXArray.zeros([rows, k], dtype: .bfloat16)
                 for relu2 in [false, true] {
-                    outputs.append(dispatch(w, s, s, x, relu2: relu2, rps: 2))
+                    outputs.append(dispatch(w, s, s, x, relu2: relu2, rps: rows == 3 ? 1 : 2))
                 }
             }
         }
