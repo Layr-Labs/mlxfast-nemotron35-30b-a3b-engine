@@ -51,7 +51,123 @@ private func relu2(_ x: MLXArray) -> MLXArray {
     return y * y
 }
 
+// MARK: - Target residual and next block normalization
+
+enum NemotronHResidualRMSNorm {
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_rms_bf16",
+        inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: """
+            constexpr uint n_reads = 4;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[n_reads];
+            const size_t offset = size_t(gid) * axis_size + lid * n_reads;
+            for (uint i = 0; i < n_reads; i++) {
+                T sum = lhs[offset + i] + rhs[offset + i];
+                residual[offset + i] = sum;
+                thread_x[i] = sum;
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < n_reads; i++) {
+                normalized[offset + i] = weight[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+            }
+            """, ensureRowContiguous: true)
+
+    static func apply(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray)?
+    {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
+            rhs.shape == lhs.shape, lhs.dtype == .bfloat16, rhs.dtype == .bfloat16,
+            type(of: norm) == RMSNorm.self,
+            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let result = kernel([lhs, rhs, norm.weight, UInt32(lhs.dim(2)), norm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
+    }
+}
+
 // MARK: - MambaRMSNormGated
+
+private enum NemotronHGatedRMSKernel {
+    nonisolated(unsafe) static let identity = MLXArray(1).asType(.bfloat16)
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
+        source: """
+            uint gid = threadgroup_position_in_grid.x;
+            uint lid = thread_position_in_threadgroup.x;
+            uint simd_lane_id = thread_index_in_simdgroup;
+            uint simd_group_id = simdgroup_index_in_threadgroup;
+            int64_t groups = int64_t(x_shape[2]) / 512;
+            int64_t row = int64_t(gid) / groups;
+            int64_t feature = (int64_t(gid) % groups) * 512 + int64_t(lid) * 4;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[4];
+            for (int i = 0; i < 4; i++) {
+                int64_t f = feature + int64_t(i);
+                T g = gate[row * gate_strides[1] + f * gate_strides[2]];
+                auto y = 1 / (1 + metal::exp(metal::abs(g)));
+                T sig = g < 0 ? y : 1 - y;
+                T activated = g * sig;
+                T gated = x[row * x_strides[1] + f * x_strides[2]] * activated;
+                thread_x[i] = gated;
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / 512 + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < 4; i++) {
+                int64_t f = feature + int64_t(i);
+                T normalized = static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                T unweighted = identity * normalized;
+                T weighted = weight[f * weight_strides[0]] * unweighted;
+                out[row * int64_t(x_shape[2]) + f] = weighted;
+            }
+            """, ensureRowContiguous: false)
+}
 
 class NemotronHRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
@@ -66,6 +182,17 @@ class NemotronHRMSNormGated: Module {
     }
 
     func callAsFunction(_ x: MLXArray, gate: MLXArray?) -> MLXArray {
+        if let gate, groupSize == 512, x.ndim == 3, x.dim(0) == 1,
+            x.dim(1) > 0, x.dim(2) > 0, x.dim(2) % 512 == 0,
+            gate.shape == x.shape, weight.shape == [x.dim(2)],
+            x.dtype == .bfloat16, gate.dtype == .bfloat16, weight.dtype == .bfloat16
+        {
+            return NemotronHGatedRMSKernel.kernel(
+                [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (128 * x.dim(1) * (x.dim(2) / 512), 1, 1),
+                threadGroup: (128, 1, 1), outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
+        }
         var states = x
         if let gate {
             states = states * silu(gate)
@@ -394,7 +521,54 @@ func nemotronSSMAttn(
     return (y, currentState)
 }
 
+private let nemotronCompiledDecodeSSM = compile(shapeless: false) { (inputs: [MLXArray]) -> [MLXArray] in
+    let (output, state) = ssmUpdate(
+        hiddenStates: inputs[0], ALog: inputs[1], B: inputs[2], C: inputs[3], D: inputs[4],
+        dt: inputs[5], dtBias: inputs[6], state: inputs[7], timeStepLimit: (0, .infinity), mask: nil)
+    return [output, state]
+}
+
+func nemotronDecodeSSM(
+    hiddenStates: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
+    dt: MLXArray, dtBias: MLXArray, state: MLXArray, timeStepLimit: (Float, Float)
+) -> (MLXArray, MLXArray) {
+    guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+          hiddenStates.dim(1) == 1,
+          [DType.bfloat16, .float16, .float32].contains(dt.dtype),
+          [DType.bfloat16, .float16, .float32].contains(dtBias.dtype),
+          timeStepLimit.0.bitPattern == 0, timeStepLimit.1 == .infinity
+    else {
+        return ssmUpdate(
+            hiddenStates: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt,
+            dtBias: dtBias, state: state, timeStepLimit: timeStepLimit, mask: nil)
+    }
+    let outputs = nemotronCompiledDecodeSSM([hiddenStates, ALog, B, C, D, dt, dtBias, state])
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Mamba2Mixer
+
+private enum NemotronShortConvKernel {
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_short_conv_silu",
+        inputNames: ["input", "weight", "bias"], outputNames: ["out"],
+        source: """
+            auto channel = thread_position_in_grid.x;
+            auto position = thread_position_in_grid.y;
+            auto in = input + position * C + channel;
+            auto w = weight + channel * 4;
+            float acc = 0;
+            for (int i = 0; i < 4; ++i) {
+                acc += static_cast<float>(in[0]) * w[i];
+                in += C;
+            }
+            T convolved = static_cast<T>(acc);
+            T x = convolved + bias[channel];
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            T sigmoid = x < 0 ? y : 1 - y;
+            out[position * C + channel] = x * sigmoid;
+            """)
+}
 
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
@@ -461,6 +635,22 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
+    func activatedConv(_ padded: MLXArray) -> MLXArray {
+        guard convKernelSize == 4, padded.ndim == 3, padded.dim(0) == 1,
+            (4...11).contains(padded.dim(1)), padded.dim(2) == convDim,
+            padded.dtype == .bfloat16, conv1d.weight.dtype == .bfloat16,
+            conv1d.weight.shape == [convDim, 4, 1], conv1d.groups == convDim,
+            conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
+            let bias = conv1d.bias, bias.dtype == .bfloat16, bias.shape == [convDim]
+        else { return silu(conv1d(padded)) }
+        let length = padded.dim(1) - 3
+        return NemotronShortConvKernel.kernel(
+            [padded, conv1d.weight, bias],
+            template: [("T", DType.bfloat16), ("C", convDim)],
+            grid: (convDim, length, 1), threadGroup: (min(convDim, 256), 1, 1),
+            outputShapes: [[1, length, convDim]], outputDTypes: [.bfloat16])[0]
+    }
+
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
         var convInput = input
 
@@ -490,8 +680,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             cache[0] = padded[0..., start ..< end, 0...]
         }
 
-        let convOutput = conv1d(padded)
-        return silu(convOutput)
+        return activatedConv(padded)
     }
 
     private func mambaForward(
@@ -591,7 +780,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let end = padded.dim(1)
         let nextConvState =
             padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
-        let convOutput = silu(conv1d(padded))
+        let convOutput = activatedConv(padded)
         let convSplits = split(
             convOutput,
             indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
@@ -607,7 +796,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             ? nemotronSSMAttn(
                 x: hidden, ALog: aLog, B: B, C: C, D: D, dt: dtArray,
                 dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit)
-            : ssmUpdate(
+            : nemotronDecodeSSM(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,
@@ -616,8 +805,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             dt: dtArray,
             dtBias: dtBias,
             state: ssmState,
-            timeStepLimit: timeStepLimit,
-            mask: nil)
+            timeStepLimit: timeStepLimit)
         let nextSSMState = nextState.asType(.float32)
 
         for (row, evaluation) in recurrentState.enumerated() {
@@ -2672,9 +2860,12 @@ private class NemotronHBlock: Module {
         modelLayerIndex: Int,
         attentionCache: (any CBv2AttendingLayerCache)?,
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
-    ) -> MLXArray {
-        let hidden = captureMTP ? nemotronMTPNormRows(x) { norm($0) } : norm(x)
+        captureMTP: Bool = false,
+        preparedNorm: MLXArray? = nil,
+        nextNorm: RMSNorm? = nil
+    ) -> (MLXArray, MLXArray?) {
+        let hidden = preparedNorm
+            ?? (captureMTP ? nemotronMTPNormRows(x) { norm($0) } : norm(x))
         let output: MLXArray
         switch blockType {
         case .mamba:
@@ -2704,7 +2895,10 @@ private class NemotronHBlock: Module {
             let moe = mixer as! NemotronHMoE
             output = captureMTP ? moe.mtpForwardRows(hidden) : moe(hidden)
         }
-        return x + output
+        if let nextNorm, let pair = NemotronHResidualRMSNorm.apply(x, output, norm: nextNorm) {
+            return (pair.0, pair.1)
+        }
+        return (x + output, nil)
     }
 }
 
@@ -2816,6 +3010,7 @@ private class NemotronHBackbone: Module {
             : nil
         defer { observation?.end() }
         var hidden = embeddings(inputs)
+        var preparedNorm: MLXArray? = nil
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -2829,16 +3024,24 @@ private class NemotronHBackbone: Module {
             } else {
                 cache = nil
             }
-            hidden = layer.cbv2Forward(
+            let next = modelLayerIndex + 1
+            let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
+                && next % nemotronEarlyEvalInterval == 0
+            let nextNorm = next < layers.count && !submitsEarly
+                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+            let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
                 attentionCache: cache,
                 recurrentState: recurrentState,
-                captureMTP: captureMTP)
+                captureMTP: captureMTP,
+                preparedNorm: preparedNorm,
+                nextNorm: nextNorm)
+            hidden = result.0
+            preparedNorm = result.1
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
-            if nemotronEarlyEvalInterval > 0, modelLayerIndex + 1 < layers.count,
-               (modelLayerIndex + 1) % nemotronEarlyEvalInterval == 0 {
+            if submitsEarly {
                 asyncEval(hidden)
             }
         }

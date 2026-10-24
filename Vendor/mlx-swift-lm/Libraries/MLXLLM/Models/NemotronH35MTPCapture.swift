@@ -46,7 +46,7 @@ extension NemotronHMamba2Mixer {
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let padded = concatenated([convState, input], axis: 1)
-        let convolution = silu(conv1d(padded))
+        let convolution = activatedConv(padded)
         let dt = computeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
@@ -98,7 +98,7 @@ extension NemotronHMamba2Mixer {
         // position still owns its exact history slice and ordinary M=1 SSM
         // update, so rejecting a suffix cannot advance persistent recurrence.
         let padded = concatenated([convState, input], axis: 1)
-        let convolution = silu(conv1d(padded))
+        let convolution = activatedConv(padded)
         // Per-position conv histories as one strided view of `padded`
         // (window p = rows p+1 ..< p+convKernelSize). Pure data movement:
         // identical values to stacking the per-position slices.
@@ -181,10 +181,11 @@ extension NemotronH35Model {
         let history = mixer.convKernelSize - 1
         let (heads, dim, groups, stateDim) =
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
-        var roots: [MLXArray] = []
+        let normInput = MLXArray.zeros([1, 1, heads * dim], dtype: activationDType)
+        var roots: [MLXArray] = [mixer.norm(normInput, gate: normInput)]
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
-            let convolution = silu(mixer.conv1d(padded))
+            let convolution = mixer.activatedConv(padded)
             let rawDt = MLXArray.zeros([1, width, heads], dtype: activationDType)
             let state = MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32)
             if nemotronMTPCompactSSM {
