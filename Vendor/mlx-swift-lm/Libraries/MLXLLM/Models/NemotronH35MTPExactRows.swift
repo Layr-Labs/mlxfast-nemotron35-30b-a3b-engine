@@ -248,6 +248,135 @@ private let nemotronMultiRowQMVSource = """
   }
 """
 
+private let nemotronMultiRowQMVAddSource = """
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 4;
+  constexpr int packs_per_thread = FAST ? 2 : 1;
+  constexpr int pack_factor = 8;
+  constexpr int bytes_per_pack = 4;
+  constexpr int group_size = 64;
+  constexpr int values_per_thread = pack_factor * packs_per_thread;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int scale_step_per_thread = group_size / values_per_thread;
+  typedef float U;
+
+  const int in_vec_size = K;
+  const int out_vec_size = N;
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+
+  const device uint8_t* ws = (const device uint8_t*)w;
+  thread U x_thread[R][values_per_thread];
+  thread U result[R][results_per_simdgroup];
+  for (int r = 0; r < R; r++) {
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      result[r][row] = 0;
+    }
+  }
+
+  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+      simd_gid * results_per_simdgroup;
+  if (out_row >= out_vec_size) {
+    return;
+  }
+
+  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+  const device T* sc = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bs = biases + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* xp = x + simd_lid * values_per_thread;
+  device T* yp = y + out_row;
+
+  U sum[R];
+  int k = 0;
+  const int k_end = FAST ? in_vec_size : in_vec_size - block_size;
+  for (; k < k_end; k += block_size) {
+    for (int r = 0; r < R; r++) {
+      sum[r] = nmr_load_vector<T, U, values_per_thread>(xp + r * in_vec_size, x_thread[r]);
+    }
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+      const device T* sl = sc + row * in_vec_size_g;
+      const device T* bl = bs + row * in_vec_size_g;
+      U s = sl[0];
+      U b = bl[0];
+      // Decode packed integer coefficients once for all verification rows.
+      // Each row keeps its original i-order and affine accumulation.
+      thread U accum[R];
+      for (int r = 0; r < R; r++) accum[r] = 0;
+      const device uint16_t* words = (const device uint16_t*)wl;
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const U a = words[i] & 0x000f;
+        const U b1 = words[i] & 0x00f0;
+        const U c = words[i] & 0x0f00;
+        const U d = words[i] & 0xf000;
+        for (int r = 0; r < R; r++) {
+          accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+              + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+        }
+      }
+      for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
+    }
+    ws += block_size * bytes_per_pack / pack_factor;
+    sc += block_size / group_size;
+    bs += block_size / group_size;
+    xp += block_size;
+  }
+  if (!FAST) {
+    const int remaining = clamp(
+        static_cast<int>(in_vec_size - k - simd_lid * values_per_thread),
+        0,
+        values_per_thread);
+    if (remaining > 0) {
+      for (int r = 0; r < R; r++) {
+        sum[r] = nmr_load_vector_safe<T, U, values_per_thread>(
+            xp + r * in_vec_size, x_thread[r], remaining);
+      }
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+        const device T* sl = sc + row * in_vec_size_g;
+        const device T* bl = bs + row * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        // Decode packed integer coefficients once for all verification rows.
+        // Each row keeps its original i-order and affine accumulation.
+        thread U accum[R];
+        for (int r = 0; r < R; r++) accum[r] = 0;
+        const device uint16_t* words = (const device uint16_t*)wl;
+        for (int i = 0; i < remaining / 4; i++) {
+          const U a = words[i] & 0x000f;
+          const U b1 = words[i] & 0x00f0;
+          const U c = words[i] & 0x0f00;
+          const U d = words[i] & 0xf000;
+          for (int r = 0; r < R; r++) {
+            accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+                + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+          }
+        }
+        for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
+      }
+    }
+  }
+
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = routed[r * out_vec_size + out_row + row] + h;
+      }
+    }
+  }
+"""
+
+
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
@@ -257,6 +386,19 @@ private final class NemotronMultiRowQMVKernel: Sendable {
             inputNames: ["w", "scales", "biases", "x", "K", "N"],
             outputNames: ["y"],
             source: nemotronMultiRowQMVSource,
+            header: nemotronMultiRowQMVHeader)
+    }
+}
+
+private final class NemotronMultiRowQMVAddKernel: Sendable {
+    static let shared = NemotronMultiRowQMVAddKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "nemotron_multirow_qmv_shared_down_add_affine4_gs64",
+            inputNames: ["w", "scales", "biases", "x", "K", "N", "routed"],
+            outputNames: ["y"],
+            source: nemotronMultiRowQMVAddSource,
             header: nemotronMultiRowQMVHeader)
     }
 }
@@ -300,6 +442,17 @@ enum NemotronMultiRowQMV {
             outputShapes: [[rows, n]],
             outputDTypes: [x.dtype])[0]
     }
+    // Caller validates the native shared banks, BF16 inputs and rows2...4.
+    static func sharedDownAdding(_ x: MLXArray, _ q: QuantizedLinear,
+                                 _ biases: MLXArray, _ routed: MLXArray) -> MLXArray {
+        let rows = x.dim(0)
+        let (kArray, nArray) = scalarPair(3712, 2688)
+        return NemotronMultiRowQMVAddKernel.shared.kernel(
+            [q.weight, q.scales, biases, x, kArray, nArray, routed],
+            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false)],
+            grid: (32, 672, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, 2688]], outputDTypes: [x.dtype])[0]
+    }
 }
 
 /// Put verification tokens on the native *batch* axis, keeping matrix M=1.
@@ -335,52 +488,4 @@ func nemotronMTPLinearRelu2Rows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     let projected = nemotronMTPLinearRows(x, linear)
     let positive = maximum(projected, MLXArray(0))
     return positive * positive
-}
-
-// Target Q/K/V share one dispatch; every tile keeps the existing row body.
-enum NemotronTargetQKV {
-    private static let source = """
-      const uint tile = threadgroup_position_in_grid.y;
-      const uint local_tile = tile < 512 ? tile : (tile < 544 ? tile - 512 : tile - 544);
-      {
-        const uint3 threadgroup_position_in_grid = uint3(0, local_tile, 0);
-        const device uint32_t* w = tile < 512 ? qw : (tile < 544 ? kw : vw);
-        const device T* scales = tile < 512 ? qs : (tile < 544 ? ks : vs);
-        const device T* biases = tile < 512 ? qb : (tile < 544 ? kb : vb);
-        device T* y = tile < 512 ? qy : (tile < 544 ? ky : vy);
-        const int N = tile < 512 ? 4096 : 256;
-    """ + nemotronMultiRowQMVSource + "\n}"
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_target_qkv_affine4_gs64",
-        inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
-        outputNames: ["qy", "ky", "vy"], source: source, header: nemotronMultiRowQMVHeader)
-
-    private static func buffers(_ linear: Linear, rows: Int) -> [MLXArray]? {
-        guard type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear,
-              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
-              q.weight.dtype == .uint32, q.weight.shape == [rows, 336],
-              q.scales.dtype == .bfloat16, q.scales.shape == [rows, 42],
-              let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [rows, 42]
-        else { return nil }
-        return [q.weight, q.scales, offsets]
-    }
-
-    static func apply(
-        _ x: MLXArray, query: Linear, key: Linear, value: Linear, captureMTP: Bool
-    ) -> (MLXArray, MLXArray, MLXArray)? {
-        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              x.ndim == 3, x.dim(0) == 1, x.dim(2) == 2688, x.dtype == .bfloat16,
-              x.dim(1) == 1 || (captureMTP && [3, 4].contains(x.dim(1))
-                && NemotronMTPExecution.batchedM1 && NemotronMultiRowQMV.enabled),
-              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
-              let v = buffers(value, rows: 256)
-        else { return nil }
-        let rows = x.dim(1)
-        let outputs = kernel(q + k + v + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
-            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false)],
-            grid: (32, 1152, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
-            outputDTypes: [x.dtype, x.dtype, x.dtype])
-        return (outputs[0], outputs[1], outputs[2])
-    }
 }
