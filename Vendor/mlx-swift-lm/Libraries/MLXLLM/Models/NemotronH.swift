@@ -333,15 +333,15 @@ private final class NemotronHScanKernels: Sendable {
             name: "nemotron_ssm_scan_decay",
             inputNames: ["dtA", "CB", "L"], outputNames: ["out", "last"],
             source: """
-                // One threadgroup = 32 simdgroups x 32 lanes: column block
-                // j0..j0+31 of one (batch, head). Simdgroup s owns column
+                // One threadgroup = 8 simdgroups x 32 lanes: column block
+                // j0..j0+7 of one (batch, head). Simdgroup s owns column
                 // j0+s, lane r is row rb*32+r: the same lane/row mapping and
                 // per-32-row simd_prefix_inclusive_sum + carried prefix as
                 // MLX strided_scan (cumsum axis -2) over tril(x, -1).
-                threadgroup float tile[32][33];
+                threadgroup float tile[32][9];
                 const uint lane = thread_index_in_simdgroup;
                 const uint s = simdgroup_index_in_threadgroup;
-                const uint j0 = threadgroup_position_in_grid.x * 32;
+                const uint j0 = threadgroup_position_in_grid.x * 8;
                 const uint bh = threadgroup_position_in_grid.z;
                 const uint bb = bh / H;
                 const uint hh = bh % H;
@@ -372,10 +372,13 @@ private final class NemotronHScanKernels: Sendable {
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     tile[lane][s] = r;
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                    const int wi = rb + int(s);
-                    const uint wj = j0 + lane;
+                    const uint writer = s * 32 + lane;
+                    const uint wr = writer / 8;
+                    const uint wc = writer % 8;
+                    const int wi = rb + int(wr);
+                    const uint wj = j0 + wc;
                     if (wi < L && int(wj) < L) {
-                        o[size_t(wi) * L + wj] = tile[s][lane];
+                        o[size_t(wi) * L + wj] = tile[wr][wc];
                     }
                 }
             """)
@@ -460,7 +463,7 @@ func nemotronSSMAttn(
             let fused = NemotronHScanKernels.shared.scanDecay(
                 [stepDtA, CB, n],
                 template: [("CBT", CB.dtype), ("H", h), ("R", repeats)],
-                grid: (((n + 31) / 32) * 1024, 1, b * h), threadGroup: (1024, 1, 1),
+                grid: (((n + 7) / 8) * 256, 1, b * h), threadGroup: (256, 1, 1),
                 outputShapes: [[b, h, n, n], [b, h, 1, n]], outputDTypes: [.float32, .float32])
             surrogateAttentionMatrix = fused[0]
             decayLast = fused[1]
@@ -486,10 +489,21 @@ func nemotronSSMAttn(
 
         // decay[..., -1:, :] == exp(segsum[..., -1:, :]) element-wise.
         let decay = decayLast.transposed(0, 3, 1, 2)
-        stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
         var dtxdecay = stepDtx * decay
         dtxdecay = dtxdecay.swappedAxes(1, 2).swappedAxes(2, 3)
-        var nextState = dtxdecay.matmul(stepB)
+        let nextStateProduct: MLXArray
+        if b == 1, h == 64, g == 8, dh == 64, d == 128, n >= 64,
+           Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu {
+            // Broadcast each B group over its heads, preserving the reduction
+            // axis and input order without materializing eight copies.
+            let groupedB = stepB.swappedAxes(2, 3).reshaped(b, g, 1, n, d)
+            nextStateProduct = dtxdecay.reshaped(b, g, repeats, dh, n)
+                .matmul(groupedB).reshaped(b, h, dh, d)
+        } else {
+            stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
+            nextStateProduct = dtxdecay.matmul(stepB)
+        }
+        var nextState = nextStateProduct
 
         let previousState = currentState
         let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
