@@ -157,3 +157,91 @@ func nemotronMTPSSMCompact(
         outputDTypes: [convolution.dtype, .float32])
     return (outputs[0], outputs[1])
 }
+
+
+// Native compact-verification producer: preserve packed conv arithmetic and
+// materialize only its existing FP32 dt tensor in the same dispatch. The
+// compact scan and strict-prefix replay consume their unchanged inputs.
+private enum NemotronPackedConvDtKernel {
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_dt",
+        inputNames: ["oldState", "input", "weight", "bias", "rawDt", "dtBias", "dt_min", "dt_max"],
+        outputNames: ["out", "padded", "timestep_out"],
+        source: """
+            int64_t channel = int64_t(thread_position_in_grid.x);
+            int64_t position = int64_t(thread_position_in_grid.y);
+            padded[(position + 3) * C + channel] =
+                input[position * input_strides[1] + channel * input_strides[2]];
+            if (position == 0) {
+                for (int i = 0; i < 3; ++i) {
+                    padded[int64_t(i) * C + channel] =
+                        oldState[int64_t(i) * oldState_strides[1] + channel * oldState_strides[2]];
+                }
+            }
+            float acc = 0;
+            for (int i = 0; i < 4; ++i) {
+                int64_t row = position + int64_t(i);
+                T value = row < 3
+                    ? oldState[row * oldState_strides[1] + channel * oldState_strides[2]]
+                    : input[(row - 3) * input_strides[1] + channel * input_strides[2]];
+                acc += static_cast<float>(value)
+                    * weight[channel * weight_strides[0] + int64_t(i) * weight_strides[1]];
+            }
+            T convolved = static_cast<T>(acc);
+            T x = convolved + bias[channel * bias_strides[0]];
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            T sigmoid = x < 0 ? y : 1 - y;
+            out[position * C + channel] = x * sigmoid;
+            if (channel < H) {
+                float z = static_cast<float>(rawDt[position * rawDt_strides[1]
+                    + channel * rawDt_strides[2]])
+                    + static_cast<float>(dtBias[channel * dtBias_strides[0]]);
+                float timestep = nemotronPackedDtLogAddExp(z, 0.0f);
+                // Match Maximum(timestep, min), then Minimum(result, max):
+                // left NaN propagates, ties select the right bound.
+                float low = metal::isnan(timestep) ? timestep
+                    : (timestep > dt_min ? timestep : dt_min);
+                timestep_out[position * H + channel] = metal::isnan(low) ? low
+                    : (low < dt_max ? low : dt_max);
+            }
+            """,
+        header: """
+            // Float LogAddExp from vendored binary_ops.h. The unqualified
+            // log1p resolves to the same vendored utils.h Float overload.
+            inline float nemotronPackedDtLogAddExp(float x, float y) {
+                if (metal::isnan(x) || metal::isnan(y)) {
+                    return metal::numeric_limits<float>::quiet_NaN();
+                }
+                constexpr float inf = metal::numeric_limits<float>::infinity();
+                float maxval = metal::max(x, y);
+                float minval = metal::min(x, y);
+                return (minval == -inf || maxval == inf)
+                    ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+            }
+            """,
+        ensureRowContiguous: false)
+}
+
+func nemotronPackedConvAndDt(
+    oldState: MLXArray, input: MLXArray, weight: MLXArray, bias: MLXArray,
+    rawDt: MLXArray, dtBias: MLXArray, timeStepLimit: (Float, Float)
+) -> (convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
+    guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+        input.ndim == 3, input.dim(0) == 1, (2...8).contains(input.dim(1)),
+        input.dim(2) == 6144, oldState.shape == [1, 3, 6144],
+        input.dtype == .bfloat16, oldState.dtype == .bfloat16,
+        weight.shape == [6144, 4, 1], weight.dtype == .bfloat16,
+        bias.shape == [6144], bias.dtype == .bfloat16,
+        rawDt.shape == [1, input.dim(1), 64], rawDt.dtype == .bfloat16,
+        dtBias.shape == [64], [DType.bfloat16, .float16, .float32].contains(dtBias.dtype)
+    else { return nil }
+    let length = input.dim(1)
+    let arrays = NemotronPackedConvDtKernel.kernel(
+        [oldState, input, weight, bias, rawDt, dtBias,
+         MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+        template: [("T", DType.bfloat16), ("C", 6144), ("H", 64)],
+        grid: (6144, length, 1), threadGroup: (256, 1, 1),
+        outputShapes: [[1, length, 6144], [1, length + 3, 6144], [1, length, 64]],
+        outputDTypes: [.bfloat16, .bfloat16, .float32])
+    return (arrays[0], arrays[1], arrays[2])
+}

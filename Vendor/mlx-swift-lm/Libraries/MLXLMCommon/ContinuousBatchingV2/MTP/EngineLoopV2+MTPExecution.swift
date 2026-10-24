@@ -617,7 +617,13 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        // One-row int32 columns already have the packet's row-major order.
+        // Preserve the original early stack for batching, singleton tails,
+        // and unknown draft outputs. Target metadata is checked below.
+        let directDraftColumns = batch == 1 && k > 1 && draftSteps.count == k
+            && draftSteps.allSatisfy { $0.shape == [1] && $0.dtype == .int32 }
+        var stackedDraftIDs: MLXArray? = directDraftColumns
+            ? nil : stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -639,11 +645,30 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+        let directPacketPrefix = directDraftColumns
+            && target.scores.shape == [1, k + 1] && target.scores.dtype == .int32
+            && (target.shortlist.map {
+                $0.massScaled.shape == [1, k + 1] && $0.massScaled.dtype == .int32
+            } ?? true)
+        if !directPacketPrefix {
+            // Restore a deferred stack for unsupported target metadata;
+            // reuse all draft outputs without another producer invocation.
+            stackedDraftIDs = stackedDraftIDs ?? stacked(draftSteps, axis: 1)
+        }
+        var packetParts: [MLXArray]
+        if let stackedDraftIDs {
+            packetParts = [stackedDraftIDs.reshaped([-1])]
+        } else {
+            packetParts = draftSteps
+        }
+        packetParts.append(target.scores.reshaped([-1]))
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
         let acceptancePacket = concatenated(packetParts, axis: 0)
+        // The immutable prefix owns its packet backing; the existing
+        // finalizer still keeps both handles and its single packet readback.
+        let draftIDs = stackedDraftIDs ?? acceptancePacket[0..<k].reshaped([1, k])
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
