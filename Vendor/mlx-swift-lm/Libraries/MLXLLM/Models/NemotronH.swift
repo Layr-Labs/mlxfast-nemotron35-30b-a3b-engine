@@ -1201,8 +1201,10 @@ class NemotronHMoEGate: Module {
 
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
+    /// The multi-row kernel repeats the M=1 gemv per row in one launch.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        let gates = NemotronMTPRouterRows.gates(x, weight)
+            ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
             routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
@@ -3734,3 +3736,4 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.mtpLayersBlockType = mtpLayersBlockType
     }
 }
+private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
