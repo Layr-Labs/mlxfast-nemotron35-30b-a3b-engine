@@ -61,8 +61,6 @@ extension EngineLoopV2 {
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
-        // finalize adds up to three syncs to the step's one (seed policy
-        // margin above, acceptance packet, verify policy margin). Serial
         // target verification adds one blocking eval per column at launch
         // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
@@ -70,8 +68,15 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
-        if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        let policyTopTwoHost: [Float]?
+        if CBv2MTPPolicyPacket.enabled {
+            policyTopTwoHost = verify.policyTopTwoValues.map { values in
+                host.suffix(values.size).map { Float(bitPattern: UInt32(bitPattern: $0)) }
+            }
+        } else {
+            policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+            if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -252,8 +257,14 @@ extension EngineLoopV2 {
                     let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
                     let state = metadata.assistantState
                 {
-                    prestager.prestageFirstDraft(
-                        token: kept[confirmed - 1], hidden: hidden, requestState: state)
+                    // A fixed depth plans the next round with exactly this
+                    // many drafts whenever enough tokens remain for it.
+                    let fixed = mtp.config.fixedDraftTokens ?? 0
+                    let depth = CBv2MTPFirstDraftPrestage.chained
+                        && rec.request.maxTokens - rec.generatedTokenCount >= fixed ? fixed : 1
+                    prestager.prestageDrafts(
+                        token: kept[confirmed - 1], hidden: hidden, requestState: state,
+                        depth: depth)
                 }
             }
             if let evaluations = verify.recurrentEvaluations[id] {
@@ -426,6 +437,19 @@ public protocol CBv2MTPFirstDraftPrestaging: AnyObject {
     /// may queue acceptance-independent head work on them.
     func speculateAfterVerify(
         targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState)
+    /// `prestageFirstDraft` plus, when `depth` > 1, the drafts the next
+    /// round would chain on it. The same hand-out and discard rules apply to
+    /// every prestaged draft.
+    func prestageDrafts(
+        token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int)
+}
+
+extension CBv2MTPFirstDraftPrestaging {
+    public func prestageDrafts(
+        token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
+    ) {
+        prestageFirstDraft(token: token, hidden: hidden, requestState: requestState)
+    }
 }
 
 public enum CBv2MTPFirstDraftPrestage {
@@ -435,6 +459,9 @@ public enum CBv2MTPFirstDraftPrestage {
     /// CBV2_MTP_SPECULATE_AFTER_VERIFY=0 disables the post-verify head rows.
     public static let speculateAfterVerify = enabled
         && ProcessInfo.processInfo.environment["CBV2_MTP_SPECULATE_AFTER_VERIFY"] != "0"
+    /// NEMOTRON_MTP_PRESTAGE_SECOND=0 prestages only the first draft.
+    public static let chained = enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_PRESTAGE_SECOND"] != "0"
 }
 
 extension EngineLoopV2 {

@@ -258,6 +258,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var roots: [MLXArray] = []
         var prestagedHidden: MLXArray?
         var prestagedResult: (tokens: MLXArray, hidden: MLXArray)?
+        /// The second draft chained on the prestaged first one; handed out
+        /// only for the first draft's own `hidden` output object.
+        var prestagedSecond: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
@@ -409,7 +412,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
     public func observeCommittedTarget(_ observation: CBv2MTPCommittedTargetObservation, requestState: any CBv2MTPRequestState) {
         let s = state(requestState)
-        if s.prestagedResult != nil { discardRound(requestState: requestState) }
+        if s.prestagedResult != nil || s.prestagedSecond != nil {
+            discardRound(requestState: requestState)
+        }
         s.nextFirstDraft = nil
         precondition(s.stagedInputCount == 0)
         let n = observation.tokens.dim(1)
@@ -439,7 +444,15 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             let carry = s.prestagedHidden
             s.prestagedResult = nil
             s.prestagedHidden = nil
-            if s.stagedInputCount == 1, let carry, carry === hidden { return prestaged }
+            let staged = s.prestagedSecond == nil ? 1 : 2
+            if s.stagedInputCount == staged, let carry, carry === hidden { return prestaged }
+            discardRound(requestState: requestState)
+        } else if let second = s.prestagedSecond {
+            // The second call chains on the first draft's own output.
+            s.prestagedSecond = nil
+            if s.stagedInputCount == 2, second.parent === hidden {
+                return (second.tokens, second.hidden)
+            }
             discardRound(requestState: requestState)
         }
         s.nextFirstDraft = nil
@@ -554,7 +567,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         clearRound(s)
     }
     private func clearRound(_ s: State) {
-        s.prestagedHidden = nil; s.prestagedResult = nil; s.speculation = nil
+        s.prestagedHidden = nil; s.prestagedResult = nil; s.prestagedSecond = nil
+        s.speculation = nil
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
     }
@@ -610,6 +624,27 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         s.prestagedResult = result
     }
 
+    /// Also chains the next round's second draft on the prestaged first one
+    /// while the GPU runs it, instead of at round build. Same ops on the same
+    /// inputs as the second `draftStep`; only the submission moves earlier.
+    public func prestageDrafts(
+        token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
+    ) {
+        prestageFirstDraft(token: token, hidden: hidden, requestState: requestState)
+        let s = state(requestState)
+        guard depth >= 2, draftLimit >= 2, let first = s.prestagedResult,
+              s.prestagedSecond == nil, s.stagedInputCount == 1
+        else { return }
+        let out = module.pagedForward(
+            hidden: first.hidden,
+            embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+        let ids = draftHead.greedy(out)
+        s.stagedInputCount += 1
+        s.roots.append(contentsOf: [out, ids])
+        asyncEval([ids, out] + s.arrays)
+        s.prestagedSecond = (tokens: ids, hidden: out, parent: first.hidden)
+    }
+
     /// Called right after the round's verify graph is submitted (before the
     /// acceptance readback): causal attention/KV over all k+1 row pairs.
     /// Finalize retains the committed prefix and selects one row for the
@@ -621,7 +656,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let s = state(requestState)
         let width = s.stagedInputCount + 1
         guard s.started, kvOnlyHistory, s.paged != nil, s.stagedInputCount > 0, s.speculation == nil,
-              s.prestagedResult == nil, targetTokens.shape == [1, width],
+              s.prestagedResult == nil, s.prestagedSecond == nil, targetTokens.shape == [1, width],
               targetHidden.shape == [1, width, target.configuration.hiddenSize]
         else { return }
         // Chained draft rows are never trusted; drop them before appending.

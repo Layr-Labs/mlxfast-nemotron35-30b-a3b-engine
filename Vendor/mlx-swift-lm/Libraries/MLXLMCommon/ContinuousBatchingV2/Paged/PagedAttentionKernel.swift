@@ -253,7 +253,12 @@ public enum PagedAttentionKernel {
     /// occupancy win invariantly needs per-row sizing (`batch: 1`, each row's
     /// OWN attended length) plus dispatch bucketed by rung, because PTOK is a
     /// kernel template parameter and one dispatch carries one value.
-    static let partitionTargetDefault = 0
+    ///
+    /// 64 on this engine: the target uses the contiguous backend, so the only
+    /// paged dispatches are the single-request MTP draft head's. Draft values
+    /// only change which proposals the target verifies, and at B=1 a ~600-row
+    /// context otherwise fills 12 threadgroups (PTOK 256) instead of 40.
+    static let partitionTargetDefault = 64
 
     /// Ceiling on the operator-settable threadgroup target.
     ///
