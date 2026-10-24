@@ -407,9 +407,44 @@ private final class NemotronMoELeaderKernel: Sendable {
     }
 }
 
+// FC1 at R = 3 reads the leader/partner pairs from the FC2 route plan (one
+// plan per call, built before FC1) instead of rescanning the router ids in
+// every output tile. The plan holds the same pairs: partner from the same
+// scan, -2 where an earlier occurrence leads (odd count before), so a third
+// occurrence leads again. Only this integer prologue changes.
+private let nmlPlannedDiscovery = (
+    """
+  const uint expert = inds[slot];
+  int before = 0;
+  for (int r = 0; r < row; r++) {
+    for (int j = 0; j < TOPK; j++) {
+      before += inds[r * TOPK + j] == expert ? 1 : 0;
+    }
+  }
+  if ((before & 1) != 0) {
+    return;
+  }
+  int partner = -1;
+  for (int r = R - 1; r > row; r--) {
+    for (int j = 0; j < TOPK; j++) {
+      if (inds[r * TOPK + j] == expert) {
+        partner = r * TOPK + j;
+      }
+    }
+  }
+""",
+    """
+  const uint expert = inds[slot];
+  const int partner = plan[18 + slot];
+  if (partner == -2) {
+    return;
+  }
+""")
+
 private final class NemotronMoELeaderPreparedKernels: Sendable {
     static let shared = NemotronMoELeaderPreparedKernels()
     let gateUp: MLXFast.MLXFastKernel?
+    let gateUpPlanned: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         gateUp = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -423,14 +458,29 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0, header: header)
         }
+        let (scan, planned) = nmlPlannedDiscovery
+        gateUpPlanned = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
+            (scan, planned),
+            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ]).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_affine4_gs64_prepared_planned",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "plan"],
+                outputNames: ["y"], source: $0, header: header)
+        }
     }
 }
 
 // Keep the accepted leader/partner QMV trace, then reduce each token's six
 // products after a shared-memory barrier. Each row has six distinct router
 // indices. Experts can repeat across rows, as in the accepted leader path.
+// RPS is the number of output columns each threadgroup owns (grid N / RPS).
+// Every SIMD group still owns its whole slot over all K for each of them.
 private let nemotronMoELeaderWeightedSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -614,6 +664,11 @@ enum NemotronMoELeader {
     static func leaderResultsPerSimdgroup(rows: Int) -> Int {
         narrowLeader && rows == 3 ? 2 : 4
     }
+    /// NEMOTRON_MTP_FC1_PLAN=0 keeps FC1's per-tile pair discovery. The
+    /// planned FC1 engages only after the load-time bit check in warm().
+    static let fc1PlanEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_PLAN"] != "0"
+    nonisolated(unsafe) static var fc1Plan = false
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -650,14 +705,16 @@ enum NemotronMoELeader {
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil) -> MLXArray {
+                      prepared: MLXArray? = nil, plan: MLXArray? = nil) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
-            return kernel(
-                [bank.weight, bank.scales, bank.biases, packed, inds],
+            let planned = topK == 6 ? plan.flatMap { p in
+                NemotronMoELeaderPreparedKernels.shared.gateUpPlanned.map { ($0, p) } } : nil
+            return (planned?.0 ?? kernel)(
+                [bank.weight, bank.scales, bank.biases, packed, inds] + (planned.map { [$0.1] } ?? []),
                 template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                            ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                            ("RELU2", relu2), ("RPS", rps)],
@@ -681,12 +738,12 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank) -> MLXArray {
-        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank) }
+                              rows: Int, bank: Bank, plan: MLXArray? = nil) -> MLXArray {
+        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n)],
+                       ("K", bank.k), ("N", bank.n), ("RPS", 4)],
             grid: (32 * (bank.n / 4), 6, 1),
             threadGroup: (32, 6, 1),
             outputShapes: [[1, rows, bank.n]],
@@ -718,17 +775,20 @@ enum NemotronMoELeader {
         let rows = x.dim(1)
         let flat = indices.reshaped(rows * 6)
         let xr = x.reshaped(rows, 2688)
+        // One route plan for FC1 and FC2 (R = 3), built from the same ids.
+        let plan = fc1Plan && rows == 3 ? NMLBalancePlan.shared.make(flat) : nil
         let act: MLXArray
         if fuseRelu2 {
             act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                relu2: true, prepared: prepared)
+                relu2: true, prepared: prepared, plan: plan)
         } else {
             let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                prepared: prepared)
+                prepared: prepared, plan: plan)
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down)
+        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down,
+            plan: plan)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -778,11 +838,41 @@ enum NemotronMoELeader {
         return y.reshaped(1, rows, topK, down.n)
     }
 
+    /// Planned FC1 vs the scanning FC1 on the loaded weights, seeded random
+    /// rows, as raw words: routes with solo slots, pairs, and experts in all
+    /// three rows (third occurrence leads again). Also JITs the pipelines.
+    private static func verifyPlannedFC1(_ up: Bank) -> Bool {
+        let routes: [[UInt32]] = [
+            (0 ..< 18).map { UInt32($0 % 6) },
+            (0 ..< 18).map { UInt32($0) },
+            [5, 9, 1, 77, 3, 120, 9, 2, 5, 64, 77, 8, 3, 9, 11, 5, 127, 2],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2, 3, 4, 9, 10, 0, 6],
+        ]
+        var same: [MLXArray] = []
+        for (i, route) in routes.enumerated() {
+            let x = MLXRandom.normal([3, up.k], dtype: .bfloat16,
+                key: MLXRandom.key(UInt64(0x9f1a0 + i)))
+            let inds = MLXArray(route)
+            for relu2 in [false, true] {
+                let a = apply(x, inds, rows: 3, topK: 6, bank: up, perSlot: false,
+                    relu2: relu2, plan: NMLBalancePlan.shared.make(inds))
+                let e = apply(x, inds, rows: 3, topK: 6, bank: up, perSlot: false, relu2: relu2)
+                same.append((a.view(dtype: .uint16) .== e.view(dtype: .uint16)).all())
+            }
+        }
+        let ok = NemotronMoELeaderPreparedKernels.shared.gateUpPlanned != nil
+            && same.allSatisfy { $0.item(Bool.self) }
+        FileHandle.standardError.write(Data(
+            "nemotron fc1 route plan: \(ok ? "on" : "off (mismatch, per-tile scan kept)") (\(same.count) cases)\n".utf8))
+        return ok
+    }
+
     /// Compile every pipeline the verify window can request (R = 1...4) at load.
     static func warm(_ model: Module) {
         guard enabled else { return }
         var outputs: [MLXArray] = []
         var seen = Set<[Int]>()
+        var checkedPlan = false
         for module in model.modules() {
             guard let moe = module as? NemotronHMoE else { continue }
             let mlp = moe.switchMLP
@@ -796,6 +886,10 @@ enum NemotronMoELeader {
                 let x = MLXArray.zeros([rows, up.k], dtype: .bfloat16)
                 let h = apply(x, inds, rows: rows, topK: topK, bank: up, perSlot: false,
                               relu2: fuseRelu2)
+                if rows == 3, topK == 6, fc1PlanEnabled, !checkedPlan {
+                    checkedPlan = true
+                    fc1Plan = verifyPlannedFC1(up)
+                }
                 if rows > 1 {
                     outputs.append(apply(h, inds, rows: rows, topK: topK, bank: down, perSlot: true))
                 }
@@ -843,7 +937,7 @@ private let nmlBalancePlanSource = """
     for (int i = 0; i < 36; i++) { tplan[i] = -1; }
     for (int slot = 0; slot < 18; slot++) {
       const int partner = lead[slot];
-      if (partner == -2) { continue; }
+      if (partner == -2) { tplan[18+slot] = -2; continue; }
       leaders[number] = slot;
       costs[number] = partner < 0 ? SOLO_COST : PAIR_COST;
       original[slot % 6] += costs[number];
@@ -920,17 +1014,24 @@ private final class NMLBalancePlan: Sendable {
 }
 private final class NMLBalanceWeighted: Sendable {
     static let shared = NMLBalanceWeighted()
+    /// Output columns per threadgroup for the balanced R = 3 FC2: two
+    /// doubles the threadgroups (N / 2 = 1344) and halves each one's columns.
+    /// Each column keeps its lane-to-K split, qdot order, BF16 store, score
+    /// multiply and ordered six-slot sum. NEMOTRON_MTP_FC2_NARROW=0 keeps four.
+    static let resultsPerSimdgroup =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_NARROW"] == "0" ? 4 : 2
     let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced",
         inputNames: ["w","scales","biases","x","inds","scores","plan"],
         outputNames: ["y"], source: nmlBalanceWeightedSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
-             _ bank: NemotronMoELeader.Bank) -> MLXArray {
-        let plan = NMLBalancePlan.shared.make(ids)
+             _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
+        let plan = plan ?? NMLBalancePlan.shared.make(ids)
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
-            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
-            grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n),
+                       ("RPS",Self.resultsPerSimdgroup)],
+            grid: (32*(bank.n/Self.resultsPerSimdgroup),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
 }

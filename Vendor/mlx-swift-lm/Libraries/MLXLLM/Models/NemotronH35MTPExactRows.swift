@@ -401,6 +401,37 @@ enum NemotronHeadPreparedActivation {
         name: "nemotron_head_prepared_qmv", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
         outputNames: ["y"], source: nemotronHeadPreparedQMVSource,
         header: nemotronMultiRowQMVHeader)
+    /// Same source with K a template constant instead of a scalar buffer:
+    /// the per-thread K chunks, block order, qdot and affine accumulation are
+    /// the same text; only loop bounds and offsets become compile-time.
+    /// Engages only for the verify K values and only after the load-time bit
+    /// check in warm(). NEMOTRON_MTP_QMV_KSPEC=0 keeps the scalar-K kernel.
+    static let projectK = MLXFast.metalKernel(
+        name: "nemotron_head_prepared_qmv_kspec", inputNames: ["w", "scales", "biases", "prepared", "N"],
+        outputNames: ["y"], source: nemotronHeadPreparedQMVSource,
+        header: nemotronMultiRowQMVHeader)
+    static let kspecEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_KSPEC"] != "0"
+    static let kspecValues: Set<Int> = [2688, 3712, 4096, 5376]
+    nonisolated(unsafe) static var kspecVerified = false
+    static func kspec(_ k: Int) -> Bool {
+        kspecEnabled && kspecVerified && kspecValues.contains(k)
+    }
+    static func projectRows(_ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
+                            _ packed: MLXArray, k: Int, n: Int, rows: Int, relu2: Bool,
+                            rps: Int, dtype: DType, constantK: Bool) -> MLXArray {
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let template: [(String, any KernelTemplateArg)] = [("T", dtype), ("R", rows),
+            ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)]
+        if constantK {
+            return projectK([w, scales, biases, packed, args.1], template: template + [("K", k)],
+                grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[rows, n]], outputDTypes: [dtype])[0]
+        }
+        return project([w, scales, biases, packed, args.0, args.1], template: template,
+            grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, n]], outputDTypes: [dtype])[0]
+    }
     private static func rowSource() -> String {
         let address = "x + row * K + chunk * PV"
         precondition(nemotronHeadPrepareSource.components(separatedBy: address).count == 2)
@@ -423,17 +454,14 @@ enum NemotronHeadPreparedActivation {
             template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
             grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
             outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
-        let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
-            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
-                       ("RELU2", false), ("RPS", 2)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
+        return projectRows(q.weight, q.scales, q.biases!, packed[0], k: k, n: n, rows: 3,
+            relu2: false, rps: 2, dtype: .bfloat16, constantK: kspec(k))
     }
     // JIT each actual prepare K specialization and the two exact QMV
     // epilogues before timed verification. N is a scalar, so eight rows of
     // dummy weights cover the same project pipelines as the full matrices.
     static func warm() {
+        verifyConstantK()
         var outputs: [MLXArray] = []
         for k in [2688, 3712, 4096, 5376] {
             let pv = k % 512 == 0 ? 16 : 8
@@ -453,6 +481,45 @@ enum NemotronHeadPreparedActivation {
             }
         }
         eval(outputs)
+    }
+
+    /// Uniform random uint32 words (every nibble), built from two exact
+    /// 16-bit halves; for the load-time bit checks only.
+    static func randomWords(_ shape: [Int], key: MLXArray) -> MLXArray {
+        let halves = MLXRandom.randInt(Int32(0) ..< Int32(65536), shape + [2], key: key)
+            .asType(.uint32)
+        return halves[.ellipsis, 0] + halves[.ellipsis, 1] * MLXArray(UInt32(65536))
+    }
+
+    /// Load-time bit check (and JIT) of the constant-K kernels: seeded random
+    /// weights, scales, offsets and rows, every verify K, both epilogues, plus
+    /// the fused Q/K/V twin; compared as raw words with the scalar-K kernel.
+    /// Any mismatch keeps the scalar-K kernels for the whole process.
+    private static func verifyConstantK() {
+        kspecVerified = false
+        guard kspecEnabled else { return }
+        var same: [MLXArray] = []
+        for (i, k) in kspecValues.sorted().enumerated() {
+            let key = MLXRandom.key(UInt64(0x6b5e0 + i))
+            let keys = MLXRandom.split(key: key, into: 4)
+            let w = randomWords([16, k / 8], key: keys[0])
+            let s = MLXRandom.normal([16, k / 64], dtype: .bfloat16, scale: 0.05, key: keys[1])
+            let b = MLXRandom.normal([16, k / 64], dtype: .bfloat16, scale: 0.05, key: keys[2])
+            let x = MLXRandom.normal([3, k], dtype: .bfloat16, key: keys[3])
+            let packed = pack(x)
+            for relu2 in [false, true] {
+                let a = projectRows(w, s, b, packed, k: k, n: 16, rows: 3, relu2: relu2,
+                    rps: 2, dtype: .bfloat16, constantK: true)
+                let e = projectRows(w, s, b, packed, k: k, n: 16, rows: 3, relu2: relu2,
+                    rps: 2, dtype: .bfloat16, constantK: false)
+                same.append((a.view(dtype: .uint16) .== e.view(dtype: .uint16)).all())
+            }
+        }
+        same += NemotronTargetQKV.constantKChecks()
+        let ok = same.allSatisfy { $0.item(Bool.self) }
+        kspecVerified = ok
+        FileHandle.standardError.write(Data(
+            "nemotron qmv constant K: \(ok ? "on" : "off (mismatch, scalar-K kernel kept)") (\(same.count) cases)\n".utf8))
     }
 
     static func prepareContiguousRows(_ x: MLXArray, pv: Int) -> MLXArray {
@@ -488,11 +555,8 @@ enum NemotronHeadPreparedActivation {
             ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
-        let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed, args.0, args.1],
-            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+        return projectRows(q.weight, q.scales, q.biases!, packed, k: k, n: n, rows: rows,
+            relu2: relu2, rps: rps, dtype: x.dtype, constantK: kspec(k))
     }
 }
 
@@ -1079,6 +1143,12 @@ enum NemotronTargetQKV {
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
         outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronHeadPreparedQMVSource + "\n}",
         header: nemotronMultiRowQMVHeader)
+    // The same launch with K = 2688 as a template constant (see projectK).
+    private static let preparedKernelK = MLXFast.metalKernel(
+        name: "nemotron_target_qkv_prepared_kspec_affine4_gs64",
+        inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared"],
+        outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronHeadPreparedQMVSource + "\n}",
+        header: nemotronMultiRowQMVHeader)
 
     /// Outputs per SIMD group for the fused Q/K/V launch: narrow at R = 3
     /// and 4 (M1 Max: -9 % and -12 %; R = 1 +7 %). Same kill switch as
@@ -1098,9 +1168,18 @@ enum NemotronTargetQKV {
     }
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
-                                 prepared: Bool = false) -> [MLXArray] {
+                                 prepared: Bool = false,
+                                 constantK: Bool? = nil) -> [MLXArray] {
         let rows = x.dim(1)
         let activations = prepared ? NemotronHeadPreparedActivation.pack(x.reshaped(rows, 2688)) : x
+        if prepared, constantK ?? NemotronHeadPreparedActivation.kspec(2688) {
+            return preparedKernelK(weights + [activations],
+                template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
+                           ("RPS", rps), ("K", 2688)],
+                grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
+                outputDTypes: [x.dtype, x.dtype, x.dtype])
+        }
         return (prepared ? preparedKernel : kernel)(
             weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -1128,6 +1207,20 @@ enum NemotronTargetQKV {
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
         }
         return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// Constant-K Q/K/V launch vs the scalar-K launch on seeded random words.
+    static func constantKChecks() -> [MLXArray] {
+        let keys = MLXRandom.split(key: MLXRandom.key(0x6b5f0), into: 10)
+        let weights = [4096, 256, 256].enumerated().flatMap { i, n in
+            [NemotronHeadPreparedActivation.randomWords([n, 336], key: keys[3 * i]),
+             MLXRandom.normal([n, 42], dtype: .bfloat16, scale: 0.05, key: keys[3 * i + 1]),
+             MLXRandom.normal([n, 42], dtype: .bfloat16, scale: 0.05, key: keys[3 * i + 2])]
+        }
+        let x = MLXRandom.normal([1, 3, 2688], dtype: .bfloat16, key: keys[9])
+        let a = dispatch(weights, x, rps: 2, prepared: true, constantK: true)
+        let e = dispatch(weights, x, rps: 2, prepared: true, constantK: false)
+        return zip(a, e).map { ($0.view(dtype: .uint16) .== $1.view(dtype: .uint16)).all() }
     }
 
     /// Narrow pipelines for the widths that use them (R = 3, 4).
