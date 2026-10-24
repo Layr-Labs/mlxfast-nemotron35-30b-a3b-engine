@@ -76,6 +76,11 @@ func nemotronMTPSSMWindow(
 let nemotronMTPCompactSSM =
     ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_COMPACT_SSM"] != "0"
 
+/// Prepared scalar parameters have an independent rollback switch. The
+/// original compact kernel remains available for unsupported configurations.
+let nemotronMTPPreparedSSM =
+    ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_PREPARED_SSM"] != "0"
+
 // Compact verify window. Per position the recurrence text is identical to
 // `nemotron_mtp_ssm_window` (and therefore to the stock M=1 `ssm_kernel`):
 // same dA, dB_by_x, state and acc expressions in the same order. X, B and C
@@ -84,11 +89,7 @@ let nemotronMTPCompactSSM =
 // recovered at commit by the same kernel run for `L = keep` steps from the
 // same input state, which reproduces the per-position state bit for bit.
 private enum NemotronMTPCompactSSMKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_ssm_compact",
-        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
-        outputNames: ["out", "state_out"],
-        source: """
+    static let prefix = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -106,9 +107,19 @@ private enum NemotronMTPCompactSSMKernel {
                 auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
                 auto C_ = conv + t * CD + CO + g_idx * Ds;
                 auto B_ = conv + t * CD + BO + g_idx * Ds;
+            """
+    static let ordinaryParameters = """
                 auto dt_ = static_cast<float>(dt[t * H + n]);
                 auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
                 auto dA = fast::exp(A * dt_);
+            """
+    static let preparedParameters = """
+                auto dt_ = parameters[(t * H + n) * 2];
+                auto dA = parameters[(t * H + n) * 2 + 1];
+            """
+    // This recurrence is shared verbatim by both variants, including its
+    // left-associated x * dt * B expression and FP32 state/accumulator order.
+    static let recurrence = """
                 float acc = 0.0;
                 for (int i = 0; i < n_per_t; ++i) {
                     auto s_idx = n_per_t * ds_idx + i;
@@ -128,7 +139,17 @@ private enum NemotronMTPCompactSSMKernel {
                     }
                 }
             }
-            """)
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
+        outputNames: ["out", "state_out"],
+        source: prefix + "\n" + ordinaryParameters + "\n" + recurrence)
+    static let preparedKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_prepared",
+        inputNames: ["conv", "D", "parameters", "state_in"],
+        outputNames: ["out", "state_out"],
+        source: prefix + "\n" + preparedParameters + "\n" + recurrence)
 }
 
 /// `convolution` is the window's activated conv output `[1, W, convDim]`
@@ -138,15 +159,26 @@ private enum NemotronMTPCompactSSMKernel {
 func nemotronMTPSSMCompact(
     convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
     state: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int,
-    steps: Int, writeOutput: Bool
+    steps: Int, writeOutput: Bool, preparedParameters: MLXArray? = nil
 ) -> (output: MLXArray, finalState: MLXArray) {
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
     precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
-    let outputs = NemotronMTPCompactSSMKernel.kernel(
-        [convolution, ALog, D, dt, state],
+    let kernel: MLXFast.MLXFastKernel
+    let inputs: [MLXArray]
+    if let preparedParameters {
+        precondition(preparedParameters.dtype == .float32
+            && preparedParameters.shape == [1, width, heads, 2])
+        kernel = NemotronMTPCompactSSMKernel.preparedKernel
+        inputs = [convolution, D, preparedParameters, state]
+    } else {
+        kernel = NemotronMTPCompactSSMKernel.kernel
+        inputs = [convolution, ALog, D, dt, state]
+    }
+    let outputs = kernel(
+        inputs,
         template: [("T", convolution.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),

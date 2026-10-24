@@ -45,16 +45,34 @@ extension NemotronHMamba2Mixer {
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
-        let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let rawDt = parts[2].reshaped(batch, length, numHeads)
+        let convolution: MLXArray
+        let padded: MLXArray
+        let parameters: MLXArray?
+        let dt: MLXArray
+        if let prepared = packedConvWithSSMParameters(convState, input, rawDt: rawDt) {
+            convolution = prepared.convolution
+            padded = prepared.padded
+            parameters = prepared.parameters
+            // A view only. Both dt and dA are loaded from the same table by
+            // the prepared recurrence; no separate dt kernel is constructed.
+            dt = prepared.parameters[.ellipsis, 0]
+        } else {
+            let ordinary = packedConv(convState, input)
+            convolution = ordinary.convolution
+            padded = ordinary.padded
+            parameters = nil
+            dt = nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit)
+        }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+            steps: length, writeOutput: true, preparedParameters: parameters)
         let history = convKernelSize - 1
-        let tape = [padded, convolution, dt]
+        // Charge and retain the whole interleaved table, not only its dt view.
+        let tape = [padded, convolution, parameters ?? dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
         do {
             try evaluation.stagePrefixReplay(
@@ -71,7 +89,8 @@ extension NemotronHMamba2Mixer {
                         ssm: nemotronMTPSSMCompact(
                             convolution: convolution, ALog: logA, D: skip, dt: dt,
                             state: initialSSM, heads: heads, headDim: dim, groups: groups,
-                            stateDim: state, steps: keep, writeOutput: false).finalState)
+                            stateDim: state, steps: keep, writeOutput: false,
+                            preparedParameters: parameters).finalState)
                 })
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
@@ -197,6 +216,23 @@ extension NemotronH35Model {
                     state: state, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, steps: width - 1, writeOutput: false)
                 roots += [window.output, window.finalState, replay.finalState]
+                if let prepared = mixer.packedConvWithSSMParameters(
+                    MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+                    MLXArray.zeros([1, width, mixer.convDim], dtype: activationDType), rawDt: rawDt) {
+                    let preparedDt = prepared.parameters[.ellipsis, 0]
+                    let preparedWindow = nemotronMTPSSMCompact(
+                        convolution: prepared.convolution, ALog: mixer.aLog, D: mixer.D,
+                        dt: preparedDt, state: state, heads: heads, headDim: dim,
+                        groups: groups, stateDim: stateDim, steps: width, writeOutput: true,
+                        preparedParameters: prepared.parameters)
+                    let preparedReplay = nemotronMTPSSMCompact(
+                        convolution: prepared.convolution, ALog: mixer.aLog, D: mixer.D,
+                        dt: preparedDt, state: state, heads: heads, headDim: dim,
+                        groups: groups, stateDim: stateDim, steps: width - 1, writeOutput: false,
+                        preparedParameters: prepared.parameters)
+                    roots += [prepared.padded, prepared.convolution, prepared.parameters,
+                              preparedWindow.output, preparedWindow.finalState, preparedReplay.finalState]
+                }
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,
                     indices: [mixer.intermediateSize, mixer.intermediateSize + groups * stateDim],

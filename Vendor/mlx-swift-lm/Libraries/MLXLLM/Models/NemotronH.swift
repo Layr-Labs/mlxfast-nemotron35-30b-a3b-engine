@@ -549,11 +549,7 @@ func nemotronDecodeSSM(
 // MARK: - Mamba2Mixer
 
 private enum NemotronPackedConvKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_packed_conv_silu",
-        inputNames: ["oldState", "input", "weight", "bias"],
-        outputNames: ["out", "padded"],
-        source: """
+    static let convolutionSource = """
             int64_t channel = int64_t(thread_position_in_grid.x);
             int64_t position = int64_t(thread_position_in_grid.y);
             padded[(position + 3) * C + channel] =
@@ -578,6 +574,46 @@ private enum NemotronPackedConvKernel {
             auto y = 1 / (1 + metal::exp(metal::abs(x)));
             T sigmoid = x < 0 ? y : 1 - y;
             out[position * C + channel] = x * sigmoid;
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu",
+        inputNames: ["oldState", "input", "weight", "bias"],
+        outputNames: ["out", "padded"],
+        source: convolutionSource, ensureRowContiguous: false)
+
+    // Same packed convolution plus one scalar task per (position, head).
+    // log1p is MLX's utils.h float helper, also used by LogAddExp.
+    static let compactParameters = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_ssm_parameters",
+        inputNames: ["oldState", "input", "weight", "bias", "raw_dt", "dt_bias",
+                     "A_log", "limit_min", "limit_max"],
+        outputNames: ["out", "padded", "parameters"],
+        source: convolutionSource + "\n" + """
+            if (channel < H) {
+                float v = static_cast<float>(raw_dt[position * raw_dt_strides[1]
+                    + channel * raw_dt_strides[2]])
+                    + static_cast<float>(dt_bias[channel * dt_bias_strides[0]]);
+                float timestep;
+                if (metal::isnan(v)) {
+                    timestep = metal::numeric_limits<float>::quiet_NaN();
+                } else {
+                    constexpr float inf = metal::numeric_limits<float>::infinity();
+                    float maxval = metal::max(v, 0.0f);
+                    float minval = metal::min(v, 0.0f);
+                    timestep = (minval == -inf || maxval == inf) ? maxval
+                        : (maxval + log1p(metal::exp(minval - maxval)));
+                }
+                // clip = Maximum(timestep, min), then Minimum(result, max),
+                // preserving native NaN propagation and argument order.
+                float lo = limit_min;
+                timestep = metal::isnan(timestep) ? timestep : (timestep > lo ? timestep : lo);
+                float hi = limit_max;
+                timestep = metal::isnan(timestep) ? timestep : (timestep < hi ? timestep : hi);
+                auto A = -fast::exp(static_cast<float>(A_log[channel * A_log_strides[0]]));
+                auto dA = fast::exp(A * timestep);
+                parameters[(position * H + channel) * 2] = timestep;
+                parameters[(position * H + channel) * 2 + 1] = dA;
+            }
             """, ensureRowContiguous: false)
 }
 
@@ -667,6 +703,37 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             outputShapes: [[1, length, convDim], [1, length + 3, convDim]],
             outputDTypes: [.bfloat16, .bfloat16])
         return (arrays[0], arrays[1])
+    }
+
+    /// Compact verification only. The returned FP32 table is (dt, dA) per
+    /// token/head; it is also retained for exact strict-prefix replay.
+    func packedConvWithSSMParameters(_ oldState: MLXArray, _ input: MLXArray,
+                                     rawDt: MLXArray)
+        -> (convolution: MLXArray, padded: MLXArray, parameters: MLXArray)? {
+        guard nemotronMTPPreparedSSM, Device.defaultDevice().deviceType == .gpu,
+            StreamOrDevice.default == .gpu,
+            convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, (2...8).contains(input.dim(1)),
+            input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
+            conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
+            conv1d.padding == 0, let bias = conv1d.bias,
+            bias.dtype == .bfloat16, bias.shape == [convDim],
+            rawDt.dtype == .bfloat16, rawDt.shape == [1, input.dim(1), numHeads],
+            dtBias.dtype == .bfloat16, dtBias.shape == [numHeads],
+            [DType.bfloat16, .float16, .float32].contains(aLog.dtype),
+            aLog.shape == [numHeads], numHeads <= convDim
+        else { return nil }
+        let length = input.dim(1)
+        let arrays = NemotronPackedConvKernel.compactParameters(
+            [oldState, input, conv1d.weight, bias, rawDt, dtBias, aLog,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads)],
+            grid: (convDim, length, 1), threadGroup: (min(convDim, 256), 1, 1),
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim],
+                           [1, length, numHeads, 2]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+        return (arrays[0], arrays[1], arrays[2])
     }
 
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
@@ -1326,26 +1393,44 @@ private final class NemotronHPrefillKernels: Sendable {
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
-        // threads; thread (e, s) counts expert e in sub-range s, a serial
-        // exclusive scan over (e, s) gives each thread its first slot, and the
-        // second pass writes slots in ascending index order.
+        // threads; E workers per segment count each route once into a shared
+        // histogram. The original serial exclusive scan over (e, s) gives
+        // each scatter thread its first slot, preserving stable input order.
         countingSort = MLXFast.metalKernel(
             name: "nemotron_moe_counting_sort",
             inputNames: ["flat", "n", "tmax"], outputNames: ["order", "inv", "sorted", "tiles"],
             source: """
                 constexpr int S = THREADS / E;
                 threadgroup uint counts[THREADS];
+                threadgroup atomic_uint histogram[THREADS];
                 uint tid = thread_position_in_threadgroup.x;
                 uint e = tid / S;
                 uint s = tid % S;
                 int chunk = (n + S - 1) / S;
                 int lo = min(n, int(s) * chunk);
                 int hi = min(n, lo + chunk);
-                uint c = 0;
-                for (int i = lo; i < hi; ++i) {
-                    c += (flat[i] == e) ? 1u : 0u;
+                atomic_store_explicit(&histogram[tid], 0u, memory_order_relaxed);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Transpose only the count-phase work assignment: each of S
+                // input segments has E workers reading disjoint positions.
+                // The scatter below retains its original (expert, segment)
+                // assignment and increasing input order.
+                uint countSegment = tid / E;
+                uint countLane = tid % E;
+                int countLo = min(n, int(countSegment) * chunk);
+                int countHi = min(n, countLo + chunk);
+                for (int i = countLo + int(countLane); i < countHi; i += E) {
+                    uint expert = flat[i];
+                    if (expert < uint(E)) {
+                        atomic_fetch_add_explicit(
+                            &histogram[expert * S + countSegment], 1u, memory_order_relaxed);
+                    }
                 }
-                counts[tid] = c;
+                // All increments finish before any bin is loaded. The
+                // existing publication barrier then protects the plain uint
+                // counts consumed by the unchanged serial prefix scan.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                counts[tid] = atomic_load_explicit(&histogram[tid], memory_order_relaxed);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
                     uint acc = 0;
