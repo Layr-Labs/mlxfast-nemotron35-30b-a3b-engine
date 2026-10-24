@@ -61,8 +61,6 @@ extension EngineLoopV2 {
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
-        // finalize adds up to three syncs to the step's one (seed policy
-        // margin above, acceptance packet, verify policy margin). Serial
         // target verification adds one blocking eval per column at launch
         // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
@@ -70,8 +68,15 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
-        if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        let policyTopTwoHost: [Float]?
+        if CBv2MTPPolicyPacket.enabled {
+            policyTopTwoHost = verify.policyTopTwoValues.map { values in
+                host.suffix(values.size).map { Float(bitPattern: UInt32(bitPattern: $0)) }
+            }
+        } else {
+            policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+            if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false

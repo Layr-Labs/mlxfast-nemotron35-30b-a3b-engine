@@ -45,6 +45,10 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+let nemotronPrefillEvalInterval =
+    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
+    ? nemotronEarlyEvalInterval : 2
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -3432,7 +3436,8 @@ private class NemotronHBackbone: Module {
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3456,9 +3461,11 @@ private class NemotronHBackbone: Module {
                 cache = nil
             }
             let next = modelLayerIndex + 1
-            let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
+            let suppressedNorm = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
-            let nextNorm = next < layers.count && !submitsEarly
+            let submitsEarly = earlyEvalInterval > 0 && next < layers.count
+                && next % earlyEvalInterval == 0
+            let nextNorm = next < layers.count && !suppressedNorm
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
             let result = layer.cbv2Forward(
                 hidden,
@@ -3478,7 +3485,7 @@ private class NemotronHBackbone: Module {
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
                 if inputs.dim(1) > 1 && !captureMTP {
-                    let group = (next - nemotronEarlyEvalInterval)..<next
+                    let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
                     // Engine prefill only (see `cbv2Hidden`). A chunk runs for
@@ -3740,7 +3747,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3750,7 +3758,7 @@ public class NemotronHModel:
         }
         return backbone.cbv2Forward(
             inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
-            recyclePrefillChunks: recyclePrefillChunks)
+            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.

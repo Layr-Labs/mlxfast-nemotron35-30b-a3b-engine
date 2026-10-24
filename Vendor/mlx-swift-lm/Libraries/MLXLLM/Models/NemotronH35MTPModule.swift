@@ -329,9 +329,9 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         precondition(positionIds == nil)
         // The engine's request prefill (the scored seed) is the first work
         // after the worker's between-phase cache drain, so let completed
-        // chunks' buffers be reused within it.
         let hidden = cbv2Hidden(
-            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true)
+            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
+            earlyEvalInterval: nemotronPrefillEvalInterval)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
