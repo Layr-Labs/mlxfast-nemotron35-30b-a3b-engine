@@ -302,6 +302,170 @@ enum NemotronMultiRowQMV {
     }
 }
 
+private let nemotronMTPRouterRowsSource = """
+  constexpr int BN = 8;
+  constexpr int SN = 32;
+  constexpr int TM = 4;
+  constexpr int TN = 4;
+  constexpr int blockM = TM;
+  constexpr int blockN = BN * SN * TN;
+  typedef float AccT;
+  threadgroup AccT tgp_memory[R * BN * (blockM + TM)];
+
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const int in_vec_size = K;
+  const int out_vec_size = N;
+
+  thread AccT result[R][TM];
+  thread T inter[TN];
+  thread AccT v_coeff[R][TN];
+  for (int r = 0; r < R; r++) {
+    for (int tm = 0; tm < TM; tm++) {
+      result[r][tm] = 0;
+    }
+  }
+
+  const int sgN = int(simd_gid);
+  const int simdN = SN * int(simd_gid);
+  int bn = (simdN + int(simd_lid)) * TN;
+  // The shape guard sends N % 4 == 0 only, so no tail tile is ever shifted.
+  const int out_row = int(tid.x) * blockM;
+  const device T* mat = w + size_t(out_row) * in_vec_size;
+
+  constexpr const uniform<int> loop_stride = make_uniform(blockN);
+  const uniform<int> in_size = make_uniform(in_vec_size);
+  const uniform<int> n_iter = in_size / loop_stride;
+  const uniform<int> last_iter = loop_stride * n_iter;
+  const uniform<int> leftover = in_size - last_iter;
+
+  for (int i = 0; i < n_iter; ++i) {
+    for (int r = 0; r < R; r++) {
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[r][tn] = static_cast<AccT>(x[r * in_vec_size + bn + tn]);
+      }
+    }
+    int mat_offset = 0;
+    for (int tm = 0; tm < TM; tm++) {
+      for (int tn = 0; tn < TN; tn++) {
+        inter[tn] = mat[mat_offset + bn + tn];
+      }
+      // One weight load, the same per-row tn-order accumulation as stock.
+      for (int r = 0; r < R; r++) {
+        for (int tn = 0; tn < TN; tn++) {
+          result[r][tm] += inter[tn] * v_coeff[r][tn];
+        }
+      }
+      mat_offset += in_vec_size;
+    }
+    bn += blockN;
+  }
+
+  if (leftover > 0) {
+    // GEMVKernel::load_safe: whole in-range quads, zero-filled otherwise.
+    const bool whole = bn + TN <= in_size;
+    for (int r = 0; r < R; r++) {
+      for (int tn = 0; tn < TN; tn++) {
+        v_coeff[r][tn] = (whole || bn + tn < in_size)
+            ? static_cast<AccT>(x[r * in_vec_size + bn + tn]) : AccT(0);
+      }
+    }
+    for (int tm = 0; tm < TM; tm++) {
+      for (int tn = 0; tn < TN; tn++) {
+        inter[tn] = (whole || bn + tn < in_size)
+            ? mat[tm * in_vec_size + bn + tn] : T(0);
+      }
+      for (int r = 0; r < R; r++) {
+        for (int tn = 0; tn < TN; tn++) {
+          result[r][tm] += inter[tn] * v_coeff[r][tn];
+        }
+      }
+    }
+  }
+
+  for (int r = 0; r < R; r++) {
+    for (int tm = 0; tm < TM; tm++) {
+      for (ushort sn = (SN / 2); sn >= 1; sn >>= 1) {
+        result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+      }
+    }
+  }
+
+  if (simd_lid == 0) {
+    for (int r = 0; r < R; r++) {
+      for (int tm = 0; tm < TM; tm++) {
+        tgp_memory[(r * BN + sgN) * (blockM + TM) + tm] = result[r][tm];
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sgN == 0 && simd_lid == 0) {
+    for (int r = 0; r < R; r++) {
+      // Stock order: result += simdgroup 1, then 2, ... then 7.
+      for (int sgn = 1; sgn < BN; sgn++) {
+        for (int tm = 0; tm < TM; tm++) {
+          result[r][tm] += tgp_memory[(r * BN + sgn) * (blockM + TM) + tm];
+        }
+      }
+      for (int tm = 0; tm < TM; tm++) {
+        y[r * out_vec_size + out_row + tm] = static_cast<T>(result[r][tm]);
+      }
+    }
+  }
+"""
+
+enum NemotronMTPRouterRows {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_ROWS"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_router_rows_gemv_bf16",
+        inputNames: ["w", "x", "K", "N"],
+        outputNames: ["y"],
+        source: nemotronMTPRouterRowsSource)
+
+    static func gates(_ x: MLXArray, _ weight: MLXArray) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)),
+              x.dim(2) == 2688, x.dtype == .bfloat16,
+              weight.dtype == .bfloat16, weight.shape == [128, 2688],
+              rowMajor.contains(ObjectIdentifier(weight))
+        else { return nil }
+        let rows = x.dim(1)
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
+        var y = kernel([weight, x, kArray, nArray],
+            template: [("T", x.dtype), ("R", rows)],
+            grid: (32 * 32, 8, 1),
+            threadGroup: (32, 8, 1),
+            outputShapes: [[1, rows, 128]],
+            outputDTypes: [x.dtype])[0]
+        if NemotronMoELeader.selfTest {
+            let expected = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+            let ok = (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+            y = which(ok, y, MLXArray(Float.nan).asType(y.dtype))
+        }
+        return y
+    }
+
+    nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
+
+    static func warm(_ model: Module) {
+        guard enabled else { return }
+        let routers = model.modules().compactMap { $0 as? NemotronHMoEGate }
+        for gate in routers {
+            eval(gate.weight)
+            if gate.weight.strides == [2688, 1] { rowMajor.insert(ObjectIdentifier(gate.weight)) }
+        }
+        guard let gate = routers.first(where: { rowMajor.contains(ObjectIdentifier($0.weight)) })
+        else { return }
+        let outputs = (1...4).compactMap { rows in
+            gates(MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), gate.weight)
+        }
+        if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
 /// Put verification tokens on the native *batch* axis, keeping matrix M=1.
 /// A singleton leading weight axis prevents MLX's flatten-to-M optimization
 /// and therefore avoids qmv_wide's different accumulation. The underlying

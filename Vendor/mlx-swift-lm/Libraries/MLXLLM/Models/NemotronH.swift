@@ -1202,7 +1202,8 @@ class NemotronHMoEGate: Module {
     /// Keep each router projection at native M=1, but perform the row-local
     /// sigmoid/selection/normalization over the complete verification window.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        let gates = NemotronMTPRouterRows.gates(x, weight)
+            ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
             routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
@@ -1305,6 +1306,47 @@ class NemotronHSwitchMLP: Module {
             outputShapes: [outShape], outputDTypes: [y.dtype])[0]
     }
 
+    func unsortedCombine(
+        _ y: MLXArray, _ indices: MLXArray, _ scores: MLXArray
+    ) -> MLXArray? {
+        guard let outShape = unsortedCombineShape(y, indices, scores) else { return nil }
+        let k = indices.dim(-1)
+        return NemotronHPrefillKernels.shared.unsortedCombine(
+            [y, scores, inputDims],
+            template: [("T", y.dtype), ("K", k)],
+            grid: (inputDims / 4, indices.size / k, 1), threadGroup: (32, 1, 1),
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0]
+    }
+
+    func unsortedCombine(
+        _ y: MLXArray, _ indices: MLXArray, _ scores: MLXArray, shared: MLXArray
+    ) -> MLXArray? {
+        guard let outShape = unsortedCombineShape(y, indices, scores),
+              shared.dtype == y.dtype, shared.shape == outShape
+        else { return nil }
+        let k = indices.dim(-1)
+        return NemotronHPrefillKernels.shared.unsortedCombineShared(
+            [y, scores, shared, inputDims],
+            template: [("T", y.dtype), ("K", k)],
+            grid: (inputDims / 4, indices.size / k, 1), threadGroup: (32, 1, 1),
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0]
+    }
+
+    private func unsortedCombineShape(
+        _ y: MLXArray, _ indices: MLXArray, _ scores: MLXArray
+    ) -> [Int]? {
+        let k = indices.dim(-1)
+        guard indices.size <= 64, (1...8).contains(k), scores.dtype == .float32,
+              scores.shape == indices.shape,
+              y.dtype == .bfloat16 || y.dtype == .float16,
+              y.dim(-1) == inputDims, y.size == indices.size * inputDims,
+              inputDims % 4 == 0
+        else { return nil }
+        var outShape = indices.shape
+        outShape[outShape.count - 1] = inputDims
+        return outShape
+    }
+
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
@@ -1318,7 +1360,15 @@ class NemotronHSwitchMLP: Module {
         }
 
         var y = fc1(x, idx, sortedIndices: doSort)
-        y = relu2(y)
+        let kernels = NemotronHPrefillKernels.shared
+        if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
+            y = kernels.relu2(
+                [y], template: [("T", y.dtype)],
+                grid: (y.size, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [y.shape], outputDTypes: [y.dtype])[0]
+        } else {
+            y = relu2(y)
+        }
         y = fc2(y, idx, sortedIndices: doSort)
 
         if doSort {
@@ -1337,6 +1387,8 @@ private final class NemotronHPrefillKernels: Sendable {
     let countingSort: MLXFast.MLXFastKernel
     let relu2: MLXFast.MLXFastKernel
     let combine: MLXFast.MLXFastKernel
+    let unsortedCombine: MLXFast.MLXFastKernel
+    let unsortedCombineShared: MLXFast.MLXFastKernel
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
@@ -1465,6 +1517,62 @@ private final class NemotronHPrefillKernels: Sendable {
                 device T* o = out + size_t(t) * N + c;
                 for (int j = 0; j < 4; ++j) {
                     o[j] = static_cast<T>(total[j]);
+                }
+            """)
+        unsortedCombine = MLXFast.metalKernel(
+            name: "nemotron_moe_unsorted_combine",
+            inputNames: ["y", "scores", "N"], outputNames: ["out"],
+            source: """
+                uint c = thread_position_in_grid.x * 4;
+                uint t = thread_position_in_grid.y;
+                float total[4];
+                for (int k = 0; k < K; ++k) {
+                    uint src = t * K + k;
+                    float s = scores[t * K + k];
+                    const device T* row = y + size_t(src) * N + c;
+                    for (int j = 0; j < 4; ++j) {
+                        float v = static_cast<float>(row[j]);
+                        float p = v * s;
+                        float a = p + 0.0f;
+                        if (k == 0) {
+                            total[j] = a;
+                        } else {
+                            total[j] = a + total[j];
+                        }
+                    }
+                }
+                device T* o = out + size_t(t) * N + c;
+                for (int j = 0; j < 4; ++j) {
+                    o[j] = static_cast<T>(total[j]);
+                }
+            """)
+        unsortedCombineShared = MLXFast.metalKernel(
+            name: "nemotron_moe_unsorted_combine_shared",
+            inputNames: ["y", "scores", "shared", "N"], outputNames: ["out"],
+            source: """
+                uint c = thread_position_in_grid.x * 4;
+                uint t = thread_position_in_grid.y;
+                float total[4];
+                for (int k = 0; k < K; ++k) {
+                    uint src = t * K + k;
+                    float s = scores[t * K + k];
+                    const device T* row = y + size_t(src) * N + c;
+                    for (int j = 0; j < 4; ++j) {
+                        float v = static_cast<float>(row[j]);
+                        float p = v * s;
+                        float a = p + 0.0f;
+                        if (k == 0) {
+                            total[j] = a;
+                        } else {
+                            total[j] = a + total[j];
+                        }
+                    }
+                }
+                const device T* sh = shared + size_t(t) * N + c;
+                device T* o = out + size_t(t) * N + c;
+                for (int j = 0; j < 4; ++j) {
+                    T combined = static_cast<T>(total[j]);
+                    o[j] = combined + sh[j];
                 }
             """)
     }
@@ -2844,16 +2952,38 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         var y: MLXArray
         if let fused = switchMLP.fusedSortedCombine(x, inds, scores) {
             y = fused
-        } else {
-            y = switchMLP(x, inds)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            if let sharedExperts {
+                y = y + sharedExpertRows(sharedExperts, x)
+            }
+            return y
         }
 
+        let routed = switchMLP(x, inds)
         if let sharedExperts {
-            y = y + sharedExperts(x)
+            let shared = sharedExpertRows(sharedExperts, x)
+            if let fused = switchMLP.unsortedCombine(routed, inds, scores, shared: shared) {
+                y = fused
+            } else if let combined = switchMLP.unsortedCombine(routed, inds, scores) {
+                y = combined + shared
+            } else {
+                y = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
+                y = y + shared
+            }
+        } else if let combined = switchMLP.unsortedCombine(routed, inds, scores) {
+            y = combined
+        } else {
+            y = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
         }
 
         return y
+    }
+
+    private func sharedExpertRows(_ mlp: NemotronHMLP, _ x: MLXArray) -> MLXArray {
+        guard x.ndim == 3, x.dim(0) == 1, (2...8).contains(x.dim(1)) else {
+            return mlp(x)
+        }
+        return nemotronMTPLinearRows(
+            nemotronMTPLinearRelu2Rows(x, mlp.upProj), mlp.downProj)
     }
 
     // Protocol conformance
@@ -3369,6 +3499,18 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         if hidden.dim(0) == 1, length > 128 {
             let start = ((length - 1) / 64) * 64 - 64
             return logits(hidden[0..., start..., 0...])
+        }
+        if hidden.dim(0) == 1, (2...8).contains(length),
+            let head = lmHead as? QuantizedLinear,
+            head.weight.dim(0) == configuration.vocabSize,
+            head.mode == .affine, head.bits == 4, head.groupSize == 64,
+            head.scales.dtype == hidden.dtype, head.biases?.dtype == hidden.dtype,
+            let rows = NemotronMultiRowQMV.apply(
+                hidden.reshaped(length, hidden.dim(2)), head)
+        {
+            var result = rows.reshaped(1, length, head.weight.dim(0))
+            if let bias = head.bias { result = result + bias }
+            return result
         }
         return logits(hidden)
     }
