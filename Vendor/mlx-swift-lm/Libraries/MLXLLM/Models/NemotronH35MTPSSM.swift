@@ -76,6 +76,8 @@ func nemotronMTPSSMWindow(
 let nemotronMTPCompactSSM =
     ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_COMPACT_SSM"] != "0"
 
+let nemotronMaterializePrefixStates = true
+
 // Compact verify window. Per position the recurrence text is identical to
 // `nemotron_mtp_ssm_window` (and therefore to the stock M=1 `ssm_kernel`):
 // same dA, dB_by_x, state and acc expressions in the same order. X, B and C
@@ -115,7 +117,14 @@ private enum NemotronMTPCompactSSMKernel {
                     if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
                     auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
                     auto state = dA * prior[i] + dB_by_x;
-                    if (t == L - 1) {
+                    // ALL stores every prefix. Index t is the state after
+                    // consuming step t, the same value a steps=t+1 replay
+                    // would return as its final state. The last-step store
+                    // keeps the original final-only layout when ALL is false.
+                    if (ALL) {
+                        state_out[((t * H + n) * Dh + d_idx) * Ds + s_idx] =
+                            static_cast<U>(state);
+                    } else if (t == L - 1) {
                         state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
                     }
                     prior[i] = static_cast<U>(state);
@@ -138,7 +147,7 @@ private enum NemotronMTPCompactSSMKernel {
 func nemotronMTPSSMCompact(
     convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
     state: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int,
-    steps: Int, writeOutput: Bool
+    steps: Int, writeOutput: Bool, storePrefixes: Bool = false
 ) -> (output: MLXArray, finalState: MLXArray) {
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
@@ -151,9 +160,14 @@ func nemotronMTPSSMCompact(
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
                    ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
-                   ("WO", writeOutput)],
+                   ("WO", writeOutput), ("ALL", storePrefixes)],
         grid: (32, headDim, heads), threadGroup: (32, 8, 1),
-        outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
+        outputShapes: [
+            writeOutput ? [1, steps, heads, headDim] : [1],
+            storePrefixes
+                ? [steps, heads, headDim, stateDim]
+                : [1, heads, headDim, stateDim],
+        ],
         outputDTypes: [convolution.dtype, .float32])
     return (outputs[0], outputs[1])
 }

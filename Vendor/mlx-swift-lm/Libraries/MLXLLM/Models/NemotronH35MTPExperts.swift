@@ -183,6 +183,31 @@ inline U nml_qdot_safe(
   }
   return scale * accum + sum * bias;
 }
+
+// Two routed rows share one expert weight tile. Decode each packed word
+// once. Each accumulator keeps the original per-row i-order, scale, and
+// bias term, so both outputs match two separate nml_qdot calls.
+template <typename U, int values_per_thread>
+inline void nml_qdot_pair(
+    const device uint8_t* w, const thread U* x0, const thread U* x1,
+    U scale, U bias, U sum0, U sum1, int N,
+    thread U& value0, thread U& value1) {
+  U accum0 = 0;
+  U accum1 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < N / 4; i++) {
+    const U a = ws[i] & 0x000f;
+    const U nib1 = ws[i] & 0x00f0;
+    const U c = ws[i] & 0x0f00;
+    const U d = ws[i] & 0xf000;
+    accum0 += x0[4 * i] * a + x0[4 * i + 1] * nib1
+        + x0[4 * i + 2] * c + x0[4 * i + 3] * d;
+    accum1 += x1[4 * i] * a + x1[4 * i + 1] * nib1
+        + x1[4 * i + 2] * c + x1[4 * i + 3] * d;
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+}
 """
 
 // RELU2 epilogue = stock relu2 on the stored bf16 value, op for op as MLX's
@@ -303,8 +328,11 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
-        result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+        U value0, value1;
+        nml_qdot_pair<U, values_per_thread>(
+            wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
+        result0[r] += value0;
+        result1[r] += value1;
       }
       ws += block_size / 2;
       sc += block_size / 64;
@@ -323,10 +351,11 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result0[r] += nml_qdot_safe<U, values_per_thread>(
-            wl, x0_thread, s, b, sum0, remaining);
-        result1[r] += nml_qdot_safe<U, values_per_thread>(
-            wl, x1_thread, s, b, sum1, remaining);
+        U value0, value1;
+        nml_qdot_pair<U, values_per_thread>(
+            wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
+        result0[r] += value0;
+        result1[r] += value1;
       }
     }
     for (int r = 0; r < results_per_simdgroup; r++) {
@@ -457,8 +486,11 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result0[r] += nml_qdot<U, values_per_thread>(wl, x0_thread, s, b, sum0);
-          result1[r] += nml_qdot<U, values_per_thread>(wl, x1_thread, s, b, sum1);
+          U value0, value1;
+          nml_qdot_pair<U, values_per_thread>(
+              wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
+          result0[r] += value0;
+          result1[r] += value1;
         }
         ws += block_size / 2;
         sc += block_size / 64;
@@ -477,10 +509,11 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result0[r] += nml_qdot_safe<U, values_per_thread>(
-              wl, x0_thread, s, b, sum0, remaining);
-          result1[r] += nml_qdot_safe<U, values_per_thread>(
-              wl, x1_thread, s, b, sum1, remaining);
+          U value0, value1;
+          nml_qdot_pair<U, values_per_thread>(
+              wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
+          result0[r] += value0;
+          result1[r] += value1;
         }
       }
       for (int r = 0; r < results_per_simdgroup; r++) {

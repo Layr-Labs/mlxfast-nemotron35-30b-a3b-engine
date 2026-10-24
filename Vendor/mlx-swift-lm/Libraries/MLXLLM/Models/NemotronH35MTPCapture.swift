@@ -33,10 +33,6 @@ extension NemotronHMamba2Mixer {
         return arrays[0]
     }
 
-    /// Compact verify: the window kernel writes only the final SSM state and
-    /// the window's y; a strict accepted prefix replays the same kernel for
-    /// `keep` steps from the same input state at commit (bitwise equal to the
-    /// captured per-position state). Conv states are views of `padded`.
     func mtpCompactForward(
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
         evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
@@ -49,32 +45,50 @@ extension NemotronHMamba2Mixer {
         let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
-        let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-            heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
         let history = convKernelSize - 1
-        let tape = [padded, convolution, dt]
-        let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
-        do {
-            try evaluation.stagePrefixReplay(
-                modelLayerIndex: modelLayerIndex, positions: length,
-                finalConv: padded[0..., length ..< (length + history), 0...],
-                finalSSM: result.finalState,
-                materializedByteCount: tapeBytes + result.finalState.nbytes,
-                evaluationRoots: tape,
-                strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
-                strictReplayRetainedRoots: tape + [initialSSM],
-                replay: { keep in
-                    CBv2RecurrentLayerState(
-                        conv: padded[0..., keep ..< (keep + history), 0...],
-                        ssm: nemotronMTPSSMCompact(
-                            convolution: convolution, ALog: logA, D: skip, dt: dt,
-                            state: initialSSM, heads: heads, headDim: dim, groups: groups,
-                            stateDim: state, steps: keep, writeOutput: false).finalState)
-                })
-        } catch {
-            preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
+        let result: (output: MLXArray, finalState: MLXArray)
+        if nemotronMaterializePrefixStates {
+            result = nemotronMTPSSMCompact(
+                convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                heads: heads, headDim: dim, groups: groups, stateDim: state,
+                steps: length, writeOutput: true, storePrefixes: true)
+            let convStack = asStrided(
+                padded, [length, history, convDim],
+                strides: [convDim, convDim, 1], offset: convDim)
+            do {
+                try evaluation.stageCaptured(
+                    modelLayerIndex: modelLayerIndex, conv: convStack,
+                    ssm: result.finalState, positions: length)
+            } catch {
+                preconditionFailure("Nemotron MTP prefix-state stage failed: \(error)")
+            }
+        } else {
+            result = nemotronMTPSSMCompact(
+                convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                heads: heads, headDim: dim, groups: groups, stateDim: state,
+                steps: length, writeOutput: true)
+            let tape = [padded, convolution, dt]
+            let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
+            do {
+                try evaluation.stagePrefixReplay(
+                    modelLayerIndex: modelLayerIndex, positions: length,
+                    finalConv: padded[0..., length ..< (length + history), 0...],
+                    finalSSM: result.finalState,
+                    materializedByteCount: tapeBytes + result.finalState.nbytes,
+                    evaluationRoots: tape,
+                    strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
+                    strictReplayRetainedRoots: tape + [initialSSM],
+                    replay: { keep in
+                        CBv2RecurrentLayerState(
+                            conv: padded[0..., keep ..< (keep + history), 0...],
+                            ssm: nemotronMTPSSMCompact(
+                                convolution: convolution, ALog: logA, D: skip, dt: dt,
+                                state: initialSSM, heads: heads, headDim: dim, groups: groups,
+                                stateDim: state, steps: keep, writeOutput: false).finalState)
+                    })
+            } catch {
+                preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
+            }
         }
         let y = result.output.reshaped(batch, length, heads * dim)
         let normalized = NemotronMTPExecution.batchedNorm
@@ -196,7 +210,13 @@ extension NemotronH35Model {
                     convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
                     state: state, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, steps: width - 1, writeOutput: false)
-                roots += [window.output, window.finalState, replay.finalState]
+                let stored = nemotronMTPSSMCompact(
+                    convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt,
+                    state: state, heads: heads, headDim: dim, groups: groups,
+                    stateDim: stateDim, steps: width, writeOutput: true,
+                    storePrefixes: true)
+                roots += [window.output, window.finalState, replay.finalState,
+                          stored.output, stored.finalState]
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,
                     indices: [mixer.intermediateSize, mixer.intermediateSize + groups * stateDim],
