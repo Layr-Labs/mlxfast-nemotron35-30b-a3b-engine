@@ -7,6 +7,18 @@ import MLXFast
 enum PagedSegmentAttention {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var zeroSinkArrays: [Int: MLXArray] = [:]
+
+    private static func zeroSinks(heads: Int) -> MLXArray {
+        let count = max(8, heads)
+        return lock.withLock {
+            if let existing = zeroSinkArrays[count] { return existing }
+            // Immutable, input-independent storage; no GPU fill or eval fence.
+            let made = MLXArray([Float](repeating: 0, count: count))
+            zeroSinkArrays[count] = made
+            return made
+        }
+    }
 
     static func inputNames(bindings: Int) -> [String] {
         ["q", "knew", "vnew"] + (0 ..< bindings).map { "segment\($0)" }
@@ -135,9 +147,8 @@ enum PagedSegmentAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
         return mergeKernel(key: mergeKey, source: source)(
-            [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
+            [partials, meta, seqinfo, sinks ?? zeroSinks(heads: qh), group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
