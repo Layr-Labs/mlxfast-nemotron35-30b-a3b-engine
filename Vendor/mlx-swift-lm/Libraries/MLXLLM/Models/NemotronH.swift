@@ -331,7 +331,7 @@ private final class NemotronHScanKernels: Sendable {
         // + exp + CB product + tril, plus the decay's last row.
         scanDecay = MLXFast.metalKernel(
             name: "nemotron_ssm_scan_decay",
-            inputNames: ["dtA", "CB", "L"], outputNames: ["out", "last"],
+            inputNames: ["dtA", "CB", "L"], outputNames: ["out", "last", "carry"],
             source: """
                 // One threadgroup = 8 simdgroups x 32 lanes: column block
                 // j0..j0+7 of one (batch, head). Simdgroup s owns column
@@ -349,6 +349,7 @@ private final class NemotronHScanKernels: Sendable {
                 const device CBT* cb = CB + size_t(bb * (H / R) + hh / R) * L * L;
                 device float* o = out + size_t(bh) * L * L;
                 float prefix = 0.0f;
+                float carryPrefix = 0.0f;
                 for (int rb = 0; rb < L; rb += 32) {
                     const int i = rb + int(lane);
                     float v = 0.0f;
@@ -358,6 +359,22 @@ private final class NemotronHScanKernels: Sendable {
                     v = simd_prefix_inclusive_sum(v);
                     v = v + prefix;
                     prefix = simd_shuffle(v, 31);
+                    // Reuse this dispatch for the separate inclusive dtA
+                    // scan. Do not derive it from causal column zero: its
+                    // masked first value has a different rounding history.
+                    // A single SIMD group owns each (batch, head) carry.
+                    if constexpr (EC) {
+                        if (j0 == 0 && s == 0) {
+                            float u = i < L
+                                ? dtA[(size_t(bb) * L + i) * H + hh] : 0.0f;
+                            u = simd_prefix_inclusive_sum(u);
+                            u = u + carryPrefix;
+                            carryPrefix = simd_shuffle(u, 31);
+                            if (i < L) {
+                                carry[(size_t(bb) * L + i) * H + hh] = metal::precise::exp(u);
+                            }
+                        }
+                    }
                     float r = 0.0f;
                     if (i < L && int(j) < L) {
                         float d = metal::precise::exp(v);
@@ -459,15 +476,21 @@ func nemotronSSMAttn(
 
         let surrogateAttentionMatrix: MLXArray
         let decayLast: MLXArray
+        let fusedExpDtACumsum: MLXArray?
         if NemotronHPrefillX5.enabled, stepDtA.dtype == .float32, h % g == 0 {
             let fused = NemotronHScanKernels.shared.scanDecay(
                 [stepDtA, CB, n],
-                template: [("CBT", CB.dtype), ("H", h), ("R", repeats)],
+                template: [("CBT", CB.dtype), ("H", h), ("R", repeats), ("EC", h > 1)],
                 grid: (((n + 7) / 8) * 256, 1, b * h), threadGroup: (256, 1, 1),
-                outputShapes: [[b, h, n, n], [b, h, 1, n]], outputDTypes: [.float32, .float32])
+                outputShapes: [[b, h, n, n], [b, h, 1, n], h > 1 ? [b, n, h] : [1]],
+                outputDTypes: [.float32, .float32, .float32])
             surrogateAttentionMatrix = fused[0]
             decayLast = fused[1]
+            // H == 1 uses MLX's contiguous scan with a different reduction
+            // layout. Retain that native path; H > 1 uses strided_scan.
+            fusedExpDtACumsum = h > 1 ? fused[2] : nil
         } else {
+            fusedExpDtACumsum = nil
             // segsum(stepDtA.swappedAxes(1, 2)) with a broadcast instead of repeat.
             let segIn = stepDtA.swappedAxes(1, 2)[.ellipsis, .newAxis]
             let segTri = MLX.tril(MLX.broadcast(segIn, to: [b, h, n, n]), k: -1)
@@ -506,7 +529,7 @@ func nemotronSSMAttn(
         var nextState = nextStateProduct
 
         let previousState = currentState
-        let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
+        let expDtACumsum = fusedExpDtACumsum ?? MLX.exp(MLX.cumsum(stepDtA, axis: -2))
         nextState =
             nextState
             + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
@@ -1547,12 +1570,17 @@ private func nemotronWarmUpPrefillKernels(
         if ssmGroups > 0, ssmHeads % ssmGroups == 0 {
             let dtA = MLXArray.zeros([1, 4, ssmHeads], dtype: .float32)
             let cbw = MLXArray.zeros([1, ssmGroups, 4, 4], dtype: dtype)
-            arrays.append(contentsOf: NemotronHScanKernels.shared.scanDecay(
+            // Match the promoted scan's eight SIMD groups, including for this L=4 warm-up.
+            let scan = NemotronHScanKernels.shared.scanDecay(
                 [dtA, cbw, 4],
-                template: [("CBT", dtype), ("H", ssmHeads), ("R", ssmHeads / ssmGroups)],
-                grid: (1024, 1, ssmHeads), threadGroup: (1024, 1, 1),
-                outputShapes: [[1, ssmHeads, 4, 4], [1, ssmHeads, 1, 4]],
-                outputDTypes: [.float32, .float32]))
+                template: [("CBT", dtype), ("H", ssmHeads), ("R", ssmHeads / ssmGroups),
+                           ("EC", ssmHeads > 1)],
+                grid: (256, 1, ssmHeads), threadGroup: (256, 1, 1),
+                outputShapes: [[1, ssmHeads, 4, 4], [1, ssmHeads, 1, 4],
+                               ssmHeads > 1 ? [1, 4, ssmHeads] : [1]],
+                outputDTypes: [.float32, .float32, .float32])
+            // EC=false retains the native H=1 carry path; do not root its dummy output.
+            arrays.append(contentsOf: scan.prefix(ssmHeads > 1 ? 3 : 2))
             if ssmStateSize == 128, ssmHeadDim % 32 == 0 {
                 arrays.append(NemotronHScanKernels.shared.windowOut(
                     [MLXArray.zeros([1, ssmHeads, ssmHeadDim, ssmStateSize], dtype: .float32),
