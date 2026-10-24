@@ -54,48 +54,61 @@ private func relu2(_ x: MLXArray) -> MLXArray {
 // MARK: - Target residual and next block normalization
 
 enum NemotronHResidualRMSNorm {
+    static let ordinaryMoE = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NEMOTRON35_MOE_JOIN_RMS"] != "0"
+
+    private static let sourcePrefix = """
+        constexpr uint n_reads = 4;
+        const uint gid = threadgroup_position_in_grid.x;
+        const uint lid = thread_position_in_threadgroup.x;
+        const uint simd_lane_id = thread_index_in_simdgroup;
+        const uint simd_group_id = simdgroup_index_in_threadgroup;
+        threadgroup float local_inv_mean[1];
+        threadgroup float local_sums[32];
+        float acc = 0;
+        float thread_x[n_reads];
+        const size_t offset = size_t(gid) * axis_size + lid * n_reads;
+        for (uint i = 0; i < n_reads; i++) {
+        """
+    private static let sourceSuffix = """
+            residual[offset + i] = sum;
+            thread_x[i] = sum;
+            acc += thread_x[i] * thread_x[i];
+        }
+        acc = simd_sum(acc);
+        if (simd_group_id == 0) {
+            local_sums[simd_lane_id] = 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane_id == 0) {
+            local_sums[simd_group_id] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group_id == 0) {
+            acc = simd_sum(local_sums[simd_lane_id]);
+            if (simd_lane_id == 0) {
+                local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < n_reads; i++) {
+            normalized[offset + i] = weight[lid * n_reads + i]
+                * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+        }
+        """
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_h_residual_rms_bf16",
         inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
-        source: """
-            constexpr uint n_reads = 4;
-            const uint gid = threadgroup_position_in_grid.x;
-            const uint lid = thread_position_in_threadgroup.x;
-            const uint simd_lane_id = thread_index_in_simdgroup;
-            const uint simd_group_id = simdgroup_index_in_threadgroup;
-            threadgroup float local_inv_mean[1];
-            threadgroup float local_sums[32];
-            float acc = 0;
-            float thread_x[n_reads];
-            const size_t offset = size_t(gid) * axis_size + lid * n_reads;
-            for (uint i = 0; i < n_reads; i++) {
-                T sum = lhs[offset + i] + rhs[offset + i];
-                residual[offset + i] = sum;
-                thread_x[i] = sum;
-                acc += thread_x[i] * thread_x[i];
-            }
-            acc = simd_sum(acc);
-            if (simd_group_id == 0) {
-                local_sums[simd_lane_id] = 0;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_lane_id == 0) {
-                local_sums[simd_group_id] = acc;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (simd_group_id == 0) {
-                acc = simd_sum(local_sums[simd_lane_id]);
-                if (simd_lane_id == 0) {
-                    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint i = 0; i < n_reads; i++) {
-                normalized[offset + i] = weight[lid * n_reads + i]
-                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
-            }
-            """, ensureRowContiguous: true)
+        source: sourcePrefix + "\n    T sum = lhs[offset + i] + rhs[offset + i];\n"
+            + sourceSuffix, ensureRowContiguous: true)
+    private static let moeKernel = MLXFast.metalKernel(
+        name: "nemotron_h_moe_residual_rms_bf16",
+        inputNames: ["lhs", "routed", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: sourcePrefix + "\n    T combined = routed[offset + i] + shared[offset + i];"
+            + "\n    T sum = lhs[offset + i] + combined;\n" + sourceSuffix,
+        ensureRowContiguous: true)
 
     static func apply(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
@@ -107,6 +120,23 @@ enum NemotronHResidualRMSNorm {
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
         let result = kernel([lhs, rhs, norm.weight, UInt32(lhs.dim(2)), norm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
+    }
+
+    static func apply(_ lhs: MLXArray, _ routed: MLXArray, _ shared: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray)?
+    {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
+            routed.shape == lhs.shape, shared.shape == lhs.shape,
+            lhs.dtype == .bfloat16, routed.dtype == .bfloat16, shared.dtype == .bfloat16,
+            type(of: norm) == RMSNorm.self,
+            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let result = moeKernel([lhs, routed, shared, norm.weight, UInt32(lhs.dim(2)), norm.eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
@@ -1326,26 +1356,44 @@ private final class NemotronHPrefillKernels: Sendable {
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
-        // threads; thread (e, s) counts expert e in sub-range s, a serial
-        // exclusive scan over (e, s) gives each thread its first slot, and the
-        // second pass writes slots in ascending index order.
+        // threads; E workers per segment count each route once into a shared
+        // histogram. The original serial exclusive scan over (e, s) gives
+        // each scatter thread its first slot, preserving stable input order.
         countingSort = MLXFast.metalKernel(
             name: "nemotron_moe_counting_sort",
             inputNames: ["flat", "n", "tmax"], outputNames: ["order", "inv", "sorted", "tiles"],
             source: """
                 constexpr int S = THREADS / E;
                 threadgroup uint counts[THREADS];
+                threadgroup atomic_uint histogram[THREADS];
                 uint tid = thread_position_in_threadgroup.x;
                 uint e = tid / S;
                 uint s = tid % S;
                 int chunk = (n + S - 1) / S;
                 int lo = min(n, int(s) * chunk);
                 int hi = min(n, lo + chunk);
-                uint c = 0;
-                for (int i = lo; i < hi; ++i) {
-                    c += (flat[i] == e) ? 1u : 0u;
+                atomic_store_explicit(&histogram[tid], 0u, memory_order_relaxed);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Transpose only the count-phase work assignment: each of S
+                // input segments has E workers reading disjoint positions.
+                // The scatter below retains its original (expert, segment)
+                // assignment and increasing input order.
+                uint countSegment = tid / E;
+                uint countLane = tid % E;
+                int countLo = min(n, int(countSegment) * chunk);
+                int countHi = min(n, countLo + chunk);
+                for (int i = countLo + int(countLane); i < countHi; i += E) {
+                    uint expert = flat[i];
+                    if (expert < uint(E)) {
+                        atomic_fetch_add_explicit(
+                            &histogram[expert * S + countSegment], 1u, memory_order_relaxed);
+                    }
                 }
-                counts[tid] = c;
+                // All increments finish before any bin is loaded. The
+                // existing publication barrier then protects the plain uint
+                // counts consumed by the unchanged serial prefix scan.
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                counts[tid] = atomic_load_explicit(&histogram[tid], memory_order_relaxed);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
                     uint acc = 0;
@@ -2807,7 +2855,7 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    fileprivate func ordinaryParts(_ x: MLXArray) -> (MLXArray, MLXArray?) {
         let (inds, scores) = gate(x)
         var y: MLXArray
         if let fused = switchMLP.fusedSortedCombine(x, inds, scores) {
@@ -2817,11 +2865,12 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
 
-        if let sharedExperts {
-            y = y + sharedExperts(x)
-        }
+        return (y, sharedExperts.map { $0(x) })
+    }
 
-        return y
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let (routed, shared) = ordinaryParts(x)
+        return shared.map { routed + $0 } ?? routed
     }
 
     // Protocol conformance
@@ -2919,7 +2968,18 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            output = captureMTP ? moe.mtpForwardRows(hidden) : moe(hidden)
+            if NemotronHResidualRMSNorm.ordinaryMoE, !captureMTP, let nextNorm,
+               type(of: moe) == NemotronHMoE.self {
+                let (routed, shared) = moe.ordinaryParts(hidden)
+                if let shared,
+                   let pair = NemotronHResidualRMSNorm.apply(x, routed, shared, norm: nextNorm) {
+                    return (pair.0, pair.1)
+                }
+                // A failed consumer guard must reuse these producers once.
+                output = shared.map { routed + $0 } ?? routed
+            } else {
+                output = captureMTP ? moe.mtpForwardRows(hidden) : moe(hidden)
+            }
         }
         if let nextNorm, let pair = NemotronHResidualRMSNorm.apply(x, output, norm: nextNorm) {
             return (pair.0, pair.1)
