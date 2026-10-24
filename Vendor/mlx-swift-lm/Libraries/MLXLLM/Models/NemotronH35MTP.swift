@@ -188,7 +188,10 @@ private final class NemotronMTPDraftHead {
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
 /// proposal and is preserved by the durable prefix checkpoint codec.
-public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
+public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter,
+    CBv2EngineThreadProviding, @unchecked Sendable {
+    // Persist across engines using this loaded assistant, never across models.
+    public let cbv2EngineThread = CBv2EngineThread()
     let module: NemotronH35MTPModule
     let target: NemotronH35Model
     private let draftHead: NemotronMTPDraftHead
