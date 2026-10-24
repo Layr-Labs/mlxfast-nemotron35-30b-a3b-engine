@@ -100,15 +100,14 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
-        var y: MLXArray
+        let shared = sharedExperts.map { $0.mtpForwardRows(x) }
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP) {
-            y = reduced
-        } else {
-            y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
-            y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            x, indices, scores, switchMLP, sharedOutput: shared) {
+            return reduced
         }
-        if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x) }
+        var y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
+        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        if let shared { y = y + shared }
         return y
     }
 }
@@ -514,12 +513,28 @@ private let nemotronMoELeaderWeightedSource = """
 private final class NemotronMoELeaderWeightedKernel: Sendable {
     static let shared = NemotronMoELeaderWeightedKernel()
     let kernel: MLXFast.MLXFastKernel
+    let kernelShared: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_weighted_qmv_affine4_gs64",
             inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
             outputNames: ["y"],
             source: nemotronMoELeaderWeightedSource,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+            ensureRowContiguous: true)
+        // Clone only the final store; every leader/partner qdot, rounded
+        // product, top-six reduction and barrier is the original body.
+        let source = nemotronMoELeaderWeightedSource.replacingOccurrences(
+            of: "y[simd_gid * N + out_row + r] = static_cast<T>(total);",
+            with: """
+              const int outputIndex = simd_gid * N + out_row + r;
+              const T rounded = static_cast<T>(total);
+              y[outputIndex] = rounded + sharedOutput[outputIndex];
+            """)
+        kernelShared = MLXFast.metalKernel(
+            name: "nemotron_moe_leader_weighted_shared_qmv_affine4_gs64",
+            inputNames: ["w", "scales", "biases", "x", "inds", "scores", "sharedOutput"],
+            outputNames: ["y"], source: source,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
             ensureRowContiguous: true)
     }
@@ -535,6 +550,8 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
+    static let fuseShared =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_SHARED"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -585,9 +602,18 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank) -> MLXArray {
-        NemotronMoELeaderWeightedKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+                              rows: Int, bank: Bank, sharedOutput: MLXArray? = nil) -> MLXArray {
+        let kernels = NemotronMoELeaderWeightedKernel.shared
+        var inputs = [bank.weight, bank.scales, bank.biases, x, inds, scores]
+        let kernel: MLXFast.MLXFastKernel
+        if let sharedOutput {
+            inputs.append(sharedOutput)
+            kernel = kernels.kernelShared
+        } else {
+            kernel = kernels.kernel
+        }
+        return kernel(
+            inputs,
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n)],
             grid: (32 * (bank.n / 4), 6, 1),
@@ -601,8 +627,11 @@ enum NemotronMoELeader {
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP
+        _ mlp: NemotronHSwitchMLP, sharedOutput: MLXArray? = nil
     ) -> MLXArray? {
+        if let sharedOutput {
+            guard sharedOutput.dtype == x.dtype, sharedOutput.shape == x.shape else { return nil }
+        }
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
               type(of: mlp.fc2) == QuantizedSwitchLinear.self,
@@ -629,11 +658,15 @@ enum NemotronMoELeader {
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down)
+        let fusedShared = fuseShared ? sharedOutput : nil
+        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down,
+                              sharedOutput: fusedShared)
+        if !fuseShared, let sharedOutput { y = y + sharedOutput }
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
-            let expected = (original * scores[.ellipsis, .newAxis])
+            var expected = (original * scores[.ellipsis, .newAxis])
                 .sum(axis: -2).asType(original.dtype)
+            if let sharedOutput { expected = expected + sharedOutput }
             let ok = (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
             y = which(ok, y, MLXArray(Float.nan).asType(y.dtype))
         }
@@ -704,6 +737,21 @@ enum NemotronMoELeader {
                     down.weight.shape == [128, 2688, 232] {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down))
+                    let shared = MLXArray.zeros([1, rows, down.n], dtype: .bfloat16)
+                    if fuseShared {
+                        outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down,
+                                                     sharedOutput: shared))
+                    }
+                    // Reach both carried ordinary combine kernels before timed work.
+                    let routes = inds.reshaped(1, rows, topK)
+                    let gains = scores.reshaped(1, rows, topK)
+                    let routed = MLXArray.zeros([1, rows, topK, down.n], dtype: .bfloat16)
+                    if let plain = mlp.unsortedCombine(routed, routes, gains) {
+                        outputs.append(plain)
+                    }
+                    if let fused = mlp.unsortedCombine(routed, routes, gains, shared: shared) {
+                        outputs.append(fused)
+                    }
                 }
             }
         }
