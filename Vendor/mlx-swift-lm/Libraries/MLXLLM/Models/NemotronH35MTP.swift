@@ -26,7 +26,10 @@ private final class NemotronMTPDraftHead {
     }()
 
     func logits(_ hidden: MLXArray) -> MLXArray {
-        prefix?.callAsFunction(hidden) ?? target.logits(hidden)
+        if let prefix {
+            return NemotronMultiRowQMV.regularHeadR1(hidden, prefix) ?? prefix(hidden)
+        }
+        return target.logits(hidden)
     }
 
     /// Multi-row twin for the post-verify head rows: the same prefix view

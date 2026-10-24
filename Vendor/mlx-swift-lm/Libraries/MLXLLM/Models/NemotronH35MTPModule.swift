@@ -160,7 +160,7 @@ extension NemotronH35Model: CBv2RecurrentMTPForwardable {
         precondition(positionIds == nil, "Nemotron Lightning does not apply RoPE")
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         // Unlike Qwen35/Gemma, this head is trained on POST-norm_f hidden.
-        return (logits(hidden), hidden)
+        return (NemotronMultiRowQMV.regularHeadR1(hidden, lmHead) ?? logits(hidden), hidden)
     }
 }
 
@@ -181,7 +181,8 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
-        case .lastPositionLogits: return (logits(last), hidden)
+        case .lastPositionLogits:
+            return (NemotronMultiRowQMV.regularHeadR1(last, lmHead) ?? logits(last), hidden)
         }
     }
 }
