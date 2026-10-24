@@ -3091,6 +3091,31 @@ public class NemotronHModel:
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    // Pure metadata only: never retain the private probe's arrays or caches.
+    // This owner outlives the fresh adapter constructed for each engine.
+    private struct RecurrentDTypeModuleKey: Equatable {
+        let path: String
+        let identity: ObjectIdentifier
+        let concreteType: ObjectIdentifier
+        let training: Bool
+    }
+    private struct RecurrentDTypeParameterKey: Equatable {
+        let path: String
+        let identity: ObjectIdentifier
+        let dtype: DType
+        let shape: [Int]
+    }
+    private struct RecurrentDTypeKey: Equatable {
+        let modules: [RecurrentDTypeModuleKey]
+        let parameters: [RecurrentDTypeParameterKey]
+    }
+    private struct RecurrentDTypeEntry {
+        let key: RecurrentDTypeKey
+        let dtypes: [Int: DType]
+    }
+    private let recurrentDTypeLock = NSLock()
+    private var recurrentDTypeEntry: RecurrentDTypeEntry?
+
     public var loraLayers: [Module] {
         backbone.layers
     }
@@ -3169,6 +3194,64 @@ public class NemotronHModel:
     /// through private caches exposes each Mamba layer's deterministic dtype
     /// without evaluating kernels or mutating request state.
     private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+        guard let key = nativeRecurrentDTypeKey() else {
+            return probeRecurrentActivationDTypes()
+        }
+        if let dtypes = recurrentDTypeLock.withLock({ () -> [Int: DType]? in
+            guard let entry = recurrentDTypeEntry, entry.key == key else { return nil }
+            return entry.dtypes
+        }) {
+            return dtypes
+        }
+        // Building this private lazy graph may enter MLX/compiler locks. Keep
+        // it outside our metadata lock and retain only its resulting dtypes.
+        let dtypes = probeRecurrentActivationDTypes()
+        if nativeRecurrentDTypeKey() == key {
+            recurrentDTypeLock.withLock {
+                recurrentDTypeEntry = RecurrentDTypeEntry(key: key, dtypes: dtypes)
+            }
+        }
+        return dtypes
+    }
+
+    private func nativeRecurrentDTypeKey() -> RecurrentDTypeKey? {
+        // GPU/default-stream native operators have value-independent dtype
+        // propagation. Other execution contexts and custom subclasses keep
+        // the original probe. Native scalar policies are immutable lets on
+        // these exact children, whose identities are checked on every call.
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHModel.self || type(of: self) == NemotronH35Model.self
+        else { return nil }
+        func native(_ module: Module) -> Bool {
+            let concrete = type(of: module)
+            return concrete == NemotronHModel.self || concrete == NemotronH35Model.self
+                || concrete == NemotronHBackbone.self || concrete == NemotronHBlock.self
+                || concrete == NemotronHMamba2Mixer.self || concrete == NemotronHAttention.self
+                || concrete == NemotronHRMSNormGated.self || concrete == NemotronHMLP.self
+                || concrete == NemotronHMoE.self || concrete == NemotronHMoEGate.self
+                || concrete == NemotronHSwitchMLP.self || concrete == RMSNorm.self
+                || concrete == Conv1d.self || concrete == Embedding.self
+                || concrete == QuantizedEmbedding.self || concrete == Linear.self
+                || concrete == QuantizedLinear.self || concrete == SwitchLinear.self
+                || concrete == QuantizedSwitchLinear.self
+        }
+        var modules: [RecurrentDTypeModuleKey] = []
+        for (path, module) in namedModules().sorted(by: { $0.0 < $1.0 }) {
+            guard native(module) else { return nil }
+            modules.append(RecurrentDTypeModuleKey(
+                path: path, identity: ObjectIdentifier(module),
+                concreteType: ObjectIdentifier(type(of: module)), training: module.training))
+        }
+        // Module.update mutates array contexts in place. Array identity alone
+        // cannot detect a dtype/shape change, so collect both on every lookup.
+        let parameterKeys = self.parameters().flattened().sorted(by: { $0.0 < $1.0 }).map {
+            RecurrentDTypeParameterKey(path: $0.0, identity: ObjectIdentifier($0.1),
+                dtype: $0.1.dtype, shape: $0.1.shape)
+        }
+        return RecurrentDTypeKey(modules: modules, parameters: parameterKeys)
+    }
+
+    private func probeRecurrentActivationDTypes() -> [Int: DType] {
         let caches = newCache(parameters: nil)
         _ = backbone(
             MLXArray([0]).reshaped(1, 1),
