@@ -45,8 +45,18 @@ extension NemotronHMamba2Mixer {
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
-        let (convolution, padded) = packedConv(convState, input)
-        let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        let convolution: MLXArray, padded: MLXArray, dt: MLXArray
+        if let prepared = mtpPackedConvAndDt(convState, input, parts[2]) {
+            convolution = prepared.convolution
+            padded = prepared.padded
+            dt = prepared.dt
+        } else {
+            let packed = packedConv(convState, input)
+            convolution = packed.convolution
+            padded = packed.padded
+            dt = nemotronPrefillComputeDt(
+                parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
+        }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
@@ -84,6 +94,22 @@ extension NemotronHMamba2Mixer {
                      gate: gate[0..., position..<(position + 1), 0...])
             }, axis: 1)
         return nemotronMTPLinearRows(normalized, outProj)
+    }
+
+    fileprivate func mtpPackedConvAndDt(
+        _ oldState: MLXArray, _ input: MLXArray, _ rawDt: MLXArray
+    ) -> (convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
+        guard type(of: self) == NemotronHMamba2Mixer.self,
+            type(of: conv1d) == Conv1d.self,
+            numHeads == 64, headDim == 64, numGroups == 8, ssmStateSize == 128,
+            convDim == 6144, convKernelSize == 4,
+            conv1d.groups == convDim, conv1d.stride == 1,
+            conv1d.dilation == 1, conv1d.padding == 0,
+            let bias = conv1d.bias
+        else { return nil }
+        return nemotronPackedConvAndDt(
+            oldState: oldState, input: input, weight: conv1d.weight, bias: bias,
+            rawDt: rawDt, dtBias: dtBias, timeStepLimit: timeStepLimit)
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -197,6 +223,13 @@ extension NemotronH35Model {
                     state: state, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, steps: width - 1, writeOutput: false)
                 roots += [window.output, window.finalState, replay.finalState]
+                // This producer has no width/stride-value template. Width 2
+                // warms the native dtype/rank/address-space variant for 2...8.
+                if width == 2, let prepared = mixer.mtpPackedConvAndDt(
+                    MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
+                    MLXArray.zeros([1, width, mixer.convDim], dtype: activationDType), rawDt) {
+                    roots += [prepared.convolution, prepared.padded, prepared.dt]
+                }
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,
                     indices: [mixer.intermediateSize, mixer.intermediateSize + groups * stateDim],

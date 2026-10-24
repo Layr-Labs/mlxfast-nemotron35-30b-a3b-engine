@@ -108,8 +108,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
-        /// Post-verify attention/KV only; finalize selects the one expert row.
-        var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
+        /// Native attention/KV rows defer wo until the committed row is known.
+        /// A nil merged tensor retains the original full-width projection path.
+        var speculation: (attention: MLXArray, merged: MLXArray?, keys: MLXArray, values: MLXArray)?
         /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
@@ -340,8 +341,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Only the first seed used authoritative target hidden. Discard every
         // chained KV row even on full acceptance, then replay accepted inputs
         // using the verifier's true hidden states before the next round.
-        let speculation = s.speculation.flatMap {
-            $0.attention.dim(1) == s.stagedInputCount + 1 && n < $0.attention.dim(1) ? $0 : nil
+        let speculation = s.speculation.flatMap { spec in
+            let width = spec.attention.dim(1)
+            let matchingMerged = spec.merged.map { $0.dim(1) == width } ?? true
+            return width == s.stagedInputCount + 1 && matchingMerged && n < width ? spec : nil
         }
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
@@ -367,8 +370,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Build the ordinary one-token tail lazily. The existing prestage
         // submits it only when the engine has a continuing carry.
         s.nextFirstDraft = speculation.map { spec in
-            let out = module.finishPagedAttentionRow(
-                spec.attention[0..., n ..< (n + 1), 0...])
+            let out = module.finishSelectedAttentionRow(
+                spec.attention[0..., n ..< (n + 1), 0...],
+                merged: spec.merged.map { $0[0..., n ..< (n + 1), 0...] })
             let ids = argMax(draftHead.logits(out)[0..., -1, 0...], axis: -1).asType(.int32)
             return (ids: ids, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
@@ -471,10 +475,10 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             cache.mtpSerializesRectangularAttention = false
             cache.mtpBatchesRectangularAttention = false
         }
-        let rows = module.pagedAttentionRows(
+        let rows = module.pagedAttentionForSelection(
             hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
-        s.speculation = (attention: rows.output, keys: rows.keys, values: rows.values)
-        let roots = [rows.output] + s.cache.innerState()
+        s.speculation = (attention: rows.attention, merged: rows.merged, keys: rows.keys, values: rows.values)
+        let roots = [rows.attention] + [rows.merged].compactMap { $0 } + s.cache.innerState()
         s.roots += roots
         asyncEval(roots)
     }
