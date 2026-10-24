@@ -156,6 +156,31 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return output
     }
 
+    /// MTP serialized verification of a single row, returning the L
+    /// per-query attention outputs (`[1, heads, 1, headDim]` each) instead of
+    /// their axis-2 concatenate, so a consumer can read them in place. The KV
+    /// update, the per-query SDPA calls and the offset advance are those of
+    /// `updateAndAttend`. Returns nil, before touching any state, for every
+    /// configuration other than: an owning layer in serialized MTP mode, one
+    /// bound row, L > 1, no keep mask, no span contexts, no softcap, and no
+    /// attention metadata or packet observation.
+    public func updateAndAttendSerialQueryRows(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> [MLXArray]? {
+        guard kind.sharesKVWithLayer == nil, mtpSerializesRectangularAttention,
+              rows.count == 1, queries.ndim == 4, queries.dim(0) == 1, queries.dim(2) > 1,
+              attentionSoftcap == nil, attentionMetadata == nil, attentionPacket == nil,
+              boundSpanContexts?.contains(where: { $0 != nil }) != true
+        else { return nil }
+        let outputs = CBv2AttentionV1.updateAndAttendSerialQueryRows(
+            row: rows[0], kind: kind,
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        return outputs
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk

@@ -14,6 +14,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     @ModuleInfo(key: "hnorm") var hiddenNorm: RMSNorm
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHAttention
+    private let draftFrontCache = NemotronH35MTPDraftFrontCache()
 
     init(_ args: NemotronHConfiguration) {
         hiddenSize = args.hiddenSize
@@ -44,8 +45,13 @@ final class NemotronH35MTPAttentionBlock: Module {
         hidden: MLXArray, embedding: MLXArray,
         cache: any CBv2AttendingLayerCache
     ) -> MLXArray {
+        let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
+        return front[0] + mixer.cbv2Forward(front[1], cache: cache)
+    }
+
+    fileprivate func uncompiledDraftFront(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         let fused = fuse(hidden: hidden, embedding: embedding)
-        return fused + mixer.cbv2Forward(norm(fused), cache: cache)
+        return [fused, norm(fused)]
     }
 
     /// Trusted target rows only need the head's K/V projections. Their
@@ -92,6 +98,54 @@ final class NemotronH35MTPAttentionBlock: Module {
             queries: queries, keys: keys, values: values, scale: mixer.scale, sinks: nil)
         let merged = attended.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         return (fused + nemotronMTPLinearRows(merged, mixer.wo), keys, values)
+    }
+}
+
+/// Only the one-token draft's stateless norm/concat/projection/norm prefix.
+/// The original attention projections and all cache operations stay outside.
+private final class NemotronH35MTPDraftFrontCache {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_DRAFT_FRONT"] != "0"
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func callAsFunction(
+        hidden: MLXArray, embedding: MLXArray, owner: NemotronH35MTPAttentionBlock
+    ) -> [MLXArray] {
+        guard Self.enabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              hidden.shape == [1, 1, 2688], hidden.dtype == .bfloat16,
+              embedding.shape == hidden.shape, embedding.dtype == hidden.dtype,
+              type(of: owner.embeddingNorm) == RMSNorm.self,
+              type(of: owner.hiddenNorm) == RMSNorm.self,
+              type(of: owner.norm) == RMSNorm.self,
+              (type(of: owner.projection) == Linear.self
+                || type(of: owner.projection) == QuantizedLinear.self)
+        else { return owner.uncompiledDraftFront(hidden: hidden, embedding: embedding) }
+        let modules: [Module] = [owner, owner.embeddingNorm, owner.hiddenNorm,
+                                 owner.projection, owner.norm]
+        let identity = modules.map(ObjectIdentifier.init)
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.identity == identity { return entry }
+            let state = modules.dropFirst().flatMap { $0.innerState() }
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak owner] arrays in
+                guard let owner else { preconditionFailure("Released Nemotron MTP draft-front owner") }
+                return owner.uncompiledDraftFront(hidden: arrays[0], embedding: arrays[1])
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        let result = withExtendedLifetime(retired) { current.function([hidden, embedding]) }
+        return result.count == 2 ? result
+            : owner.uncompiledDraftFront(hidden: hidden, embedding: embedding)
     }
 }
 

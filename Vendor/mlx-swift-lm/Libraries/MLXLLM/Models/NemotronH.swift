@@ -632,6 +632,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     @ParameterInfo(key: "D") var D: MLXArray
 
     @ModuleInfo(key: "norm") var norm: NemotronHRMSNormGated
+    let mtpCompactGraphCache = NemotronH35MTPCompactGraphCache()
 
     init(_ args: NemotronHConfiguration) {
         self.numHeads = args.mambaNumHeads
@@ -988,6 +989,13 @@ class NemotronHAttention: Module, NemotronHMixer {
 
         // Keep parity with the selected MLX artifact's serial oracle: current
         // mlx-lm NemotronH attention does not apply RoPE despite rope_theta.
+        // Serialized MTP verify: o_proj reads the per-query outputs in place.
+        if captureMTP, batch == 1, length > 1, NemotronMTPAttentionDirect.enabled,
+           let layerCache = cache as? CBv2LayerCache,
+           let rows = layerCache.updateAndAttendSerialQueryRows(
+               queries: queries, keys: keys, values: values, scale: scale, sinks: nil) {
+            return NemotronMTPAttentionDirect.project(rows, wo)
+        }
         let output = cache.updateAndAttend(
             queries: queries,
             keys: keys,
