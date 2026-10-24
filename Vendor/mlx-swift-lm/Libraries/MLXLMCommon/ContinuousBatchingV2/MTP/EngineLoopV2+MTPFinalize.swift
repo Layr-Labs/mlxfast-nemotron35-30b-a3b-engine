@@ -58,6 +58,18 @@ extension EngineLoopV2 {
             }
         }
 
+        // A completed prompt's sampled token was confirmed by the ordinary
+        // finalize; its predicting hidden is the next round's carry.
+        for (id, hidden) in round.prefillCarries {
+            guard !step.discard.contains(id), let rec = scheduler.record(for: id),
+                rec.generatedTokenCount < rec.request.maxTokens,
+                let token = rec.tokens.last
+            else { continue }
+            mtp.storeCarry(
+                id: id, token: token, hidden: hidden,
+                tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
+        }
+
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round
@@ -119,6 +131,7 @@ extension EngineLoopV2 {
             }
 
             var accepted = 0
+            // mtpDeviceAcceptedDrafts repeats this walk on device.
             while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
@@ -217,6 +230,8 @@ extension EngineLoopV2 {
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
+                (stateful as? any CBv2MTPDeviceAcceptedPrestaging)?.noteHostAcceptedDrafts(
+                    accepted, requestState: state)
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
@@ -452,6 +467,19 @@ extension CBv2MTPFirstDraftPrestaging {
     }
 }
 
+/// Optional: queue the next round's first draft right behind the verify, for
+/// the row the device picks from the acceptance packet, so the head does not
+/// wait for the host's finalize. The host still decides: finalize reports its
+/// own accept count, and the drafter adopts the queued draft only when that
+/// count selects the same row (otherwise it builds it as before).
+public protocol CBv2MTPDeviceAcceptedPrestaging: CBv2MTPFirstDraftPrestaging {
+    /// After `speculateAfterVerify`. acceptedDrafts: [1] int32, the leading
+    /// draft matches in the acceptance packet.
+    func speculateNextFirstDraft(acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState)
+    /// Before `finalizeRound`: the host walk's accept count.
+    func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState)
+}
+
 public enum CBv2MTPFirstDraftPrestage {
     /// CBV2_MTP_PRESTAGE_FIRST_DRAFT=0 restores submission at round build.
     public static let enabled =
@@ -462,6 +490,9 @@ public enum CBv2MTPFirstDraftPrestage {
     /// NEMOTRON_MTP_PRESTAGE_SECOND=0 prestages only the first draft.
     public static let chained = enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_PRESTAGE_SECOND"] != "0"
+    /// CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT=0 restores host-selected tail submission.
+    public static let deviceAccepted = speculateAfterVerify
+        && ProcessInfo.processInfo.environment["CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT"] != "0"
 }
 
 extension EngineLoopV2 {
@@ -485,6 +516,25 @@ extension EngineLoopV2 {
                 targetTokens: targets[index ..< (index + 1)],
                 targetHidden: verify.lastHidden[index ..< (index + 1)],
                 requestState: state)
+            if CBv2MTPFirstDraftPrestage.deviceAccepted, verify.k > 0,
+                let deviceAccepted = speculator as? any CBv2MTPDeviceAcceptedPrestaging
+            {
+                deviceAccepted.speculateNextFirstDraft(
+                    acceptedDrafts: Self.mtpDeviceAcceptedDrafts(verify, row: index),
+                    requestState: state)
+            }
         }
+    }
+
+    /// The finalize accept walk on device, from the acceptance packet's own
+    /// draft and target ids: [1] int32. Must stay identical to the host walk
+    /// in `finalizeMTPRound`.
+    static func mtpDeviceAcceptedDrafts(_ verify: CBv2MTPRoundInFlight.Verify, row: Int) -> MLXArray {
+        let k = verify.k, width = k + 1, draftCount = verify.rows.count * k
+        let packet = verify.acceptancePacket
+        let drafts = packet[(row * k) ..< (row * k + k)]
+        let targets = packet[(draftCount + row * width) ..< (draftCount + row * width + k)]
+        let matches = (targets .== drafts).asType(.int32)
+        return cumprod(matches, axis: 0).sum(axis: 0, keepDims: true).asType(.int32)
     }
 }

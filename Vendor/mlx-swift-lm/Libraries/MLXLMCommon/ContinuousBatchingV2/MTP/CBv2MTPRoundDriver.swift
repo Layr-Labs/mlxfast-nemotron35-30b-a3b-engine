@@ -123,6 +123,9 @@ final class CBv2MTPRoundInFlight {
     /// Plain prompt/decode target observations whose request-owned assistant
     /// states stay detached until this step's target graph is fenced.
     let committedObservationRows: [CommittedObservationRow]
+    /// Prompt-completing rows and the hidden that predicted their sampled
+    /// token; finalize stores it as the row's carry.
+    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
 
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
@@ -140,14 +143,23 @@ final class CBv2MTPRoundInFlight {
         seedRows: [(id: CBv2RequestID, decodeIndex: Int)],
         seedHidden: MLXArray?,
         seedPolicyTopTwoValues: MLXArray?,
-        committedObservationRows: [CommittedObservationRow]
+        committedObservationRows: [CommittedObservationRow],
+        prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
     ) {
         self.verify = verify
         self.seedRows = seedRows
         self.seedHidden = seedHidden
         self.seedPolicyTopTwoValues = seedPolicyTopTwoValues
         self.committedObservationRows = committedObservationRows
+        self.prefillCarries = prefillCarries
     }
+}
+
+/// `NEMOTRON_MTP_PREFILL_CARRY=0` restores the one-token seed step after a
+/// completed prompt.
+enum CBv2MTPPrefillCarry {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFILL_CARRY"] != "0"
 }
 
 enum CBv2MTPPolicyPacket {

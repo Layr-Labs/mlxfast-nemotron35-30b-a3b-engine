@@ -94,7 +94,8 @@ extension EngineLoopV2 {
                 seedRows: graph.seedRows,
                 seedHidden: graph.seedHidden,
                 seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
-                committedObservationRows: graph.committedObservationRows)
+                committedObservationRows: graph.committedObservationRows,
+                prefillCarries: graph.prefillCarries)
         }
         step.forwardShapes = shapes
         shapes?.attach()

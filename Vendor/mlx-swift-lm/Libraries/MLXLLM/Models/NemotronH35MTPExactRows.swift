@@ -455,6 +455,15 @@ enum NemotronHeadPreparedActivation {
                     grid: (32, 4, 1), threadGroup: (32, 2, 1),
                     outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
             }
+            // The target head's pipeline (K 2688, no ReLU2) at its own RPS.
+            if k == 2688 && NemotronMultiRowQMV.headRPS(n: 131072) != 2 {
+                let rps = NemotronMultiRowQMV.headRPS(n: 131072)
+                outputs.append(project([w, s, s, packed[0], args.0, args.1],
+                    template: [("T", x.dtype), ("R", 3), ("FAST", false),
+                               ("RELU2", false), ("RPS", rps)],
+                    grid: (32, 8 / rps, 1), threadGroup: (32, 2, 1),
+                    outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
+            }
         }
         eval(outputs)
     }
@@ -542,6 +551,13 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
     static let narrowEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
+    /// NEMOTRON_MTP_HEAD_RPS4=0 keeps two outputs per SIMD group on the
+    /// 131,072-row target head. Four halves the threadgroups that each
+    /// re-read the prepared rows; every output keeps its lane split, block
+    /// order and closing simd_sum, so only the row-to-SIMD-group map moves.
+    static let headRPS4 =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_RPS4"] != "0"
+    static func headRPS(n: Int) -> Int { headRPS4 && n == 131072 ? 4 : 2 }
 
     /// DARKBLOOM_BONSAI_R8B=0 keeps the MTP wo projection and residual add
     /// as two launches. Otherwise the fused route engages only after the
@@ -665,7 +681,7 @@ enum NemotronMultiRowQMV {
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
         if narrowEnabled && x.dim(0) == 3 && n >= 2688 {
             let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2,
-                rps: 2, prepared: prepared)
+                rps: headRPS(n: n), prepared: prepared)
             guard NemotronMoELeader.selfTest else { return y }
             return nemotronBitwiseOrNaN(y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 2))
         }
@@ -1178,18 +1194,22 @@ enum NemotronHeadScreen {
     static let rows = 65536
 
     // One simdgroup scores RPS rows. Lane l owns half-groups l, l + 32, ...
-    // (32 values = one uint4 of packed words) of the selected groups.
+    // (32 values = one uint4 of packed words) of the selected groups. Rows
+    // from LO up (the upper vocabulary half, when scored) read their own,
+    // smaller group set S2 / groups2; LO is a multiple of RPS, so the choice
+    // is uniform per simdgroup.
     private static let partialSource = """
-      // S <= 16: lane l owns half-group l (32 values, 16 bytes).
+      // S, S2 <= 16: lane l owns half-group l (32 values, 16 bytes).
       constexpr int KW = 336;
       constexpr int KG = 42;
       constexpr int VPL = 32;
-      constexpr int H = 2 * S;
       const int lane = int(thread_index_in_simdgroup);
       const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
       const int row0 = sg * RPS;
+      const bool upper = row0 >= LO;
+      const int H = upper ? 2 * S2 : 2 * S;
       const bool on = lane < H;
-      const int g = on ? int(groups[lane >> 1]) : 0;
+      const int g = on ? int(upper ? groups2[lane >> 1] : groups[lane >> 1]) : 0;
       const int part = lane & 1;
       const int woff = g * 8 + part * 4;
       const device T* xp = x + g * 64 + part * 32;
@@ -1406,7 +1426,7 @@ enum NemotronHeadScreen {
 
     private static let partialKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_partial_affine4_gs64",
-        inputNames: ["w", "scales", "biases", "x", "groups"],
+        inputNames: ["w", "scales", "biases", "x", "groups", "groups2"],
         outputNames: ["scores"], source: partialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
@@ -1425,15 +1445,21 @@ enum NemotronHeadScreen {
     }
 
     /// hidden [1, 1, 2688] bf16; the head arrays are the full shared head.
+    /// `upperGroups` (count `upperGroupCount`) also screens rows 65536..<131072
+    /// with that smaller group set; candidate ids stay global head rows, and
+    /// every chunk keeps the same per-chunk selection and exact rescore.
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
+        upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
+        let rows = upperGroups == nil ? Self.rows : headRows
         let scores = partialKernel(
-            [weight, scales, biases, hidden, groups],
+            [weight, scales, biases, hidden, groups, upperGroups ?? groups],
             template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
-                       ("NSG", simdgroups)],
+                       ("NSG", simdgroups), ("LO", Self.rows),
+                       ("S2", upperGroups == nil ? groupCount : upperGroupCount)],
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32])[0]
         let chunks = rows / chunk

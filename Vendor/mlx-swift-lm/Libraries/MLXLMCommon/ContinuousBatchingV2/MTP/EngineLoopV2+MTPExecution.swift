@@ -33,6 +33,8 @@ struct CBv2MTPGraphBuild {
     let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
+    /// Rows whose prompt completed here: the last prompt row's hidden.
+    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
 }
 
 extension EngineLoopV2 {
@@ -284,6 +286,7 @@ extension EngineLoopV2 {
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
+        var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -376,6 +379,16 @@ extension EngineLoopV2 {
             }
             if let observedHidden {
                 try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
+                // The last prompt row's hidden predicted the sampled token,
+                // so it is that token's carry: the first round can verify
+                // [sampled, drafts] without a one-token seed step first.
+                if CBv2MTPPrefillCarry.enabled, row.samples, mtp.usesRequestStatefulDrafter,
+                    mtp.tracksPersistentHistory, mtpBasicEligible(rec)
+                {
+                    let n = observedHidden.dim(1)
+                    prefillCarries.append(
+                        (id: rec.id, hidden: observedHidden[0..., (n - 1) ..< n, 0...]))
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -462,7 +475,8 @@ extension EngineLoopV2 {
             seedHidden: seedHidden,
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
-            committedObservationRows: committedObservationRows)
+            committedObservationRows: committedObservationRows,
+            prefillCarries: prefillCarries)
     }
 
     private func mtpBuildVerifyGraph(
