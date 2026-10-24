@@ -598,6 +598,15 @@ public final class CBv2RecurrentStateEvaluation {
         input[modelLayerIndex]
     }
 
+    /// Already-built roots only: schedule their identical graphs at an existing
+    /// within-request submission boundary. Ownership and commit order stay here.
+    public func stagedEvaluationRoots(in layers: Range<Int>) -> [MLXArray] {
+        guard !evaluated, !isCaptured else { return [] }
+        return staged.keys.sorted().filter { layers.contains($0) }.flatMap { index in
+            [staged[index]!.conv, staged[index]!.ssm].compactMap { $0 }
+        }
+    }
+
     public func stage(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
         guard stagedCapturedPositions == nil, stagedPrefixReplay.isEmpty else {
             throw CBv2RecurrentStateError.lifecycleViolation(

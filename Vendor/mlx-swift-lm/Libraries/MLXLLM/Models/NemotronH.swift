@@ -595,6 +595,20 @@ private enum NemotronPackedConvKernel {
             """, ensureRowContiguous: false)
 }
 
+
+private enum NemotronRequestConvHistory {
+    static let copy = MLXFast.metalKernel(
+        name: "nemotron_request_conv_history_copy",
+        inputNames: ["source"], outputNames: ["out"],
+        source: """
+            uint channel = thread_position_in_grid.x;
+            uint row = thread_position_in_grid.y;
+            uint batch = thread_position_in_grid.z;
+            out[(batch * N + row) * C + channel] = source[
+                batch * source_strides[0] + row * source_strides[1] + channel * source_strides[2]];
+            """, ensureRowContiguous: false)
+}
+
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
@@ -810,8 +824,16 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         let (convOutput, padded) = packedConv(convState, convInput)
         let end = padded.dim(1)
-        let nextConvState =
-            padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        let history = padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        let nextConvState: MLXArray
+        if hiddenStates.dim(1) > 8 {
+            nextConvState = NemotronRequestConvHistory.copy(
+                [history], template: [("N", history.dim(1)), ("C", convDim)],
+                grid: (convDim, history.dim(1), batch), threadGroup: (256, 1, 1),
+                outputShapes: [history.shape], outputDTypes: [history.dtype])[0]
+        } else {
+            nextConvState = history
+        }
         let convSplits = split(
             convOutput,
             indices: [intermediateSize, intermediateSize + numGroups * ssmStateSize],
@@ -3102,7 +3124,13 @@ private class NemotronHBackbone: Module {
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
-                asyncEval(hidden)
+                if inputs.dim(1) > 1 && !captureMTP {
+                    let group = (next - nemotronEarlyEvalInterval)..<next
+                    let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
+                    asyncEval([hidden] + states)
+                } else {
+                    asyncEval(hidden)
+                }
             }
         }
         precondition(
@@ -3737,3 +3765,4 @@ public struct NemotronHConfiguration: Codable, Sendable {
     }
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
+private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
