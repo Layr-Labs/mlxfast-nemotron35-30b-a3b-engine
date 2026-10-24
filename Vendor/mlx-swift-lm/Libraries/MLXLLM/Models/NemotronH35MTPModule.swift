@@ -7,6 +7,83 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// The two row-local RMS norms write directly into their halves of the fusion
+/// input. Each half keeps rms_single_row's 4 values/lane and 672-thread tree.
+/// The strided reads also handle a target-hidden slice without a staging copy.
+private enum NemotronMTPJoinedNorm {
+    static let enabled = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_NEMOTRON35_MTP_JOINED_RMS"] != "0"
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_joined_rms_bf16",
+        inputNames: ["embedding", "hidden", "ew", "hw", "eeps", "heps"],
+        outputNames: ["joined"],
+        source: """
+            constexpr uint axis_size = 2688;
+            constexpr uint n_reads = 4;
+            const uint row = threadgroup_position_in_grid.x;
+            const uint bank = threadgroup_position_in_grid.y;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const device T* x = bank == 0 ? embedding : hidden;
+            const device T* w = bank == 0 ? ew : hw;
+            const int64_t row_stride = bank == 0 ? embedding_strides[1] : hidden_strides[1];
+            const int64_t feature_stride = bank == 0 ? embedding_strides[2] : hidden_strides[2];
+            const int64_t weight_stride = bank == 0 ? ew_strides[0] : hw_strides[0];
+            const float eps = bank == 0 ? eeps : heps;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[n_reads];
+            for (uint i = 0; i < n_reads; i++) {
+                thread_x[i] = x[int64_t(row) * row_stride + int64_t(lid * n_reads + i) * feature_stride];
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < n_reads; i++) {
+                joined[(size_t(row) * 2 + bank) * axis_size + lid * n_reads + i] =
+                    w[int64_t(lid * n_reads + i) * weight_stride]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+            }
+            """, ensureRowContiguous: false)
+
+    static func apply(_ embedding: MLXArray, _ hidden: MLXArray,
+                      embeddingNorm: RMSNorm, hiddenNorm: RMSNorm) -> MLXArray? {
+        // Stock RMS uses UInt32 weight strides; keep other weight views on
+        // its original path. The kernel reads input view strides as Int64.
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              hidden.ndim == 3, hidden.dim(0) == 1, hidden.dim(1) > 0, hidden.dim(2) == 2688,
+              embedding.shape == hidden.shape, hidden.dtype == .bfloat16, embedding.dtype == .bfloat16,
+              type(of: embeddingNorm) == RMSNorm.self, type(of: hiddenNorm) == RMSNorm.self,
+              embeddingNorm.weight.shape == [2688], hiddenNorm.weight.shape == [2688],
+              embeddingNorm.weight.dtype == .bfloat16, hiddenNorm.weight.dtype == .bfloat16,
+              embeddingNorm.weight.strides == [1], hiddenNorm.weight.strides == [1]
+        else { return nil }
+        return kernel([embedding, hidden, embeddingNorm.weight, hiddenNorm.weight,
+                       embeddingNorm.eps,
+                       hiddenNorm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * hidden.dim(1), 2, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, hidden.dim(1), 5376]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
 final class NemotronH35MTPAttentionBlock: Module {
     let hiddenSize: Int
     @ModuleInfo(key: "eh_proj") var projection: Linear
@@ -24,8 +101,14 @@ final class NemotronH35MTPAttentionBlock: Module {
         _mixer.wrappedValue = NemotronHAttention(args)
     }
 
+    private func joinedNorm(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
+        NemotronMTPJoinedNorm.apply(embedding, hidden,
+            embeddingNorm: embeddingNorm, hiddenNorm: hiddenNorm)
+            ?? concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
+    }
+
     private func fuse(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
-        projection(concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1))
+        projection(joinedNorm(hidden: hidden, embedding: embedding))
     }
 
     func projectedKVDType(hiddenDType: DType) -> DType {
@@ -78,7 +161,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
-        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
+        let joined = joinedNorm(hidden: hidden, embedding: embedding)
         let fused = nemotronMTPLinearRows(joined, projection)
         let x = norm(fused)
         let batch = x.dim(0), length = x.dim(1)
