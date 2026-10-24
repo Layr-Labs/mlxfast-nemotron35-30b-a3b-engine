@@ -3030,6 +3030,7 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
 private class NemotronHBlock: Module {
     let blockType: NemotronHBlockType
+    private let mtpPairGraph = NemotronH35MTPBlockPairGraphCache()
 
     @ModuleInfo(key: "norm") var norm: RMSNorm
 
@@ -3115,6 +3116,12 @@ private class NemotronHBlock: Module {
             output = captureMTP
                 ? moe.mtpForwardRows(hidden, prepared: preparedActivation) : moe(hidden)
         }
+        return finishResidual(x, output, nextNorm: nextNorm, nextPreparedMoE: nextPreparedMoE)
+    }
+
+    func finishResidual(
+        _ x: MLXArray, _ output: MLXArray, nextNorm: RMSNorm?, nextPreparedMoE: Bool
+    ) -> (MLXArray, MLXArray?, MLXArray?) {
         if nextPreparedMoE, let nextNorm,
            let triple = NemotronHResidualRMSNorm.applyPrepared(x, output, norm: nextNorm) {
             return (triple.0, triple.1, triple.2)
@@ -3123,6 +3130,121 @@ private class NemotronHBlock: Module {
             return (pair.0, pair.1, nil)
         }
         return (x + output, nil, nil)
+    }
+
+    func pairedMTPForward(
+        _ x: MLXArray, preparedNorm: MLXArray?, nextBlock: NemotronHBlock,
+        modelLayerIndex: Int, recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (residual: MLXArray, moeOutput: MLXArray)? {
+        guard NemotronH35MTPBlockPairGraphCache.enabled,
+              blockType == .mamba, nextBlock.blockType == .moe,
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              recurrentState.count == 1, let mamba = mixer as? NemotronHMamba2Mixer
+        else { return nil }
+        let evaluation = recurrentState[0]
+        let initial = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+        let conv = initial?.conv ?? MLXArray.zeros([1, 3, 6144], dtype: .bfloat16)
+        let ssm = initial?.ssm ?? MLXArray.zeros([1, 64, 64, 128], dtype: .float32)
+        guard let arrays = mtpPairGraph(
+            x, preparedNorm: preparedNorm, convState: conv, initialSSM: ssm,
+            first: self, second: nextBlock) else { return nil }
+        mamba.mtpStageCompactReplay(
+            padded: arrays[2], convolution: arrays[3], timeInfo: arrays[4], finalSSM: arrays[5],
+            length: 3, modelLayerIndex: modelLayerIndex,
+            evaluation: evaluation, initialSSM: ssm)
+        return (arrays[0], arrays[1])
+    }
+
+    /// Only arrays and parameter handles enter this calculation. The caller
+    /// stages the returned replay payload after the compiled call completes.
+    func mtpPairArrays(
+        _ x: MLXArray, preparedNorm: MLXArray?, convState: MLXArray, initialSSM: MLXArray,
+        second: NemotronHBlock, compiledComponents: Bool
+    ) -> [MLXArray] {
+        let mamba = mixer as! NemotronHMamba2Mixer
+        let moe = second.mixer as! NemotronHMoE
+        let normalized = preparedNorm ?? nemotronMTPNormRows(x) { norm($0) }
+        let numerical = compiledComponents
+            ? mamba.mtpCompactGraphCache(
+                normalized, convState: convState, initialSSM: initialSSM, owner: mamba)
+            : mamba.mtpCompactArrays(normalized, convState: convState, initialSSM: initialSSM)
+        let boundary = finishResidual(
+            x, numerical[0], nextNorm: second.norm, nextPreparedMoE: true)
+        let moeInput = boundary.1 ?? nemotronMTPNormRows(boundary.0) { second.norm($0) }
+        let output = compiledComponents
+            ? moe.mtpForwardRows(moeInput, prepared: boundary.2)
+            : moe.mtpForwardRowsUncompiled(moeInput, prepared: boundary.2)
+        return [boundary.0, output, numerical[1], numerical[2], numerical[3], numerical[4]]
+    }
+}
+
+/// One adjacent native Mamba/MoE numerical pair. It never owns request state,
+/// transactions, attention KV or a replay closure. Compiled entries receive
+/// current conv/SSM and optional current normalized input as explicit arrays.
+private final class NemotronH35MTPBlockPairGraphCache {
+    struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_PAIRED_GRAPH"] != "0"
+    private let lock = NSLock()
+    private var entries: [Bool: Entry] = [:]
+
+    func callAsFunction(
+        _ x: MLXArray, preparedNorm: MLXArray?, convState: MLXArray, initialSSM: MLXArray,
+        first: NemotronHBlock, second: NemotronHBlock
+    ) -> [MLXArray]? {
+        guard Self.enabled, nemotronMTPCompactSSM,
+              NemotronH35MTPCompactGraphCache.enabled, NemotronMTPExecution.compiledMoE,
+              NemotronMTPExecution.batchedM1, NemotronMTPExecution.batchedNorm,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: first) == NemotronHBlock.self, type(of: second) == NemotronHBlock.self,
+              first.blockType == .mamba, second.blockType == .moe,
+              type(of: first.norm) == RMSNorm.self, type(of: second.norm) == RMSNorm.self,
+              let mamba = first.mixer as? NemotronHMamba2Mixer,
+              let moe = second.mixer as? NemotronHMoE,
+              let mambaIdentity = NemotronH35MTPCompactGraphCache.nativeIdentity(mamba),
+              let moeIdentity = NemotronH35MTPGraphCache.nativeIdentity(moe),
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              convState.shape == [1, 3, 6144], convState.dtype == .bfloat16,
+              initialSSM.shape == [1, 64, 64, 128], initialSSM.dtype == .float32
+        else { return nil }
+        if let preparedNorm {
+            guard preparedNorm.shape == x.shape, preparedNorm.dtype == x.dtype else { return nil }
+        }
+        let usesNorm = preparedNorm != nil
+        let identity = [ObjectIdentifier(first), ObjectIdentifier(first.norm),
+                        ObjectIdentifier(second), ObjectIdentifier(second.norm)]
+            + mambaIdentity + moeIdentity
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry = entries[usesNorm], entry.identity == identity { return entry }
+            let state = first.innerState() + second.innerState()
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak first, weak second] arrays in
+                guard let first, let second else { preconditionFailure("Released Nemotron graph pair owner") }
+                return first.mtpPairArrays(
+                    arrays[0], preparedNorm: usesNorm ? arrays[3] : nil,
+                    convState: arrays[1], initialSSM: arrays[2],
+                    second: second, compiledComponents: false)
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entries[usesNorm]
+            entries[usesNorm] = replacement
+            return replacement
+        }
+        var arguments = [x, convState, initialSSM]
+        if let preparedNorm { arguments.append(preparedNorm) }
+        let result = withExtendedLifetime(retired) { current.function(arguments) }
+        guard result.count == 6 else { return nil }
+        guard NemotronMoELeader.selfTest else { return result }
+        // Outside the pair compile, the original component caches retain
+        // their own optional original-recurrence and per-operator oracles.
+        let expected = first.mtpPairArrays(
+            x, preparedNorm: preparedNorm, convState: convState, initialSSM: initialSSM,
+            second: second, compiledComponents: true)
+        return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
     }
 }
 
@@ -3239,6 +3361,7 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
+        var pairedMoEOutput: (layerIndex: Int, output: MLXArray)? = nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3256,17 +3379,28 @@ private class NemotronHBackbone: Module {
                 && next % nemotronEarlyEvalInterval == 0
             let nextNorm = next < layers.count && !submitsEarly
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
-            let result = layer.cbv2Forward(
-                hidden,
-                modelLayerIndex: modelLayerIndex,
-                attentionCache: cache,
-                recurrentState: recurrentState,
-                captureMTP: captureMTP,
-                preparedNorm: preparedNorm,
-                preparedActivation: preparedActivation,
-                nextNorm: nextNorm,
-                nextPreparedMoE: captureMTP && nextNorm != nil && next < layers.count
-                    && layers[next].blockType == .moe)
+            let nextPreparedMoE = captureMTP && nextNorm != nil && next < layers.count
+                && layers[next].blockType == .moe
+            let result: (MLXArray, MLXArray?, MLXArray?)
+            if let paired = pairedMoEOutput {
+                precondition(paired.layerIndex == modelLayerIndex && layer.blockType == .moe)
+                result = layer.finishResidual(
+                    hidden, paired.output, nextNorm: nextNorm, nextPreparedMoE: nextPreparedMoE)
+                pairedMoEOutput = nil
+            } else if captureMTP, !submitsEarly, next < layers.count,
+                      layer.blockType == .mamba, layers[next].blockType == .moe,
+                      let pair = layer.pairedMTPForward(
+                          hidden, preparedNorm: preparedNorm, nextBlock: layers[next],
+                          modelLayerIndex: modelLayerIndex, recurrentState: recurrentState) {
+                result = (pair.residual, nil, nil)
+                pairedMoEOutput = (next, pair.moeOutput)
+            } else {
+                result = layer.cbv2Forward(
+                    hidden, modelLayerIndex: modelLayerIndex, attentionCache: cache,
+                    recurrentState: recurrentState, captureMTP: captureMTP,
+                    preparedNorm: preparedNorm, preparedActivation: preparedActivation,
+                    nextNorm: nextNorm, nextPreparedMoE: nextPreparedMoE)
+            }
             hidden = result.0
             preparedNorm = result.1
             preparedActivation = result.2
@@ -3293,6 +3427,9 @@ private class NemotronHBackbone: Module {
                     asyncEval(hidden)
                 }
             }
+        }
+        if case .some = pairedMoEOutput {
+            preconditionFailure("NemotronH paired MoE output was not consumed")
         }
         precondition(
             attentionIndex == caches.count,

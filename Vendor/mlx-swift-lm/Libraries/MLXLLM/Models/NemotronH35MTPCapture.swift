@@ -14,7 +14,7 @@ final class NemotronH35MTPCompactGraphCache {
         let identity: [ObjectIdentifier]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
-    private static let enabled =
+    static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
     private let lock = NSLock()
     private var entry: Entry?
@@ -58,7 +58,7 @@ final class NemotronH35MTPCompactGraphCache {
         return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
+    static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -111,7 +111,20 @@ extension NemotronHMamba2Mixer {
         let length = hiddenStates.dim(1)
         let arrays = mtpCompactGraphCache(
             hiddenStates, convState: convState, initialSSM: initialSSM, owner: self)
-        let (padded, convolution, dt, finalSSM) = (arrays[1], arrays[2], arrays[3], arrays[4])
+        mtpStageCompactReplay(
+            padded: arrays[1], convolution: arrays[2], timeInfo: arrays[3], finalSSM: arrays[4],
+            length: length, modelLayerIndex: modelLayerIndex,
+            evaluation: evaluation, initialSSM: initialSSM)
+        return arrays[0]
+    }
+
+    /// Transaction ownership remains outside every compiled numerical graph.
+    func mtpStageCompactReplay(
+        padded: MLXArray, convolution: MLXArray, timeInfo: MLXArray, finalSSM: MLXArray,
+        length: Int, modelLayerIndex: Int, evaluation: CBv2RecurrentStateEvaluation,
+        initialSSM: MLXArray
+    ) {
+        let dt = timeInfo
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
@@ -137,7 +150,6 @@ extension NemotronHMamba2Mixer {
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
         }
-        return arrays[0]
     }
 
     /// Original numerical graph, with request state supplied as dynamic arrays.

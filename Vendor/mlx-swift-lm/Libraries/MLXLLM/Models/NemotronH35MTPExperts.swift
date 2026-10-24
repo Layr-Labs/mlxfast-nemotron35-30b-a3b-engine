@@ -58,7 +58,7 @@ final class NemotronH35MTPGraphCache {
         return result.isEmpty ? MLXArray(0) : result[0]
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
+    static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
