@@ -2870,6 +2870,11 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = fused
         } else {
             y = switchMLP(x, inds)
+            if let sharedExperts {
+                let shared = sharedExperts(x)
+                if let fused = NemotronMoECombine.apply(y, scores, shared) { return fused }
+                return (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype) + shared
+            }
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
 

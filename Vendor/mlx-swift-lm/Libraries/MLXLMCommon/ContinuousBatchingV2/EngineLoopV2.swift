@@ -629,7 +629,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     let gauges: CBv2EngineGauges
 
     private let engineQueue = DispatchQueue(
-        label: "com.eigen.cbv2.engine", qos: .userInitiated)
+        label: "com.eigen.cbv2.engine", qos: .userInteractive)
+    /// Engine-queue only; nil when the OS work interval is unavailable.
+    private let workInterval = CBv2EngineWorkInterval()
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
@@ -2110,6 +2112,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         markStepStarted()
+        workInterval?.stepBegan()
         // Instruments-only step interval: both ends gated on `isEnabled`, so
         // an unattached process pays one static bool read per step.
         let signposter = Self.signposter
@@ -2121,6 +2124,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 CBv2StepProfiler.record(
                     "v2.step.wall", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
             }
+            workInterval?.stepEnded()
         }
 
         // One monotonic clock read per step, reused for lease expiry, admission
@@ -3510,6 +3514,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // instant. Every per-row stamp below, the cumulative step wall, and
         // finishes driven by this finalize reuse it (no per-row reads).
         let readbackDoneNanos = DispatchTime.now().uptimeNanoseconds
+        workInterval?.hostWorkBegan(readbackNanos: readbackDoneNanos)
         step.readbackDoneNanos = readbackDoneNanos
         stepWallNanosTotal = Self.saturatingAdd(
             stepWallNanosTotal, readbackDoneNanos &- step.wallStartedNanos)

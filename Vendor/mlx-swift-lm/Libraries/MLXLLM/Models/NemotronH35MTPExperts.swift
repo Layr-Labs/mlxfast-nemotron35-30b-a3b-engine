@@ -113,6 +113,119 @@ extension NemotronHMoE {
     }
 }
 
+// MARK: - Exact few-row MoE combine plus shared add
+//
+// The stock tail of a few-row MoE call, (y * scores[..., None]).sum(-2)
+// .asType(T) + shared, in one pass. Each bf16 expert output is promoted to fp32
+// and multiplied by its fp32 score in its own statement (the stock product,
+// rounded once); the K-way sum follows col_reduce_small (lsize.y == K <= 8:
+// row j is op(p_j, 0), then total = op(row_j, total) for j = 1..K-1); the
+// total narrows to T and the shared-expert output is added in T, as the stock
+// AsType and Add kernels do.
+private let nemotronMoECombineSource = """
+  uint c = thread_position_in_grid.x * 4;
+  uint t = thread_position_in_grid.y;
+  float total[4];
+  for (int k = 0; k < K; ++k) {
+    float s = scores[t * K + k];
+    const device T* row = y + (size_t(t) * K + k) * N + c;
+    for (int j = 0; j < 4; ++j) {
+      float v = static_cast<float>(row[j]);
+      float p = v * s;
+      float a = p + 0.0f;
+      if (k == 0) {
+        total[j] = a;
+      } else {
+        total[j] = a + total[j];
+      }
+    }
+  }
+  const device T* sh = shared + size_t(t) * N + c;
+  device T* o = out + size_t(t) * N + c;
+  for (int j = 0; j < 4; ++j) {
+    T h = static_cast<T>(total[j]);
+    o[j] = h + sh[j];
+  }
+"""
+
+private final class NemotronMoECombineKernel: Sendable {
+    static let shared = NemotronMoECombineKernel()
+    let kernel: MLXFast.MLXFastKernel
+    private init() {
+        kernel = MLXFast.metalKernel(
+            name: "nemotron_moe_rows_combine",
+            inputNames: ["y", "scores", "shared"], outputNames: ["out"],
+            source: nemotronMoECombineSource)
+    }
+}
+
+enum NemotronMoECombine {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MOE_ROWS_COMBINE"] != "0"
+    nonisolated(unsafe) private static var verified = false
+
+    /// Stock-equivalent `(y * scores[..., None]).sum(-2).asType(y.dtype) + shared`
+    /// for y [..., R, K, N], scores [..., R, K] fp32, shared [..., R, N];
+    /// nil = use the stock ops. Engages only after `verify()` matched.
+    static func apply(_ y: MLXArray, _ scores: MLXArray, _ shared: MLXArray) -> MLXArray? {
+        guard verified else { return nil }
+        return fused(y, scores, shared)
+    }
+
+    private static func fused(
+        _ y: MLXArray, _ scores: MLXArray, _ shared: MLXArray
+    ) -> MLXArray? {
+        guard enabled, y.ndim >= 2, y.dtype == .bfloat16 || y.dtype == .float16,
+              scores.dtype == .float32, shared.dtype == y.dtype
+        else { return nil }
+        let k = y.dim(-2)
+        let n = y.dim(-1)
+        guard (1...8).contains(k), n % 4 == 0,
+              scores.shape == Array(y.shape.dropLast()),
+              shared.shape == Array(y.shape.dropLast(2)) + [n]
+        else { return nil }
+        let rows = scores.size / k
+        var out = NemotronMoECombineKernel.shared.kernel(
+            [y, scores, shared],
+            template: [("T", y.dtype), ("K", k), ("N", n)],
+            grid: (n / 4, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [shared.shape], outputDTypes: [y.dtype])[0]
+        if NemotronMoELeader.selfTest {
+            let stock = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype) + shared
+            let ok = (out.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+            out = which(ok, out, MLXArray(Float.nan).asType(out.dtype))
+        }
+        return out
+    }
+
+    /// Load-time bit check on seeded random rows, one per row count the few-row
+    /// route can request: the fused route engages only if every output equals
+    /// the stock three-op tail bit for bit. Also JITs the pipelines outside any
+    /// request, and any failed call leaves the stock ops in place.
+    static func verify() {
+        verified = false
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu else { return }
+        var matches = true
+        for rows in 1 ... 8 {
+            let y = MLXRandom.normal(
+                [1, rows, 6, 2688], dtype: .bfloat16, scale: 4,
+                key: MLXRandom.key(UInt64(0x5c00 + rows)))
+            let scores = MLXRandom.normal(
+                [1, rows, 6], dtype: .float32, key: MLXRandom.key(UInt64(0x5c10 + rows)))
+            let shared = MLXRandom.normal(
+                [1, rows, 2688], dtype: .bfloat16, scale: 4,
+                key: MLXRandom.key(UInt64(0x5c20 + rows)))
+            guard let fused = fused(y, scores, shared) else { return }
+            let expected = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+                .asType(y.dtype) + shared
+            let same = fused.view(dtype: .uint16) .== expected.view(dtype: .uint16)
+            matches = matches && same.all().item(Bool.self)
+        }
+        verified = matches
+    }
+}
+
 // MARK: - Exact multi-row MoE verify (expert leader)
 //
 // Stock verify runs one affine_gather_qmv threadgroup per (row, slot). Here the
