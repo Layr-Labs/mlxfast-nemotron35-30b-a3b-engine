@@ -45,6 +45,11 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+/// Early asyncEval interval for the MTP verify/capture forward. Each early
+/// submit commits a command buffer and skips the next layer's fused norm, so
+/// the 52-layer verify graph uses a wider interval than prefill.
+let nemotronMTPVerifyEarlyEvalInterval = 8
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -595,7 +600,34 @@ private enum NemotronPackedConvKernel {
             """, ensureRowContiguous: false)
 }
 
+/// Read-only all-zero initial recurrent state for a fresh CBv2 request,
+/// built once per layer (and dtype/shape) instead of once per request. The
+/// values are exactly the zeros the per-request path materialized; inputs are
+/// never written, and the cached array keeps a reference so it is never
+/// donated. Held outside the module tree so it registers no parameters.
+private final class NemotronHZeroRecurrentState: @unchecked Sendable {
+    private var convZero: MLXArray?
+    private var ssmZero: MLXArray?
+
+    func conv(shape: [Int], dtype: DType) -> MLXArray {
+        if let convZero, convZero.dtype == dtype, convZero.shape == shape { return convZero }
+        let zero = MLXArray.zeros(shape, dtype: dtype)
+        eval(zero)
+        convZero = zero
+        return zero
+    }
+
+    func ssm(shape: [Int]) -> MLXArray {
+        if let ssmZero, ssmZero.shape == shape { return ssmZero }
+        let zero = MLXArray.zeros(shape, dtype: .float32)
+        eval(zero)
+        ssmZero = zero
+        return zero
+    }
+}
+
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
+    private let zeroRecurrentState = NemotronHZeroRecurrentState()
     let numHeads: Int
     let hiddenSize: Int
     let ssmStateSize: Int
@@ -794,14 +826,13 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
             convRows.append(
                 state?.conv
-                    ?? MLXArray.zeros(
-                        [1, max(0, convKernelSize - 1), convDim],
+                    ?? zeroRecurrentState.conv(
+                        shape: [1, max(0, convKernelSize - 1), convDim],
                         dtype: hiddenStates.dtype))
             ssmRows.append(
                 state?.ssm
-                    ?? MLXArray.zeros(
-                        [1, numHeads, headDim, ssmStateSize],
-                        dtype: .float32))
+                    ?? zeroRecurrentState.ssm(
+                        shape: [1, numHeads, headDim, ssmStateSize]))
         }
         let convState =
             convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
@@ -3083,8 +3114,10 @@ private class NemotronHBackbone: Module {
                 cache = nil
             }
             let next = modelLayerIndex + 1
-            let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
-                && next % nemotronEarlyEvalInterval == 0
+            let earlyEvalInterval =
+                captureMTP ? nemotronMTPVerifyEarlyEvalInterval : nemotronEarlyEvalInterval
+            let submitsEarly = earlyEvalInterval > 0 && next < layers.count
+                && next % earlyEvalInterval == 0
             let nextNorm = next < layers.count && !submitsEarly
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
             let result = layer.cbv2Forward(

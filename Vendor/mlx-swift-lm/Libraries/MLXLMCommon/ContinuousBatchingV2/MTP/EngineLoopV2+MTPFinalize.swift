@@ -70,7 +70,10 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        // The margin only feeds the marginal depth policy; a fixed depth never
+        // reads it, so skip that host copy.
+        let policyTopTwoHost =
+            mtp.usesMarginalPolicy ? verify.policyTopTwoValues?.asArray(Float.self) : nil
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
@@ -299,32 +302,38 @@ extension EngineLoopV2 {
             // states the row's post-round accounting — the boundary invariant
             // a consumer checks is
             // `numComputedAfter == tokensCountAfter - 1`.
-            mtp.recordRound(
-                drafted: k, accepted: observedAccepted, emitted: confirmed,
-                audit: CBv2MTPRoundAuditRecord(
-                    requestID: id.raw,
-                    k: k,
-                    draftTokens: Array(
-                        host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
-                    targetTokens: outcome.targets,
-                    accepted: accepted,
-                    confirmed: confirmed,
-                    rejected: rejected,
-                    tokensCountAfter: rec.tokens.count,
-                    numComputedAfter: rec.numComputedTokens,
-                    generatedAfter: rec.generatedTokenCount,
-                    finishReason: finishReason.map { String(describing: $0) }))
-            let rejectionObserved = accepted < k && confirmed > accepted
-            let acceptanceTruncated =
-                !rejectionObserved && confirmed <= accepted && confirmed < k
-            mtp.observeRequestAcceptance(
-                id: id,
-                draftedDepth: k,
-                acceptedDepth: observedAccepted,
-                rejectionObserved: rejectionObserved,
-                endedByTruncation: acceptanceTruncated)
+            // Round telemetry (audit record, acceptance observation) only
+            // reads host values. Run it after the next first draft is
+            // prestaged so the GPU is not left waiting on bookkeeping.
+            let recordRoundTelemetry = {
+                mtp.recordRound(
+                    drafted: k, accepted: observedAccepted, emitted: confirmed,
+                    audit: CBv2MTPRoundAuditRecord(
+                        requestID: id.raw,
+                        k: k,
+                        draftTokens: Array(
+                            host[batchIndex * k ..< (batchIndex + 1) * k].map(Int.init)),
+                        targetTokens: outcome.targets,
+                        accepted: accepted,
+                        confirmed: confirmed,
+                        rejected: rejected,
+                        tokensCountAfter: rec.tokens.count,
+                        numComputedAfter: rec.numComputedTokens,
+                        generatedAfter: rec.generatedTokenCount,
+                        finishReason: finishReason.map { String(describing: $0) }))
+                let rejectionObserved = accepted < k && confirmed > accepted
+                let acceptanceTruncated =
+                    !rejectionObserved && confirmed <= accepted && confirmed < k
+                mtp.observeRequestAcceptance(
+                    id: id,
+                    draftedDepth: k,
+                    acceptedDepth: observedAccepted,
+                    rejectionObserved: rejectionObserved,
+                    endedByTruncation: acceptanceTruncated)
+            }
 
             if let finishReason {
+                recordRoundTelemetry()
                 if let state = metadata.assistantState {
                     mtp.releaseDetachedAssistantState(state)
                 }
@@ -380,6 +389,7 @@ extension EngineLoopV2 {
                     prestager.prestageFirstDraft(
                         token: kept[confirmed - 1], hidden: carryHidden, requestState: state)
                 }
+                recordRoundTelemetry()
             }
         }
 
