@@ -572,7 +572,8 @@ enum NemotronMoELeader {
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
         NemotronMoELeaderKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds],
+            [nemotronWeightAnchor(bank.weight), nemotronWeightAnchor(bank.scales),
+             nemotronWeightAnchor(bank.biases), x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                        ("RELU2", relu2)],
@@ -587,7 +588,8 @@ enum NemotronMoELeader {
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank) -> MLXArray {
         NemotronMoELeaderWeightedKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+            [nemotronWeightAnchor(bank.weight), nemotronWeightAnchor(bank.scales),
+             nemotronWeightAnchor(bank.biases), x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n)],
             grid: (32 * (bank.n / 4), 6, 1),

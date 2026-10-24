@@ -45,6 +45,56 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+let nemotronWeightAnchorEnabled =
+    ProcessInfo.processInfo.environment["NEMOTRON_WEIGHT_ANCHOR"] != "0"
+
+/// MLX commits the open command buffer once the input arrays bound since the
+/// last commit span more than its per-device element budget (50M on a Max).
+/// It counts each array's own span, so one 80M-element expert bank forced a
+/// commit after every MoE kernel, and every commit is a GPU start gap. The
+/// custom kernels index their weights from the base pointer with compile-time
+/// shapes and never read the input's shape, so an eight-element view at the
+/// same offset binds the same buffer at the same address and reads the same
+/// bytes. (MLX passes inputs under eight elements in the constant space.)
+/// Views of the loaded quantized weights are built and evaluated once at load
+/// (`NemotronWeightAnchors.prepare`), so a round's graph gains no reshape or
+/// slice nodes; any other array gets an uncached view.
+func nemotronWeightAnchor(_ a: MLXArray) -> MLXArray {
+    guard nemotronWeightAnchorEnabled, a.size > 8 else { return a }
+    return NemotronWeightAnchors.shared.anchor(a)
+}
+
+final class NemotronWeightAnchors: @unchecked Sendable {
+    static let shared = NemotronWeightAnchors()
+    private let lock = NSLock()
+    // Keyed by the weight's object identity; the entry retains the weight so
+    // the identifier cannot be reused while the entry exists.
+    private var entries: [ObjectIdentifier: (source: MLXArray, anchor: MLXArray)] = [:]
+
+    func anchor(_ a: MLXArray) -> MLXArray {
+        if let hit = lock.withLock({ entries[ObjectIdentifier(a)] }) { return hit.anchor }
+        return a.reshaped(-1)[0 ..< 8]
+    }
+
+    /// Input-independent load-time preparation: one view per weight, scale
+    /// and bias array of every quantized linear in `model`.
+    func prepare(_ model: Module) {
+        guard nemotronWeightAnchorEnabled else { return }
+        var built: [(MLXArray, MLXArray)] = []
+        for module in model.modules()
+        where module is QuantizedLinear || module is QuantizedSwitchLinear {
+            for (key, value) in module.parameters().flattened()
+            where ["weight", "scales", "biases"].contains(key) && value.size > 8 {
+                built.append((value, value.reshaped(-1)[0 ..< 8]))
+            }
+        }
+        eval(built.map { $0.1 })
+        lock.withLock {
+            for (source, view) in built { entries[ObjectIdentifier(source)] = (source, view) }
+        }
+    }
+}
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -2800,7 +2850,8 @@ func nemotronRunGather(
           ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
     else { return nil }
     return NemotronHRunGatherKernel.shared.kernel(
-        [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k],
+        [x, nemotronWeightAnchor(ops.weight), nemotronWeightAnchor(ops.scales),
+         nemotronWeightAnchor(biases), tiles.tiles, nOut, k],
         template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
                    ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", relu2)],
         grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
