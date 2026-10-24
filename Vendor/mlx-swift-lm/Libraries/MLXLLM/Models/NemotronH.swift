@@ -990,6 +990,9 @@ class NemotronHAttention: Module, NemotronHMixer {
 // MARK: - MLP
 
 class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
+    private static let ordinaryR1SharedUp =
+        ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_ORDINARY_R1_SHARED_UP"] != "0"
+
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
@@ -1001,7 +1004,22 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(relu2(upProj(x)))
+        // Keep ordinary M=1 and the existing BF16 projection/activation stores.
+        // Other geometries and unknown overrides retain the original entry.
+        if Self.ordinaryR1SharedUp, type(of: self) == NemotronHMLP.self,
+           type(of: upProj) == QuantizedLinear.self,
+           type(of: downProj) == QuantizedLinear.self,
+           x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+           NemotronMTPExecution.batchedM1,
+           let up = upProj as? QuantizedLinear, up.bias == nil,
+           up.weight.shape == [3712, 336], up.scales.shape == [3712, 42],
+           let offsets = up.biases, offsets.shape == [3712, 42],
+           Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+           let activated = NemotronMultiRowQMV.apply(
+               x.reshaped(1, 2688), up, relu2: true) {
+            return downProj(activated.reshaped(1, 1, 3712))
+        }
+        return downProj(relu2(upProj(x)))
     }
 
     // Protocol conformance
