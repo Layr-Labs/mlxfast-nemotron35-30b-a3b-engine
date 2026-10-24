@@ -75,7 +75,8 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronMoELeader.warm(target)
-        assistant.warmPostVerifySpeculation()
+        // The general pass replaces one synthetic post-verify warm-up with
+        // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
         assistant.warmUpExactShapes()
         return assistant
@@ -95,19 +96,27 @@ extension NemotronH35MTPAssistant {
 extension NemotronH35MTPAssistant {
     func warmUpExactShapes() {
         let environment = ProcessInfo.processInfo.environment
-        guard environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP"] != "0" else { return }
+        guard environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP"] != "0" else {
+            warmPostVerifySpeculation()
+            return
+        }
         let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 2
         let depth = max(1, min(requested, maximumDraftTokens ?? 7, 7))
         let promptLength = max(8, Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PROMPT"] ?? "") ?? 488)
         let prefillLength = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PREFILL"] ?? "") ?? 1024
+        // This records the one attempted replacement even if a later
+        // operation throws, so the catch path cannot add another warm pass.
+        var postVerifyWarmupWidth: Int?
         do {
             // A tile-aligned timed-prefill length (the seed length is not
             // aligned, so its kernels use the other alignment variants).
             if prefillLength > 0 { try warmUpPrefill(length: prefillLength) }
-            try runWarmUp(depth: depth, promptLength: promptLength)
+            try runWarmUp(depth: depth, promptLength: promptLength,
+                          postVerifyWarmupWidth: &postVerifyWarmupWidth)
         } catch {
             FileHandle.standardError.write(Data("nemotron mtp warm-up skipped: \(error)\n".utf8))
         }
+        warmPostVerifySpeculation(skippingWidth: postVerifyWarmupWidth)
         Memory.clearCache()
     }
 
@@ -138,7 +147,9 @@ extension NemotronH35MTPAssistant {
         try evaluation.commit()
     }
 
-    private func runWarmUp(depth: Int, promptLength: Int) throws {
+    private func runWarmUp(
+        depth: Int, promptLength: Int, postVerifyWarmupWidth: inout Int?
+    ) throws {
         let kinds = target.cbv2LayerKinds
         let maxLength = promptLength + 4 * (depth + 2) + 16
         let backend = CBv2ContiguousKVBackend(
@@ -237,7 +248,18 @@ extension NemotronH35MTPAssistant {
             let verifyRoots = try evaluation.evaluate()
             asyncEval([packet, values, verify.lastHidden] + verifyRoots
                 + cacheState() + evaluationTargets(for: draftState))
-            _ = packet.asArray(Int32.self)
+            // Replace ONE existing synthetic width with real verifier rows.
+            // The third deep round is the inherited zero-acceptance case:
+            // the assistant is already started and the selected offset is 0.
+            let warmPostVerify = postVerifyWarmupWidth == nil && k == depth
+                && confirmed == 1 && canWarmPostVerifySpeculation(width: width)
+            if warmPostVerify {
+                postVerifyWarmupWidth = width
+                speculateAfterVerify(
+                    targetTokens: packet[k ..< (k + width)].reshaped([1, width]),
+                    targetHidden: verify.lastHidden, requestState: draftState)
+            }
+            let hostPacket = packet.asArray(Int32.self)
             _ = values.asArray(Float.self)
             let keep = confirmed
             try evaluation.commit(keepPositions: keep)
@@ -251,8 +273,16 @@ extension NemotronH35MTPAssistant {
                 committedTargetHidden: verify.lastHidden[0..., 0..<(keep - 1), 0...])
             seed = ids[0..., (keep - 1)..<keep, 0].reshaped(1, 1)
             carry = verify.lastHidden[0..., (keep - 1)..<keep, 0...]
+            if warmPostVerify {
+                prestageFirstDraft(
+                    token: Int(hostPacket[k + keep - 1]), hidden: carry,
+                    requestState: draftState)
+            }
             eval([seed, carry] + evaluationTargets(for: draftState))
         }
+        // Depth one has no shallower round to consume the prestaged row.
+        // Release that private transaction through the ordinary discard path.
+        discardRound(requestState: draftState)
         Stream.gpu.synchronize()
     }
 }
