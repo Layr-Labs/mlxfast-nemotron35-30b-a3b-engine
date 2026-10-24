@@ -3237,6 +3237,7 @@ private class NemotronHBackbone: Module {
         var preparedNorm: MLXArray? = nil
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
+        var submittedPrefillChunk: MLXArray? = nil
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3275,6 +3276,17 @@ private class NemotronHBackbone: Module {
                     let group = (next - nemotronEarlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
+                    // A prefill chunk runs for milliseconds while the host
+                    // builds the next one in well under one, so without a
+                    // wait the host encodes (and allocates) every layer's
+                    // intermediates before the first chunk completes. Once
+                    // the previous chunk finishes, its temporaries return to
+                    // MLX's buffer cache for the next chunk to reuse, which
+                    // matters after a drain empties that cache (the seed
+                    // window). This chunk is already queued behind it, so the
+                    // GPU never waits on the host. Evaluation order only.
+                    if let previous = submittedPrefillChunk { eval(previous) }
+                    submittedPrefillChunk = hidden
                 } else {
                     asyncEval(hidden)
                 }
@@ -3284,6 +3296,22 @@ private class NemotronHBackbone: Module {
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
+    }
+}
+
+/// Holds one model's probed Mamba activation dtypes. Input-independent: the
+/// probe reads loaded parameter types only, never request tokens or state.
+private final class NemotronHActivationDTypeMemo: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved: [Int: DType]?
+
+    func value(_ resolve: () -> [Int: DType]) -> [Int: DType] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved { return resolved }
+        let value = resolve()
+        resolved = value
+        return value
     }
 }
 
@@ -3297,6 +3325,7 @@ public class NemotronHModel:
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
+    private let recurrentActivationDTypes = NemotronHActivationDTypeMemo()
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -3372,12 +3401,19 @@ public class NemotronHModel:
         }
     }
 
+    /// The probe below depends only on loaded parameter types, which every
+    /// reader sees after load, so it runs once per model rather than once per
+    /// adapter (each engine build and each stepper).
+    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+        recurrentActivationDTypes.value { probeRecurrentActivationDTypes() }
+    }
+
     /// Resolve convolution-history widths from the loaded model itself.
     /// Quantized storage dtype is not the activation dtype, and retained
     /// fp32 parameters can promote later residuals. A lazy one-token graph
     /// through private caches exposes each Mamba layer's deterministic dtype
     /// without evaluating kernels or mutating request state.
-    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+    private func probeRecurrentActivationDTypes() -> [Int: DType] {
         let caches = newCache(parameters: nil)
         _ = backbone(
             MLXArray([0]).reshaped(1, 1),

@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -85,6 +86,7 @@ extension NemotronH35MTPAssistant {
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
         assistant.warmUpExactShapes()
+        NemotronWiredMemory.apply()
         return assistant
     }
 }
@@ -290,5 +292,31 @@ extension NemotronH35MTPAssistant {
         // Release that private transaction through the ordinary discard path.
         discardRound(requestState: draftState)
         Stream.gpu.synchronize()
+    }
+}
+
+/// MLX tracks every Metal allocation for its standing residency set but wires
+/// none of them until a wired limit is set; mlx-swift-lm's own generate path
+/// sets one around each request. The benchmark engine never did, so the
+/// loaded weights were left to per-command-buffer residency across the
+/// benchmarker's idle gates. Called once, last in load: the limit covers what
+/// is live then (target and head weights, load-time constants) plus page
+/// rounding, so the weights stay resident for the worker's life while
+/// per-request allocations stay outside the set and add no residency commits.
+/// No GPU work is issued and no value changes.
+/// NEMOTRON_WIRED_LIMIT=0 keeps the previous behavior.
+enum NemotronWiredMemory {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_WIRED_LIMIT"] != "0"
+
+    static func apply() {
+        guard enabled, let recommended = GPU.maxRecommendedWorkingSetBytes() else { return }
+        Stream.gpu.synchronize()
+        Memory.clearCache()
+        // MLX refuses a limit above the recommended working set.
+        let limit = min(Memory.activeMemory + (32 << 20), recommended / 4 * 3)
+        _ = try? withError { () -> Int32 in
+            var previous: size_t = 0
+            return mlx_set_wired_limit(&previous, size_t(limit))
+        }
     }
 }
