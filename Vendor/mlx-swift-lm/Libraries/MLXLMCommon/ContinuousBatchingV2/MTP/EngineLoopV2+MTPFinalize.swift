@@ -244,6 +244,10 @@ extension EngineLoopV2 {
                 // Target KV/recurrent truth is committed first. The assistant
                 // receives only accepted draft inputs and their trusted target
                 // hidden rows; every speculative head suffix is discarded.
+                if let selected = mtp.drafter as? any CBv2MTPSelectedRowSpeculating {
+                    selected.reconcileSelectedRowSpeculation(
+                        acceptedDraftTokens: accepted, requestState: state)
+                }
                 stateful.finalizeRound(
                     requestState: state,
                     confirmedInputTokens: 1 + committedDraftCount,
@@ -415,6 +419,17 @@ public protocol CBv2MTPFirstDraftPrestaging: AnyObject {
         targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState)
 }
 
+/// Optional single-row refinement. The device selects the natural exact-match
+/// prefix; the existing host readback later reconciles that row with the actual
+/// committed prefix. A truncated prefix must not reuse another row's draft.
+public protocol CBv2MTPSelectedRowSpeculating: CBv2MTPFirstDraftPrestaging {
+    func speculateSelectedRowAfterVerify(
+        draftTokens: MLXArray, targetTokens: MLXArray, targetHidden: MLXArray,
+        requestState: any CBv2MTPRequestState)
+    func reconcileSelectedRowSpeculation(
+        acceptedDraftTokens: Int, requestState: any CBv2MTPRequestState)
+}
+
 public enum CBv2MTPFirstDraftPrestage {
     /// CBV2_MTP_PRESTAGE_FIRST_DRAFT=0 restores submission at round build.
     public static let enabled =
@@ -441,10 +456,18 @@ extension EngineLoopV2 {
             .reshaped([batch, width])
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
-            speculator.speculateAfterVerify(
-                targetTokens: targets[index ..< (index + 1)],
-                targetHidden: verify.lastHidden[index ..< (index + 1)],
-                requestState: state)
+            if batch == 1, let selected = speculator as? any CBv2MTPSelectedRowSpeculating {
+                selected.speculateSelectedRowAfterVerify(
+                    draftTokens: verify.draftIDs[index ..< (index + 1)],
+                    targetTokens: targets[index ..< (index + 1)],
+                    targetHidden: verify.lastHidden[index ..< (index + 1)],
+                    requestState: state)
+            } else {
+                speculator.speculateAfterVerify(
+                    targetTokens: targets[index ..< (index + 1)],
+                    targetHidden: verify.lastHidden[index ..< (index + 1)],
+                    requestState: state)
+            }
         }
     }
 }

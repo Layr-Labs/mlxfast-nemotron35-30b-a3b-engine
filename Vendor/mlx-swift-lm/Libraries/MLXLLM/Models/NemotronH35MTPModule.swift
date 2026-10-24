@@ -144,11 +144,22 @@ final class NemotronH35MTPModule: Module {
             hidden: hidden, embedding: embedding, cache: cache)
     }
     func pagedForwardRows(
-        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
+        hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache,
+        selectedRow: MLXArray? = nil
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
         let a = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardRows(
             hidden: hidden, embedding: embedding, cache: cache)
-        return ((layers[1] as! NemotronH35MTPExpertBlock).forwardRows(a.output), a.keys, a.values)
+        // All causal attention and K/V rows are still required for history.
+        // Only the selected continuation needs the stateless expert/head tail.
+        let expertInput: MLXArray
+        if let selectedRow {
+            precondition(hidden.dim(0) == 1 && selectedRow.shape == [1]
+                && selectedRow.dtype == .int32)
+            expertInput = take(a.output, selectedRow, axis: 1)
+        } else {
+            expertInput = a.output
+        }
+        return ((layers[1] as! NemotronH35MTPExpertBlock).forwardRows(expertInput), a.keys, a.values)
     }
 }
 

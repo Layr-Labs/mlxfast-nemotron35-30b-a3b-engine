@@ -110,6 +110,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var canPrestageFirstDraft = false
         /// Post-verify head rows over (target token r, target hidden r).
         var speculation: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
+        /// One device-selected expert/head output, but the full attention K/V.
+        var selectedSpeculation: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray, width: Int)?
+        /// Natural acceptance from the existing packet readback, never a new sync.
+        var selectedNaturalAcceptance: Int?
         /// The accepted row of `speculation` after finalize (next first draft).
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
@@ -343,7 +347,13 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         let speculation = s.speculation.flatMap {
             $0.ids.dim(1) == s.stagedInputCount + 1 && n < $0.ids.dim(1) ? $0 : nil
         }
-        if speculation != nil {
+        let selected = s.selectedSpeculation.flatMap {
+            $0.width == s.stagedInputCount + 1 && n < $0.width ? $0 : nil
+        }
+        // EOS, length or a common-width clamp can shorten the committed prefix.
+        // Keep its exact K/V, but reuse the selected draft only at its own row.
+        let reuseSelected = selected != nil && s.selectedNaturalAcceptance == n
+        if speculation != nil || selected != nil {
             // Post-verify speculation already appended rows (target token r,
             // target hidden r) after the trusted seed row. Exact-greedy
             // acceptance makes rows 0..<n the accepted replay; keep them.
@@ -362,10 +372,17 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         clearRound(s)
         // Row n pairs the next seed (target token n) with the carry hidden:
         // it is the next round's first draft, already computed.
-        s.nextFirstDraft = speculation.map { spec in
-            (ids: spec.ids[0..., n], out: spec.out[0..., n ..< (n + 1), 0...],
-             keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
-             values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+        if let selected, reuseSelected {
+            s.nextFirstDraft = (
+                ids: selected.ids.reshaped([1]), out: selected.out,
+                keys: selected.keys[0..., 0..., n ..< (n + 1), 0...],
+                values: selected.values[0..., 0..., n ..< (n + 1), 0...])
+        } else {
+            s.nextFirstDraft = speculation.map { spec in
+                (ids: spec.ids[0..., n], out: spec.out[0..., n ..< (n + 1), 0...],
+                 keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
+                 values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+            }
         }
     }
     public func discardRound(requestState: any CBv2MTPRequestState) {
@@ -380,6 +397,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
     private func clearRound(_ s: State) {
         s.prestagedHidden = nil; s.prestagedResult = nil; s.speculation = nil
+        s.selectedSpeculation = nil; s.selectedNaturalAcceptance = nil
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
     }
@@ -393,7 +411,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
 }
 
-extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
+extension NemotronH35MTPAssistant: CBv2MTPSelectedRowSpeculating {
     /// Called from finalize once the next round's carry is final, while the
     /// GPU is idle after the acceptance readback. Builds and submits exactly
     /// the first draft the next round would build (same ops, same inputs:
@@ -444,12 +462,50 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     public func speculateAfterVerify(
         targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState
     ) {
+        buildPostVerifySpeculation(
+            draftTokens: nil, targetTokens: targetTokens, targetHidden: targetHidden,
+            requestState: requestState)
+    }
+
+    public func speculateSelectedRowAfterVerify(
+        draftTokens: MLXArray, targetTokens: MLXArray, targetHidden: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) {
+        buildPostVerifySpeculation(
+            draftTokens: draftTokens, targetTokens: targetTokens, targetHidden: targetHidden,
+            requestState: requestState)
+    }
+
+    public func reconcileSelectedRowSpeculation(
+        acceptedDraftTokens: Int, requestState: any CBv2MTPRequestState
+    ) {
+        let s = state(requestState)
+        if s.selectedSpeculation != nil { s.selectedNaturalAcceptance = acceptedDraftTokens }
+    }
+
+    private func buildPostVerifySpeculation(
+        draftTokens: MLXArray?, targetTokens: MLXArray, targetHidden: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) {
         let s = state(requestState)
         let width = s.stagedInputCount + 1
         guard s.started, kvOnlyHistory, s.paged != nil, s.stagedInputCount > 0, s.speculation == nil,
+              s.selectedSpeculation == nil,
               s.prestagedResult == nil, targetTokens.shape == [1, width],
               targetHidden.shape == [1, width, target.configuration.hiddenSize]
         else { return }
+        let selectedRow: MLXArray?
+        if let draftTokens {
+            guard draftTokens.shape == [1, width - 1], draftTokens.dtype == .int32,
+                  targetTokens.dtype == .int32 else { return }
+            // Products of 0/1 equality flags remain one exactly until the first
+            // mismatch. Their integer sum is the same prefix as the host walk.
+            // Do not count isolated matches after a rejection or read a scalar.
+            let matches = (draftTokens .== targetTokens[0..., 0 ..< (width - 1)]).asType(.int32)
+            selectedRow = cumprod(matches, axis: 1).sum(axis: 1).asType(.int32)
+        } else {
+            selectedRow = nil
+        }
         // Chained draft rows are never trusted; drop them before appending.
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
         // Attend the rows one query column at a time through the decode
@@ -466,10 +522,16 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             cache.mtpBatchesRectangularAttention = false
         }
         let rows = module.pagedForwardRows(
-            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
+            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache,
+            selectedRow: selectedRow)
         let logits = draftHead.rowLogits(rows.output)
         let ids = argMax(logits, axis: -1).asType(.int32)
-        s.speculation = (ids: ids, out: rows.output, keys: rows.keys, values: rows.values)
+        if selectedRow != nil {
+            s.selectedSpeculation = (ids: ids, out: rows.output, keys: rows.keys,
+                                    values: rows.values, width: width)
+        } else {
+            s.speculation = (ids: ids, out: rows.output, keys: rows.keys, values: rows.values)
+        }
         let roots = [ids, rows.output] + s.cache.innerState()
         s.roots += roots
         asyncEval(roots)
@@ -489,8 +551,8 @@ enum NemotronH35MTPSpeculation {
 extension NemotronH35MTPAssistant {
     /// Load-time JIT of the post-verify speculation path at every row width a
     /// round can request (2...4 = depth 1...3, tail-clamped rounds included):
-    /// the head's rows forward (multi-row qmv, column attention, compiled row
-    /// MoE trace + leader kernel, multi-row LM head rows, argmax), finalize's
+    /// the head's attention rows, device prefix selection, one-row expert/LM
+    /// head tail and argmax, finalize's
     /// row slices and prestage's re-append + handout. Runs the real entry
     /// points on throwaway request state with zero inputs; values are
     /// discarded. The one-token draft and the target paths are left to the
@@ -531,10 +593,12 @@ extension NemotronH35MTPAssistant {
             let packet = MLXArray.zeros([drafts + width], dtype: .int32)
             let targets = packet[drafts ..< (drafts + width)].reshaped([1, width])
             let hidden = MLXArray.zeros([1, width, a.hiddenSize], dtype: hiddenDType)
-            speculateAfterVerify(
+            speculateSelectedRowAfterVerify(
+                draftTokens: packet[0 ..< drafts].reshaped([1, drafts]),
                 targetTokens: targets[0 ..< 1], targetHidden: hidden[0 ..< 1],
                 requestState: requestState)
             eval(evaluationTargets(for: requestState))
+            reconcileSelectedRowSpeculation(acceptedDraftTokens: drafts, requestState: requestState)
             finalizeRound(
                 requestState: requestState, confirmedInputTokens: drafts + 1,
                 committedDraftTokens: MLXArray.zeros([1, drafts], dtype: .int32),
