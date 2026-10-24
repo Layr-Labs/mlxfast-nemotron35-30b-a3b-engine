@@ -109,6 +109,9 @@ final class CBv2MTPRoundInFlight {
         let policyTopTwoValues: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// NEMOTRON_KERNEL_SELFTEST=1 only: (new, original) int32 or
+        /// bit-viewed arrays that finalize compares on the host.
+        var selfTestChecks: [(name: String, fast: MLXArray, reference: MLXArray)] = []
 
     }
 

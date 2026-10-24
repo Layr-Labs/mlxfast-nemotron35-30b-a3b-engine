@@ -70,6 +70,18 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
+        // NEMOTRON_KERNEL_SELFTEST=1 only (empty otherwise): round-end glue
+        // against the original build, bit for bit.
+        for check in verify.selfTestChecks {
+            let fast = check.fast.asArray(Int32.self)
+            let reference = check.reference.asArray(Int32.self)
+            if fast != reference || check.fast.shape != check.reference.shape {
+                FileHandle.standardError.write(Data(
+                    "CBv2 round-end self-test: \(check.name) differs: \(fast) vs \(reference)\n"
+                        .utf8))
+                preconditionFailure("CBv2 round-end self-test failed: \(check.name)")
+            }
+        }
         let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k

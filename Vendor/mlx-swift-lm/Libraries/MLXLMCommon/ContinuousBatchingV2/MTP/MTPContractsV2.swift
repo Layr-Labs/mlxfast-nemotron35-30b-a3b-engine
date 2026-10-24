@@ -39,6 +39,16 @@ public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
     func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
 }
 
+/// Additive: `cbv2MTPTopTwo` whose finalize launch also writes the round's
+/// acceptance packet `[B * k drafts | B * (1 + k) top-1 ids]` (flat int32)
+/// from the `[B, 1 + k]` int32 verify `window`. `ids`/`values` must be
+/// bitwise those of `cbv2MTPTopTwo(logits)`. nil = not supported for these
+/// shapes; the engine then builds the packet as before.
+public protocol CBv2MTPPolicyTopTwoPacketProviding: AnyObject {
+    func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
+        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
+}
+
 /// Runtime availability for type-erased model adapters whose static wrapper
 /// type cannot express whether the wrapped target implements top-two.
 public protocol CBv2MTPPolicyTopTwoCapabilityProviding: AnyObject {

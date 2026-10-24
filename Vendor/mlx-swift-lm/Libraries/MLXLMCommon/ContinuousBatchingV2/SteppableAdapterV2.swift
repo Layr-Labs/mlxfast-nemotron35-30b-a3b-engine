@@ -408,6 +408,15 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoPacketProviding {
+    public func cbv2MTPTopTwoPacket(
+        _ logits: MLXArray, window: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+        (model as? any CBv2MTPPolicyTopTwoPacketProviding)?
+            .cbv2MTPTopTwoPacket(logits, window: window)
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter:
     CBv2MTPPolicyTopTwoCapabilityProviding
 {

@@ -27,15 +27,22 @@ extension EngineLoopV2 {
     /// with genuine target samples drawn with the request's real sampler
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
+    /// `window`: the same tokens as `columns` concatenated on axis 1, built
+    /// by one launch (CBV2_MTP_VERIFY_TOKENS); the rectangular forward reads
+    /// it instead of concatenating. `packet` is non-nil only when the top-two
+    /// finalize also wrote the acceptance packet (CBV2_MTP_TOPTWO_PACKET).
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        window: MLXArray? = nil
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
         diagnostics: [CBv2LogitDiagnosticPacket],
-        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
+        recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]],
+        packet: MLXArray?,
+        selfTestChecks: [(name: String, fast: MLXArray, reference: MLXArray)]
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
@@ -46,6 +53,8 @@ extension EngineLoopV2 {
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         var capturedInnerState: [MLXArray] = []
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
+        var packet: MLXArray?
+        var selfTestChecks: [(name: String, fast: MLXArray, reference: MLXArray)] = []
         let diagnosticOffsets = logitDiagnostic == nil ? nil : rows.map {
             Self.positionOffset(kvStates[$0.rec.id]!)
         }
@@ -228,7 +237,7 @@ extension EngineLoopV2 {
                     cache.mtpBatchesRectangularAttention = false
                 }
             }
-            let tokens = concatenated(columns, axis: 1)
+            let tokens = window ?? concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
@@ -277,7 +286,28 @@ extension EngineLoopV2 {
                 let width = output.logits.dim(1)
                 let vocabulary = output.logits.dim(2)
                 let flat = output.logits.reshaped([1, batch * width, vocabulary])
-                let topTwo = provider.cbv2MTPTopTwo(flat)
+                // The acceptance packet rides the top-two finalize launch
+                // only where the packet is drafts + top-1 ids exactly: the
+                // greedy argmax packet (no target-prefix samples) and no
+                // shortlist mass tail.
+                var fused: (ids: MLXArray, values: MLXArray, packet: MLXArray)?
+                if CBv2RoundEndGlue.topTwoPacket, let window, !useTargetPrefix,
+                    (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?.draftShortlistSize
+                        == nil,
+                    let packetProvider = mtp.model as? any CBv2MTPPolicyTopTwoPacketProviding
+                {
+                    fused = packetProvider.cbv2MTPTopTwoPacket(flat, window: window)
+                }
+                let topTwo = fused.map { (ids: $0.ids, values: $0.values) }
+                    ?? provider.cbv2MTPTopTwo(flat)
+                packet = fused?.packet
+                if CBv2RoundEndGlue.selfTest, fused != nil {
+                    let reference = provider.cbv2MTPTopTwo(flat)
+                    selfTestChecks.append(("top-two ids", topTwo.ids, reference.ids))
+                    selfTestChecks.append(
+                        ("top-two values", topTwo.values.view(dtype: .int32),
+                         reference.values.view(dtype: .int32)))
+                }
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
                     topTwo.values.reshaped([batch, width, 2]).asType(.float32))
@@ -306,7 +336,8 @@ extension EngineLoopV2 {
 
         return (
             scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent)
+            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent,
+            packet, selfTestChecks)
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

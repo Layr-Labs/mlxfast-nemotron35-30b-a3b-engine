@@ -23,6 +23,31 @@ enum PagedSegmentTransfers {
         if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
         """
 
+    /// CBV2_PAGED_STRIDED_WRITE: `writeBody` reading keys/values through
+    /// their own element strides, so a transposed or sliced `[H, n, D]` view
+    /// is written without the implicit contiguous copy of each input. The
+    /// source element for (h, token, d) is the same one the copy would have
+    /// placed at ((h * n + token) * D + d); every store is unchanged.
+    private static let stridedWriteBody = """
+        const int h = int(thread_position_in_grid.y);
+        const int d = int(thread_position_in_grid.x);
+        const int r = int(thread_position_in_grid.z);
+        const int token = records[r * 3];
+        const int page = records[r * 3 + 1];
+        const int slot = records[r * 3 + 2];
+        if (page > 0) {
+            const int64_t ks = int64_t(h) * keys_strides[0]
+                + int64_t(token) * keys_strides[1] + int64_t(d) * keys_strides[2];
+            const int64_t vs = int64_t(h) * values_strides[0]
+                + int64_t(token) * values_strides[1] + int64_t(d) * values_strides[2];
+            const size_t target = (((size_t)page * H + h) * S + slot) * D + d;
+            device T* destination = storage;
+            destination[target] = keys[ks];
+            destination[VBASE + target] = values[vs];
+        }
+        if (h == 0 && d == 0 && r == 0) fence[0] = previous[0] + 1;
+        """
+
     private static let readBody = """
         const int h = int(thread_position_in_grid.y);
         const int d = int(thread_position_in_grid.x);
@@ -68,6 +93,21 @@ enum PagedSegmentTransfers {
         }
     }
 
+    private static func stridedWriteKernel(dtype: DType) -> MLXFast.MLXFastKernel {
+        let key = "cbv2_segment_write_strided_\(dtype)"
+        return lock.withLock {
+            if let existing = kernels[key] { return existing }
+            let made = MLXFast.metalKernel(
+                name: key,
+                inputNames: ["keys", "values", "storage", "records", "previous"],
+                outputNames: ["fence"], source: stridedWriteBody,
+                ensureRowContiguous: false,
+                mutableInputs: ["storage"])
+            kernels[key] = made
+            return made
+        }
+    }
+
     private static func records(_ triples: [Int32]) -> MLXArray {
         precondition(triples.count % 3 == 0)
         return MLXArray(triples + Array(repeating: 0, count: max(0, 24 - triples.count)))
@@ -99,8 +139,12 @@ enum PagedSegmentTransfers {
         precondition(values.shape == keys.shape)
         let k = keys
         let v = values
+        // Strided reads replace the implicit contiguous copies of k and v
+        // (one launch each for a transposed or sliced view). Same stores.
+        let write = CBv2RoundEndGlue.stridedSegmentWrite
+            ? stridedWriteKernel(dtype: group.dtype) : kernel(reading: false, dtype: group.dtype)
         for (segment, triples) in buckets(group: group, slots: slots) {
-            group.writeFence = kernel(reading: false, dtype: group.dtype)(
+            group.writeFence = write(
                 [k, v, segment.storage, records(triples), group.writeFence],
                 template: [("T", group.dtype), ("H", group.key.kvHeads),
                            ("D", group.key.headDim), ("S", group.pageSize),

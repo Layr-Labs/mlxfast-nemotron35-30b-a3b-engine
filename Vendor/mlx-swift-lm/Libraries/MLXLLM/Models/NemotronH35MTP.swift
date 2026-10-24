@@ -589,6 +589,12 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             // Attention/KV are already submitted; the selected one-token
             // expert/head tail is lazy. Re-append its trusted K/V and submit
             // the tail at this existing boundary inside the decode window.
+            // NEMOTRON_MTP_PRESTAGE_SPLIT_EVAL: commit the expert tail on its
+            // own first, so the GPU runs it while the host encodes the head
+            // screen and the K/V append (one command buffer is otherwise
+            // committed only after all of them are encoded). Evaluation
+            // order only; the same arrays are evaluated.
+            if CBv2RoundEndGlue.prestageSplitEval { asyncEval([next.out]) }
             s.baseOffset = s.cacheOffset
             s.paged!.row.beginSpeculativeWrite()
             s.savedTokens = []; s.savedHidden = []; s.savedFrontier = s.frontier
@@ -605,6 +611,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let result = draftStep(
             tokens: MLXArray([Int32(token)]).reshaped([1, 1]), hidden: hidden,
             shortlist: nil, requestState: requestState)
+        if CBv2RoundEndGlue.prestageSplitEval { asyncEval([result.hidden]) }
         asyncEval([result.tokens, result.hidden] + s.arrays)
         s.prestagedHidden = hidden
         s.prestagedResult = result
@@ -725,5 +732,17 @@ extension NemotronH35MTPAssistant {
             eval([first.tokens, first.hidden] + evaluationTargets(for: requestState))
             discardRound(requestState: requestState)
         }
+    }
+}
+
+/// The round's acceptance packet from the top-two finalize launch
+/// (CBV2_MTP_TOPTWO_PACKET): same partial kernel and merge code as
+/// `cbv2MTPTopTwo`, so `ids`/`values` are bitwise unchanged; the packet
+/// holds integer copies of the window's drafts and of the first ids.
+extension NemotronH35Model: CBv2MTPPolicyTopTwoPacketProviding {
+    public func cbv2MTPTopTwoPacket(
+        _ logits: MLXArray, window: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+        cbv2TopTwoRowsPacket(logits, window: window)
     }
 }

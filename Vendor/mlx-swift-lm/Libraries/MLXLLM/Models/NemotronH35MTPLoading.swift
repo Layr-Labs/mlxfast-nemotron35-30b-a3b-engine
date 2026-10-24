@@ -81,6 +81,13 @@ extension NemotronH35MTPAssistant {
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPAttentionDirect.warm(target)
+        // Load-time JIT of the round-end glue kernels (CBv2RoundEndGlue):
+        // the verify window and the top-two finalize with the packet.
+        CBv2MTPVerifyTokens.warm()
+        if CBv2RoundEndGlue.topTwoPacket {
+            cbv2TopTwoRowsPacketWarm(
+                logitsDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
+        }
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().

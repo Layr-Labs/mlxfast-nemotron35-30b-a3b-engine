@@ -575,6 +575,12 @@ extension EngineLoopV2 {
                         hidden: currentHidden[index],
                         shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
                         requestState: requestState)
+                    // CBV2_MTP_DRAFT_SPLIT_EVAL: commit the draft's hidden
+                    // state (embedding through expert tail) before the head
+                    // screen is encoded, so the GPU starts the step one
+                    // command buffer earlier. Evaluation order only; a
+                    // prestaged (already submitted) step is a no-op here.
+                    if CBv2RoundEndGlue.draftSplitEval { asyncEval([result.hidden]) }
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
@@ -617,7 +623,11 @@ extension EngineLoopV2 {
                 draftHidden = nextHidden
             }
         }
-        let draftIDs = stacked(draftSteps, axis: 1)
+        // One-row rounds: the verify window [1, 1 + k] in one launch
+        // (CBV2_MTP_VERIFY_TOKENS). The original stack/concatenate build is
+        // kept for every other shape and for the self-test reference.
+        let window = batch == 1
+            ? CBv2MTPVerifyTokens.assemble(seed: seedColumn, drafts: draftSteps) : nil
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -632,18 +642,47 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp, window: window)
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
-        if let shortlist = target.shortlist {
-            packetParts.append(shortlist.massScaled.reshaped([-1]))
+        // The packet layout is unchanged: [B * k drafts | B * (1 + k)
+        // scores | optional shortlist masses]. With the fused top-two packet
+        // (CBV2_MTP_TOPTWO_PACKET) the drafts are its prefix; otherwise the
+        // window's draft columns (a view) or the original stack.
+        var selfTestChecks: [(name: String, fast: MLXArray, reference: MLXArray)] = []
+        func referenceDraftIDs() -> MLXArray { stacked(draftSteps, axis: 1) }
+        let draftIDs: MLXArray
+        let acceptancePacket: MLXArray
+        if let fusedPacket = target.packet {
+            precondition(target.shortlist == nil, "CBv2 MTP: fused packet with a shortlist tail")
+            draftIDs = fusedPacket[0 ..< batch * k].reshaped([batch, k])
+            acceptancePacket = fusedPacket
+        } else {
+            draftIDs = window.map { $0[0..., 1...] } ?? referenceDraftIDs()
+            var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+            if let shortlist = target.shortlist {
+                packetParts.append(shortlist.massScaled.reshaped([-1]))
+            }
+            acceptancePacket = concatenated(packetParts, axis: 0)
         }
-        let acceptancePacket = concatenated(packetParts, axis: 0)
+        if CBv2RoundEndGlue.selfTest, window != nil || target.packet != nil {
+            let reference = referenceDraftIDs()
+            if let window {
+                selfTestChecks.append(
+                    ("verify window", window, concatenated(targetColumns, axis: 1)))
+            }
+            var parts = [reference.reshaped([-1]), target.scores.reshaped([-1])]
+            if let shortlist = target.shortlist {
+                parts.append(shortlist.massScaled.reshaped([-1]))
+            }
+            selfTestChecks.append(
+                ("acceptance packet", acceptancePacket, concatenated(parts, axis: 0)))
+            selfTestChecks.append(("draft ids", draftIDs, reference))
+        }
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
@@ -656,6 +695,7 @@ extension EngineLoopV2 {
             policyTopTwoValues: target.policyTopTwo?.values)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        result.selfTestChecks = selfTestChecks + target.selfTestChecks
         return result
     }
 

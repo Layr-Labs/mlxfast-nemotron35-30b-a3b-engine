@@ -190,12 +190,25 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// the tokens about to be processed (snapshot semantics). KV-shared
     /// layers own no rows, so their own value is empty (they reuse the
     /// source layer's pre-update capture).
-    public var positionOffsets: MLXArray { cachedPositionOffsets }
+    public var positionOffsets: MLXArray {
+        if pendingPositionAdvance != 0 {
+            cachedPositionOffsets = cachedPositionOffsets + pendingPositionAdvance
+            pendingPositionAdvance = 0
+        }
+        return cachedPositionOffsets
+    }
+
+    /// CBV2_LAZY_POSITION_OFFSETS: the `+ L` advances not yet applied to
+    /// `cachedPositionOffsets` (host int32, wrapping like the device add).
+    /// The getter applies them in one add; a host rebuild clears them. A
+    /// model that never reads the offsets launches no advance at all.
+    private var pendingPositionAdvance: Int32 = 0
 
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
+        pendingPositionAdvance = 0
     }
 
     // MARK: - Attention
@@ -211,8 +224,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var roots: [MLXArray] = []
         roots.reserveCapacity(pagedRows.count * 2)
         for (index, row) in pagedRows.enumerated() {
-            let k = keys[index]
-            let v = values[index]
+            // CBV2_PAGED_STRIDED_WRITE: a slice view (no launch) instead of
+            // an Int subscript (an MLX `take`, one gather launch per array);
+            // the strided segment write reads the same elements.
+            let k = CBv2RoundEndGlue.stridedSegmentWrite
+                ? keys[index ..< (index + 1)].squeezed(axis: 0) : keys[index]
+            let v = CBv2RoundEndGlue.stridedSegmentWrite
+                ? values[index ..< (index + 1)].squeezed(axis: 0) : values[index]
             row.write(keys: k, values: v)
             roots.append(k)
             roots.append(v)
@@ -332,7 +350,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // is [B,chunk] with one common chunk length) — the rows just
         // advanced their absolute counters by exactly L, so the cached
         // device array tracks them without a per-step host rebuild.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        if CBv2RoundEndGlue.lazyPositionOffsets {
+            pendingPositionAdvance &+= Int32(l)
+        } else {
+            cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        }
         return output
     }
 
