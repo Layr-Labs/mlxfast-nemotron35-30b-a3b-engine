@@ -304,12 +304,17 @@ extension EngineLoopV2 {
                 tokens: row.count, packed: false, vision: visionChunk,
                 stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
                 launchNanos: launchNanos)
-            // Configure the request's assistant backing before building any
-            // target prefill layers. Paged allocation fences its stream; doing
-            // it in observeCommittedTarget below would drain the target's
-            // early submissions partway through construction of this graph.
+            // With a default-stream zero-fill (NEMOTRON_PAGED_HOST_ZERO=0),
+            // configure the request's assistant backing before building any
+            // target prefill layers: that paged allocation fences the GPU
+            // stream, and doing it in observeCommittedTarget below would drain
+            // the target's early submissions partway through this graph. The
+            // default host zero-fill runs on the CPU stream and fences only
+            // that, so observeCommittedTarget allocates it after the target
+            // prefill's early chunks are queued, under GPU work.
             // Keep ownership in the driver until the observation detaches it.
-            if !visionChunk, mtp.tracksPersistentHistory, mtpBasicEligible(rec),
+            if !pagedSegmentHostZeroFill, !visionChunk, mtp.tracksPersistentHistory,
+                mtpBasicEligible(rec),
                 let state = try mtp.takeOrMakeAssistantState(
                     for: rec.id,
                     maximumSequenceLength: rec.request.promptTokens.count
