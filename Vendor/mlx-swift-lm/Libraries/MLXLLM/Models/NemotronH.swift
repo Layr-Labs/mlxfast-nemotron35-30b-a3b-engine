@@ -648,8 +648,11 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
     func packedConv(_ oldState: MLXArray, _ input: MLXArray)
         -> (convolution: MLXArray, padded: MLXArray) {
-        guard convKernelSize == 4, oldState.shape == [1, 3, convDim],
-            input.ndim == 3, input.dim(0) == 1, (1...8).contains(input.dim(1)),
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            type(of: conv1d) == Conv1d.self, convDim > 0,
+            convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, input.dim(1) > 0,
+            input.dim(1) <= Int(Int32.max) - 3,
             input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
             conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
             conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
@@ -924,22 +927,13 @@ class NemotronHAttention: Module, NemotronHMixer {
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
-        captureMTP: Bool = false,
-        targetQKV: Bool = false
+        captureMTP: Bool = false
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(x, query: wq, key: wk, value: wv, captureMTP: captureMTP) {
-            projections = outputs
-        } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
-        }
-        let (q, k, v) = projections
+        let q = captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x)
+        let k = captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x)
+        let v = captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x)
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
@@ -2907,7 +2901,7 @@ private class NemotronHBlock: Module {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
             output = (mixer as! NemotronHAttention).cbv2Forward(
-                hidden, cache: attentionCache, captureMTP: captureMTP, targetQKV: true)
+                hidden, cache: attentionCache, captureMTP: captureMTP)
         case .mlp:
             precondition(
                 attentionCache == nil,
