@@ -45,6 +45,14 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+/// Layers between early asyncEval calls on the MTP prefill path only. The seed
+/// window is the first request after the engine drains MLX's buffer cache, so a
+/// shorter chunk hands its transient live set back to that cache sooner.
+/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
+let nemotronPrefillEvalInterval =
+    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
+    ? nemotronEarlyEvalInterval : 2
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -1330,7 +1338,10 @@ enum NemotronHRouterSelection {
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_h_router_select",
         inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
-        source: """
+        source: source, header: sigmoidHeader, ensureRowContiguous: true)
+
+    /// Also the router-rows epilogue's selection (NemotronMTPRouterRows).
+    static let source = """
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             threadgroup float original[128];
@@ -1383,8 +1394,7 @@ enum NemotronHRouterSelection {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
-            """,
-        header: sigmoidHeader, ensureRowContiguous: true)
+            """
 
     static func apply(
         gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
@@ -1505,6 +1515,7 @@ class NemotronHMoEGate: Module {
     /// sigmoid/selection/normalization over the complete verification window.
     /// The multi-row kernel repeats the M=1 gemv per row in one launch.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if let selected = NemotronMTPRouterRows.select(x, gate: self) { return selected }
         let gates = NemotronMTPRouterRows.gates(x, weight)
             ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
@@ -3432,7 +3443,8 @@ private class NemotronHBackbone: Module {
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3456,9 +3468,14 @@ private class NemotronHBackbone: Module {
                 cache = nil
             }
             let next = modelLayerIndex + 1
-            let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
+            // The layers that hand the fused residual+norm down are unchanged:
+            // they stay tied to the default spacing, so a different eval
+            // interval only adds boundaries and never alters the graph.
+            let suppressedNorm = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
-            let nextNorm = next < layers.count && !submitsEarly
+            let submitsEarly = earlyEvalInterval > 0 && next < layers.count
+                && next % earlyEvalInterval == 0
+            let nextNorm = next < layers.count && !suppressedNorm
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
             let result = layer.cbv2Forward(
                 hidden,
@@ -3478,7 +3495,7 @@ private class NemotronHBackbone: Module {
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
                 if inputs.dim(1) > 1 && !captureMTP {
-                    let group = (next - nemotronEarlyEvalInterval)..<next
+                    let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
                     // Engine prefill only (see `cbv2Hidden`). A chunk runs for
@@ -3740,7 +3757,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3750,7 +3768,7 @@ public class NemotronHModel:
         }
         return backbone.cbv2Forward(
             inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
-            recyclePrefillChunks: recyclePrefillChunks)
+            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.

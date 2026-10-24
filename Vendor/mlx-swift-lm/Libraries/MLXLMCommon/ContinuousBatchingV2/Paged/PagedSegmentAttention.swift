@@ -135,9 +135,9 @@ enum PagedSegmentAttention {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
         return mergeKernel(key: mergeKey, source: source)(
-            [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
+            [partials, meta, seqinfo, sinks ?? PagedSegmentZeroSinks.shared(max(8, qh)),
+             group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
@@ -179,5 +179,22 @@ enum PagedMTPBatchedColumns {
             source: source, dispatchCache: dispatchCache)
         let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
+    }
+}
+
+/// Dummy sinks for the merge pass (HAS_SINKS false never reads them): one
+/// evaluated zero buffer per size, instead of a zero-fill launch per call.
+/// Read-only after creation (engine-thread discipline, like
+/// PagedAttentionKernel.zeroSinks).
+enum PagedSegmentZeroSinks {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var buffers: [Int: MLXArray] = [:]
+    static func shared(_ count: Int) -> MLXArray {
+        lock.lock(); defer { lock.unlock() }
+        if let buffer = buffers[count] { return buffer }
+        let buffer = MLXArray.zeros([count], dtype: .float32)
+        eval(buffer)
+        buffers[count] = buffer
+        return buffer
     }
 }

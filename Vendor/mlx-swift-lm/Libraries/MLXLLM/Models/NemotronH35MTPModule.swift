@@ -7,6 +7,176 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Post-verify rows: enorm(embedding) and hnorm(hidden) written into their
+/// halves of the joined eh_proj input by one launch (kernel revived from
+/// fkiene's d1b44b3e). Each
+/// threadgroup is MLX's single-row rms_norm for one (row, half): 672 threads
+/// x 4 reads, the same float square accumulation, two-level simd_sum with
+/// zero-filled local_sums, precise::rsqrt and the `w * T(x * inv_mean)` store.
+enum NemotronMTPJoinedNorms {
+    /// NEMOTRON_MTP_JOINED_NORMS=0 keeps two stock norms and a concatenate.
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOINED_NORMS"] != "0"
+    /// NEMOTRON_MTP_JOINED_NORMS_PREPARED=0 keeps the separate K = 5376
+    /// activation prepare ahead of the post-verify eh_proj.
+    static let preparedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOINED_NORMS_PREPARED"] != "0"
+
+    private static let source = """
+            constexpr uint n_reads = 4;
+            const uint gid = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint row = gid / 2;
+            const uint half_index = gid % 2;
+            const device T* x = half_index == 0 ? first : second;
+            const device T* w = half_index == 0 ? first_weight : second_weight;
+            const float eps = half_index == 0 ? first_eps : second_eps;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[n_reads];
+            const size_t offset = size_t(row) * axis_size + lid * n_reads;
+            for (uint i = 0; i < n_reads; i++) {
+                thread_x[i] = x[offset + i];
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const size_t out_offset = (size_t(row) * 2 + half_index) * axis_size + lid * n_reads;
+            for (uint i = 0; i < n_reads; i++) {
+                joined[out_offset + i] = w[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+            }
+            """
+
+    private static let inputNames = ["first", "second", "first_weight", "second_weight",
+                                      "axis_size", "first_eps", "second_eps"]
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_joined_rms_bf16", inputNames: inputNames,
+        outputNames: ["joined"], source: source, ensureRowContiguous: true)
+
+    /// The same kernel plus the eh_proj's prepared K = 5376 activation (PV 8),
+    /// built from the stored BF16 values with the prepare kernel's arithmetic
+    /// (the epilogue of the promoted residual_rms_prepared join). Row r, half h
+    /// owns chunks h * 336 ..< h * 336 + 336 of the joined row.
+    private static func preparedSource() -> String {
+        var s = source
+        func swap(_ old: String, _ new: String) {
+            precondition(s.components(separatedBy: old).count == 2, "joined prepared: \(old)")
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        swap("threadgroup float local_inv_mean[1];",
+             "threadgroup float local_inv_mean[1];\nthreadgroup T rounded[2688];")
+        swap("joined[out_offset + i] = w[lid * n_reads + i]", "T value = w[lid * n_reads + i]")
+        swap("* static_cast<T>(thread_x[i] * local_inv_mean[0]);",
+             "* static_cast<T>(thread_x[i] * local_inv_mean[0]);\n"
+             + "joined[out_offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+        return s + """
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < 336) {
+                const int chunk = int(half_index) * 336 + int(lid);
+                const int local = int(lid) * 8;
+                float values[8];
+                float total = 0;
+                for (int i = 0; i < 8; i += 4) {
+                    total += float(rounded[local + i]) + float(rounded[local + i + 1])
+                        + float(rounded[local + i + 2]) + float(rounded[local + i + 3]);
+                    values[i] = rounded[local + i];
+                    values[i + 1] = rounded[local + i + 1] / 16.0f;
+                    values[i + 2] = rounded[local + i + 2] / 256.0f;
+                    values[i + 3] = rounded[local + i + 3] / 4096.0f;
+                }
+                const int base = (int(row) * 21 + chunk / 32) * 9 * 32 + chunk % 32;
+                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
+                prepared[base + 8 * 32] = total;
+            }
+            """
+    }
+    private static let preparedKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_joined_rms_prepared_bf16", inputNames: inputNames,
+        outputNames: ["joined", "prepared"], source: preparedSource(),
+        ensureRowContiguous: true)
+
+    private static func eligible(_ first: MLXArray, _ firstNorm: RMSNorm,
+                                 _ second: MLXArray, _ secondNorm: RMSNorm) -> Bool {
+        enabled && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && first.ndim == 3 && first.dim(0) == 1 && first.dim(1) > 0 && first.dim(2) == 2688
+            && second.shape == first.shape && first.dtype == .bfloat16
+            && second.dtype == .bfloat16
+            && type(of: firstNorm) == RMSNorm.self && type(of: secondNorm) == RMSNorm.self
+            && firstNorm.weight.shape == [2688] && firstNorm.weight.dtype == .bfloat16
+            && secondNorm.weight.shape == [2688] && secondNorm.weight.dtype == .bfloat16
+    }
+
+    private static func reference(_ first: MLXArray, _ firstNorm: RMSNorm,
+                                  _ second: MLXArray, _ secondNorm: RMSNorm) -> MLXArray {
+        concatenated([firstNorm(first), secondNorm(second)], axis: -1)
+    }
+
+    static func apply(_ first: MLXArray, _ firstNorm: RMSNorm,
+                      _ second: MLXArray, _ secondNorm: RMSNorm) -> MLXArray {
+        guard eligible(first, firstNorm, second, secondNorm)
+        else { return reference(first, firstNorm, second, secondNorm) }
+        let rows = first.dim(1)
+        let joined = kernel([first, second, firstNorm.weight, secondNorm.weight,
+                             UInt32(2688), firstNorm.eps, secondNorm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, rows, 2 * 2688]], outputDTypes: [.bfloat16])[0]
+        guard NemotronMoELeader.selfTest else { return joined }
+        return nemotronBitwiseOrNaN(joined, reference(first, firstNorm, second, secondNorm))
+    }
+
+    /// Post-verify rows (R = 3): (joined, prepared [3, 21, 288]) or nil when
+    /// the eh_proj would not take the narrow prepared route.
+    static func applyPrepared(_ first: MLXArray, _ firstNorm: RMSNorm,
+                              _ second: MLXArray, _ secondNorm: RMSNorm) -> (MLXArray, MLXArray)? {
+        guard preparedEnabled, NemotronMTPExecution.batchedM1,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              first.shape == [1, 3, 2688], eligible(first, firstNorm, second, secondNorm)
+        else { return nil }
+        let outputs = preparedKernel([first, second, firstNorm.weight, secondNorm.weight,
+                                      UInt32(2688), firstNorm.eps, secondNorm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * 2 * 3, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, 3, 2 * 2688], [3, 21, 9 * 32]],
+            outputDTypes: [.bfloat16, .float32])
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
+        let expected = reference(first, firstNorm, second, secondNorm)
+        let packed = NemotronHeadPreparedActivation.pack(expected.reshaped(3, 2 * 2688))
+        let ok = MLX.logicalAnd(
+            (outputs[0].view(dtype: .uint16) .== expected.view(dtype: .uint16)).all(),
+            (outputs[1].view(dtype: .uint32) .== packed.view(dtype: .uint32)).all())
+        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[1], MLXArray(Float.nan)))
+    }
+}
+
+/// Post-verify rows: `norm(fused)` and wq's K = 2688 prepared activation in
+/// one launch (the promoted entry join kernel, normPreparedRows).
+/// NEMOTRON_MTP_POST_VERIFY_NORM_PREPARED=0 keeps stock norm + prepare.
+enum NemotronMTPPostVerifyJoins {
+    static let normPrepared =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_POST_VERIFY_NORM_PREPARED"] != "0"
+}
+
 final class NemotronH35MTPAttentionBlock: Module {
     let hiddenSize: Int
     @ModuleInfo(key: "eh_proj") var projection: Linear
@@ -84,11 +254,25 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
-        let joined = concatenated([embeddingNorm(embedding), hiddenNorm(hidden)], axis: -1)
-        let fused = nemotronMTPLinearRows(joined, projection)
-        let x = norm(fused)
+        let joined: MLXArray
+        var joinedPrepared: MLXArray?
+        if let pair = NemotronMTPJoinedNorms.applyPrepared(
+            embedding, embeddingNorm, hidden, hiddenNorm) {
+            (joined, joinedPrepared) = pair
+        } else {
+            joined = NemotronMTPJoinedNorms.apply(embedding, embeddingNorm, hidden, hiddenNorm)
+        }
+        let fused = nemotronMTPLinearRows(joined, projection, prepared: joinedPrepared)
+        let x: MLXArray
+        var xPrepared: MLXArray?
+        if NemotronMTPPostVerifyJoins.normPrepared,
+           let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: norm) {
+            (x, xPrepared) = pair
+        } else {
+            x = norm(fused)
+        }
         let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq)
+        let queries = nemotronMTPLinearRows(x, mixer.wq, prepared: xPrepared)
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
         let keys = nemotronMTPLinearRows(x, mixer.wk)
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
@@ -329,9 +513,12 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         precondition(positionIds == nil)
         // The engine's request prefill (the scored seed) is the first work
         // after the worker's between-phase cache drain, so let completed
-        // chunks' buffers be reused within it.
+        // chunks' buffers be reused within it. Halve the chunk there: the seed
+        // pays for re-faulting its transient live set, the scored prefill does
+        // not.
         let hidden = cbv2Hidden(
-            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true)
+            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
+            earlyEvalInterval: nemotronPrefillEvalInterval)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)

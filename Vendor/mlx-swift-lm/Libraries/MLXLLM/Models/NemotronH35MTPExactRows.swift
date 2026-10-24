@@ -949,6 +949,62 @@ private let nemotronMTPRouterRowsSource = """
   }
 """
 
+// Router rows plus selection in one launch. The GEMV body above is unchanged
+// except its final store: each threadgroup publishes its 4 columns x R rows
+// as the float value of the rounded BF16 gate (exactly what the selection
+// kernel reads back from the BF16 gates), fences at device scope and counts
+// itself in. The last threadgroup to arrive runs NemotronHRouterSelection's
+// source unchanged but for addresses, SIMD group r on row r (groups past R
+// repeat row R - 1 in their own scratch so every thread meets the barriers;
+// only r < R store).
+// One uint32 output: [indices R*6 | weight bits R*6 | gates R*128 | counter].
+private func nemotronMTPRouterSelectSource() -> String {
+    var gemv = nemotronMTPRouterRowsSource
+    let store = "y[r * out_vec_size + out_row + tm] = static_cast<T>(result[r][tm]);"
+    precondition(gemv.components(separatedBy: store).count == 2)
+    gemv = gemv.replacingOccurrences(of: store, with: """
+        atomic_store_explicit(&sel_atomic[R * 12 + r * out_vec_size + out_row + tm],
+                  as_type<uint>(float(static_cast<T>(result[r][tm]))), memory_order_relaxed);
+        """)
+    var select = NemotronHRouterSelection.source
+    func swap(_ old: String, _ new: String) {
+        precondition(select.components(separatedBy: old).count == 2, "router select: \(old)")
+        select = select.replacingOccurrences(of: old, with: new)
+    }
+    swap("const uint row = threadgroup_position_in_grid.y;",
+         "const uint row = min(uint(simd_gid), uint(R - 1));")
+    swap("threadgroup float original[128];", "threadgroup float* original = select_original[simd_gid];")
+    swap("threadgroup float normalized[6];", "threadgroup float* normalized = select_normalized[simd_gid];")
+    swap("float(gates[row * 128 + id])", """
+        as_type<float>(atomic_load_explicit(
+                    &sel_atomic[R * 12 + row * 128 + id], memory_order_relaxed))
+        """)
+    swap("indices[row * 6 + slot] = winner;",
+         "if (simd_gid < uint(R)) { sel[row * 6 + slot] = winner; }")
+    swap("if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }",
+         "if (simd_gid < uint(R) && lane < 6) { sel[R * 6 + row * 6 + lane] = as_type<uint>(normalized[lane] * 2.5f); }")
+    return "device atomic_uint* sel_atomic = (device atomic_uint*)sel;\n" + gemv + """
+
+      // Publish, then count in; the last arriver acquires every column.
+      threadgroup bool select_last;
+      if (sgN == 0 && simd_lid == 0) {
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        const uint arrived = atomic_fetch_add_explicit(
+            &sel_atomic[R * 12 + R * out_vec_size], 1u, memory_order_relaxed);
+        select_last = arrived == uint(NEG ? 0 : out_vec_size / blockM - 1);
+        if (select_last) {
+          atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+      if (!select_last) return;
+      atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+      threadgroup float select_original[8][128];
+      threadgroup float select_normalized[8][6];
+      {
+      """ + select + "\n  }\n"
+}
+
 enum NemotronMTPRouterRows {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_ROWS"] != "0"
@@ -992,6 +1048,107 @@ enum NemotronMTPRouterRows {
     // warm(), before any compile trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
 
+    /// NEMOTRON_MTP_ROUTER_SELECT_EPILOGUE=0 keeps router rows and the
+    /// selection as two launches. Otherwise the one-launch route engages only
+    /// after warm() matched it bit for bit against the two-launch route.
+    static let selectEpilogue =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_EPILOGUE"] != "0"
+    /// Negative controls only: the FIRST arriving threadgroup selects (stale
+    /// gates). "1" also skips the qualification (the token gate must catch
+    /// it); "2" keeps it (the qualification must refuse the route).
+    private static let selectNegativeMode =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_NEG"] ?? ""
+    private static let selectNegative = ["1", "2"].contains(selectNegativeMode)
+    private static let selectKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_router_rows_select_bf16",
+        inputNames: ["w", "x", "bias", "K", "N"],
+        outputNames: ["sel"],
+        source: nemotronMTPRouterSelectSource(),
+        header: NemotronHRouterSelection.sigmoidHeader)
+    nonisolated(unsafe) private static var selectQualified: Bool?
+
+    /// One-launch gates + selection for `gate.mtpForwardRows`, or nil (the
+    /// caller keeps router rows, then NemotronHRouterSelection).
+    static func select(_ x: MLXArray, gate: NemotronHMoEGate) -> (MLXArray, MLXArray)? {
+        guard selectQualified == true, let fused = fusedSelect(x, gate: gate) else { return nil }
+        guard NemotronMoELeader.selfTest else { return fused }
+        guard let gates = gates(x, gate.weight), let expected = NemotronHRouterSelection.apply(
+            gates: gates, eSCB: gate.eSCB, topK: gate.topK, nGroup: gate.nGroup,
+            topkGroup: gate.topkGroup, routedScalingFactor: gate.routedScalingFactor,
+            normTopkProb: gate.normTopkProb)
+        else { return nil }
+        let ok = MLX.logicalAnd((fused.0 .== expected.0).all(),
+            (fused.1.view(dtype: .uint32) .== expected.1.view(dtype: .uint32)).all())
+        return (fused.0, which(ok, fused.1, MLXArray(Float.nan)))
+    }
+
+    private static func fusedSelect(_ x: MLXArray, gate: NemotronHMoEGate) -> (MLXArray, MLXArray)? {
+        guard selectEpilogue, enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)),
+              x.dim(2) == 2688, x.dtype == .bfloat16,
+              gate.weight.dtype == .bfloat16, gate.weight.shape == [128, 2688],
+              rowMajor.contains(ObjectIdentifier(gate.weight)),
+              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32,
+              gate.topK == 6, gate.nGroup == 1, gate.topkGroup == 1,
+              gate.normTopkProb, gate.routedScalingFactor == 2.5
+        else { return nil }
+        let rows = x.dim(1)
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
+        let sel = selectKernel([gate.weight, x, gate.eSCB, kArray, nArray],
+            template: [("T", x.dtype), ("R", rows), ("NEG", selectNegative)],
+            grid: (32 * 32, 8, 1),
+            threadGroup: (32, 8, 1),
+            outputShapes: [[rows * 140 + 1]],
+            outputDTypes: [.uint32], initValue: 0)[0]
+        return (sel[0 ..< rows * 6].reshaped(1, rows, 6),
+                sel[(rows * 6) ..< (rows * 12)].view(dtype: .float32).reshaped(1, rows, 6))
+    }
+
+    /// Load-time qualification over every registered router of `routers`,
+    /// R = 1...8 (every width the route accepts), seeded random rows, repeated launches: indices and weight
+    /// bits must equal the two-launch route. Any mismatch, or a JIT failure,
+    /// keeps the two-launch route for the process.
+    private static func qualifySelect(_ routers: [NemotronHMoEGate]) {
+        guard selectEpilogue, selectQualified != false else { return }
+        var ok = !routers.isEmpty
+        if selectNegativeMode == "1" { selectQualified = ok; return }
+        do {
+            try withError {
+                var checks: [MLXArray] = []
+                for (index, gate) in routers.enumerated() {
+                    for rows in 1 ... 8 {
+                        let x = MLXRandom.normal([1, rows, 2688], dtype: .bfloat16,
+                            key: MLXRandom.key(UInt64(0x7b00 + 8 * index + rows)))
+                        guard let gates = gates(x, gate.weight),
+                              let expected = NemotronHRouterSelection.apply(
+                                gates: gates, eSCB: gate.eSCB, topK: gate.topK,
+                                nGroup: gate.nGroup, topkGroup: gate.topkGroup,
+                                routedScalingFactor: gate.routedScalingFactor,
+                                normTopkProb: gate.normTopkProb)
+                        else { ok = false; continue }
+                        for _ in 0 ..< 4 {
+                            guard let fused = fusedSelect(x, gate: gate) else { ok = false; break }
+                            checks.append(MLX.logicalAnd((fused.0 .== expected.0).all(),
+                                (fused.1.view(dtype: .uint32)
+                                    .== expected.1.view(dtype: .uint32)).all()))
+                        }
+                    }
+                }
+                if !checks.isEmpty {
+                    let all = stacked(checks).all()
+                    try checkedEval(all)
+                    ok = ok && all.item(Bool.self)
+                }
+            }
+        } catch {
+            ok = false
+        }
+        selectQualified = (selectQualified ?? true) && ok
+        FileHandle.standardError.write(Data(
+            "nemotron router select epilogue: \(selectQualified == true ? "on" : "off")\n".utf8))
+    }
+
     /// Record row-major router weights, then compile every pipeline the
     /// verify window can request (R = 1...4) at load.
     static func warm(_ model: Module) {
@@ -1007,6 +1164,7 @@ enum NemotronMTPRouterRows {
             gates(MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), gate.weight)
         }
         if !outputs.isEmpty { eval(outputs) }
+        qualifySelect(routers.filter { rowMajor.contains(ObjectIdentifier($0.weight)) })
     }
 }
 
