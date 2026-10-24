@@ -6,8 +6,35 @@ import MLXNN
 extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
-        let activated = nemotronMTPLinearRelu2Rows(x, upProj)
-        return nemotronMTPLinearRows(activated, downProj)
+        let up = nemotronMTPLinearRows(x, upProj)
+        let activated = maximum(up, MLXArray(0))
+        return nemotronMTPLinearRows(activated * activated, downProj)
+    }
+
+    func mtpForwardRowsAdding(_ x: MLXArray, _ routed: MLXArray) -> MLXArray? {
+        guard NemotronMTPExecution.batchedM1, NemotronMultiRowQMV.enabled,
+            NemotronMoELeader.enabled, type(of: self) == NemotronHMLP.self,
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            x.ndim == 3, x.dim(0) == 1, (2...4).contains(x.dim(1)), x.dim(2) == 2688,
+            x.dtype == .bfloat16, routed.dtype == .bfloat16, routed.shape == x.shape,
+            let up = upProj as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+            let down = downProj as? QuantizedLinear, type(of: down) == QuantizedLinear.self,
+            up.bias == nil, down.bias == nil,
+            up.mode == .affine, down.mode == .affine,
+            up.bits == 4, down.bits == 4, up.groupSize == 64, down.groupSize == 64,
+            up.weight.dtype == .uint32, up.weight.shape == [3712, 336],
+            up.scales.dtype == .bfloat16, up.scales.shape == [3712, 42],
+            up.biases?.dtype == .bfloat16, up.biases?.shape == [3712, 42],
+            down.weight.dtype == .uint32, down.weight.shape == [2688, 464],
+            down.scales.dtype == .bfloat16, down.scales.shape == [2688, 58],
+            let biases = down.biases, biases.dtype == .bfloat16, biases.shape == [2688, 58]
+        else { return nil }
+        let projected = nemotronMTPLinearRows(x, upProj)
+        let activated = maximum(projected, MLXArray(0))
+        let rows = NemotronMultiRowQMV.sharedDownAdding(
+            (activated * activated).reshaped(x.dim(1), 3712), down, biases,
+            routed.reshaped(x.dim(1), 2688))
+        return rows.reshaped(1, x.dim(1), 2688)
     }
 }
 
@@ -103,6 +130,9 @@ extension NemotronHMoE {
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP) {
+            if let sharedExperts, let combined = sharedExperts.mtpForwardRowsAdding(x, reduced) {
+                return combined
+            }
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
