@@ -174,9 +174,22 @@ private let nemotronMultiRowQMVSource = """
       const device T* bl = bs + row * in_vec_size_g;
       U s = sl[0];
       U b = bl[0];
-      for (int r = 0; r < R; r++) {
-        result[r][row] += nmr_qdot<U, values_per_thread>(wl, x_thread[r], s, b, sum[r]);
+      // Decode packed integer coefficients once for all verification rows.
+      // Each row keeps its original i-order and affine accumulation.
+      thread U accum[R];
+      for (int r = 0; r < R; r++) accum[r] = 0;
+      const device uint16_t* words = (const device uint16_t*)wl;
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const U a = words[i] & 0x000f;
+        const U b1 = words[i] & 0x00f0;
+        const U c = words[i] & 0x0f00;
+        const U d = words[i] & 0xf000;
+        for (int r = 0; r < R; r++) {
+          accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+              + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+        }
       }
+      for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
     }
     ws += block_size * bytes_per_pack / pack_factor;
     sc += block_size / group_size;
@@ -199,10 +212,22 @@ private let nemotronMultiRowQMVSource = """
         const device T* bl = bs + row * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        for (int r = 0; r < R; r++) {
-          result[r][row] += nmr_qdot_safe<U, values_per_thread>(
-              wl, x_thread[r], s, b, sum[r], remaining);
+        // Decode packed integer coefficients once for all verification rows.
+        // Each row keeps its original i-order and affine accumulation.
+        thread U accum[R];
+        for (int r = 0; r < R; r++) accum[r] = 0;
+        const device uint16_t* words = (const device uint16_t*)wl;
+        for (int i = 0; i < remaining / 4; i++) {
+          const U a = words[i] & 0x000f;
+          const U b1 = words[i] & 0x00f0;
+          const U c = words[i] & 0x0f00;
+          const U d = words[i] & 0xf000;
+          for (int r = 0; r < R; r++) {
+            accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+                + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
+          }
         }
+        for (int r = 0; r < R; r++) result[r][row] += s * accum[r] + b * sum[r];
       }
     }
   }
