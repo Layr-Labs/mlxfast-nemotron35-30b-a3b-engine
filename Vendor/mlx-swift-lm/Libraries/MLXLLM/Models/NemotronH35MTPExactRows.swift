@@ -1177,6 +1177,63 @@ enum NemotronHeadScreen {
     static let headRows = 131072
     static let rows = 65536
 
+    /// Draft-only screening arithmetic. A loaded head must qualify this
+    /// variant before selecting it; original full-K rescore stays unchanged.
+    static let naxPartialAvailable =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_NAX"] != "0"
+        && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+
+    // The accepted run-gather header supplies the stock quantized tile
+    // loader and NAX fragments. Only selected K-groups are visited here.
+    // Unlike the final rescore this is approximate screening: dequantization
+    // rounds to BF16 and NAX has its own accumulation order.
+    private static let naxPartialSource = """
+      constexpr int BN = 64;
+      constexpr int BK = 64;
+      constexpr int BP = BK + 16 / sizeof(T);
+      constexpr int K = 2688;
+      constexpr int N = 65536;
+      constexpr short TM = 1;
+      constexpr short TN = 2;
+      constexpr short TK = 2;
+      const uint sg = simdgroup_index_in_threadgroup;
+      const uint lane = thread_index_in_simdgroup;
+      const int col = int(threadgroup_position_in_grid.x) * BN;
+      const short tn = short(sg) * 32;
+      threadgroup T packed[BN * BP];
+      using Loader = QuantizedBlockLoader<T, BN, BK, BP, true, 64, 64, 4>;
+      NAXTile<float, TM, TN> accum;
+      accum.clear();
+      for (int it = 0; it < S; it++) {
+        const int group = int(groups[it]);
+        const device uint8_t* bytes = (const device uint8_t*)w
+            + size_t(col) * (K / 2) + group * (BK / 2);
+        thread Loader loader(bytes, scales + size_t(col) * 42 + group,
+            biases + size_t(col) * 42 + group, K, packed, sg, lane);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        loader.load_unsafe();
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < BK; kk += 32) {
+          NAXTile<T, TM, TK> a;
+          NAXTile<T, TN, TK> b;
+          // The sole real row is row zero; the remaining fragment rows
+          // are zero-filled by the original safe fragment loader.
+          a.load_safe(x + group * BK + kk, K, short2(32, 1));
+          b.template load<T, BP, 1>(packed + tn * BP + kk);
+          tile_matmad_nax(accum, a, metal::bool_constant<false>{},
+              b, metal::bool_constant<true>{});
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      accum.template store_slice<false>(scores + col + tn, N,
+          short2(0, 0), short2(32, 1));
+    """
+    private static let naxPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_draft_screen_nax_selected_groups",
+        inputNames: ["w", "scales", "biases", "x", "groups"],
+        outputNames: ["scores"], source: naxPartialSource,
+        header: nemotronRunGatherHeader, ensureRowContiguous: true)
+
     // One simdgroup scores RPS rows. Lane l owns half-groups l, l + 32, ...
     // (32 values = one uint4 of packed words) of the selected groups.
     private static let partialSource = """
@@ -1428,14 +1485,22 @@ enum NemotronHeadScreen {
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, useNAXPartial: Bool = false
     ) -> Result {
-        let scores = partialKernel(
+        let scores: MLXArray
+        if useNAXPartial, naxPartialAvailable, hidden.dtype == .bfloat16 {
+            scores = naxPartialKernel([weight, scales, biases, hidden, groups],
+                template: [("T", hidden.dtype), ("S", groupCount)],
+                grid: (32 * (rows / 64), 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        } else {
+            scores = partialKernel(
             [weight, scales, biases, hidden, groups],
             template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
                        ("NSG", simdgroups)],
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        }
         let chunks = rows / chunk
         let selectGroups = 8
         let picked = selectKernel(

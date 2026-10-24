@@ -1895,7 +1895,7 @@ private func nemotronWarmUpPrefillKernels(
 /// that the stock affine_gather_qmm_rhs_nax uses, followed by its run-aligned
 /// clone. Output stores add a typed ReLU2 specialization; the remaining
 /// declarations retain the stock math. Unused declarations are dropped.
-private let nemotronRunGatherHeader = #"""
+let nemotronRunGatherHeader = #"""
 // Subset of the MLX JIT preamble that stock affine_gather_qmm_rhs_nax is
 // compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Only the
 // output stores add the typed ReLU2 specialization; unused declarations are dropped.

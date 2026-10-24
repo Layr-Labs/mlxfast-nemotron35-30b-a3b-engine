@@ -35,6 +35,7 @@ private final class NemotronMTPDraftHead {
         let weight: MLXArray, scales: MLXArray, biases: MLXArray
         let groups: MLXArray
         let groupCount: Int, chunk: Int, keep: Int
+        let useNAXPartial: Bool
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -48,7 +49,7 @@ private final class NemotronMTPDraftHead {
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
-            keep: screen.keep)
+            keep: screen.keep, useNAXPartial: screen.useNAXPartial)
         if NemotronHeadScreen.check { checkAgainstStock(hidden, result, screen) }
         return result.id
     }
@@ -140,39 +141,57 @@ private final class NemotronMTPDraftHead {
         let plan = Screen(
             weight: head.weight, scales: head.scales, biases: biases,
             groups: MLXArray(selected.map { UInt32($0) }),
-            groupCount: groupCount, chunk: chunk, keep: keep)
+            groupCount: groupCount, chunk: chunk, keep: keep, useNAXPartial: false)
         // Qualification on fixed synthetic inputs: every kept value must be
         // bitwise the stock prefix logit, and the pick the max kept value.
-        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
-        var agree = 0
-        for _ in 0..<4 {
-            let t = (0..<k).map { _ -> Float in
-                state = state &* 6364136223846793005 &+ 1442695040888963407
-                return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+        func qualify(useNAXPartial: Bool) throws -> Int? {
+            try withError {
+                var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+                var agree = 0
+                for _ in 0..<4 {
+                    let t = (0..<k).map { _ -> Float in
+                        state = state &* 6364136223846793005 &+ 1442695040888963407
+                        return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                    }
+                    let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                    let result = NemotronHeadScreen.run(
+                        x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                        groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                        useNAXPartial: useNAXPartial)
+                    let full = prefix(x)[0, -1].asType(.float32)
+                    let stock = argMax(full, axis: -1).asType(.int32)
+                    eval(full, stock, result.id, result.candidateIds, result.candidateValues)
+                    let fullValues = full.asArray(Float.self)
+                    let ids = result.candidateIds.asArray(Int32.self)
+                    let values = result.candidateValues.asArray(Float.self)
+                    let id = Int(result.id.item(Int32.self))
+                    var best = 0
+                    for i in ids.indices
+                    where values[i] > values[best] || (values[i] == values[best] && ids[i] < ids[best]) { best = i }
+                    guard Set(ids).count == ids.count, ids.allSatisfy({ (0..<Int32(rows)).contains($0) }),
+                          zip(ids, values).allSatisfy({ fullValues[Int($0)].bitPattern == $1.bitPattern }),
+                          id == Int(ids[best]) else { return nil }
+                    if id == Int(stock.item(Int32.self)) { agree += 1 }
+                }
+                return agree
             }
-            let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
-            let result = NemotronHeadScreen.run(
-                x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
-                groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep)
-            let full = prefix(x)[0, -1].asType(.float32)
-            let stock = argMax(full, axis: -1).asType(.int32)
-            eval(full, stock, result.id, result.candidateIds, result.candidateValues)
-            let fullValues = full.asArray(Float.self)
-            let ids = result.candidateIds.asArray(Int32.self)
-            let values = result.candidateValues.asArray(Float.self)
-            let id = Int(result.id.item(Int32.self))
-            var best = 0
-            for i in ids.indices
-            where values[i] > values[best] || (values[i] == values[best] && ids[i] < ids[best]) { best = i }
-            guard Set(ids).count == ids.count, ids.allSatisfy({ (0..<Int32(rows)).contains($0) }),
-                  zip(ids, values).allSatisfy({ fullValues[Int($0)].bitPattern == $1.bitPattern }),
-                  id == Int(ids[best])
-            else { return report("off (rescore is not bitwise the stock head)") }
-            if id == Int(stock.item(Int32.self)) { agree += 1 }
         }
-        screen = plan
+        var useNAXPartial = NemotronHeadScreen.naxPartialAvailable
+        var agreement: Int?
+        if useNAXPartial {
+            agreement = try? qualify(useNAXPartial: true)
+            if agreement == nil {
+                useNAXPartial = false
+                report("NAX partial off (qualification mismatch or error); checking original screen")
+            }
+        }
+        if !useNAXPartial { agreement = try? qualify(useNAXPartial: false) }
+        guard let agree = agreement else { return report("off (screen qualification mismatch or error)") }
+        screen = Screen(weight: plan.weight, scales: plan.scales, biases: plan.biases,
+            groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+            useNAXPartial: useNAXPartial)
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
-            + " qualified (synthetic agreement \(agree)/4)")
+            + " qualified (synthetic agreement \(agree)/4, NAX partial \(useNAXPartial))")
     }
 
     /// Multi-row twin for the post-verify head rows: the same prefix view
