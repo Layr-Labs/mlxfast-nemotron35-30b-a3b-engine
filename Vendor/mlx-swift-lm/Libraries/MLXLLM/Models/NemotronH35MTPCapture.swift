@@ -6,6 +6,61 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+final class NemotronMambaCapturedGraph {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entries: [ObjectIdentifier: Entry] = [:]
+    static let shared = NemotronMambaCapturedGraph()
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MAMBA_CAPTURED_GRAPH"] != "0"
+
+    func tensors(
+        owner: NemotronHMamba2Mixer, hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray
+    ) -> [MLXArray] {
+        guard Self.enabled else {
+            return owner.mtpCompactTensors(
+                hiddenStates: hiddenStates, convState: convState, initialSSM: initialSSM)
+        }
+        let key = ObjectIdentifier(owner)
+        let native = Self.nativeIdentity(owner)
+        let parameters = native == nil ? owner.innerState() : nil
+        let identity = native ?? (owner.modules().map(ObjectIdentifier.init)
+            + (parameters ?? []).map(ObjectIdentifier.init))
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry = entries[key], entry.identity == identity { return entry }
+            let state = parameters ?? owner.innerState()
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak owner] inputs in
+                guard let owner else { preconditionFailure("Released Nemotron Mamba captured owner") }
+                return owner.mtpCompactTensors(
+                    hiddenStates: inputs[0], convState: inputs[1], initialSSM: inputs[2])
+            }
+            let replacement = Entry(identity: identity, function: function)
+            retired = entries[key]
+            entries[key] = replacement
+            return replacement
+        }
+        return withExtendedLifetime(retired) {
+            current.function([hiddenStates, convState, initialSSM])
+        }
+    }
+
+    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
+        func linear(_ value: Linear) -> Bool {
+            type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
+        }
+        guard type(of: owner) == NemotronHMamba2Mixer.self,
+            linear(owner.inProj), linear(owner.outProj),
+            type(of: owner.conv1d) == Conv1d.self,
+            type(of: owner.norm) == NemotronHRMSNormGated.self
+        else { return nil }
+        return [owner, owner.inProj, owner.outProj, owner.conv1d, owner.norm].map(ObjectIdentifier.init)
+    }
+}
+
 extension NemotronHMamba2Mixer {
     func cbv2ForwardCaptured(
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
@@ -37,10 +92,9 @@ extension NemotronHMamba2Mixer {
     /// the window's y; a strict accepted prefix replays the same kernel for
     /// `keep` steps from the same input state at commit (bitwise equal to the
     /// captured per-position state). Conv states are views of `padded`.
-    func mtpCompactForward(
-        _ hiddenStates: MLXArray, modelLayerIndex: Int,
-        evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
-    ) -> MLXArray {
+    func mtpCompactTensors(
+        hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray
+    ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         let projected = nemotronMTPLinearRows(hiddenStates, inProj)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
@@ -48,20 +102,39 @@ extension NemotronHMamba2Mixer {
         let (convolution, padded) = packedConv(convState, input)
         let dt = nemotronPrefillComputeDt(parts[2].reshaped(batch, length, numHeads), dtBias, timeStepLimit)
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
-        let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+            convolution: convolution, ALog: aLog, D: D, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
             steps: length, writeOutput: true)
+        let y = result.output.reshaped(batch, length, heads * dim)
+        let normalized = NemotronMTPExecution.batchedNorm
+            ? norm(y, gate: gate)
+            : concatenated((0..<length).map { position in
+                norm(y[0..., position..<(position + 1), 0...],
+                     gate: gate[0..., position..<(position + 1), 0...])
+            }, axis: 1)
+        return [nemotronMTPLinearRows(normalized, outProj), padded, convolution, dt, result.finalState]
+    }
+
+    func mtpCompactForward(
+        _ hiddenStates: MLXArray, modelLayerIndex: Int,
+        evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray
+    ) -> MLXArray {
+        let length = hiddenStates.dim(1)
+        let tensors = NemotronMambaCapturedGraph.shared.tensors(
+            owner: self, hiddenStates: hiddenStates, convState: convState, initialSSM: initialSSM)
+        let padded = tensors[1], convolution = tensors[2], dt = tensors[3], finalState = tensors[4]
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
+        let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
+        let (logA, skip) = (self.aLog, self.D)
         do {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
                 finalConv: padded[0..., length ..< (length + history), 0...],
-                finalSSM: result.finalState,
-                materializedByteCount: tapeBytes + result.finalState.nbytes,
+                finalSSM: finalState,
+                materializedByteCount: tapeBytes + finalState.nbytes,
                 evaluationRoots: tape,
                 strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
                 strictReplayRetainedRoots: tape + [initialSSM],
@@ -76,14 +149,7 @@ extension NemotronHMamba2Mixer {
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
         }
-        let y = result.output.reshaped(batch, length, heads * dim)
-        let normalized = NemotronMTPExecution.batchedNorm
-            ? norm(y, gate: gate)
-            : concatenated((0..<length).map { position in
-                norm(y[0..., position..<(position + 1), 0...],
-                     gate: gate[0..., position..<(position + 1), 0...])
-            }, axis: 1)
-        return nemotronMTPLinearRows(normalized, outProj)
+        return tensors[0]
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -214,6 +280,19 @@ extension NemotronH35Model {
             MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
+        if NemotronMambaCapturedGraph.enabled {
+            for layer in modules().compactMap({ $0 as? NemotronHMamba2Mixer }) {
+                var traced: [MLXArray] = []
+                for width in 2...4 {
+                    let hidden = MLXArray.zeros([1, width, layer.hiddenSize], dtype: activationDType)
+                    let conv = MLXArray.zeros([1, history, layer.convDim], dtype: activationDType)
+                    let ssm = MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32)
+                    traced += NemotronMambaCapturedGraph.shared.tensors(
+                        owner: layer, hiddenStates: hidden, convState: conv, initialSSM: ssm)
+                }
+                eval(traced)
+            }
+        }
         if !roots.isEmpty { eval(roots) }
     }
 }

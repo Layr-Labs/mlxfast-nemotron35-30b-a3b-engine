@@ -301,15 +301,33 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 s.roots = primed
             }
         } else {
-            // Post-prefill accepted target rows retain one-token arithmetic.
-            for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
-                for i in 0..<ids.dim(1) {
-                    let hiddenRow = rows[0..., i..<(i + 1), 0...]
-                    let embedding = target.mtpEmbedding(ids[0..., i..<(i + 1)])
-                    if kvOnlyHistory {
+            if kvOnlyHistory, !s.pendingTokens.isEmpty {
+                let ids = s.pendingTokens.count == 1
+                    ? s.pendingTokens[0]
+                    : concatenated(s.pendingTokens, axis: 1)
+                let rows = s.pendingHidden.count == 1
+                    ? s.pendingHidden[0]
+                    : concatenated(s.pendingHidden, axis: 1)
+                var start = 0
+                let n = ids.dim(1)
+                while start < n {
+                    let count = min(8, n - start)
+                    let hiddenRow = rows[0..., start..<(start + count), 0...]
+                    let embedding = target.mtpEmbedding(ids[0..., start..<(start + count)])
+                    if count == 1 {
                         s.roots += module.appendTrustedKV(
                             hidden: hiddenRow, embedding: embedding, cache: s.cache)
                     } else {
+                        s.roots += module.appendTrustedKVRows(
+                            hidden: hiddenRow, embedding: embedding, cache: s.cache)
+                    }
+                    start += count
+                }
+            } else {
+                for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
+                    for i in 0..<ids.dim(1) {
+                        let hiddenRow = rows[0..., i..<(i + 1), 0...]
+                        let embedding = target.mtpEmbedding(ids[0..., i..<(i + 1)])
                         s.roots.append(module.pagedForward(
                             hidden: hiddenRow, embedding: embedding, cache: s.cache))
                     }

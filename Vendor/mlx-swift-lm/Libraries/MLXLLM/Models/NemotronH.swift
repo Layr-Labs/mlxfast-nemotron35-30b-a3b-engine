@@ -3053,7 +3053,7 @@ private class NemotronHBackbone: Module {
             let next = modelLayerIndex + 1
             let submitsEarly = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
-            let nextNorm = next < layers.count && !submitsEarly
+            let nextNorm = next < layers.count
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
             let result = layer.cbv2Forward(
                 hidden,
@@ -3068,7 +3068,7 @@ private class NemotronHBackbone: Module {
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
-                asyncEval(hidden)
+                asyncEval(preparedNorm.map { [hidden, $0] } ?? [hidden])
             }
         }
         precondition(
@@ -3326,16 +3326,11 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
     ) -> MLXArray {
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         // A long single-row forward (the teacher-forced prompt prefill) is
-        // only ever read at its last position. Project just the trailing
-        // rows from the start of the second-to-last 64-row M tile: the
-        // quantized matmul then sees M in 65...128 (> 32, so the same
-        // qmm_nax bm=64 / qmm bm=32 kernel as the full M) and the last row's
-        // tile holds exactly the same rows as in the full projection, so
-        // those logits are bitwise identical. Shorter forwards (decode,
-        // verify windows) keep every position.
         let length = hidden.dim(1)
         if hidden.dim(0) == 1, length > 128 {
-            let start = ((length - 1) / 64) * 64 - 64
+            let lastTileStart = ((length - 1) / 64) * 64
+            let lastTileRows = length - lastTileStart
+            let start = lastTileStart - (lastTileRows <= 32 ? 64 : 0)
             return logits(hidden[0..., start..., 0...])
         }
         return logits(hidden)
