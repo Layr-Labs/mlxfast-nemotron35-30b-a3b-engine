@@ -153,6 +153,111 @@ private final class NemotronH35MTPDraftFrontCache {
     }
 }
 
+/// Draft-only approximation: fuse six-way selection with retaining the three
+/// highest-mass candidates, keeping their original six-way routing weights.
+/// Target routers and target expert counts stay in NemotronH.swift; every
+/// proposed token still passes the target verifier. Keep the original parallel
+/// router GEMV; no equivalence to the full six-expert head is claimed.
+private enum NemotronH35MTPDraftRouter {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED_TOP3"] != "0"
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_draft_top6_and_retained_top3",
+        inputNames: ["gates", "correction"], outputNames: ["indices", "weights"],
+        source: """
+          const uint row = threadgroup_position_in_grid.y;
+          const uint lane = thread_index_in_simdgroup;
+          threadgroup float original[128];
+          for (uint i = 0; i < 4; ++i) {
+            const uint id = lane + 32 * i;
+            original[id] = nemotron_h_router_sigmoid(float(gates[row * 128 + id]));
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          {
+            float corrected[4];
+            bool selected[4] = {false, false, false, false};
+            float chosen[6];
+            uint chosenIDs[6];
+            for (uint i = 0; i < 4; ++i) {
+              const uint id = lane + 32 * i;
+              corrected[i] = original[id] + float(correction[id]);
+            }
+            for (uint slot = 0; slot < 6; ++slot) {
+              uint local_id = 0xffffffff;
+              float local_score = -INFINITY;
+              for (uint i = 0; i < 4; ++i) {
+                if (!selected[i] && (local_id == 0xffffffff
+                    || (!metal::isnan(corrected[i])
+                        && (metal::isnan(local_score) || corrected[i] > local_score)))) {
+                  local_id = lane + 32 * i;
+                  local_score = corrected[i];
+                }
+              }
+              const bool ordered = local_id != 0xffffffff && !metal::isnan(local_score);
+              const bool any_ordered = simd_any(ordered);
+              const float maximum = simd_max(ordered ? local_score : -INFINITY);
+              const uint winner = simd_min(
+                  ((!any_ordered && local_id != 0xffffffff)
+                      || (ordered && local_score == maximum)) ? local_id : 0xffffffff);
+              if (lane == 0) {
+                chosenIDs[slot] = winner;
+                chosen[slot] = original[winner];
+              }
+              for (uint i = 0; i < 4; ++i) {
+                if (lane + 32 * i == winner) selected[i] = true;
+              }
+            }
+            if (lane == 0) {
+              float total = 0.0f;
+              for (uint slot = 0; slot < 6; ++slot) total = chosen[slot] + total;
+              const float denominator = total + 1e-20f;
+              bool retained[6] = {false, false, false, false, false, false};
+              for (uint slot = 0; slot < 3; ++slot) {
+                int best = -1;
+                for (int candidate = 0; candidate < 6; ++candidate) {
+                  if (!retained[candidate] && (best < 0
+                      || (!metal::isnan(chosen[candidate])
+                          && (metal::isnan(chosen[best]) || chosen[candidate] > chosen[best])))) {
+                    best = candidate;
+                  }
+                }
+                retained[best] = true;
+                indices[row * 3 + slot] = chosenIDs[best];
+                // Keep each retained expert's original six-way weight;
+                // reducing expert count does not rescale the routed branch.
+                const float normalized = chosen[best] / denominator;
+                weights[row * 3 + slot] = normalized * 2.5f;
+              }
+            }
+          }
+          """, header: NemotronHRouterSelection.sigmoidHeader)
+
+    static func apply(_ x: MLXArray, mixer: NemotronHMoE) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
+              x.dim(2) == 2688, x.dtype == .bfloat16,
+              type(of: mixer) == NemotronHMoE.self,
+              type(of: mixer.gate) == NemotronHMoEGate.self,
+              type(of: mixer.switchMLP) == NemotronHSwitchMLP.self,
+              mixer.gate.topK == 6, mixer.gate.nGroup == 1, mixer.gate.topkGroup == 1,
+              mixer.gate.normTopkProb, mixer.gate.routedScalingFactor == 2.5,
+              mixer.gate.weight.shape == [128, 2688], mixer.gate.eSCB.shape == [128],
+              mixer.gate.weight.dtype == .bfloat16 || mixer.gate.weight.dtype == .float32,
+              mixer.gate.eSCB.dtype == .bfloat16 || mixer.gate.eSCB.dtype == .float32
+        else { return nil }
+        let rows = x.dim(1)
+        let gates = MLX.matmul(x, mixer.gate.weight.transposed())
+        let route = kernel([gates, mixer.gate.eSCB],
+            grid: (32, rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[1, rows, 3], [1, rows, 3]], outputDTypes: [.uint32, .float32])
+        let routed = mixer.switchMLP(x, route[0])
+        var y = (routed * route[1][.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
+        if let shared = mixer.sharedExperts { y = y + shared(x) }
+        return y
+    }
+}
+
 final class NemotronH35MTPExpertBlock: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHMoE
@@ -173,15 +278,19 @@ final class NemotronH35MTPExpertBlock: Module {
         return uncompiledOneTokenTail(x)
     }
 
-    // Keep the ordinary one-token operations: this cache does not switch to
-    // the separately specialized multi-row router or expert kernels.
+    // The same draft-only policy serves single steps and row replay. The
+    // disabled/non-native fallback retains the ordinary one-token operations.
     fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
-        finalNorm(x + mixer(norm(x)))
+        let normalized = norm(x)
+        return finalNorm(x + (NemotronH35MTPDraftRouter.apply(normalized, mixer: mixer)
+            ?? mixer(normalized)))
     }
 
-    /// Row-batched twin of `callAsFunction` through the verify MoE row path.
+    /// Row-batched twin of the same draft policy, with the original fallback.
     func forwardRows(_ x: MLXArray) -> MLXArray {
-        finalNorm(x + mixer.mtpForwardRows(norm(x)))
+        let normalized = norm(x)
+        return finalNorm(x + (NemotronH35MTPDraftRouter.apply(normalized, mixer: mixer)
+            ?? mixer.mtpForwardRows(normalized)))
     }
 }
 
