@@ -365,6 +365,127 @@ func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {
     return which(ok, y, MLXArray(Float.nan).asType(y.dtype))
 }
 
+// Row-pointer twin of the multi-row qmv: row r reads its activations from its
+// own buffer x<r> instead of from x + r * K. The body is the same source with
+// only the three activation address expressions replaced, so every load,
+// coefficient decode, product, K-order and simd_sum is unchanged; only where
+// the row's K values live moves. It lets the MTP verify's o_proj read the R
+// per-query SDPA outputs in place, without the axis-2 concatenate (R copies)
+// and the token-major transpose copy that build the [R, K] input today.
+enum NemotronMultiRowQMVRowInputs {
+    private static func source(rows: Int) -> String {
+        var s = nemotronMultiRowQMVSource
+        func swap(_ old: String, _ new: String, count: Int) {
+            precondition(s.components(separatedBy: old).count - 1 == count,
+                         "multirow qmv row-pointer source: \(old)")
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        let names = (0..<rows).map { "x\($0)" }.joined(separator: ", ")
+        swap("const device T* xp = x + simd_lid * values_per_thread;",
+             "const device T* xr[\(rows)] = {\(names)};\n  int xo = simd_lid * values_per_thread;",
+             count: 1)
+        swap("xp + r * in_vec_size", "xr[r] + xo", count: 2)
+        swap("xp += block_size;", "xo += block_size;", count: 1)
+        precondition(s.range(of: "\\bxp\\b", options: .regularExpression) == nil,
+                     "multirow qmv row-pointer source: stray xp")
+        return s
+    }
+
+    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+    private static let lock = NSLock()
+    private static func kernel(rows: Int) -> MLXFast.MLXFastKernel {
+        lock.lock(); defer { lock.unlock() }
+        if let kernel = kernels[rows] { return kernel }
+        let kernel = MLXFast.metalKernel(
+            name: "nemotron_multirow_qmv_affine4_gs64_rowptr\(rows)",
+            inputNames: ["w", "scales", "biases"] + (0..<rows).map { "x\($0)" } + ["K", "N"],
+            outputNames: ["y"],
+            source: source(rows: rows),
+            header: nemotronMultiRowQMVHeader)
+        kernels[rows] = kernel
+        return kernel
+    }
+
+    /// rows: R row-contiguous activations of K elements each (any shape).
+    /// Returns [R, N], bitwise equal to NemotronMultiRowQMV.apply on the
+    /// [R, K] stack of the same rows, or nil wherever that call would not
+    /// take the multi-row kernel.
+    static func apply(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray? {
+        guard NemotronMultiRowQMV.enabled, NemotronMTPExecution.batchedM1,
+              (2...8).contains(rows.count),
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              let biases = q.biases, q.weight.ndim == 2, q.weight.dtype == .uint32
+        else { return nil }
+        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, n % 8 == 0,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16,
+              rows.allSatisfy({ $0.dtype == .bfloat16 && $0.size == k })
+        else { return nil }
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(k, n)
+        // The same outputs-per-SIMD-group the stacked call picks for (R, K, N).
+        let rps = NemotronMultiRowQMV.resultsPerSimdgroup(rows: rows.count, k: k, n: n)
+        return kernel(rows: rows.count)(
+            [q.weight, q.scales, biases] + rows + [kArray, nArray],
+            template: [("T", DType.bfloat16), ("R", rows.count), ("FAST", k % 512 == 0),
+                       ("RELU2", false), ("RPS", rps)],
+            grid: (32, n / rps, 1),
+            threadGroup: (32, 2, 1),
+            outputShapes: [[rows.count, n]],
+            outputDTypes: [DType.bfloat16])[0]
+    }
+}
+
+/// MTP verify attention output projection over the serialized per-query
+/// attention outputs. NEMOTRON_MTP_ATTN_DIRECT=0 restores the concatenate +
+/// transpose copy + multi-row qmv.
+enum NemotronMTPAttentionDirect {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ATTN_DIRECT"] != "0"
+
+    /// rows: L outputs [1, heads, 1, headDim] in query order. Returns
+    /// [1, L, N], bitwise equal to the original
+    /// nemotronMTPLinearRows(concat(rows, axis 2) -> [1, L, heads * headDim], wo).
+    static func project(_ rows: [MLXArray], _ wo: Linear) -> MLXArray {
+        let length = rows.count
+        func original() -> MLXArray {
+            let output = length == 1 ? rows[0] : concatenated(rows, axis: 2)
+            let merged = output.transposed(0, 2, 1, 3).reshaped(1, length, -1)
+            return nemotronMTPLinearRows(merged, wo)
+        }
+        guard let q = wo as? QuantizedLinear,
+              rows.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 && $0.dim(2) == 1 }),
+              let direct = NemotronMultiRowQMVRowInputs.apply(rows, q)
+        else { return original() }
+        var y = direct.reshaped(1, length, q.weight.dim(0))
+        if let bias = q.bias { y = y + bias }
+        if NemotronMoELeader.selfTest { y = nemotronBitwiseOrNaN(y, original()) }
+        return y
+    }
+
+    /// Compile the row-pointer pipelines for every verify width (R = 2...4)
+    /// on each distinct attention o_proj shape, at load, with the RPS each
+    /// width uses.
+    static func warm(_ model: Module) {
+        guard enabled else { return }
+        var outputs: [MLXArray] = []
+        var seen = Set<[Int]>()
+        for module in model.modules() {
+            guard let attention = module as? NemotronHAttention,
+                  let q = attention.wo as? QuantizedLinear else { continue }
+            let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+            for rows in 2...4 {
+                guard seen.insert([rows, k, n]).inserted else { continue }
+                let xs = (0..<rows).map { _ in
+                    MLXArray.zeros([1, attention.numHeads, 1, k / attention.numHeads],
+                                   dtype: .bfloat16)
+                }
+                if let y = NemotronMultiRowQMVRowInputs.apply(xs, q) { outputs.append(y) }
+            }
+        }
+        if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
 // Multi-row BF16 router projection. Stock `matmul(x_row, weight.T)` at M=1,
 // N=128, K=2688 takes gemv_axbpy's non-transposed-matrix branch (K >= 16 * N),
 // i.e. gemv_bfloat16_bm1_bn8_sm1_sn32_tm4_tn4: 8 simdgroups split K in
@@ -372,11 +493,14 @@ func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {
 // simd_shuffle_down tree and a simdgroup-ordered threadgroup sum. This body is
 // GEMVKernel::run for those parameters with the vector side repeated per row,
 // so every row is bitwise equal to its own M=1 gemv. Each weight tile is
-// loaded once for all rows instead of once per row.
+// loaded once for all rows instead of once per row. RTM output rows per
+// threadgroup (stock TM = 4): each output row keeps its own lanes, K blocks,
+// tn order, shuffle tree and simdgroup-ordered sum, and no row reads
+// another's partials, so RTM only moves rows between threadgroups.
 private let nemotronMTPRouterRowsSource = """
   constexpr int BN = 8;
   constexpr int SN = 32;
-  constexpr int TM = 4;
+  constexpr int TM = RTM;
   constexpr int TN = 4;
   constexpr int blockM = TM;
   constexpr int blockN = BN * SN * TN;
@@ -506,20 +630,35 @@ enum NemotronMTPRouterRows {
               weight.dtype == .bfloat16, weight.shape == [128, 2688],
               rowMajor.contains(ObjectIdentifier(weight))
         else { return nil }
-        let rows = x.dim(1)
-        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
-        var y = kernel([weight, x, kArray, nArray],
-            template: [("T", x.dtype), ("R", rows)],
-            grid: (32 * 32, 8, 1),
-            threadGroup: (32, 8, 1),
-            outputShapes: [[1, rows, 128]],
-            outputDTypes: [x.dtype])[0]
+        var y = dispatch(x, weight, tm: rowsPerThreadgroup(rows: x.dim(1)))
         if NemotronMoELeader.selfTest {
             let expected = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
             let ok = (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
             y = which(ok, y, MLXArray(Float.nan).asType(y.dtype))
         }
         return y
+    }
+
+    private static func dispatch(_ x: MLXArray, _ weight: MLXArray, tm: Int) -> MLXArray {
+        let rows = x.dim(1)
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
+        return kernel([weight, x, kArray, nArray],
+            template: [("T", x.dtype), ("R", rows), ("RTM", tm)],
+            grid: (32 * (128 / tm), 8, 1),
+            threadGroup: (32, 8, 1),
+            outputShapes: [[1, rows, 128]],
+            outputDTypes: [x.dtype])[0]
+    }
+
+    /// NEMOTRON_MTP_ROUTER_NARROW=0 keeps the stock four rows per threadgroup.
+    /// Two rows per threadgroup (64 threadgroups instead of 32) at R = 1...4:
+    /// M1 Max microbenchmark, dependent chains over the 23 real routers,
+    /// -8 % (R = 1) to -15 % (R = 3) per launch. A fixed width table, never a
+    /// run-time timing pick.
+    static let narrowEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_NARROW"] != "0"
+    static func rowsPerThreadgroup(rows: Int) -> Int {
+        narrowEnabled && (1...4).contains(rows) ? 2 : 4
     }
 
     // Router weights whose loaded layout is row-major [128, 2688]: there the

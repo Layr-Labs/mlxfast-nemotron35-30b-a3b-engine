@@ -645,6 +645,29 @@ enum CBv2AttentionV1 {
                 queries: queries, keys: keys, values: values, scale: scale,
                 L: newTokenCount, kL: keyCount, window: nil, sinks: nil, softcap: nil)
         }
+        let outputs = queryBlockOutputs(
+            queries: queries, keys: keys, values: values,
+            newTokenCount: newTokenCount, window: window, scale: scale,
+            sinks: sinks, softcap: softcap, blockSize: blockSize,
+            spanContext: spanContext, keepMask: keepMask)
+        if blockSize > 1, outputs.count > 1 {
+            let tokenMajor = outputs.map { $0.transposed(0, 2, 1, 3) }
+            return concatenated(tokenMajor, axis: 1).transposed(0, 2, 1, 3)
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// The per-block attention outputs `attendQueryBlocks` joins, in query
+    /// order. Shared so a caller that consumes the blocks separately (the
+    /// MTP verify's per-row o_proj inputs) evaluates exactly the same graph.
+    private static func queryBlockOutputs(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        newTokenCount: Int, window: Int?, scale: Float,
+        sinks: MLXArray?, softcap: Float?, blockSize: Int,
+        spanContext: CBv2SpanChunkContext?, keepMask: MLXArray?
+    ) -> [MLXArray] {
+        let keyCount = keys.dim(2)
+        let historyCount = keyCount - newTokenCount
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
         var offset = 0
@@ -706,11 +729,31 @@ enum CBv2AttentionV1 {
             }
             offset += count
         }
-        if blockSize > 1, outputs.count > 1 {
-            let tokenMajor = outputs.map { $0.transposed(0, 2, 1, 3) }
-            return concatenated(tokenMajor, axis: 1).transposed(0, 2, 1, 3)
-        }
-        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+        return outputs
+    }
+
+    /// The serialized MTP verification of one row (B == 1, L > 1), returning
+    /// the L per-query outputs `[1, heads, 1, headDim]` before the axis-2
+    /// concatenate that `updateAndAttend` would apply. Same KV update, same
+    /// per-query SDPA calls. Only the serialized, span-free, keep-mask-free
+    /// configuration is served; the caller checks that before calling.
+    static func updateAndAttendSerialQueryRows(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> [MLXArray] {
+        precondition(
+            queries.dim(0) == 1 && queries.dim(2) > 1,
+            "CBv2AttentionV1: serial query rows serve one row with L > 1")
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        return queryBlockOutputs(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: 1,
+            spanContext: nil, keepMask: nil)
     }
 
     /// One query at a time — the pinned MTP serial-verification path.
