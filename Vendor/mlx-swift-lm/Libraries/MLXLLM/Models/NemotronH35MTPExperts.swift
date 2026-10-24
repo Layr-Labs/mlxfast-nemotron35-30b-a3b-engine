@@ -202,7 +202,7 @@ inline T nml_store(float v) {
 """
 
 private let nemotronMoELeaderSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -235,7 +235,7 @@ private let nemotronMoELeaderSource = """
     }
   }
 
-  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
@@ -535,6 +535,10 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_FUSE_RELU2"] != "0"
+    /// NEMOTRON_MTP_MOE_NARROW=0 keeps four outputs per SIMD group in the
+    /// gate/up leader walk at every width (fkiene e03d9f16).
+    static let narrowLeader =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -569,14 +573,19 @@ enum NemotronMoELeader {
 
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
+    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
+        narrowLeader && rows == 3 ? 2 : 4
+    }
+
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
-        NemotronMoELeaderKernel.shared.kernel(
+        let rps = leaderResultsPerSimdgroup(rows: rows)
+        return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
-            grid: (32, bank.n / 4, rows * topK),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
@@ -713,54 +722,71 @@ enum NemotronMoELeader {
 }
 
 private let nmlBalancePlanSource = """
-  if (thread_position_in_grid.x != 0) { return; }
-  int leaders[18], partners[18], costs[18];
-  int counts[6] = {0}, loads[6] = {0}, original[6] = {0};
-  int number = 0;
-  for (int i = 0; i < 36; i++) { plan[i] = -1; }
-  for (int slot = 0; slot < 18; slot++) {
+  const uint lane = thread_position_in_grid.x;
+  threadgroup uint ids[18];
+  threadgroup int lead[18];
+  threadgroup int leaders[18];
+  threadgroup int costs[18];
+  threadgroup int tplan[36];
+  if (lane < 18) { ids[lane] = inds[lane]; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane < 18) {
+    const int slot = int(lane);
     const int row = slot / 6;
-    const uint expert = inds[slot];
+    const uint expert = ids[slot];
     int before = 0;
     for (int r = 0; r < row; r++) {
-      for (int j = 0; j < 6; j++) { before += inds[r*6+j] == expert ? 1 : 0; }
+      for (int j = 0; j < 6; j++) { before += ids[r*6+j] == expert ? 1 : 0; }
     }
-    if ((before & 1) != 0) { continue; }
     int partner = -1;
     for (int r = 2; r > row; r--) {
       for (int j = 0; j < 6; j++) {
-        if (inds[r*6+j] == expert) { partner = r*6+j; }
+        if (ids[r*6+j] == expert) { partner = r*6+j; }
       }
     }
-    leaders[number] = slot; partners[number] = partner;
-    costs[number] = partner < 0 ? SOLO_COST : PAIR_COST;
-    original[slot % 6] += costs[number];
-    plan[18+slot] = partner;
-    number++;
+    // -2 marks a slot whose earlier occurrence leads it.
+    lead[slot] = (before & 1) != 0 ? -2 : partner;
   }
-  // Stable largest-cost-first order; integer load, then group id break ties.
-  for (int assigned = 0; assigned < number; assigned++) {
-    int best = -1;
-    for (int j = 0; j < number; j++) {
-      if (costs[j] >= 0 && (best < 0 || costs[j] > costs[best])) { best = j; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) {
+    int counts[6] = {0}, loads[6] = {0}, original[6] = {0};
+    int number = 0;
+    for (int i = 0; i < 36; i++) { tplan[i] = -1; }
+    for (int slot = 0; slot < 18; slot++) {
+      const int partner = lead[slot];
+      if (partner == -2) { continue; }
+      leaders[number] = slot;
+      costs[number] = partner < 0 ? SOLO_COST : PAIR_COST;
+      original[slot % 6] += costs[number];
+      tplan[18+slot] = partner;
+      number++;
     }
-    int group = -1;
-    for (int g = 0; g < 6; g++) {
-      if (counts[g] < 3 && (group < 0 || loads[g] < loads[group])) { group = g; }
+    // Stable largest-cost-first order; integer load, then group id break ties.
+    for (int assigned = 0; assigned < number; assigned++) {
+      int best = -1;
+      for (int j = 0; j < number; j++) {
+        if (costs[j] >= 0 && (best < 0 || costs[j] > costs[best])) { best = j; }
+      }
+      int group = -1;
+      for (int g = 0; g < 6; g++) {
+        if (counts[g] < 3 && (group < 0 || loads[g] < loads[group])) { group = g; }
+      }
+      tplan[group*3+counts[group]] = leaders[best];
+      counts[group]++; loads[group] += costs[best]; costs[best] = -1;
     }
-    plan[group*3+counts[group]] = leaders[best];
-    counts[group]++; loads[group] += costs[best]; costs[best] = -1;
+    int oldMax = 0, newMax = 0;
+    for (int g = 0; g < 6; g++) { oldMax = max(oldMax,original[g]); newMax = max(newMax,loads[g]); }
+    if (oldMax <= newMax) {
+      for (int i = 0; i < 18; i++) { tplan[i] = -1; }
+      for (int g = 0; g < 6; g++) { counts[g] = 0; }
+      for (int j = 0; j < number; j++) {
+        const int slot = leaders[j], g = slot % 6;
+        tplan[g*3+counts[g]++] = slot;
+      }
+    }
   }
-  int oldMax = 0, newMax = 0;
-  for (int g = 0; g < 6; g++) { oldMax = max(oldMax,original[g]); newMax = max(newMax,loads[g]); }
-  if (oldMax <= newMax) {
-    for (int i = 0; i < 18; i++) { plan[i] = -1; }
-    for (int g = 0; g < 6; g++) { counts[g] = 0; }
-    for (int j = 0; j < number; j++) {
-      const int slot = leaders[j], g = slot % 6;
-      plan[g*3+counts[g]++] = slot;
-    }
-  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i = lane; i < 36; i += 32) { plan[i] = tplan[i]; }
 """
 private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacingOccurrences(
     of: """
@@ -795,7 +821,7 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
 """)
 private final class NMLBalancePlan: Sendable {
     static let shared = NMLBalancePlan()
-    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan",
+    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan_tg",
         inputNames: ["inds"], outputNames: ["plan"], source: nmlBalancePlanSource)
     func make(_ ids: MLXArray, pairCost: Int = 1500) -> MLXArray {
         kernel([ids], template: [("PAIR_COST",pairCost), ("SOLO_COST",1000)],

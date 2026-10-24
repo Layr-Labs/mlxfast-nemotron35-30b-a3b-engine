@@ -632,6 +632,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     @ParameterInfo(key: "D") var D: MLXArray
 
     @ModuleInfo(key: "norm") var norm: NemotronHRMSNormGated
+    let mtpCompactGraphCache = NemotronH35MTPCompactGraphCache()
 
     init(_ args: NemotronHConfiguration) {
         self.numHeads = args.mambaNumHeads
@@ -988,6 +989,13 @@ class NemotronHAttention: Module, NemotronHMixer {
 
         // Keep parity with the selected MLX artifact's serial oracle: current
         // mlx-lm NemotronH attention does not apply RoPE despite rope_theta.
+        // Serialized MTP verify: o_proj reads the per-query outputs in place.
+        if captureMTP, batch == 1, length > 1, NemotronMTPAttentionDirect.enabled,
+           let layerCache = cache as? CBv2LayerCache,
+           let rows = layerCache.updateAndAttendSerialQueryRows(
+               queries: queries, keys: keys, values: values, scale: scale, sinks: nil) {
+            return NemotronMTPAttentionDirect.project(rows, wo)
+        }
         let output = cache.updateAndAttend(
             queries: queries,
             keys: keys,
@@ -3140,6 +3148,22 @@ private class NemotronHBackbone: Module {
     }
 }
 
+/// Holds one model's probed Mamba activation dtypes. Input-independent: the
+/// probe reads loaded parameter types only, never request tokens or state.
+private final class NemotronHActivationDTypeMemo: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved: [Int: DType]?
+
+    func value(_ resolve: () -> [Int: DType]) -> [Int: DType] {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved { return resolved }
+        let value = resolve()
+        resolved = value
+        return value
+    }
+}
+
 // MARK: - Main Model (matches Python's Model class)
 
 public class NemotronHModel:
@@ -3150,6 +3174,7 @@ public class NemotronHModel:
 
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
+    private let recurrentActivationDTypes = NemotronHActivationDTypeMemo()
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -3225,12 +3250,19 @@ public class NemotronHModel:
         }
     }
 
+    /// The probe below depends only on loaded parameter types, which every
+    /// reader sees after load, so it runs once per model rather than once per
+    /// adapter (each engine build and each stepper).
+    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+        recurrentActivationDTypes.value { probeRecurrentActivationDTypes() }
+    }
+
     /// Resolve convolution-history widths from the loaded model itself.
     /// Quantized storage dtype is not the activation dtype, and retained
     /// fp32 parameters can promote later residuals. A lazy one-token graph
     /// through private caches exposes each Mamba layer's deterministic dtype
     /// without evaluating kernels or mutating request state.
-    private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
+    private func probeRecurrentActivationDTypes() -> [Int: DType] {
         let caches = newCache(parameters: nil)
         _ = backbone(
             MLXArray([0]).reshaped(1, 1),
