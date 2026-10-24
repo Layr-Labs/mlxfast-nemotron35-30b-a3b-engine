@@ -268,6 +268,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
+        /// The next first draft queued behind the verify for the device-picked
+        /// row, and the host walk's accept count that decides whether to adopt it.
+        var deviceFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
+        var hostAcceptedDrafts: Int?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -524,6 +528,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         let speculation = s.speculation.flatMap {
             $0.attention.dim(1) == s.stagedInputCount + 1 && n < $0.attention.dim(1) ? $0 : nil
         }
+        // A draft queued for the device-picked row is this row's draft only when
+        // the host walk accepted exactly n (no stop/length truncation).
+        let deviceFirstDraft = s.hostAcceptedDrafts == n ? s.deviceFirstDraft : nil
+        if s.deviceFirstDraft != nil { NemotronH35MTPDeviceFirstDraft.record(adopted: deviceFirstDraft != nil) }
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
             // target hidden r) after the trusted seed row. Exact-greedy
@@ -543,11 +551,13 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         clearRound(s)
         // The engine has already read and reconciled exact target acceptance.
         // Use the ACTUALLY committed prefix, including stop/length truncation.
-        // Slice a view with this host index: no device prefix scan or gather,
-        // no new readback, and no expert/head work for discarded rows.
-        // Build the ordinary one-token tail lazily. The existing prestage
-        // submits it only when the engine has a continuing carry.
+        // When the device-picked tail (`speculateNextFirstDraft`, queued behind
+        // the verify) is for this same n, adopt it. Otherwise slice a view with
+        // this host index (no new readback, no expert/head work for discarded
+        // rows) and build the ordinary one-token tail lazily. The existing
+        // prestage submits it only when the engine has a continuing carry.
         s.nextFirstDraft = speculation.map { spec in
+            if let deviceFirstDraft { return deviceFirstDraft }
             let out = module.finishPagedAttentionRow(
                 spec.attention[0..., n ..< (n + 1), 0...])
             let ids = draftHead.greedy(out)
@@ -571,6 +581,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.speculation = nil
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
+        s.deviceFirstDraft = nil; s.hostAcceptedDrafts = nil
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
@@ -680,6 +691,49 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let roots = [rows.output] + s.cache.innerState()
         s.roots += roots
         asyncEval(roots)
+    }
+}
+
+extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
+    /// Queue the next round's first draft for the device-picked row right
+    /// behind `speculateAfterVerify`: the same one-token expert/head tail and
+    /// K/V row the host path takes from `speculation` at finalize, gathered
+    /// with the device index instead of a host one.
+    public func speculateNextFirstDraft(
+        acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState
+    ) {
+        let s = state(requestState)
+        guard let spec = s.speculation, acceptedDrafts.shape == [1],
+              spec.attention.dim(1) == s.stagedInputCount + 1
+        else { return }
+        let row = acceptedDrafts.asType(.int32)
+        let out = module.finishPagedAttentionRow(take(spec.attention, row, axis: 1))
+        let ids = draftHead.greedy(out)
+        let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
+        s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        asyncEval([ids, out, keys, values])
+    }
+
+    public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {
+        state(requestState).hostAcceptedDrafts = accepted
+    }
+}
+
+/// NEMOTRON_MTP_DEVICE_FIRST_DRAFT_LOG=1: report how often finalize adopts the
+/// device-picked first draft (a discard only costs the queued head work).
+enum NemotronH35MTPDeviceFirstDraft {
+    static let log =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_FIRST_DRAFT_LOG"] == "1"
+    nonisolated(unsafe) private static var adopted = 0
+    nonisolated(unsafe) private static var discarded = 0
+
+    static func record(adopted wasAdopted: Bool) {
+        guard log else { return }
+        if wasAdopted { adopted += 1 } else { discarded += 1 }
+        if (adopted + discarded) % 64 == 0 {
+            FileHandle.standardError.write(Data(
+                "MTP device first draft: adopted \(adopted) discarded \(discarded)\n".utf8))
+        }
     }
 }
 

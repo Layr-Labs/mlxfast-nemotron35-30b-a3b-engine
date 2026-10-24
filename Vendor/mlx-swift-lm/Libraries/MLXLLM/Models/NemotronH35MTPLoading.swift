@@ -264,6 +264,12 @@ extension NemotronH35MTPAssistant {
                 speculateAfterVerify(
                     targetTokens: packet[k ..< (k + width)].reshaped([1, width]),
                     targetHidden: verify.lastHidden, requestState: draftState)
+                // The device-picked first draft (gathered row, same tail) for
+                // the row this warm-up round confirms; finalize adopts it.
+                if CBv2MTPFirstDraftPrestage.deviceAccepted {
+                    speculateNextFirstDraft(
+                        acceptedDrafts: MLXArray([Int32(confirmed - 1)]), requestState: draftState)
+                }
             }
             let hostPacket = packet.asArray(Int32.self)
             _ = values.asArray(Float.self)
@@ -273,6 +279,7 @@ extension NemotronH35MTPAssistant {
                 if width > keep { row.rollback(width - keep) }
                 row.commitSpeculativeWrite()
             }
+            noteHostAcceptedDrafts(keep - 1, requestState: draftState)
             finalizeRound(
                 requestState: draftState, confirmedInputTokens: keep,
                 committedDraftTokens: window[0..., 1..<keep],

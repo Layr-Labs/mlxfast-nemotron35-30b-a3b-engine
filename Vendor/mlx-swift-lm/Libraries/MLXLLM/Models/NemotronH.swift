@@ -50,10 +50,11 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
-/// Layers between early asyncEval calls on the MTP prefill path only. The seed
-/// window is the first request after the engine drains MLX's buffer cache, so a
-/// shorter chunk hands its transient live set back to that cache sooner.
-/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
+/// Layers per submitted chunk in a multi-token (prompt prefill) CBv2 forward,
+/// where each chunk also waits for the previous one so its temporaries return
+/// to MLX's buffer cache before the next chunk allocates. Every prompt prefill
+/// (engine request prefill and teacher-forced stepper alike) runs this one
+/// path. `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
@@ -3538,9 +3539,7 @@ private class NemotronHBackbone: Module {
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false,
-        earlyEvalInterval: Int = nemotronEarlyEvalInterval
+        captureMTP: Bool = false
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3551,6 +3550,8 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
+        let prefillChunks = inputs.dim(1) > 1 && !captureMTP
+        let earlyEvalInterval = prefillChunks ? nemotronPrefillEvalInterval : nemotronEarlyEvalInterval
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3590,22 +3591,20 @@ private class NemotronHBackbone: Module {
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
-                if inputs.dim(1) > 1 && !captureMTP {
+                if prefillChunks {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
-                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
-                    // milliseconds while the host builds the next in well under
-                    // one, so without a wait the host encodes, and allocates,
-                    // every layer's intermediates before the first chunk
-                    // completes. Waiting on the previous chunk returns its
-                    // temporaries to MLX's buffer cache for the next chunk; this
-                    // chunk is already queued, so the GPU never waits on the
-                    // host. Evaluation order only; values are unchanged.
-                    if recyclePrefillChunks {
-                        if let previous = submittedPrefillChunk { eval(previous) }
-                        submittedPrefillChunk = hidden
-                    }
+                    // Every prompt prefill. A chunk runs for milliseconds while
+                    // the host builds the next in well under one, so without a
+                    // wait the host encodes, and allocates, every layer's
+                    // intermediates before the first chunk completes. Waiting on
+                    // the previous chunk returns its temporaries to MLX's buffer
+                    // cache for the next chunk; this chunk is already queued, so
+                    // the GPU never waits on the host. Evaluation order only;
+                    // values are unchanged.
+                    if let previous = submittedPrefillChunk { eval(previous) }
+                    submittedPrefillChunk = hidden
                 } else {
                     asyncEval(hidden)
                 }
@@ -3855,9 +3854,7 @@ public class NemotronHModel:
         _ inputs: MLXArray,
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false,
-        recyclePrefillChunks: Bool = false,
-        earlyEvalInterval: Int = nemotronEarlyEvalInterval
+        captureMTP: Bool = false
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3866,8 +3863,7 @@ public class NemotronHModel:
             return attending
         }
         return backbone.cbv2Forward(
-            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
-            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
+            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.
