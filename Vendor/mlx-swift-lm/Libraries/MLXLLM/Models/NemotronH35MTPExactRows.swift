@@ -1426,7 +1426,7 @@ enum NemotronHeadScreen {
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32])[0]
         let chunks = rows / chunk
-        let selectGroups = 8
+        let selectGroups = 4
         let picked = selectKernel(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
