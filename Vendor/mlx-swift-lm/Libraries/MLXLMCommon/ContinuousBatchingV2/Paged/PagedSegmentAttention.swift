@@ -106,7 +106,12 @@ enum PagedSegmentAttention {
         }
         let partials = MLXArray.zeros([b, qh, plan.maxPartitions, d], dtype: .float32)
         // Padding preserves a device pointer even for a one-head/one-partition probe.
-        let meta = MLXArray.zeros([max(8, b * qh * plan.maxPartitions * 2)], dtype: .float32)
+        let metaCount = max(8, b * qh * plan.maxPartitions * 2)
+        // Keep scratch private to this dispatch. Bound CPU zeroing to 4 KiB;
+        // larger attention batches retain the existing GPU fill.
+        let meta = metaCount <= 1024
+            ? MLXArray([Float](repeating: 0, count: metaCount))
+            : MLXArray.zeros([metaCount], dtype: .float32)
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
