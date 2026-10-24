@@ -595,6 +595,8 @@ private final class NemotronHScanKernels: Sendable {
     let maskedDecay: MLXFast.MLXFastKernel
     let scanDecay: MLXFast.MLXFastKernel
     let windowOut: MLXFast.MLXFastKernel
+    let initialWindowPrev: MLXFast.MLXFastKernel
+    let initialWindowOut: MLXFast.MLXFastKernel
     private init() {
         // One scan window's output, astype(y + ec[..., None] * yPrev, OT) with
         // yPrev = state @ C as the stock broadcast matmul computes it: MLX
@@ -676,6 +678,59 @@ private final class NemotronHScanKernels: Sendable {
                     }
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                 }
+            """, ensureRowContiguous: false)
+        // A fresh request's SSM state is explicitly zero in every head and
+        // output row. Reduce the identical state*C product once per C group,
+        // retaining the general kernel's four-term partials and reduction tree.
+        // Read the real zero buffer rather than fold zero*C (NaN/signed zero).
+        initialWindowPrev = MLXFast.metalKernel(
+            name: "nemotron_ssm_initial_window_prev",
+            inputNames: ["state", "C", "n"], outputNames: ["prev"],
+            source: """
+                threadgroup float part[32];
+                const uint lane = thread_index_in_simdgroup;
+                const uint t = threadgroup_position_in_grid.x;
+                const uint gg = threadgroup_position_in_grid.y;
+                const uint bb = threadgroup_position_in_grid.z;
+                const int k0 = int(lane) * 4;
+                const device float* sp = state + bb * state_strides[0];
+                const device CT* cp = C + bb * C_strides[0] + gg * C_strides[2];
+                float acc = 0.0f;
+                for (int tn = 0; tn < 4; ++tn) {
+                    const float st = sp[(k0 + tn) * state_strides[3]];
+                    const float cv = static_cast<float>(cp[t * C_strides[1] + (k0 + tn) * C_strides[3]]);
+                    acc += st * cv;
+                }
+                part[lane] = acc;
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                if (lane == 0) {
+                    float a[16];
+                    for (int q = 0; q < 16; ++q) { a[q] = part[q] + part[q + 16]; }
+                    float b[8];
+                    for (int q = 0; q < 8; ++q) { b[q] = a[q] + a[q + 8]; }
+                    float c[4];
+                    for (int q = 0; q < 4; ++q) { c[q] = b[q] + b[q + 4]; }
+                    const float d0 = c[0] + c[2];
+                    const float d1 = c[1] + c[3];
+                    prev[(bb * n + t) * G + gg] = d0 + d1;
+                }
+            """, ensureRowContiguous: false)
+        initialWindowOut = MLXFast.metalKernel(
+            name: "nemotron_ssm_initial_window_out",
+            inputNames: ["prev", "y", "ec", "n"], outputNames: ["out"],
+            source: """
+                const uint i = thread_position_in_grid.x;
+                if (i >= uint(n * H * DH)) return;
+                const uint dd = i % DH;
+                const uint hh = (i / DH) % H;
+                const uint t = i / (DH * H);
+                const uint bb = thread_position_in_grid.z;
+                const float yp = prev[(bb * n + t) * (H / R) + hh / R];
+                const float e = ec[bb * ec_strides[0] + t * ec_strides[1] + hh * ec_strides[2]];
+                const float p = e * yp;
+                const float yv = y[bb * y_strides[0] + hh * y_strides[1] + t * y_strides[2] + dd * y_strides[3]];
+                const float u = yv + p;
+                out[size_t(bb) * n * H * DH + i] = static_cast<OT>(u);
             """, ensureRowContiguous: false)
         // Fused segsum (tril(x, -1) -> cumsum(axis -2) in strided_scan order)
         // + exp + CB product + tril, plus the decay's last row.
@@ -781,7 +836,7 @@ func nemotronPrefillComputeDt(
 func nemotronSSMAttn(
     x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
     dt: MLXArray, dtBias: MLXArray, state: MLXArray,
-    timeStepLimit: (Float, Float)
+    timeStepLimit: (Float, Float), initialStateIsZero: Bool = false
 ) -> (MLXArray, MLXArray) {
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
@@ -863,12 +918,25 @@ func nemotronSSMAttn(
         if NemotronHPrefillX5.enabled, d == 128, dh % 32 == 0, h % g == 0,
            previousState.dtype == .float32, yWindow.dtype == .float32,
            expDtACumsum.dtype == .float32 {
-            outputs.append(NemotronHScanKernels.shared.windowOut(
-                [previousState, stepC, yWindow, expDtACumsum, n],
-                template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
-                           ("DH", dh), ("TC", 32)],
-                grid: (dh / 32 * 128, (n + 31) / 32, b * h), threadGroup: (128, 1, 1),
-                outputShapes: [[b, n, h, dh]], outputDTypes: [x.dtype])[0])
+            if initialStateIsZero, start == 0, b == 1, h == 64, g == 8, dh == 64,
+               ProcessInfo.processInfo.environment["NEMOTRON_INITIAL_WINDOW_FACTOR"] != "0" {
+                let prev = NemotronHScanKernels.shared.initialWindowPrev(
+                    [previousState, stepC, n], template: [("CT", stepC.dtype), ("G", g)],
+                    grid: (n * 32, g, b), threadGroup: (32, 1, 1),
+                    outputShapes: [[b, n, g]], outputDTypes: [.float32])[0]
+                outputs.append(NemotronHScanKernels.shared.initialWindowOut(
+                    [prev, yWindow, expDtACumsum, n],
+                    template: [("OT", x.dtype), ("H", h), ("R", repeats), ("DH", dh)],
+                    grid: (n * h * dh, 1, b), threadGroup: (256, 1, 1),
+                    outputShapes: [[b, n, h, dh]], outputDTypes: [x.dtype])[0])
+            } else {
+                outputs.append(NemotronHScanKernels.shared.windowOut(
+                    [previousState, stepC, yWindow, expDtACumsum, n],
+                    template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
+                               ("DH", dh), ("TC", 32)],
+                    grid: (dh / 32 * 128, (n + 31) / 32, b * h), threadGroup: (128, 1, 1),
+                    outputShapes: [[b, n, h, dh]], outputDTypes: [x.dtype])[0])
+            }
         } else {
             let reshapedState = previousState.reshaped(b, 1, g, repeats, dh, d)
             let reshapedC = stepC.reshaped(b, n, g, 1, d, 1)
@@ -1155,8 +1223,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         var ssmRows: [MLXArray] = []
         convRows.reserveCapacity(batch)
         ssmRows.reserveCapacity(batch)
+        var initialStateIsZero = true
         for evaluation in recurrentState {
             let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+            initialStateIsZero = initialStateIsZero && state == nil
             convRows.append(
                 state?.conv
                     ?? MLXArray.zeros(
@@ -1199,7 +1269,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let (y, nextState) = convOutput.dim(1) > 1
             ? nemotronSSMAttn(
                 x: hidden, ALog: aLog, B: B, C: C, D: D, dt: dtArray,
-                dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit)
+                dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit,
+                initialStateIsZero: initialStateIsZero)
             : nemotronDecodeSSM(
             hiddenStates: hidden,
             ALog: aLog,
