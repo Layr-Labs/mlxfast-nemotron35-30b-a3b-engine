@@ -3,10 +3,10 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-/// Drafts score only the first half of the target head's rows; the target
+/// Drafts score only the first quarter of the target head's rows; the target
 /// still scores every emitted token over the full vocabulary. Ids below 1000
 /// are control tokens (both EOS ids included), 1000..<1256 the raw bytes, and
-/// every later id is a BPE merge in rank order, so the first half keeps all
+/// every later id is a BPE merge in rank order, so the first quarter keeps all
 /// control and byte ids and the earliest merges. A row prefix of a row-major
 /// quantized matrix is a strided view (no copy) that runs the same qmv kernel,
 /// so each kept logit equals the full head's. Held outside the module tree so
@@ -18,7 +18,7 @@ private final class NemotronMTPDraftHead {
 
     lazy var prefix: QuantizedLinear? = {
         guard let head = self.target.lmHead as? QuantizedLinear else { return nil }
-        let rows = 0..<(head.weight.dim(0) / 2)
+        let rows = 0..<(head.weight.dim(0) / 4)
         return QuantizedLinear(
             weight: head.weight[rows], bias: head.bias?[rows],
             scales: head.scales[rows], biases: head.biases?[rows],
