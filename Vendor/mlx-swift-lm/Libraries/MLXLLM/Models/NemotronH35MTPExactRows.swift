@@ -122,7 +122,7 @@ inline U nmr_qdot_safe(
 
 private let nemotronMultiRowQMVSource = """
   constexpr int num_simdgroups = 2;
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = OUTPUTS;
   constexpr int packs_per_thread = FAST ? 2 : 1;
   constexpr int pack_factor = 8;
   constexpr int bytes_per_pack = 4;
@@ -258,12 +258,16 @@ enum NemotronMultiRowQMV {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
+        // More output rows share each activation load for short windows.
+        // Keep the original tile for wider windows and non-multiple tails.
+        let outputsPerSIMD = rows <= 4 && n % 16 == 0 ? 8 : 4
         let fast = k % 512 == 0
         let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
             [q.weight, q.scales, biases, x, kArray, nArray],
-            template: [("T", x.dtype), ("R", rows), ("FAST", fast)],
-            grid: (32, n / 4, 1),
+            template: [("T", x.dtype), ("R", rows), ("FAST", fast),
+                       ("OUTPUTS", outputsPerSIMD)],
+            grid: (32, n / outputsPerSIMD, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]],
             outputDTypes: [x.dtype])[0]
@@ -333,7 +337,7 @@ enum NemotronTargetQKV {
         else { return nil }
         let rows = x.dim(1)
         let outputs = kernel(q + k + v + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
-            template: [("T", x.dtype), ("R", rows), ("FAST", false)],
+            template: [("T", x.dtype), ("R", rows), ("FAST", false), ("OUTPUTS", 4)],
             grid: (32, 1152, 1), threadGroup: (32, 2, 1),
             outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
             outputDTypes: [x.dtype, x.dtype, x.dtype])
