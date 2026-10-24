@@ -496,6 +496,123 @@ enum NemotronHeadPreparedActivation {
     }
 }
 
+enum NemotronSharedUpPrepared {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MOE_SHARED_UP_PREPARED"] != "0"
+    nonisolated(unsafe) private static var verified = false
+
+    private static func producerSource() -> String? {
+        let groups = "constexpr int num_simdgroups = 2;"
+        let store = "yp[r * out_vec_size + row] = h;"
+        guard nemotronHeadPreparedQMVSource.components(separatedBy: groups).count == 2,
+              nemotronHeadPreparedQMVSource.components(separatedBy: store).count == 2
+        else { return nil }
+        let original = nemotronHeadPreparedQMVSource
+            .replacingOccurrences(of: groups, with: "constexpr int num_simdgroups = 4;")
+            .replacingOccurrences(of: store, with: store
+                + "\n        upTile[r * 8 + simd_gid * results_per_simdgroup + row] = h;")
+        return "threadgroup T upTile[R * 8];\n" + original + """
+
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const uint group = tid.y;
+          if (simd_gid == 0 && simd_lid < R) {
+            const uint r = simd_lid;
+            float values[8];
+            float sum = 0;
+            for (int i = 0; i < 8; i += 4) {
+              sum += float(upTile[r * 8 + i]) + float(upTile[r * 8 + i + 1])
+                  + float(upTile[r * 8 + i + 2]) + float(upTile[r * 8 + i + 3]);
+              values[i] = upTile[r * 8 + i];
+              values[i + 1] = upTile[r * 8 + i + 1] / 16.0f;
+              values[i + 2] = upTile[r * 8 + i + 2] / 256.0f;
+              values[i + 3] = upTile[r * 8 + i + 3] / 4096.0f;
+            }
+            const uint base = (r * 15 + group / 32) * 288 + group % 32;
+            for (int i = 0; i < 8; ++i) nextPrepared[base + i * 32] = values[i];
+            nextPrepared[base + 8 * 32] = sum;
+          }
+          // The last tile has sixteen unused lanes. Give them defined zeros;
+          // the unchanged down kernel's safe tail never reads those lanes.
+          if (group == 463 && simd_gid == 1 && simd_lid >= 16) {
+            for (int r = 0; r < R; ++r) {
+              const uint base = (r * 15 + 14) * 288 + simd_lid;
+              for (int i = 0; i < 9; ++i) nextPrepared[base + i * 32] = 0.0f;
+            }
+          }
+          """
+    }
+
+    private static let kernel: MLXFast.MLXFastKernel? = producerSource().map {
+        MLXFast.metalKernel(
+            name: "nemotron_shared_up_relu2_and_down_prepare",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y", "nextPrepared"], source: $0,
+            header: nemotronMultiRowQMVHeader, ensureRowContiguous: true)
+    }
+
+    static func apply(_ x: MLXArray, _ up: Linear, prepared: MLXArray?)
+        -> (activated: MLXArray, prepared: MLXArray)? {
+        guard verified, let pair = produce(x, up, prepared: prepared) else { return nil }
+        guard NemotronMoELeader.selfTest else { return pair }
+        let expected = nemotronMTPLinearRelu2Rows(x, up, prepared: prepared)
+        let packed = NemotronHeadPreparedActivation.pack(expected.reshaped(3, 3712))
+        let same = matches(pair, expected: expected, packed: packed)
+        return (which(same, pair.activated, MLXArray(Float.nan).asType(.bfloat16)),
+                which(same, pair.prepared, MLXArray(Float.nan)))
+    }
+
+    private static func produce(_ x: MLXArray, _ up: Linear, prepared: MLXArray?)
+        -> (activated: MLXArray, prepared: MLXArray)? {
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              type(of: up) == QuantizedLinear.self, let q = up as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [3712, 336], q.weight.dtype == .uint32,
+              q.scales.shape == [3712, 42], q.scales.dtype == .bfloat16,
+              let offsets = q.biases, offsets.shape == q.scales.shape,
+              offsets.dtype == .bfloat16, let kernel else { return nil }
+        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        let (k, n) = NemotronMultiRowQMV.scalarPair(2688, 3712)
+        let arrays = kernel([q.weight, q.scales, offsets, input, k, n],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false),
+                       ("RELU2", true), ("RPS", 2)],
+            grid: (32, 1856, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[1, 3, 3712], [3, 15, 288]], outputDTypes: [.bfloat16, .float32])
+        return (arrays[0], arrays[1])
+    }
+
+    private static func matches(
+        _ pair: (activated: MLXArray, prepared: MLXArray), expected: MLXArray, packed: MLXArray
+    ) -> MLXArray {
+        // Original pack leaves the final sixteen inactive lanes unspecified.
+        // Slice before comparison, so those lanes are never read by the oracle.
+        let actual = pair.prepared.reshaped(3, 15, 9, 32)
+        let reference = packed.reshaped(3, 15, 9, 32)
+        let actualFull = actual[0..., 0..<14, 0..., 0...].view(dtype: .uint32)
+        let referenceFull = reference[0..., 0..<14, 0..., 0...].view(dtype: .uint32)
+        let actualTail = actual[0..., 14..<15, 0..., 0..<16].view(dtype: .uint32)
+        let referenceTail = reference[0..., 14..<15, 0..., 0..<16].view(dtype: .uint32)
+        let valuesMatch = (pair.activated.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+        let preparedMatch = logicalAnd((actualFull .== referenceFull).all(), (actualTail .== referenceTail).all())
+        return logicalAnd(valuesMatch, preparedMatch)
+    }
+
+    static func verify(_ model: Module) {
+        verified = false
+        guard let moe = model.modules().lazy.compactMap({ $0 as? NemotronHMoE }).first,
+              let shared = moe.sharedExperts else { return }
+        let x = MLXRandom.normal([1, 3, 2688], dtype: .bfloat16, key: MLXRandom.key(0x7550))
+        let input = NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        guard let pair = produce(x, shared.upProj, prepared: input) else { return }
+        let expected = nemotronMTPLinearRelu2Rows(x, shared.upProj, prepared: input)
+        let expectedPrepared = NemotronHeadPreparedActivation.pack(expected.reshaped(3, 3712))
+        verified = matches(pair, expected: expected, packed: expectedPrepared).item(Bool.self)
+    }
+}
+
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
