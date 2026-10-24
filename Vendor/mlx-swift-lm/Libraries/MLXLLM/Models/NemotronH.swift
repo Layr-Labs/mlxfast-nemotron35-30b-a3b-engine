@@ -244,6 +244,7 @@ private final class NemotronHScanKernels: Sendable {
     static let shared = NemotronHScanKernels()
     let maskedDecay: MLXFast.MLXFastKernel
     let scanDecay: MLXFast.MLXFastKernel
+    let carryScan: MLXFast.MLXFastKernel
     let windowOut: MLXFast.MLXFastKernel
     private init() {
         // One scan window's output, astype(y + ec[..., None] * yPrev, OT) with
@@ -327,6 +328,55 @@ private final class NemotronHScanKernels: Sendable {
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                 }
             """, ensureRowContiguous: false)
+        // Keep carry independent of CB. Match the native FP32 strided scan's
+        // 32x32 tile, four reads per thread and per-column prefix order; fuse
+        // only its final exp, after the FP32 scan value is stored in the tile.
+        carryScan = MLXFast.metalKernel(
+            name: "nemotron_ssm_independent_carry",
+            inputNames: ["dtA", "L"], outputNames: ["carry"],
+            source: """
+                threadgroup float tile[32][36];
+                const uint tid = thread_position_in_threadgroup.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint bb = threadgroup_position_in_grid.z;
+                const uint h0 = threadgroup_position_in_grid.x * 32;
+                const uint ry = (tid * 4) / 32;
+                const uint rx = (tid * 4) % 32;
+                const uint sx = sg * 4;
+                float prefix[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (int rb = 0; rb < L; rb += 32) {
+                    const int t = rb + int(ry);
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int k = 0; k < 4; ++k) {
+                        const uint hh = h0 + rx + k;
+                        tile[ry][rx + k] = t < L && hh < H
+                            ? dtA[(size_t(bb) * L + t) * H + hh] : 0.0f;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    float values[4];
+                    for (int k = 0; k < 4; ++k) {
+                        values[k] = tile[lane][sx + k];
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int k = 0; k < 4; ++k) {
+                        values[k] = simd_prefix_inclusive_sum(values[k]);
+                        values[k] = values[k] + prefix[k];
+                        prefix[k] = simd_shuffle(values[k], 31);
+                    }
+                    for (int k = 0; k < 4; ++k) {
+                        tile[lane][sx + k] = values[k];
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int k = 0; k < 4; ++k) {
+                        const uint hh = h0 + rx + k;
+                        if (t < L && hh < H) {
+                            carry[(size_t(bb) * L + t) * H + hh] =
+                                metal::precise::exp(tile[ry][rx + k]);
+                        }
+                    }
+                }
+            """)
         // Fused segsum (tril(x, -1) -> cumsum(axis -2) in strided_scan order)
         // + exp + CB product + tril, plus the decay's last row.
         scanDecay = MLXFast.metalKernel(
@@ -506,7 +556,17 @@ func nemotronSSMAttn(
         var nextState = nextStateProduct
 
         let previousState = currentState
-        let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
+        let expDtACumsum: MLXArray
+        if NemotronHPrefillX5.enabled, stepDtA.dtype == .float32, h > 1 {
+            // No CB input: the carry remains independently schedulable.
+            expDtACumsum = NemotronHScanKernels.shared.carryScan(
+                [stepDtA, n], template: [("H", h)],
+                grid: (((h + 31) / 32) * 256, 1, b), threadGroup: (256, 1, 1),
+                outputShapes: [[b, n, h]], outputDTypes: [.float32])[0]
+        } else {
+            // H=1 is the native contiguous scan, with a different sum order.
+            expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
+        }
         nextState =
             nextState
             + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
@@ -1550,7 +1610,7 @@ private func nemotronWarmUpPrefillKernels(
             arrays.append(contentsOf: NemotronHScanKernels.shared.scanDecay(
                 [dtA, cbw, 4],
                 template: [("CBT", dtype), ("H", ssmHeads), ("R", ssmHeads / ssmGroups)],
-                grid: (1024, 1, ssmHeads), threadGroup: (1024, 1, 1),
+                grid: (256, 1, ssmHeads), threadGroup: (256, 1, 1),
                 outputShapes: [[1, ssmHeads, 4, 4], [1, ssmHeads, 1, 4]],
                 outputDTypes: [.float32, .float32]))
             if ssmStateSize == 128, ssmHeadDim % 32 == 0 {
