@@ -276,6 +276,11 @@ private let nemotronHeadPreparedQMVSource = """
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = group_size / values_per_thread;
   typedef float U;
+  // R = 3 without FAST (K % 512 != 0): each masked nibble reaches its float
+  // through an exact ushort -> half convert (<= 4 significant bits, <= 61440)
+  // widened as an operand. Same float value, same FP32 arithmetic and order.
+  // M4: 1.9-2.2% faster at K 2688/3712; neutral or slower with FAST, kept stock.
+  constexpr bool half_decode = !FAST && R == 3;
 
   const int in_vec_size = K;
   const int out_vec_size = N;
@@ -327,10 +332,10 @@ private let nemotronHeadPreparedQMVSource = """
       for (int r = 0; r < R; r++) accum[r] = 0;
       const device uint16_t* words = (const device uint16_t*)wl;
       for (int i = 0; i < values_per_thread / 4; i++) {
-        const U a = words[i] & 0x000f;
-        const U b1 = words[i] & 0x00f0;
-        const U c = words[i] & 0x0f00;
-        const U d = words[i] & 0xf000;
+        const U a = half_decode ? U(half(ushort(words[i] & 0x000f))) : U(words[i] & 0x000f);
+        const U b1 = half_decode ? U(half(ushort(words[i] & 0x00f0))) : U(words[i] & 0x00f0);
+        const U c = half_decode ? U(half(ushort(words[i] & 0x0f00))) : U(words[i] & 0x0f00);
+        const U d = half_decode ? U(half(ushort(words[i] & 0xf000))) : U(words[i] & 0xf000);
         for (int r = 0; r < R; r++) {
           accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
               + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
@@ -366,10 +371,10 @@ private let nemotronHeadPreparedQMVSource = """
         for (int r = 0; r < R; r++) accum[r] = 0;
         const device uint16_t* words = (const device uint16_t*)wl;
         for (int i = 0; i < remaining / 4; i++) {
-          const U a = words[i] & 0x000f;
-          const U b1 = words[i] & 0x00f0;
-          const U c = words[i] & 0x0f00;
-          const U d = words[i] & 0xf000;
+          const U a = half_decode ? U(half(ushort(words[i] & 0x000f))) : U(words[i] & 0x000f);
+          const U b1 = half_decode ? U(half(ushort(words[i] & 0x00f0))) : U(words[i] & 0x00f0);
+          const U c = half_decode ? U(half(ushort(words[i] & 0x0f00))) : U(words[i] & 0x0f00);
+          const U d = half_decode ? U(half(ushort(words[i] & 0xf000))) : U(words[i] & 0xf000);
           for (int r = 0; r < R; r++) {
             accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
                 + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
@@ -1171,6 +1176,12 @@ enum NemotronTargetQKV {
 enum NemotronHeadScreen {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN"] != "0"
     static let check = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_CHECK"] == "1"
+    /// NEMOTRON_MTP_HEAD_SCREEN_PACKED=0 gathers scales/biases from the head rows.
+    static var packedScalesBiases: Bool {
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_PACKED"] != "0"
+            && packedPartialSource.components(separatedBy: "sb[size_t(row) * (2 * S)").count == 3
+            && !packedPartialSource.contains("scales[") && !packedPartialSource.contains("biases[")
+    }
     static let width = 2688
     static let wordsPerRow = 336
     static let groupsPerRow = 42
@@ -1178,18 +1189,22 @@ enum NemotronHeadScreen {
     static let rows = 65536
 
     // One simdgroup scores RPS rows. Lane l owns half-groups l, l + 32, ...
-    // (32 values = one uint4 of packed words) of the selected groups.
+    // (32 values = one uint4 of packed words) of the selected groups. Rows
+    // from LO up (the upper vocabulary half, when scored) read their own,
+    // smaller group set S2 / groups2; LO is a multiple of RPS, so the choice
+    // is uniform per simdgroup.
     private static let partialSource = """
-      // S <= 16: lane l owns half-group l (32 values, 16 bytes).
+      // S, S2 <= 16: lane l owns half-group l (32 values, 16 bytes).
       constexpr int KW = 336;
       constexpr int KG = 42;
       constexpr int VPL = 32;
-      constexpr int H = 2 * S;
       const int lane = int(thread_index_in_simdgroup);
       const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
       const int row0 = sg * RPS;
+      const bool upper = row0 >= LO;
+      const int H = upper ? 2 * S2 : 2 * S;
       const bool on = lane < H;
-      const int g = on ? int(groups[lane >> 1]) : 0;
+      const int g = on ? int(upper ? groups2[lane >> 1] : groups[lane >> 1]) : 0;
       const int part = lane & 1;
       const int woff = g * 8 + part * 4;
       const device T* xp = x + g * 64 + part * 32;
@@ -1406,8 +1421,45 @@ enum NemotronHeadScreen {
 
     private static let partialKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_partial_affine4_gs64",
-        inputNames: ["w", "scales", "biases", "x", "groups"],
+        inputNames: ["w", "scales", "biases", "x", "groups", "groups2"],
         outputNames: ["scores"], source: partialSource)
+    /// The same body reading each row's selected scales and biases from one
+    /// packed bf16 record ([selected scales, selected biases], 2 * S per row;
+    /// upper rows use their first 2 * S2) instead of gathering them from the
+    /// 42-group rows: the same values in the same order, so scores are bitwise
+    /// equal (checked at load).
+    private static let packedPartialSource = partialSource
+        .replacingOccurrences(
+            of: "const float sc = float(scales[size_t(row) * KG + g]);",
+            with: "const float sc = float(sb[size_t(row) * (2 * S) + (lane >> 1)]);")
+        .replacingOccurrences(
+            of: "const float bi = float(biases[size_t(row) * KG + g]);",
+            with: "const float bi = float(sb[size_t(row) * (2 * S) + (upper ? S2 : S) + (lane >> 1)]);")
+    private static let packedPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_packed_affine4_gs64",
+        inputNames: ["w", "sb", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: packedPartialSource)
+
+    /// [rows, 2 * groupCount] bf16: each row's selected scales then biases
+    /// (rows from `rows` up: the upper group set, zero-padded). Copies of the
+    /// head's own bytes, built once at load for the draft screen only.
+    static func packScalesBiases(
+        scales: MLXArray, biases: MLXArray, groups: [Int], groupCount: Int,
+        upperGroups: [Int]?
+    ) -> MLXArray {
+        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
+            let index = MLXArray(selected.map { Int32($0) })
+            var parts = [take(scales[range], index, axis: 1), take(biases[range], index, axis: 1)]
+            if selected.count < groupCount {
+                parts.append(MLXArray.zeros(
+                    [range.count, 2 * (groupCount - selected.count)], dtype: scales.dtype))
+            }
+            return concatenated(parts, axis: 1)
+        }
+        let lower = pack(0..<rows, groups)
+        guard let upperGroups else { return lower }
+        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
+    }
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -1425,17 +1477,30 @@ enum NemotronHeadScreen {
     }
 
     /// hidden [1, 1, 2688] bf16; the head arrays are the full shared head.
+    /// `upperGroups` (count `upperGroupCount`) also screens rows 65536..<131072
+    /// with that smaller group set; candidate ids stay global head rows, and
+    /// every chunk keeps the same per-chunk selection and exact rescore.
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
+        upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
+        packed: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
-        let scores = partialKernel(
-            [weight, scales, biases, hidden, groups],
-            template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
-                       ("NSG", simdgroups)],
+        let rows = upperGroups == nil ? Self.rows : headRows
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
+            ("NSG", simdgroups), ("LO", Self.rows),
+            ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
+        let scores = (packed.map {
+            packedPartialKernel(
+                [weight, $0, hidden, groups, upperGroups ?? groups], template: template,
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])
+        } ?? partialKernel(
+            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: template,
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[rows]], outputDTypes: [.float32])[0]
+            outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
         let selectGroups = 8
         let picked = selectKernel(
