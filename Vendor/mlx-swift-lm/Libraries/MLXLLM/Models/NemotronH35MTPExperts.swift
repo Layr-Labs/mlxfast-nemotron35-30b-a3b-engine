@@ -202,7 +202,7 @@ inline T nml_store(float v) {
 """
 
 private let nemotronMoELeaderSource = """
-  constexpr int results_per_simdgroup = 4;
+  constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = 64 / values_per_thread;
@@ -235,7 +235,7 @@ private let nemotronMoELeaderSource = """
     }
   }
 
-  const int out_row = tid.y * 8 + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
@@ -569,14 +569,21 @@ enum NemotronMoELeader {
 
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
+    static let narrowGateUpAtVerifyWidth = true
+
+    static func leaderResultsPerSimdgroup(rows: Int) -> Int {
+        narrowGateUpAtVerifyWidth && rows == 3 ? 2 : 4
+    }
+
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
-        NemotronMoELeaderKernel.shared.kernel(
+        let rps = leaderResultsPerSimdgroup(rows: rows)
+        return NemotronMoELeaderKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
-            grid: (32, bank.n / 4, rows * topK),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
@@ -713,7 +720,6 @@ enum NemotronMoELeader {
 }
 
 private let nmlBalancePlanSource = """
-  if (thread_position_in_grid.x != 0) { return; }
   int leaders[18], partners[18], costs[18];
   int counts[6] = {0}, loads[6] = {0}, original[6] = {0};
   int number = 0;
@@ -786,6 +792,11 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
     }
 
 """, with: """
+  threadgroup int plan[36];
+  if (simd_gid == 0 && simd_lid == 0) {
+\(nmlBalancePlanSource)
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int job = 0; job < 3; job++) {
     const int slot = plan[simd_gid * 3 + job];
     if (slot < 0) { continue; }
@@ -793,28 +804,18 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
     const int partner = plan[18 + slot];
 
 """)
-private final class NMLBalancePlan: Sendable {
-    static let shared = NMLBalancePlan()
-    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan",
-        inputNames: ["inds"], outputNames: ["plan"], source: nmlBalancePlanSource)
-    func make(_ ids: MLXArray, pairCost: Int = 1500) -> MLXArray {
-        kernel([ids], template: [("PAIR_COST",pairCost), ("SOLO_COST",1000)],
-            grid: (32,1,1), threadGroup: (32,1,1),
-            outputShapes: [[36]], outputDTypes: [.int32])[0]
-    }
-}
 private final class NMLBalanceWeighted: Sendable {
     static let shared = NMLBalanceWeighted()
-    let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced",
-        inputNames: ["w","scales","biases","x","inds","scores","plan"],
+    let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced_inplan",
+        inputNames: ["w","scales","biases","x","inds","scores"],
         outputNames: ["y"], source: nmlBalanceWeightedSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
              _ bank: NemotronMoELeader.Bank) -> MLXArray {
-        let plan = NMLBalancePlan.shared.make(ids)
-        return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
-            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
+        kernel([bank.weight,bank.scales,bank.biases,x,ids,scores],
+            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n),
+                       ("PAIR_COST",1500),("SOLO_COST",1000)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }

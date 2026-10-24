@@ -251,6 +251,7 @@ private let nemotronMultiRowQMVSource = """
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
+    let attentionOutputAdding: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_multirow_qmv_affine4_gs64",
@@ -258,6 +259,14 @@ private final class NemotronMultiRowQMVKernel: Sendable {
             outputNames: ["y"],
             source: nemotronMultiRowQMVSource,
             header: nemotronMultiRowQMVHeader)
+        let addingSource = nemotronMultiRowQMVSource.replacingOccurrences(
+            of: "yp[r * out_vec_size + row] = h;",
+            with: "yp[r * out_vec_size + row] = residual[r * out_vec_size + out_row + row] + h;")
+        attentionOutputAdding = MLXFast.metalKernel(
+            name: "nemotron_mtp_attention_output_add_affine4_gs64",
+            inputNames: ["residual", "w", "scales", "biases", "x", "K", "N"],
+            outputNames: ["y"], source: addingSource,
+            header: nemotronMultiRowQMVHeader, ensureRowContiguous: true)
     }
 }
 
@@ -279,6 +288,37 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
     static let narrowEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
+    static let attentionOutputAdd =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ATTENTION_OUTPUT_ADD"] != "0"
+
+    static func applyAttentionOutputAdding(
+        _ x: MLXArray, _ linear: Linear, residual: MLXArray
+    ) -> MLXArray? {
+        guard enabled, attentionOutputAdd, NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, (2...4).contains(x.dim(1)),
+              x.dim(2) == 4096, x.dtype == .bfloat16,
+              residual.shape == [1, x.dim(1), 2688], residual.dtype == x.dtype,
+              type(of: linear) == QuantizedLinear.self,
+              let q = linear as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [2688, 512],
+              q.scales.dtype == .bfloat16, q.scales.shape == [2688, 64],
+              let offsets = q.biases, offsets.dtype == .bfloat16,
+              offsets.shape == q.scales.shape else { return nil }
+        let rows = x.dim(1)
+        let rps = resultsPerSimdgroup(rows: rows, k: 4096, n: 2688)
+        let (k, n) = scalarPair(4096, 2688)
+        let y = NemotronMultiRowQMVKernel.shared.attentionOutputAdding(
+            [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
+             x.reshaped(rows, 4096), k, n],
+            template: [("T", x.dtype), ("R", rows), ("FAST", true),
+                       ("RELU2", false), ("RPS", rps)],
+            grid: (32, 2688 / rps, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, rows, 2688]], outputDTypes: [x.dtype])[0]
+        guard NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(y, residual + nemotronMTPLinearRows(x, linear))
+    }
 
     /// Outputs per SIMD group for one verify width and (K, N). Two outputs
     /// halve each threadgroup's rows and double the threadgroups; each output
