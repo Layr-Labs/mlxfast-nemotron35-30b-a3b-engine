@@ -91,21 +91,25 @@ extension NemotronHMoE {
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
         let scores: MLXArray
+        let partners: MLXArray?
         if NemotronMTPExecution.batchedRouter {
-            let routed = gate.mtpForwardRows(x)
+            let routed = gate.mtpForwardRowsWithPartners(x)
             indices = routed.0
             scores = routed.1
+            partners = routed.2
         } else {
             let routed = (0..<x.dim(1)).map { gate(x[0..., $0..<($0 + 1), 0...]) }
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
+            partners = nil
         }
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP) {
+            x, indices, scores, switchMLP, partners: partners) {
             y = reduced
         } else {
-            y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
+            y = NemotronMoELeader.switchRows(x, indices, switchMLP, partners: partners)
+                ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
         if let sharedExperts { y = y + sharedExperts.mtpForwardRows(x) }
@@ -217,20 +221,27 @@ private let nemotronMoELeaderSource = """
   const int slot = tid.z;
   const int row = slot / TOPK;
   const uint expert = inds[slot];
-  int before = 0;
-  for (int r = 0; r < row; r++) {
-    for (int j = 0; j < TOPK; j++) {
-      before += inds[r * TOPK + j] == expert ? 1 : 0;
-    }
-  }
-  if ((before & 1) != 0) {
-    return;
-  }
   int partner = -1;
-  for (int r = R - 1; r > row; r--) {
-    for (int j = 0; j < TOPK; j++) {
-      if (inds[r * TOPK + j] == expert) {
-        partner = r * TOPK + j;
+  if constexpr (PAIRED) {
+    partner = int(partners[slot]);
+    if (partner == -2) {
+      return;
+    }
+  } else {
+    int before = 0;
+    for (int r = 0; r < row; r++) {
+      for (int j = 0; j < TOPK; j++) {
+        before += inds[r * TOPK + j] == expert ? 1 : 0;
+      }
+    }
+    if ((before & 1) != 0) {
+      return;
+    }
+    for (int r = R - 1; r > row; r--) {
+      for (int j = 0; j < TOPK; j++) {
+        if (inds[r * TOPK + j] == expert) {
+          partner = r * TOPK + j;
+        }
       }
     }
   }
@@ -346,7 +357,7 @@ private final class NemotronMoELeaderKernel: Sendable {
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_qmv_affine4_gs64",
-            inputNames: ["w", "scales", "biases", "x", "inds"],
+            inputNames: ["w", "scales", "biases", "x", "inds", "partners"],
             outputNames: ["y"],
             source: nemotronMoELeaderSource,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
@@ -374,20 +385,27 @@ private let nemotronMoELeaderWeightedSource = """
   for (int slot = simd_gid; slot < R * TOPK; slot += TOPK) {
     const int row = slot / TOPK;
     const uint expert = inds[slot];
-    int before = 0;
-    for (int r = 0; r < row; r++) {
-      for (int j = 0; j < TOPK; j++) {
-        before += inds[r * TOPK + j] == expert ? 1 : 0;
-      }
-    }
-    if ((before & 1) != 0) {
-      continue;
-    }
     int partner = -1;
-    for (int r = R - 1; r > row; r--) {
-      for (int j = 0; j < TOPK; j++) {
-        if (inds[r * TOPK + j] == expert) {
-          partner = r * TOPK + j;
+    if constexpr (PAIRED) {
+      partner = int(partners[slot]);
+      if (partner == -2) {
+        continue;
+      }
+    } else {
+      int before = 0;
+      for (int r = 0; r < row; r++) {
+        for (int j = 0; j < TOPK; j++) {
+          before += inds[r * TOPK + j] == expert ? 1 : 0;
+        }
+      }
+      if ((before & 1) != 0) {
+        continue;
+      }
+      for (int r = R - 1; r > row; r--) {
+        for (int j = 0; j < TOPK; j++) {
+          if (inds[r * TOPK + j] == expert) {
+            partner = r * TOPK + j;
+          }
         }
       }
     }
@@ -517,7 +535,7 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_weighted_qmv_affine4_gs64",
-            inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
+            inputNames: ["w", "scales", "biases", "x", "inds", "scores", "partners"],
             outputNames: ["y"],
             source: nemotronMoELeaderWeightedSource,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
@@ -570,12 +588,14 @@ enum NemotronMoELeader {
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
-                      bank: Bank, perSlot: Bool, relu2: Bool = false) -> MLXArray {
+                      bank: Bank, perSlot: Bool, relu2: Bool = false,
+                      partners: MLXArray? = nil) -> MLXArray {
         NemotronMoELeaderKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds],
+            [bank.weight, bank.scales, bank.biases, x, inds,
+             partners ?? inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2)],
+                       ("RELU2", relu2), ("PAIRED", partners != nil)],
             grid: (32, bank.n / 4, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
@@ -585,11 +605,12 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank) -> MLXArray {
+                              rows: Int, bank: Bank, partners: MLXArray? = nil) -> MLXArray {
         NemotronMoELeaderWeightedKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+            [bank.weight, bank.scales, bank.biases, x, inds, scores,
+             partners ?? inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n)],
+                       ("K", bank.k), ("N", bank.n), ("PAIRED", partners != nil)],
             grid: (32 * (bank.n / 4), 6, 1),
             threadGroup: (32, 6, 1),
             outputShapes: [[1, rows, bank.n]],
@@ -601,7 +622,7 @@ enum NemotronMoELeader {
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP
+        _ mlp: NemotronHSwitchMLP, partners: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -611,6 +632,7 @@ enum NemotronMoELeader {
               x.dim(2) == 2688, x.dtype == .bfloat16,
               indices.dtype == .uint32, indices.shape == [1, x.dim(1), 6],
               scores.dtype == .float32, scores.shape == indices.shape,
+              partners == nil || (partners?.dtype == .int32 && partners?.shape == indices.shape),
               let up = bank(mlp.fc1, k: 2688, dtype: .bfloat16),
               let down = bank(mlp.fc2, k: 1856, dtype: .bfloat16),
               up.weight.shape == [128, 1856, 336],
@@ -623,13 +645,16 @@ enum NemotronMoELeader {
         let xr = x.reshaped(rows, 2688)
         let act: MLXArray
         if fuseRelu2 {
-            act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false, relu2: true)
+            act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
+                        relu2: true, partners: partners?.reshaped(rows * 6))
         } else {
-            let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false)
+            let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
+                          partners: partners?.reshaped(rows * 6))
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down)
+        var y = applyWeighted(act, flat, scores.reshaped(rows * 6), rows: rows, bank: down,
+                              partners: partners?.reshaped(rows * 6))
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -643,11 +668,13 @@ enum NemotronMoELeader {
     /// Stock-equivalent `switchMLP(x, indices)` for x [1, R, H], indices
     /// [1, R, topK] (unsorted route, R * topK <= 64). Returns [1, R, topK, H].
     static func switchRows(_ x: MLXArray, _ indices: MLXArray,
-                           _ mlp: NemotronHSwitchMLP) -> MLXArray? {
+                           _ mlp: NemotronHSwitchMLP, partners: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.ndim == 3, x.dim(0) == 1, (2...4).contains(x.dim(1)),
               x.dtype == .bfloat16, indices.ndim == 3, indices.dim(0) == 1,
               indices.dim(1) == x.dim(1), indices.dtype == .uint32,
               indices.size <= 64,
+              partners == nil || (indices.dim(2) == 6 && partners?.dtype == .int32
+                  && partners?.shape == indices.shape),
               let up = bank(mlp.fc1, k: x.dim(2), dtype: x.dtype),
               let down = bank(mlp.fc2, k: up.n, dtype: x.dtype), down.n == x.dim(2)
         else { return nil }
@@ -656,13 +683,16 @@ enum NemotronMoELeader {
         let xr = x.reshaped(rows, x.dim(2))
         let act: MLXArray
         if fuseRelu2 {
-            act = apply(xr, flat, rows: rows, topK: topK, bank: up, perSlot: false, relu2: true)
+            act = apply(xr, flat, rows: rows, topK: topK, bank: up, perSlot: false,
+                        relu2: true, partners: partners?.reshaped(rows * topK))
         } else {
-            let h = apply(xr, flat, rows: rows, topK: topK, bank: up, perSlot: false)
+            let h = apply(xr, flat, rows: rows, topK: topK, bank: up, perSlot: false,
+                          partners: partners?.reshaped(rows * topK))
             let a = maximum(h, MLXArray(0))
             act = a * a
         }
-        var y = apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true)
+        var y = apply(act, flat, rows: rows, topK: topK, bank: down, perSlot: true,
+                      partners: partners?.reshaped(rows * topK))
         if selfTest {
             // Stock route on the same inputs: gather_qmv fc1, relu2 ops, gather_qmv fc2.
             let xe = MLX.expandedDimensions(x, axes: [-2, -3])
@@ -704,6 +734,30 @@ enum NemotronMoELeader {
                     down.weight.shape == [128, 2688, 232] {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down))
+                }
+                // New router and PAIRED=true QMV specializations must be
+                // compiled on private dummy inputs before any timed request.
+                let gate = moe.gate
+                if let routed = NemotronHRouterSelection.applyWithPartners(
+                    gates: MLXArray.zeros([1, rows, 128], dtype: .bfloat16),
+                    eSCB: gate.eSCB, topK: gate.topK, nGroup: gate.nGroup,
+                    topkGroup: gate.topkGroup, routedScalingFactor: gate.routedScalingFactor,
+                    normTopkProb: gate.normTopkProb) {
+                    let route = routed.0.reshaped(rows * topK)
+                    let pairs = routed.2.reshaped(rows * topK)
+                    let pairedH = apply(x, route, rows: rows, topK: topK, bank: up,
+                        perSlot: false, relu2: fuseRelu2, partners: pairs)
+                    outputs += [routed.0, routed.1, routed.2]
+                    if rows > 1 {
+                        outputs.append(apply(pairedH, route, rows: rows, topK: topK,
+                            bank: down, perSlot: true, partners: pairs))
+                    }
+                    if topK == 6, up.weight.shape == [128, 1856, 336],
+                        down.weight.shape == [128, 2688, 232] {
+                        outputs.append(applyWeighted(pairedH, route,
+                            routed.1.reshaped(rows * topK), rows: rows, bank: down,
+                            partners: pairs))
+                    }
                 }
             }
         }

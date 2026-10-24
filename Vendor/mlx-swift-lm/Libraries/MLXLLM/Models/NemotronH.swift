@@ -1070,6 +1070,114 @@ enum NemotronHRouterSelection {
             """,
         header: sigmoidHeader, ensureRowContiguous: true)
 
+    // The short-window leader QMV uses the same expert pairing for fc1 and
+    // fc2. Compute it once after row-local selection, while every row's six
+    // indices are still in this threadgroup. A negative two marks a follower;
+    // negative one is an unpaired leader; other values are partner slot IDs.
+    // Every SIMD retains the original router arithmetic and lane ownership.
+    private static let pairedKernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select_with_partners",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights", "partners"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint row = simdgroup_index_in_threadgroup;
+            threadgroup float originalRows[R * 128];
+            threadgroup float normalizedRows[R * 6];
+            threadgroup uint routes[R * 6];
+            threadgroup float* original = originalRows + row * 128;
+            threadgroup float* normalized = normalizedRows + row * 6;
+            float corrected[4];
+            bool selected[4] = {false, false, false, false};
+            float chosen[6];
+            for (uint i = 0; i < 4; ++i) {
+                const uint id = lane + 32 * i;
+                original[id] = nemotron_h_router_sigmoid(float(gates[row * 128 + id]));
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < 4; ++i) {
+                const uint id = lane + 32 * i;
+                corrected[i] = original[id] + bias[id];
+            }
+            for (uint slot = 0; slot < 6; ++slot) {
+                uint local_id = 0xffffffff;
+                float local_score = -INFINITY;
+                for (uint i = 0; i < 4; ++i) {
+                    if (!selected[i] && (local_id == 0xffffffff
+                        || (!metal::isnan(corrected[i])
+                            && (metal::isnan(local_score) || corrected[i] > local_score)))) {
+                        local_id = lane + 32 * i;
+                        local_score = corrected[i];
+                    }
+                }
+                const bool ordered = local_id != 0xffffffff && !metal::isnan(local_score);
+                const bool any_ordered = simd_any(ordered);
+                const float maximum = simd_max(ordered ? local_score : -INFINITY);
+                const uint winner = simd_min(
+                    ((!any_ordered && local_id != 0xffffffff)
+                        || (ordered && local_score == maximum)) ? local_id : 0xffffffff);
+                if (lane == 0) {
+                    indices[row * 6 + slot] = winner;
+                    routes[row * 6 + slot] = winner;
+                    chosen[slot] = original[winner];
+                }
+                for (uint i = 0; i < 4; ++i) {
+                    if (lane + 32 * i == winner) { selected[i] = true; }
+                }
+            }
+            if (lane == 0) {
+                // Match row_reduce_small's value + total order from positive zero.
+                float total = 0.0f;
+                for (uint slot = 0; slot < 6; ++slot) { total = chosen[slot] + total; }
+                const float denominator = total + 1e-20f;
+                for (uint slot = 0; slot < 6; ++slot) {
+                    normalized[slot] = chosen[slot] / denominator;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
+            if (lane < 6) {
+                const uint expert = routes[row * 6 + lane];
+                int before = 0;
+                for (int r = 0; r < int(row); r++) {
+                    for (int j = 0; j < 6; j++) {
+                        before += routes[r * 6 + j] == expert ? 1 : 0;
+                    }
+                }
+                int partner = -2;
+                if ((before & 1) == 0) {
+                    partner = -1;
+                    for (int r = R - 1; r > int(row); r--) {
+                        for (int j = 0; j < 6; j++) {
+                            if (routes[r * 6 + j] == expert) {
+                                partner = r * 6 + j;
+                            }
+                        }
+                    }
+                }
+                partners[row * 6 + lane] = partner;
+            }
+            """,
+        header: sigmoidHeader, ensureRowContiguous: true)
+
+    static func applyWithPartners(
+        gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
+        routedScalingFactor: Float, normTopkProb: Bool
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            gates.ndim == 3, gates.dim(0) == 1, (2...4).contains(gates.dim(1)),
+            gates.dim(2) == 128, gates.dtype == .bfloat16,
+            eSCB.shape == [128], eSCB.dtype == .float32,
+            topK == 6, nGroup == 1, topkGroup == 1,
+            normTopkProb, routedScalingFactor == 2.5
+        else { return nil }
+        let rows = gates.dim(1), shape = [1, gates.dim(1), 6]
+        let result = pairedKernel(
+            [gates, eSCB], template: [("R", rows)],
+            grid: (32, rows, 1), threadGroup: (32, rows, 1),
+            outputShapes: [shape, shape, shape], outputDTypes: [.uint32, .float32, .int32])
+        return (result[0], result[1], result[2])
+    }
+
     static func apply(
         gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
         routedScalingFactor: Float, normTopkProb: Bool
@@ -1192,6 +1300,23 @@ class NemotronHMoEGate: Module {
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
             routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+    }
+
+    /// One router projection graph, with optional short-window expert pairs.
+    /// Width one, wider windows and unsupported routers keep the original
+    /// selection path and do not construct or consume pairing metadata.
+    func mtpForwardRowsWithPartners(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray?) {
+        let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        if NemotronMoELeader.enabled,
+           let routed = NemotronHRouterSelection.applyWithPartners(
+               gates: gates, eSCB: eSCB, topK: topK, nGroup: nGroup, topkGroup: topkGroup,
+               routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb) {
+            return (routed.0, routed.1, routed.2)
+        }
+        let routed = groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
+            nGroup: nGroup, topkGroup: topkGroup,
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+        return (routed.0, routed.1, nil)
     }
 }
 
