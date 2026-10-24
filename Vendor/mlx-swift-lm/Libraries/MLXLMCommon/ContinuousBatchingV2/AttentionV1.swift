@@ -632,6 +632,19 @@ enum CBv2AttentionV1 {
         let keyCount = keys.dim(2)
         let historyCount = keyCount - newTokenCount
         precondition(historyCount >= 0)
+        // Preserve native causal tile order; tails of 1...8 use another SDPA path.
+        if Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            queries.shape == [1, 32, newTokenCount, 128],
+            keys.shape == [1, 2, newTokenCount, 128], values.shape == keys.shape,
+            queries.dtype == .bfloat16, keys.dtype == .bfloat16, values.dtype == .bfloat16,
+            historyCount == 0, window == nil, spanContext == nil, keepMask == nil,
+            sinks == nil, softcap == nil, blockSize % 64 == 0, newTokenCount > blockSize,
+            (newTokenCount % blockSize == 0 || newTokenCount % blockSize > 8)
+        {
+            return attend(
+                queries: queries, keys: keys, values: values, scale: scale,
+                L: newTokenCount, kL: keyCount, window: nil, sinks: nil, softcap: nil)
+        }
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((newTokenCount + blockSize - 1) / blockSize)
         var offset = 0
