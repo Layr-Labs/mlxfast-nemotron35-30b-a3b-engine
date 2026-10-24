@@ -220,12 +220,31 @@ class NemotronHRMSNormGated: Module {
         let flattened = normed.reshaped(shape)
         return weight * flattened
     }
+
+    /// callAsFunction in one kernel (NemotronHScanKernels.gatedNorm), for the
+    /// shapes where the stock norm is MLX rms_single_row with every thread
+    /// reading 4 values: groupSize a multiple of 128, at most 4096.
+    func fused(_ x: MLXArray, gate: MLXArray) -> MLXArray? {
+        guard NemotronHPrefillX5.enabled, x.dtype == .bfloat16 || x.dtype == .float16,
+              gate.dtype == x.dtype, weight.dtype == x.dtype, x.ndim == 3,
+              gate.shape == x.shape, groupSize % 128 == 0, groupSize <= 4096,
+              x.dim(2) % groupSize == 0, weight.shape == [x.dim(2)]
+        else { return nil }
+        let groups = x.dim(2) / groupSize
+        return NemotronHScanKernels.shared.gatedNorm(
+            [x, gate, weight, MLXArray(eps)],
+            template: [("T", x.dtype), ("GS", groupSize), ("G", groups)],
+            grid: (groupSize / 4, x.dim(0) * x.dim(1) * groups, 1),
+            threadGroup: (groupSize / 4, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+    }
 }
 
 // MARK: - Prefill x5 switches
 
 /// Prefill x5: stable counting sort with expert-run tiles, expert-run NAX
-/// gather, the fused segsum scan and the fused scan-window output.
+/// gather, the fused segsum scan, the fused scan-window output and the fused
+/// Mamba element glue (dt/dtA/dtx, broadcast B, gated norm).
 /// NEMOTRON_PREFILL_X5=0 restores the argsort / stock gather / masked-decay
 /// graph.
 enum NemotronHPrefillX5 {
@@ -245,8 +264,73 @@ private final class NemotronHScanKernels: Sendable {
     let maskedDecay: MLXFast.MLXFastKernel
     let scanDecay: MLXFast.MLXFastKernel
     let windowOut: MLXFast.MLXFastKernel
+    let gatedNorm: MLXFast.MLXFastKernel
     private init() {
-        // One scan window's output, astype(y + ec[..., None] * yPrev, OT) with
+        // NemotronHRMSNormGated in one kernel: weight * rms_norm(y * silu(gate))
+        // per group of GS. silu is the compiled bf16 Sigmoid functor and
+        // multiply, then the bf16 product with y; the norm is MLX
+        // rms_single_row (GS / 4 threads of 4 reads, acc += x * x, simd_sum,
+        // 32-slot threadgroup simd_sum, precise::rsqrt(acc / axis_size + eps),
+        // w * T(x * inv) with the identity w = 1), then the bf16 weight product.
+        gatedNorm = MLXFast.metalKernel(
+            name: "nemotron_gated_rms_norm",
+            inputNames: ["y", "gate", "w", "eps"], outputNames: ["out"],
+            source: """
+                threadgroup float local_inv_mean[1];
+                threadgroup float local_sums[32];
+                const uint lid = thread_position_in_threadgroup.x;
+                const uint simd_lane_id = thread_index_in_simdgroup;
+                const uint simd_group_id = simdgroup_index_in_threadgroup;
+                const uint row = threadgroup_position_in_grid.y;
+                const uint tok = row / G;
+                const uint c0 = (row % G) * GS + lid * 4;
+                const uint bb = tok / y_shape[1];
+                const uint tt = tok % y_shape[1];
+                const device T* yr = y + bb * y_strides[0] + tt * y_strides[1];
+                const device T* gr = gate + bb * gate_strides[0] + tt * gate_strides[1];
+                const uint axis_size = GS;
+                float acc = 0;
+                float thread_x[4];
+                for (int i = 0; i < 4; i++) {
+                    const T gv = gr[(c0 + i) * gate_strides[2]];
+                    const T sg = nemotron_sigmoid(gv);
+                    const T sl = gv * sg;
+                    const T st = yr[(c0 + i) * y_strides[2]] * sl;
+                    thread_x[i] = st;
+                    acc += thread_x[i] * thread_x[i];
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) {
+                    local_sums[simd_lane_id] = 0;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_lane_id == 0) {
+                    local_sums[simd_group_id] = acc;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc = simd_sum(local_sums[simd_lane_id]);
+                    if (simd_lane_id == 0) {
+                        local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                device T* o = out + size_t(tok) * (G * GS);
+                const T one = static_cast<T>(1);
+                for (int i = 0; i < 4; i++) {
+                    const T nv = one * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                    o[c0 + i] = w[c0 + i] * nv;
+                }
+            """,
+            header: """
+                template <typename T>
+                inline T nemotron_sigmoid(T x) {
+                    auto y = 1 / (1 + metal::exp(metal::abs(x)));
+                    return (x < 0) ? y : 1 - y;
+                }
+                """,
+            ensureRowContiguous: false)
+        // One scan window's output, astype(y + ec[..., None] * yPrev, OT) + x * D with
         // yPrev = state @ C as the stock broadcast matmul computes it: MLX
         // gemv_float32_bm4_bn1_sm1_sn32_tm4_tn4 for K = 128, i.e. per output
         // lane l sums k = 4l..4l+3 from 0 with `acc += s * c`, then
@@ -254,11 +338,12 @@ private final class NemotronHScanKernels: Sendable {
         // lane l's partial goes to threadgroup memory and one lane adds the
         // 32 partials in that tree order, so a simdgroup keeps 8 state rows
         // in registers for TC tokens instead of one 128-thread group per
-        // (token, head, 16 rows). Product, sum and narrowing stay in
-        // registers with one rounding each, as in the stock kernels.
+        // (token, head, 16 rows). Product, sum, narrowing and the typed
+        // x * D multiply and add stay in registers with one rounding each, as
+        // in the stock kernels.
         windowOut = MLXFast.metalKernel(
             name: "nemotron_ssm_window_out",
-            inputNames: ["state", "C", "y", "ec", "n"], outputNames: ["out"],
+            inputNames: ["state", "C", "y", "ec", "x", "Dp", "n"], outputNames: ["out"],
             source: """
                 constexpr int RB = 8;
                 constexpr int TB = 32 / RB;
@@ -322,7 +407,9 @@ private final class NemotronHScanKernels: Sendable {
                         const float yv = y[bb * y_strides[0] + hh * y_strides[1] + t * y_strides[2]
                             + (i0 + orow) * y_strides[3]];
                         const float u = yv + p;
-                        out[((size_t(bb) * n + t) * H + hh) * DH + i0 + orow] = static_cast<OT>(u);
+                        const OT xd = x[bb * x_strides[0] + t * x_strides[1] + hh * x_strides[2]
+                            + (i0 + orow) * x_strides[3]] * Dp[hh];
+                        out[((size_t(bb) * n + t) * H + hh) * DH + i0 + orow] = static_cast<OT>(u) + xd;
                     }
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                 }
@@ -350,6 +437,17 @@ private final class NemotronHScanKernels: Sendable {
                 device float* o = out + size_t(bh) * L * L;
                 float prefix = 0.0f;
                 for (int rb = 0; rb < L; rb += 32) {
+                    if (rb + 31 < int(j0)) {
+                        // Every row here is above the diagonal of every tile
+                        // column: tril(x, -1) is +0, so the scan and the carry
+                        // stay +0 and the output is 0.
+                        const int zi = rb + int(s);
+                        const uint zj = j0 + lane;
+                        if (zi < L && int(zj) < L) {
+                            o[size_t(zi) * L + zj] = 0.0f;
+                        }
+                        continue;
+                    }
                     const int i = rb + int(lane);
                     float v = 0.0f;
                     if (i < L && int(j) < L && i > int(j)) {
@@ -359,15 +457,13 @@ private final class NemotronHScanKernels: Sendable {
                     v = v + prefix;
                     prefix = simd_shuffle(v, 31);
                     float r = 0.0f;
-                    if (i < L && int(j) < L) {
+                    if (i < L && int(j) <= i) {
                         float d = metal::precise::exp(v);
                         if (i == L - 1) {
                             last[size_t(bh) * L + j] = d;
                         }
-                        if (int(j) <= i) {
-                            float c = static_cast<float>(cb[size_t(i) * L + j]);
-                            r = c * d;
-                        }
+                        float c = static_cast<float>(cb[size_t(i) * L + j]);
+                        r = c * d;
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                     tile[lane][s] = r;
@@ -418,6 +514,31 @@ func nemotronPrefillComputeDt(
         dt, dtBias, MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)])[0]
 }
 
+// dtA = dt * A and dtx = dt[..., None] * x in one compiled graph, with dt
+// as nemotronPrefillComputeDt and A = -exp(A_log) in the A_log dtype then
+// cast, as the separate ops compute them.
+private let nemotronCompiledPrefillDtAx = compile(shapeless: true) {
+    (inputs: [MLXArray]) -> [MLXArray] in
+    let dt = MLX.clip(
+        softplus(inputs[0].asType(.float32) + inputs[1]), min: inputs[2], max: inputs[3])
+    let A = -MLX.exp(inputs[4]).asType(dt.dtype)
+    return [dt * A, MLX.expandedDimensions(dt, axis: -1) * inputs[5]]
+}
+
+private func nemotronPrefillDtAx(
+    _ dt: MLXArray, _ dtBias: MLXArray, _ timeStepLimit: (Float, Float), ALog: MLXArray,
+    x: MLXArray
+) -> (MLXArray, MLXArray)? {
+    let types: [DType] = [.bfloat16, .float16, .float32]
+    guard NemotronHPrefillX5.enabled, Device.defaultDevice().deviceType == .gpu,
+          StreamOrDevice.default == .gpu, types.contains(dt.dtype),
+          types.contains(dtBias.dtype), types.contains(ALog.dtype), types.contains(x.dtype)
+    else { return nil }
+    let r = nemotronCompiledPrefillDtAx([
+        dt, dtBias, MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), ALog, x])
+    return (r[0], r[1])
+}
+
 /// Bitwise copy of `ssmAttn` (SSM.swift, not editable) for L > 1 with a
 /// prior state. Only materialized copies feeding element-wise ops change:
 /// the segsum input is a broadcast view instead of `repeated` (the tril
@@ -433,11 +554,21 @@ func nemotronSSMAttn(
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
 
-    let dt = nemotronPrefillComputeDt(dt, dtBias, timeStepLimit)
     let repeats = h / g
-    let A = -MLX.exp(ALog).asType(dt.dtype)
-    let dtA = dt * A.reshaped(1, 1, -1)
-    let dtx = dt.reshaped(b, l, h, 1) * x
+    let dtA: MLXArray
+    let dtx: MLXArray
+    if let fused = nemotronPrefillDtAx(dt, dtBias, timeStepLimit, ALog: ALog, x: x) {
+        (dtA, dtx) = fused
+    } else {
+        let dt = nemotronPrefillComputeDt(dt, dtBias, timeStepLimit)
+        let A = -MLX.exp(ALog).asType(dt.dtype)
+        dtA = dt * A.reshaped(1, 1, -1)
+        dtx = dt.reshaped(b, l, h, 1) * x
+    }
+    // One window kernel per window, which also adds x * D (no post-loop add).
+    let fusedWindow = NemotronHPrefillX5.enabled && d == 128 && dh % 32 == 0 && h % g == 0
+        && state.dtype == .float32 && dtA.dtype == .float32 && dtx.dtype == .float32
+        && D.dtype == x.dtype && (x.dtype == .bfloat16 || x.dtype == .float16)
 
     let step = 256
     var currentState = state
@@ -486,21 +617,31 @@ func nemotronSSMAttn(
 
         // decay[..., -1:, :] == exp(segsum[..., -1:, :]) element-wise.
         let decay = decayLast.transposed(0, 3, 1, 2)
-        stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
-        var dtxdecay = stepDtx * decay
-        dtxdecay = dtxdecay.swappedAxes(1, 2).swappedAxes(2, 3)
-        var nextState = dtxdecay.matmul(stepB)
+        var nextState: MLXArray
+        if NemotronHPrefillX5.enabled, dtx.dtype == .float32 {
+            // B of the group broadcast over its R heads instead of repeated:
+            // per head the same [dh, n] x [n, d] float32 product with B in the
+            // same transposed layout (ld n), without the [b, h, d, n] copy and
+            // its float32 promotion.
+            let groupB = stepB.asType(.float32).expandedDimensions(axis: 2).swappedAxes(3, 4)
+            let dtxdecay = (stepDtx * decay).reshaped(b, n, g, repeats, dh)
+                .transposed(0, 2, 3, 4, 1)
+            nextState = dtxdecay.matmul(groupB).reshaped(b, h, dh, d)
+        } else {
+            stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
+            var dtxdecay = stepDtx * decay
+            dtxdecay = dtxdecay.swappedAxes(1, 2).swappedAxes(2, 3)
+            nextState = dtxdecay.matmul(stepB)
+        }
 
         let previousState = currentState
         let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
         nextState =
             nextState
             + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
-        if NemotronHPrefillX5.enabled, d == 128, dh % 32 == 0, h % g == 0,
-           previousState.dtype == .float32, yWindow.dtype == .float32,
-           expDtACumsum.dtype == .float32 {
+        if fusedWindow {
             outputs.append(NemotronHScanKernels.shared.windowOut(
-                [previousState, stepC, yWindow, expDtACumsum, n],
+                [previousState, stepC, yWindow, expDtACumsum, x[0..., start ..< end, 0..., 0...], D, n],
                 template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
                            ("DH", dh), ("TC", 32)],
                 grid: (dh / 32 * 128, (n + 31) / 32, b * h), threadGroup: (128, 1, 1),
@@ -517,6 +658,9 @@ func nemotronSSMAttn(
         currentState = nextState
     }
 
+    if fusedWindow {
+        return (outputs.count == 1 ? outputs[0] : MLX.concatenated(outputs, axis: 1), currentState)
+    }
     let y = MLX.concatenated(outputs, axis: 1) + x * D.reshaped(1, 1, h, 1)
     return (y, currentState)
 }
@@ -841,9 +985,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // The fp32 recurrent accumulator is persistent state, not an
         // activation-width promotion. mlx-lm narrows SSM output back to the
         // input dtype before gated normalization and the output projection.
-        return outProj(norm(
-            y.asType(hiddenStates.dtype).flattened(start: 2),
-            gate: gate))
+        let yFlat = y.asType(hiddenStates.dtype).flattened(start: 2)
+        return outProj(norm.fused(yFlat, gate: gate) ?? norm(yFlat, gate: gate))
     }
 
     // Protocol conformance
@@ -1526,11 +1669,23 @@ private func nemotronWarmUpPrefillKernels(
                     [MLXArray.zeros([1, ssmHeads, ssmHeadDim, ssmStateSize], dtype: .float32),
                      MLXArray.zeros([1, 2, ssmGroups, ssmStateSize], dtype: dtype),
                      MLXArray.zeros([1, ssmHeads, 2, ssmHeadDim], dtype: .float32),
-                     MLXArray.zeros([1, 2, ssmHeads], dtype: .float32), 2],
+                     MLXArray.zeros([1, 2, ssmHeads], dtype: .float32),
+                     MLXArray.zeros([1, 2, ssmHeads, ssmHeadDim], dtype: dtype),
+                     MLXArray.zeros([ssmHeads], dtype: dtype), 2],
                     template: [("CT", dtype), ("OT", dtype), ("H", ssmHeads),
                                ("R", ssmHeads / ssmGroups), ("DH", ssmHeadDim), ("TC", 32)],
                     grid: (ssmHeadDim / 32 * 128, 1, ssmHeads), threadGroup: (128, 1, 1),
                     outputShapes: [[1, 2, ssmHeads, ssmHeadDim]], outputDTypes: [dtype])[0])
+            }
+            let width = ssmHeads * ssmHeadDim
+            let groupSize = width / ssmGroups
+            if width % ssmGroups == 0, groupSize % 128 == 0, groupSize <= 4096 {
+                let yw = MLXArray.zeros([1, 2, width], dtype: dtype)
+                arrays.append(NemotronHScanKernels.shared.gatedNorm(
+                    [yw, yw, MLXArray.zeros([width], dtype: dtype), MLXArray(Float(1e-5))],
+                    template: [("T", dtype), ("GS", groupSize), ("G", ssmGroups)],
+                    grid: (groupSize / 4, 2 * ssmGroups, 1), threadGroup: (groupSize / 4, 1, 1),
+                    outputShapes: [[1, 2, width]], outputDTypes: [dtype])[0])
             }
         }
     }
