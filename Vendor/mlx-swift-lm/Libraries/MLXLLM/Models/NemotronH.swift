@@ -1341,7 +1341,7 @@ private final class NemotronHPrefillKernels: Sendable {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
         // threads; E workers per segment count each route once into a shared
-        // histogram. The original serial exclusive scan over (e, s) gives
+        // histogram. A two-level integer SIMD exclusive scan over (e, s) gives
         // each scatter thread its first slot, preserving stable input order.
         countingSort = MLXFast.metalKernel(
             name: "nemotron_moe_counting_sort",
@@ -1374,19 +1374,22 @@ private final class NemotronHPrefillKernels: Sendable {
                     }
                 }
                 // All increments finish before any bin is loaded. The
-                // existing publication barrier then protects the plain uint
-                // counts consumed by the unchanged serial prefix scan.
+                // integer prefix scan consumes the completed histogram bins.
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                counts[tid] = atomic_load_explicit(&histogram[tid], memory_order_relaxed);
+                uint c = atomic_load_explicit(&histogram[tid], memory_order_relaxed);
+                static_assert(THREADS == 1024, "counting-sort scan width");
+                threadgroup uint simdOffsets[32];
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint localPrefix = simd_prefix_exclusive_sum(c);
+                if (lane == 31) { simdOffsets[sg] = localPrefix + c; }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (tid == 0) {
-                    uint acc = 0;
-                    for (int q = 0; q < THREADS; ++q) {
-                        uint v = counts[q];
-                        counts[q] = acc;
-                        acc += v;
-                    }
+                if (sg == 0) {
+                    uint total = simdOffsets[lane];
+                    simdOffsets[lane] = simd_prefix_exclusive_sum(total);
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                counts[tid] = simdOffsets[sg] + localPrefix;
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (tid == 0) {
                     // Expert-run tiles of BMT rows: (first row, rows, expert).
@@ -3357,17 +3360,18 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
-        // A long single-row forward (the teacher-forced prompt prefill) is
-        // only ever read at its last position. Project just the trailing
-        // rows from the start of the second-to-last 64-row M tile: the
-        // quantized matmul then sees M in 65...128 (> 32, so the same
-        // qmm_nax bm=64 / qmm bm=32 kernel as the full M) and the last row's
-        // tile holds exactly the same rows as in the full projection, so
-        // those logits are bitwise identical. Shorter forwards (decode,
-        // verify windows) keep every position.
+        // A long single-row forward consumes only its last position.
+        // Keep the original last 64-row tile and M > 32 so quantized
+        // dispatch retains qmm_nax bm=64 (or the ordinary qmm bm=32).
+        // Only a final tile of <=32 rows needs the preceding tile to
+        // preserve that dispatch. A fuller last tile can stand alone,
+        // removing 64 unused LM-head rows without changing its inputs.
+        // Short forwards (decode and verify) still keep every position.
         let length = hidden.dim(1)
         if hidden.dim(0) == 1, length > 128 {
-            let start = ((length - 1) / 64) * 64 - 64
+            let lastTileStart = ((length - 1) / 64) * 64
+            let lastTileRows = length - lastTileStart
+            let start = lastTileStart - (lastTileRows <= 32 ? 64 : 0)
             return logits(hidden[0..., start..., 0...])
         }
         return logits(hidden)
