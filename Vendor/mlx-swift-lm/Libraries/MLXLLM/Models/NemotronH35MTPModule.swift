@@ -493,10 +493,13 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         // after the worker's between-phase cache drain, so let completed
         // chunks' buffers be reused within it. Halve the chunk there: the seed
         // pays for re-faulting its transient live set, the scored prefill does
-        // not.
+        // not. `seedVariant` selects the seed-route kernels
+        // (`NemotronHSeedVariant`, bitwise identical); the teacher-forced
+        // stepper's `cbv2Forward` never sets either.
         let hidden = cbv2Hidden(
             tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
-            earlyEvalInterval: nemotronPrefillEvalInterval)
+            earlyEvalInterval: nemotronPrefillEvalInterval,
+            seedVariant: NemotronHSeedVariant.enabled)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
