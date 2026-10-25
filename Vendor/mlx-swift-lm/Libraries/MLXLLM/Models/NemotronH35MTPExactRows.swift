@@ -2379,6 +2379,48 @@ enum NemotronTargetQKV {
             header: nemotronMultiRowQMVHeader, mutableInputs: ["kcache", "vcache"])
     }()
 
+    // NEMOTRON_MTP_DICT2: the prepared launches' twins reading each tile's
+    // (scale, bias) through `NemotronSBDict` (`nemotronSBDictSource` of the
+    // same body). Per tile, `scales` is that tensor's pair index and
+    // `biases` its FP32 pair table.
+    private static let dictTilePrefix = tilePrefix
+        .replacingOccurrences(of: "const device T* scales = ", with: "const device uint16_t* scales = ")
+        .replacingOccurrences(of: "const device T* biases = ", with: "const device float* biases = ")
+    private static func dictKernel(_ name: String, body: String, header: String, writingKV: Bool)
+        -> MLXFast.MLXFastKernel? {
+        nemotronSBDictSource(body).map {
+            MLXFast.metalKernel(
+                name: name,
+                inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"]
+                    + (writingKV ? ["kcache", "vcache", "kvpos"] : []),
+                outputNames: ["qy", "ky", "vy"], source: dictTilePrefix + $0 + "\n}",
+                header: header, mutableInputs: writingKV ? ["kcache", "vcache"] : [])
+        }
+    }
+    private static let preparedDictKernel = dictKernel(
+        "nemotron_target_qkv_prepared_affine4_gs64_sbd", body: nemotronHeadPreparedQMVSource,
+        header: nemotronMultiRowQMVHeader, writingKV: false)
+    private static let preparedHalfDictKernel = dictKernel(
+        "nemotron_target_qkv_prepared_affine4_gs64_hf_sbd",
+        body: NemotronHeadPreparedActivation.preparedHalfSource,
+        header: NemotronHeadPreparedActivation.preparedHalfHeader, writingKV: false)
+    private static let preparedWritingKVDictKernel = dictKernel(
+        "nemotron_target_qkv_prepared_kv_affine4_gs64_sbd",
+        body: nemotronHeadPreparedQMVSource.replacingOccurrences(of: storeLine, with: storeAndCache),
+        header: nemotronMultiRowQMVHeader, writingKV: true)
+
+    /// q, k and v as [weight, pair index, pair table] each, or nil.
+    private static func dictBuffers(_ query: Linear, _ key: Linear, _ value: Linear,
+                                    lookup: (AnyObject) -> NemotronSBDict.Dict? = NemotronSBDict.extendedDict)
+        -> [MLXArray]? {
+        var buffers: [MLXArray] = []
+        for linear in [query, key, value] {
+            guard let q = linear as? QuantizedLinear, let d = lookup(q) else { return nil }
+            buffers += [q.weight, d.index, d.table]
+        }
+        return buffers
+    }
+
     /// Kill switch (code constant; 0 = crown kernel): decode form of the
     /// R = 1 fused Q/K/V launch (MTP draft attention). The R = 3 prepared
     /// launch follows NemotronHeadPreparedActivation.halfDecodeForm.
@@ -2435,7 +2477,7 @@ enum NemotronTargetQKV {
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
                                  prepared: Bool = false,
-                                 packed: MLXArray? = nil) -> [MLXArray] {
+                                 packed: MLXArray? = nil, dict: [MLXArray]? = nil) -> [MLXArray] {
         let rows = x.dim(1)
         // `packed`: the same K=2688 (PV 8) layout `pack` writes, prepared by
         // the preceding join from these exact BF16 rows.
@@ -2453,13 +2495,57 @@ enum NemotronTargetQKV {
         let extra = prepared
             ? nemotronHalfTemplate(preparedForm != nil, preparedForm ?? 0)
             : nemotronHalfTemplate(r1Half, r1HalfDecodeForm)
-        return chosen(
-            weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
+        let twin = dict == nil || !prepared || qkvLoad != 0 ? nil
+            : (preparedForm == nil ? preparedDictKernel : preparedHalfDictKernel)
+        return (twin ?? chosen)(
+            (twin != nil ? dict! : weights) + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", rps)] + extra,
             grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
             outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
             outputDTypes: [x.dtype, x.dtype, x.dtype])
+    }
+
+    /// Load time: each dictionary twin against its record launch on one
+    /// layer's real Q/K/V weights, bit for bit (outputs and written cache
+    /// rows), or nil when the layer has no dictionaries or a twin is missing.
+    static func dictMatches(query: Linear, key: Linear, value: Linear) -> MLXArray? {
+        guard Device.defaultDevice().deviceType == .gpu,
+              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
+              let v = buffers(value, rows: 256),
+              let dict = dictBuffers(query, key, value, lookup: NemotronSBDict.extendedCandidate),
+              preparedDictKernel != nil, preparedHalfDictKernel != nil,
+              let writingTwin = preparedWritingKVDictKernel
+        else { return nil }
+        func bits(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+        }
+        let x = (MLXRandom.normal([1, 3, 2688], key: MLXRandom.key(0x9c7d)) * 0.5).asType(.bfloat16)
+        var same = MLXArray(true)
+        for (a, b) in zip(dispatch(q + k + v, x, rps: 2, prepared: true),
+                          dispatch(q + k + v, x, rps: 2, prepared: true, dict: dict)) {
+            same = logicalAnd(same, bits(a, b))
+        }
+        let packed = NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        let caches = (0 ..< 4).map { _ in MLXArray.zeros([1, 2, 8, 128], dtype: .bfloat16) }
+        eval(caches)
+        func write(_ kernel: MLXFast.MLXFastKernel, _ weights: [MLXArray], _ kc: MLXArray, _ vc: MLXArray)
+            -> [MLXArray] {
+            kernel(
+                weights + [packed, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
+                           kc, vc, MLXArray([Int32(2), Int32(8)])],
+                template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)],
+                grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[1, 3, 4096], [1, 3, 256], [1, 3, 256]],
+                outputDTypes: [x.dtype, x.dtype, x.dtype])
+        }
+        let record = write(preparedWritingKVKernel, q + k + v, caches[0], caches[1])
+        let twin = write(writingTwin, dict, caches[2], caches[3])
+        eval(record + twin)
+        for (a, b) in zip(record, twin) {
+            same = logicalAnd(same, bits(a, b))
+        }
+        return logicalAnd(same, logicalAnd(bits(caches[0], caches[2]), bits(caches[1], caches[3])))
     }
 
     static func apply(
@@ -2475,7 +2561,8 @@ enum NemotronTargetQKV {
         else { return nil }
         let rps = resultsPerSimdgroup(rows: x.dim(1))
         let prepared = preparedEnabled && rps == 2 && x.dim(1) == 3
-        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared, packed: packed)
+        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared, packed: packed,
+                               dict: dictBuffers(query, key, value))
         if rps != 4, NemotronMoELeader.selfTest {
             let expected = dispatch(q + k + v, x, rps: 4)
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
@@ -2507,8 +2594,10 @@ enum NemotronTargetQKV {
         else { return nil }
         let activations = NemotronHeadPreparedActivation.compatible(packed, rows: 3, k: 2688)
             ?? NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
-        var outputs = preparedWritingKVKernel(
-            q + k + v + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
+        let dict = dictBuffers(query, key, value)
+        let twin = dict == nil ? nil : preparedWritingKVDictKernel
+        var outputs = (twin ?? preparedWritingKVKernel)(
+            (twin != nil ? dict! : q + k + v) + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
                          kCache, vCache, MLXArray([Int32(offset), Int32(capacity)])],
             template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)],
             grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),

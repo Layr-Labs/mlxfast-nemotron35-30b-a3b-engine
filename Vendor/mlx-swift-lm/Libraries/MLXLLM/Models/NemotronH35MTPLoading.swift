@@ -78,7 +78,7 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
-        NemotronSBDict.prepare(target)
+        NemotronSBDict.prepare(target, draft: assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)

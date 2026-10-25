@@ -620,7 +620,24 @@ private final class NemotronMoELeaderKernel: Sendable {
     /// Production-only copy with the constant 8-value tail (nmlTail8Source);
     /// `kernel` stays the reference the self-tests compare against.
     let tail8: MLXFast.MLXFastKernel?
+    /// `kernel` and `tail8` reading (scale, bias) through `NemotronSBDict`.
+    let kernelDict: MLXFast.MLXFastKernel?
+    let tail8Dict: MLXFast.MLXFastKernel?
     private init() {
+        kernelDict = nemotronSBDictSource(nemotronMoELeaderSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_affine4_gs64_sbd",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
+        tail8Dict = nmlTail8Source(nemotronMoELeaderSource).flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_sbd",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_qmv_affine4_gs64",
             inputNames: ["w", "scales", "biases", "x", "inds"],
@@ -956,7 +973,8 @@ enum NemotronMoELeader {
     /// tail8: production calls only (the self-test references keep false).
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil, tail8: Bool = false) -> MLXArray {
+                      prepared: MLXArray? = nil, tail8: Bool = false,
+                      dict: NemotronSBDict.Dict? = nil) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
@@ -973,8 +991,21 @@ enum NemotronMoELeader {
                 outputShapes: [[rows * topK, bank.n]],
                 outputDTypes: [x.dtype])[0]
         }
-        let kernel = (tail8 ? NemotronMoELeaderKernel.shared.tail8 : nil)
-            ?? NemotronMoELeaderKernel.shared.kernel
+        let kernels = NemotronMoELeaderKernel.shared
+        let tailed = tail8 && kernels.tail8 != nil
+        let kernel = (tailed ? kernels.tail8 : nil) ?? kernels.kernel
+        // The selected kernel's dictionary twin, one-row calls only (the draft tail).
+        if let dict, rows == 1, !perSlot, let twin = tailed ? kernels.tail8Dict : kernels.kernelDict {
+            return twin(
+                [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index), dict.table, x, inds],
+                template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
+                           ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
+                           ("RELU2", relu2), ("RPS", rps)],
+                grid: (32, bank.n / rps, rows * topK),
+                threadGroup: (32, 2, 1),
+                outputShapes: [[rows * topK, bank.n]],
+                outputDTypes: [x.dtype])[0]
+        }
         return kernel(
             [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
              NemotronBankBinding.bind(bank.biases), x, inds],
@@ -1063,8 +1094,8 @@ enum NemotronMoELeader {
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank, plan: MLXArray? = nil,
-                              tail8: Bool = false) -> MLXArray {
-        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
+                              tail8: Bool = false, dict: NemotronSBDict.Dict? = nil) -> MLXArray {
+        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan, dict: dict) }
         let kernel = (tail8 ? NemotronMoELeaderWeightedKernel.shared.tail8 : nil)
             ?? NemotronMoELeaderWeightedKernel.shared.kernel
         return kernel(
@@ -1113,7 +1144,8 @@ enum NemotronMoELeader {
                 balancePlan = fused.plan
             } else {
                 act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                    relu2: true, prepared: prepared, tail8: leaderTail8)
+                    relu2: true, prepared: prepared, tail8: leaderTail8,
+                    dict: NemotronSBDict.extendedDict(mlp.fc1))
                 balancePlan = nil
             }
         } else {
@@ -1140,7 +1172,7 @@ enum NemotronMoELeader {
         }
         var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
             ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: balancePlan,
-                tail8: leaderTail8)
+                tail8: leaderTail8, dict: NemotronSBDict.extendedDict(mlp.fc2))
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -1354,10 +1386,34 @@ private final class NMLBalanceWeighted: Sendable {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
             ensureRowContiguous: true)
     }
+    /// `kernel` and `tail8` reading (scale, bias) through `NemotronSBDict`.
+    let kernelDict = nemotronSBDictSource(nmlBalanceWeightedSource).map {
+        MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced_sbd",
+            inputNames: ["w","scales","biases","x","inds","scores","plan"],
+            outputNames: ["y"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+            ensureRowContiguous: true)
+    }
+    let tail8Dict = nmlTail8Source(nmlBalanceWeightedSource).flatMap(nemotronSBDictSource).map {
+        MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced_tail8_sbd",
+            inputNames: ["w","scales","biases","x","inds","scores","plan"],
+            outputNames: ["y"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+            ensureRowContiguous: true)
+    }
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
-             _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
+             _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil,
+             dict: NemotronSBDict.Dict? = nil) -> MLXArray {
         let plan = plan ?? NMLBalancePlan.shared.make(ids)
-        let kernel = (NemotronMoELeader.fc2Tail8 ? tail8 : nil) ?? self.kernel
+        let tailed = NemotronMoELeader.fc2Tail8 && tail8 != nil
+        let kernel = (tailed ? tail8 : nil) ?? self.kernel
+        if let dict, let twin = tailed ? tail8Dict : kernelDict {
+            return twin([NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index), dict.table,
+                         x, ids, scores, plan],
+                template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
+                grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+                outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
+        }
         return kernel([NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
                        NemotronBankBinding.bind(bank.biases), x, ids, scores, plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
@@ -2641,6 +2697,11 @@ inline void nml_qdot_triple(
 // NEMOTRON_MTP_SB_DICT=0 keeps the record kernels.
 enum NemotronSBDict {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SB_DICT"] != "0"
+    /// The same dictionary for the draft head's tensors and for the decode
+    /// readers the record left on BF16 metadata: the one-row draft FC1
+    /// (leader), the three-row draft FC2 (balanced) and the target
+    /// Q/K/V launch. NEMOTRON_MTP_DICT2=0 keeps their record kernels.
+    static let extendedEnabled = enabled && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DICT2"] != "0"
 
     struct Dict {
         /// One uint16 pair index per group, in the scales' shape and order.
@@ -2651,16 +2712,31 @@ enum NemotronSBDict {
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var dicts: [ObjectIdentifier: Dict] = [:]
+    /// The dictionaries the `NEMOTRON_MTP_DICT2` kernels read: every target
+    /// tensor's and the draft head's, whether or not the record's kernels
+    /// passed their own checks.
+    nonisolated(unsafe) private static var extendedDicts: [ObjectIdentifier: Dict] = [:]
+    nonisolated(unsafe) private static var extended = false
 
     /// The verified dictionary of `owner`'s scales and biases, if any.
     static func dict(_ owner: AnyObject) -> Dict? {
         lock.withLock { dicts[ObjectIdentifier(owner)] }
     }
 
+    /// `owner`'s dictionary for a `NEMOTRON_MTP_DICT2` kernel, once they passed.
+    static func extendedDict(_ owner: AnyObject) -> Dict? {
+        lock.withLock { extended ? extendedDicts[ObjectIdentifier(owner)] : nil }
+    }
+
+    /// `extendedDict` before the checks (the load-time checks themselves).
+    static func extendedCandidate(_ owner: AnyObject) -> Dict? {
+        lock.withLock { extendedDicts[ObjectIdentifier(owner)] }
+    }
+
     /// Every built dictionary's index (for `NemotronBankBinding.warm`: an FC1
     /// index is per expert and addressed from its base like the scales).
     static var indexArrays: [MLXArray] {
-        lock.withLock { dicts.values.map { $0.index } }
+        lock.withLock { (Array(dicts.values) + Array(extendedDicts.values)).map { $0.index } }
     }
 
     /// One tensor's pair dictionary, or nil when its pairs need more than 16
@@ -2720,7 +2796,7 @@ enum NemotronSBDict {
     /// every routed FC1 bank and every 4-bit target projection, then each
     /// dictionary kernel against its record kernel, bit for bit, on the real
     /// weights of every layer it serves.
-    static func prepare(_ model: Module) {
+    static func prepare(_ model: Module, draft: Module? = nil) {
         guard enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var built: [ObjectIdentifier: Dict] = [:]
         for module in model.modules() {
@@ -2738,14 +2814,125 @@ enum NemotronSBDict {
         }
         lock.withLock { dicts = built }
         let (same, fc1, shapes) = checkKernels(model)
-        guard same else {
+        if same {
+            FileHandle.standardError.write(Data(
+                "nemotron sb dict on: \(built.count) tensors, \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
+        } else {
             lock.withLock { dicts = [:] }
             FileHandle.standardError.write(
                 Data("nemotron sb dict off: a dictionary kernel differs from its record kernel\n".utf8))
+        }
+        guard extendedEnabled, let draft else { return }
+        prepareExtended(model, draft: draft, recordDicts: built, recordOn: same)
+    }
+
+    /// The draft head's dictionaries (routed FC1 and FC2 banks, 4-bit
+    /// projections), then every kernel that reads them or the target Q/K/V
+    /// dictionaries against its record kernel, bit for bit, on the real
+    /// weights. The draft head's three-row FC1 and projections read through
+    /// the record's own dictionary kernels, so they join only when those
+    /// passed. Any miss keeps the record's dictionaries and kernels only.
+    private static func prepareExtended(_ model: Module, draft: Module,
+                                        recordDicts: [ObjectIdentifier: Dict], recordOn: Bool) {
+        var added: [ObjectIdentifier: Dict] = [:]
+        for module in draft.modules() {
+            if let moe = module as? NemotronHMoE {
+                guard type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                      type(of: moe.switchMLP.fc2) == QuantizedSwitchLinear.self,
+                      let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                      up.weight.shape == [128, 1856, 336],
+                      let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                      down.weight.shape == [128, 2688, 232] else { continue }
+                if let d = make(scales: up.scales, biases: up.biases) {
+                    added[ObjectIdentifier(moe.switchMLP.fc1)] = d
+                }
+                if let d = make(scales: down.scales, biases: down.biases) {
+                    added[ObjectIdentifier(moe.switchMLP.fc2)] = d
+                }
+            } else if let q = module as? QuantizedLinear, q.mode == .affine, q.bits == 4,
+                      q.groupSize == 64, q.bias == nil, q.weight.dtype == .uint32, q.weight.ndim == 2,
+                      let biases = q.biases, let d = make(scales: q.scales, biases: biases) {
+                added[ObjectIdentifier(q)] = d
+            }
+        }
+        lock.withLock {
+            extendedDicts = recordDicts.merging(added) { old, _ in old }
+            if recordOn { dicts.merge(added) { old, _ in old } }
+        }
+        let (draftSame, draftFC1, draftShapes) = recordOn ? checkKernels(draft) : (true, 0, [])
+        let (moeSame, moeLayers, twins) = checkMoE(draft.modules() + model.modules())
+        var qkvSame = MLXArray(true)
+        var qkvLayers = 0
+        for module in model.modules() {
+            guard let attention = module as? NemotronHAttention,
+                  let ok = NemotronTargetQKV.dictMatches(
+                      query: attention.wq, key: attention.wk, value: attention.wv) else { continue }
+            qkvSame = logicalAnd(qkvSame, ok)
+            qkvLayers += 1
+        }
+        guard draftSame, moeSame, qkvSame.item(Bool.self) else {
+            lock.withLock {
+                dicts = recordOn ? recordDicts : [:]
+                extendedDicts = [:]
+            }
+            FileHandle.standardError.write(Data(
+                "nemotron sb dict2 off: a dictionary kernel differs from its record kernel\n".utf8))
             return
         }
-        FileHandle.standardError.write(Data(
-            "nemotron sb dict on: \(built.count) tensors, \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
+        lock.withLock { extended = true }
+        FileHandle.standardError.write(Data((
+            "nemotron sb dict2 on: \(added.count) draft tensors, \(draftFC1) draft FC1 banks, "
+            + "\(moeLayers) MoE layers (twins \(twins)), \(qkvLayers) Q/K/V layers, "
+            + "draft prepared shapes \(draftShapes)\n").utf8))
+    }
+
+    /// The one-row leader FC1 and three-row balanced FC2 twins against their
+    /// record kernels on every MoE layer that has the dictionary (the draft
+    /// head's, and the target's FC1 for one-row verify rounds): relu2-like
+    /// sparse and dense FC2 inputs, an expert repeated across rows.
+    private static func checkMoE(_ modules: [Module]) -> (Bool, Int, String) {
+        let leader = NemotronMoELeaderKernel.shared, balanced = NMLBalanceWeighted.shared
+        let tail8 = NemotronMoELeader.leaderTail8
+        let twins = [
+            (tail8 && leader.tail8 != nil ? leader.tail8Dict : leader.kernelDict) != nil,
+            (NemotronMoELeader.fc2Tail8 && balanced.tail8 != nil ? balanced.tail8Dict : balanced.kernelDict) != nil,
+        ].map { $0 ? "1" : "0" }.joined()
+        var same = MLXArray(true)
+        var layers = 0
+        let keys = MLXRandom.split(key: MLXRandom.key(0xd1c2), into: 4)
+        let one = MLXArray([3, 17, 42, 77, 100, 127] as [UInt32])
+        let three = MLXArray([3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127] as [UInt32])
+        let x = (MLXRandom.normal([1, 2688], key: keys[0]) * 0.5).asType(.bfloat16)
+        let h = abs(MLXRandom.normal([18, 1856], key: keys[1])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [18, 1856], key: keys[2]) .< MLXArray(Float(0.08))
+        let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[3])
+        func bits(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+        }
+        for module in modules {
+            guard let moe = module as? NemotronHMoE,
+                  let du = extendedCandidate(moe.switchMLP.fc1),
+                  let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16)
+            else { continue }
+            layers += 1
+            for relu2 in [true, false] {
+                let a = NemotronMoELeader.apply(x, one, rows: 1, topK: 6, bank: up, perSlot: false,
+                    relu2: relu2, tail8: tail8)
+                let b = NemotronMoELeader.apply(x, one, rows: 1, topK: 6, bank: up, perSlot: false,
+                    relu2: relu2, tail8: tail8, dict: du)
+                same = logicalAnd(same, bits(a, b))
+            }
+            guard let dd = extendedCandidate(moe.switchMLP.fc2),
+                  let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16)
+            else { continue }
+            for input in [which(keep, h, MLXArray(Float(0))), h] {
+                let act = (input * input).asType(.bfloat16)
+                same = logicalAnd(same, bits(
+                    NemotronMoELeader.applyWeighted(act, three, scores, rows: 3, bank: down),
+                    NemotronMoELeader.applyWeighted(act, three, scores, rows: 3, bank: down, dict: dd)))
+            }
+        }
+        return (same.item(Bool.self), layers, twins)
     }
 
     private static func checkKernels(_ model: Module) -> (Bool, Int, [[Int]]) {
