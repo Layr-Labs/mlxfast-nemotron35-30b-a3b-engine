@@ -1045,7 +1045,7 @@ enum NemotronMoELeader {
         // `products`: the unreduced slot products for the captured verify's
         // join kernel, which sums them itself (same expressions and order).
         if products, rows == 3,
-           let prod = NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2) {
+           let prod = NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2, plan: balancePlan) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -1054,7 +1054,7 @@ enum NemotronMoELeader {
                 .== expected.view(dtype: .uint16)).all()
             return which(ok, prod, MLXArray(Float.nan))
         }
-        var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
+        var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2, plan: balancePlan)
             ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: balancePlan,
                 tail8: leaderTail8)
         if selfTest {
@@ -1642,6 +1642,32 @@ private let nemotronZSkipTiledSeqSource = """
   }
 """
 
+// Same ordinary tiled kernel; only the current-call slot dispatch order changes.
+private let nemotronZSkipPlanOrderSource: String = {
+    let original = "  const int slot = int(threadgroup_position_in_grid.y);"
+    let ordered = """
+  int slot = -1;
+  if (thread_index_in_simdgroup == 0) {
+    int ordinal = int(threadgroup_position_in_grid.y);
+    for (int j = 0; j < 18; j++) {
+      const int leader = plan[j];
+      if (leader < 0) { continue; }
+      if (ordinal == 0) { slot = leader; break; }
+      ordinal--;
+      const int partner = plan[18 + leader];
+      if (partner >= 0) {
+        if (ordinal == 0) { slot = partner; break; }
+        ordinal--;
+      }
+    }
+  }
+  slot = simd_broadcast(slot, 0);
+  if (slot < 0) { return; }
+"""
+    precondition(nemotronZSkipTiledSeqSource.components(separatedBy: original).count == 2)
+    return nemotronZSkipTiledSeqSource.replacingOccurrences(of: original, with: ordered)
+}()
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1706,6 +1732,14 @@ enum NemotronZSkip {
     /// if the staged one misses a bit check.
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
+    nonisolated(unsafe) private static var planOrder =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_PLAN_ORDER"] != "0"
+    private static let planOrderKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_tiled_current_plan_order",
+        inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "plan"],
+        outputNames: ["prod"], source: nemotronZSkipPlanOrderSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
     private static var kernel: MLXFast.MLXFastKernel {
         tiled ? tiledSlotKernel : (staged ? stagedSlotKernel : recordSlotKernel)
     }
@@ -1738,15 +1772,24 @@ enum NemotronZSkip {
     /// Returns [1, rows, 2688]. Every slot is its own threadgroup column, so
     /// the slot kernel is the same for any row count.
     static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy,
-                    rows: Int = 3) -> MLXArray {
-        reduceProducts(products(x, inds, scores, copy: copy, rows: rows), rows: rows)
+                    rows: Int = 3, plan: MLXArray? = nil) -> MLXArray {
+        reduceProducts(products(x, inds, scores, copy: copy, rows: rows, plan: plan), rows: rows)
     }
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, plan: MLXArray? = nil,
+                                 reference: Bool = false) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
+        if tiled && planOrder && !reference && rows == 3,
+           let plan, plan.shape == [36], plan.dtype == .int32 {
+            return planOrderKernel(
+                [copy.codes, copy.scales, copy.biases, x, inds, scores, plan],
+                template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+                grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+        }
         return kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
@@ -1775,21 +1818,21 @@ enum NemotronZSkip {
     /// The R = 3 weighted slot products of a target layer ([18 * 2688] FP32,
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 owner: SwitchLinear) -> MLXArray? {
+                                 owner: SwitchLinear, plan: MLXArray? = nil) -> MLXArray? {
         guard joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
               x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+        return products(x, inds, scores, copy: copy, rows: 3, plan: plan)
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
-                         owner: SwitchLinear) -> MLXArray? {
+                         owner: SwitchLinear, plan: MLXArray? = nil) -> MLXArray? {
         guard rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        return run(x, inds, scores, copy: copy, plan: plan)
     }
 
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
@@ -1800,6 +1843,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, planOrder {
+            planOrder = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: plan-order check missed; original tiled kernel\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled {
             // The tiled kernel missed a check: the K-major copy, every layer again.
             tiled = false
@@ -1876,11 +1925,35 @@ enum NemotronZSkip {
         let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
         let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[2])
         var same = MLXArray(true)
-        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
+        // All trial families keep six distinct router IDs within each row,
+        // matching the existing36-int plan's caller contract.
+        let routeFamilies: [[UInt32]] = [
+            routes,
+            (0 ..< 18).map { (offset + UInt32($0 % 6)) % 128 },
+            (0 ..< 18).map { (offset + UInt32($0)) % 128 },
+            (0 ..< 18).map { (offset + UInt32($0 < 12 ? $0 % 6 : $0)) % 128 },
+            (0 ..< 18).map { i in
+                let id = i < 6 ? i : (i < 12 ? (i - 5) % 6 : (i < 15 ? i - 12 : i + 16))
+                return (offset + UInt32(id)) % 128
+            },
+        ]
+        let orderedChecks: [(MLXArray, MLXArray)] = tiled && planOrder ? routeFamilies.map {
+            let ids = MLXArray($0)
+            return (ids, NMLBalancePlan.shared.make(ids))
+        } : []
+        let currentPlan = tiled && planOrder ? NMLBalancePlan.shared.make(inds) : nil
+        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16),
+                  MLXArray.zeros([18, 1856], dtype: .bfloat16)] {
             let act = (a * a).asType(.bfloat16)
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
-            let got = run(act, inds, scores, copy: copy)
+            let got = run(act, inds, scores, copy: copy, plan: currentPlan)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+            for (trialIndices, trialPlan) in orderedChecks {
+                let baseline = products(act, trialIndices, scores, copy: copy, rows: 3, reference: true)
+                let candidate = products(act, trialIndices, scores, copy: copy, rows: 3, plan: trialPlan)
+                same = logicalAnd(same,
+                    (candidate.view(dtype: .uint32) .== baseline.view(dtype: .uint32)).all())
+            }
         }
         return same.item(Bool.self)
     }
