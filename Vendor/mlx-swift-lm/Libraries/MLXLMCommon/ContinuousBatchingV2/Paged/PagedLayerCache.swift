@@ -192,9 +192,18 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// the tokens about to be processed (snapshot semantics). KV-shared
     /// layers own no rows, so their own value is empty (they reuse the
     /// source layer's pre-update capture).
-    public var positionOffsets: MLXArray { cachedPositionOffsets }
+    public var positionOffsets: MLXArray {
+        if positionOffsetsDeferred { rebuildPositionOffsets() }
+        return cachedPositionOffsets
+    }
+
+    /// The Nemotron draft head has no RoPE and never reads its offsets, so
+    /// its cache skips the per-call device `+ L` (one dispatch in each
+    /// draft root set) and rebuilds from the host frontier if one is read.
+    private var positionOffsetsDeferred = false
 
     private func rebuildPositionOffsets() {
+        positionOffsetsDeferred = false
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
@@ -227,6 +236,21 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // generation ordering as updateAndAttend.
         roots.append(contentsOf: innerState())
         return roots
+    }
+
+    /// `appendTrusted` of `n` rows the single row's storage already holds
+    /// just past its frontier (`PagedSequenceKV.readvanceRetained`): the same
+    /// frontier, offsets and fence roots, without the write dispatch. nil,
+    /// with no change, when they cannot be re-exposed (including any write
+    /// after `generation`, the row's `writeGeneration` seen right after the
+    /// write that stored them); append them instead.
+    public func readvanceTrusted(_ n: Int, writtenAt generation: UInt64) -> [MLXArray]? {
+        guard !pool.writeValidation.isFaulted, kind.sharesKVWithLayer == nil,
+            pagedRows.count == 1, pagedRows[0].readvanceRetained(n, writtenAt: generation)
+        else { return nil }
+        rebuildPositionOffsets()
+        retainedPrefillKV = []
+        return innerState()
     }
 
     public func updateAndAttend(
@@ -334,7 +358,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // is [B,chunk] with one common chunk length) — the rows just
         // advanced their absolute counters by exactly L, so the cached
         // device array tracks them without a per-step host rebuild.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        if nemotronDraftAttention && NemotronMTPDraftChainCleanup.hostPositionOffsets {
+            positionOffsetsDeferred = true
+        } else {
+            cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        }
         return output
     }
 
