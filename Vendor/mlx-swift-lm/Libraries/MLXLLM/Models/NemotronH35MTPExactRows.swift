@@ -1481,6 +1481,185 @@ enum NemotronHeadScreen {
         inputNames: ["scores", "w", "scales", "biases", "x"],
         outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
         source: selectSource, header: nemotronMultiRowQMVHeader)
+
+    private static let scanSelection = """
+      if (sgid == 0) {
+        float v[P1];
+        const device float* sp = scores + base + lane * P1;
+        for (int i = 0; i < P1; i++) v[i] = sp[i];
+        ulong taken = 0;
+        float bv = -INFINITY;
+        int bi = -1;
+        for (int i = 0; i < P1; i++) {
+          if (bi < 0 || v[i] > bv) { bv = v[i]; bi = i; }
+        }
+        for (int c = 0; c < C; c++) {
+          float mv = bv;
+          int mi = bi < 0 ? 0x7fffffff : lane * P1 + bi;
+          for (ushort off = 16; off > 0; off >>= 1) {
+            const float ov = simd_shuffle_xor(mv, off);
+            const int oi = simd_shuffle_xor(mi, off);
+            if (oi != 0x7fffffff && (mi == 0x7fffffff || ov > mv || (ov == mv && oi < mi))) {
+              mv = ov; mi = oi;
+            }
+          }
+          if (lane == 0) cand[c] = base + mi;
+          if (mi / P1 == lane) {
+            taken |= (1ul << ulong(mi - lane * P1));
+            bv = -INFINITY;
+            bi = -1;
+            for (int i = 0; i < P1; i++) {
+              if (((taken >> ulong(i)) & 1ul) == 0 && (bi < 0 || v[i] > bv)) { bv = v[i]; bi = i; }
+            }
+          }
+        }
+      }
+    """
+    private static let heapSelection = """
+      if (sgid == 0) {
+        float v[P1];
+        ushort order[P1];
+        const device float* sp = scores + base + lane * P1;
+        bool linear = false;
+        for (int i = 0; i < P1; i++) {
+          v[i] = sp[i];
+          order[i] = ushort(i);
+          linear = linear || ((as_type<uint>(v[i]) & 0x7fffffffu) > 0x7f800000u);
+        }
+        ulong taken = 0;
+        int count = P1;
+        float bv = -INFINITY;
+        int bi = -1;
+        if (linear) {
+          for (int i = 0; i < P1; i++) {
+            if (bi < 0 || v[i] > bv) { bv = v[i]; bi = i; }
+          }
+        } else {
+          for (int root = P1 / 2 - 1; root >= 0; root--) {
+            nhs_sift(v, order, root, count);
+          }
+          bv = v[0]; bi = int(order[0]);
+        }
+        for (int c = 0; c < C; c++) {
+          float mv = bv;
+          int mi = bi < 0 ? 0x7fffffff : lane * P1 + bi;
+          for (ushort off = 16; off > 0; off >>= 1) {
+            const float ov = simd_shuffle_xor(mv, off);
+            const int oi = simd_shuffle_xor(mi, off);
+            if (oi != 0x7fffffff && (mi == 0x7fffffff || ov > mv || (ov == mv && oi < mi))) {
+              mv = ov; mi = oi;
+            }
+          }
+          if (lane == 0) cand[c] = base + mi;
+          if (mi / P1 == lane) {
+            if (linear) {
+              taken |= (1ul << ulong(mi - lane * P1));
+              bv = -INFINITY;
+              bi = -1;
+              for (int i = 0; i < P1; i++) {
+                if (((taken >> ulong(i)) & 1ul) == 0 && (bi < 0 || v[i] > bv)) { bv = v[i]; bi = i; }
+              }
+            } else {
+              count--;
+              if (count > 0) {
+                v[0] = v[count]; order[0] = order[count];
+                nhs_sift(v, order, 0, count);
+                bv = v[0]; bi = int(order[0]);
+              } else {
+                bv = -INFINITY; bi = -1;
+              }
+            }
+          }
+        }
+      }
+    """
+    private static let heapHeader = """
+      inline bool nhs_better(float a, ushort ai, float b, ushort bi) {
+        return a > b || (a == b && ai < bi);
+      }
+      inline void nhs_sift(thread float* values, thread ushort* order, int root, int count) {
+        const float value = values[root];
+        const ushort id = order[root];
+        int child = root * 2 + 1;
+        while (child < count) {
+          if (child + 1 < count && nhs_better(values[child + 1], order[child + 1], values[child], order[child])) {
+            child++;
+          }
+          if (!nhs_better(values[child], order[child], value, id)) break;
+          values[root] = values[child]; order[root] = order[child];
+          root = child; child = root * 2 + 1;
+        }
+        values[root] = value; order[root] = id;
+      }
+    """
+    private static let heapSelectSource = selectSource.replacingOccurrences(
+        of: scanSelection, with: heapSelection)
+    private static let heapSelectKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_select_private_heap_affine4_gs64",
+        inputNames: ["scores", "w", "scales", "biases", "x"],
+        outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
+        source: heapSelectSource, header: nemotronMultiRowQMVHeader + "\n" + heapHeader)
+    private final class HeapAdmission: @unchecked Sendable {
+        let lock = NSLock()
+        var shapes: Set<[Int]> = []
+    }
+    private static let heapAdmission = HeapAdmission()
+    private static let heapRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_HEAP"] != "0"
+
+    /// Compare the whole selector/rescore with the retained source at load.
+    /// Only shape admission metadata survives; no synthetic arrays are cached.
+    static func prepareHeapSelector(weight: MLXArray, scales: MLXArray, biases: MLXArray,
+                                    chunk: Int, keep: Int) {
+        guard heapRequested, chunk == 1024, (4...64).contains(keep), keep % 4 == 0,
+              selectSource.components(separatedBy: scanSelection).count == 2 else { return }
+        let shape = [chunk, keep]
+        heapAdmission.lock.withLock { _ = heapAdmission.shapes.remove(shape) }
+        var admitted = false
+        do {
+            admitted = try withError {
+                let chunks = 3, count = chunk * chunks, groups = 8
+                let x = MLXArray((0..<width).map { Float(($0 * 37) % 127 - 63) / 64 })
+                    .asType(.bfloat16).reshaped(1, 1, width)
+                for pattern in 0..<6 {
+                    let values = (0..<count).map { i -> Float in
+                        switch pattern {
+                        case 0: return Float((i * 73 + 19) % 257 - 128) / 8
+                        case 1: return Float(count - i)
+                        case 2: return i % 2 == 0 ? Float(0) : Float(bitPattern: 0x80000000)
+                        case 3: return -Float.infinity
+                        case 4: return i % 97 == 0 ? Float.infinity : Float(i % 11 - 5)
+                        default:
+                            return i % 53 == 0 ? Float(bitPattern: 0x7fc01234) : Float(i % 7 - 3)
+                        }
+                    }
+                    let scores = MLXArray(values)
+                    let template: [(String, any KernelTemplateArg)] = [
+                        ("T", DType.bfloat16), ("CH", chunk), ("C", keep), ("NSG", groups)]
+                    func run(_ kernel: MLXFast.MLXFastKernel) -> [MLXArray] {
+                        kernel([scores, weight, scales, biases, x], template: template,
+                            grid: (32, groups * chunks, 1), threadGroup: (32, groups, 1),
+                            outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
+                            outputDTypes: [.int32, .float32, .float32, .int32])
+                    }
+                    let reference = run(selectKernel), candidate = run(heapSelectKernel)
+                    for index in reference.indices {
+                        let a = reference[index], b = candidate[index]
+                        let equal = a.dtype == .float32
+                            ? (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                            : (a .== b).all()
+                        if !equal.item(Bool.self) { return false }
+                    }
+                }
+                return true
+            }
+        } catch {
+            admitted = false
+        }
+        if admitted { heapAdmission.lock.withLock { _ = heapAdmission.shapes.insert(shape) } }
+        FileHandle.standardError.write(Data(
+            "nemotron mtp head selector heap: \(admitted ? "bitwise qualified" : "off; original selector")\n".utf8))
+    }
     private static let finalKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_final",
         inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
@@ -1519,7 +1698,10 @@ enum NemotronHeadScreen {
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
         let selectGroups = 8
-        let picked = selectKernel(
+        let heap = hidden.dtype == .bfloat16
+            && heapAdmission.lock.withLock { heapAdmission.shapes.contains([chunk, keep]) }
+        let selector = heap ? heapSelectKernel : selectKernel
+        let picked = selector(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),

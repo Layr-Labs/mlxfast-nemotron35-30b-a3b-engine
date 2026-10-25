@@ -126,6 +126,8 @@ private final class NemotronMTPDraftHead {
               let prefix, prefix.weight.dim(0) == rows,
               gamma.shape == [k]
         else { return report("off (head, shape or setting does not qualify)") }
+        NemotronHeadScreen.prepareHeapSelector(weight: head.weight, scales: head.scales,
+            biases: biases, chunk: chunk, keep: keep)
         // Weight-only importance per K-group: sum over the group's columns of
         // gamma[c]^2 * ||W[:, c]||^2 over the scored rows.
         let g = gamma.asType(.float32)
