@@ -12,6 +12,7 @@ import MLXNN
 final class NemotronH35MTPCompactGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
+        let decayQualified: Bool
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private static let enabled =
@@ -36,10 +37,12 @@ final class NemotronH35MTPCompactGraphCache {
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared)
         }
         let usesPrepared = prepared != nil
+        let decayQualified = owner.mtpConvDtDecayQualified
         let slot = usesPrepared ? 1 : 0
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
-            if let entry = entries[slot], entry.identity == identity { return entry }
+            if let entry = entries[slot], entry.identity == identity,
+                entry.decayQualified == decayQualified { return entry }
             let state = owner.innerState()
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
@@ -48,7 +51,8 @@ final class NemotronH35MTPCompactGraphCache {
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[3] : nil)
             }
-            let replacement = Entry(identity: identity, function: function)
+            let replacement = Entry(
+                identity: identity, decayQualified: decayQualified, function: function)
             retired = entries[slot]
             entries[slot] = replacement
             return replacement
@@ -56,7 +60,7 @@ final class NemotronH35MTPCompactGraphCache {
         let result = withExtendedLifetime(retired) {
             current.function([hidden, convState, initialSSM] + (prepared.map { [$0] } ?? []))
         }
-        guard result.count == 5 else {
+        guard (5...6).contains(result.count) else {
             // Retain any enclosing MLX error while avoiding empty indexing.
             return owner.mtpCompactArrays(
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared)
@@ -83,6 +87,60 @@ final class NemotronH35MTPCompactGraphCache {
 }
 
 extension NemotronHMamba2Mixer {
+    /// Fixed synthetic admission on the official worker, before any captured
+    /// graph is traced. A failure leaves the exact original producer/SSM path.
+    func qualifyConvDtDecay(activationDType: DType) -> Bool {
+        guard Self.convDtDecayEnabled, nemotronMTPCompactSSM else { return false }
+        do {
+            return try withError {
+                for width in 2...4 {
+                    let value = [Float(0), 0.125, -0.375][width - 2]
+                    let oldState = (MLXArray.ones(
+                        [1, 3, convDim], dtype: activationDType) * -0.0625).asType(activationDType)
+                    let input = (MLXArray.ones(
+                        [1, width, convDim], dtype: activationDType) * value).asType(activationDType)
+                    let rawDt = (MLXArray.ones(
+                        [1, width, numHeads], dtype: activationDType) * value).asType(activationDType)
+                    guard let fused = packedConvDtDecay(oldState, input, rawDt, qualifying: true),
+                          let original = packedConvDt(oldState, input, rawDt)
+                    else { return false }
+                    var checks = [
+                        (fused.convolution.view(dtype: .uint16)
+                            .== original.convolution.view(dtype: .uint16)).all(),
+                        (fused.padded.view(dtype: .uint16)
+                            .== original.padded.view(dtype: .uint16)).all(),
+                        (fused.dt.view(dtype: .uint32) .== original.dt.view(dtype: .uint32)).all(),
+                    ]
+                    // Nonzero state makes the decay observable even when an
+                    // input or model bias happens to make x/B/C zero.
+                    let state = MLXArray.ones(
+                        [1, numHeads, headDim, ssmStateSize], dtype: .float32) * 0.25
+                    for keep in 1...width {
+                        let output = keep == width
+                        let reference = nemotronMTPSSMCompact(
+                            convolution: original.convolution, ALog: aLog, D: D, dt: original.dt,
+                            state: state, heads: numHeads, headDim: headDim, groups: numGroups,
+                            stateDim: ssmStateSize, steps: keep, writeOutput: output)
+                        let candidate = nemotronMTPSSMCompact(
+                            convolution: fused.convolution, ALog: aLog, D: D, dt: fused.dt,
+                            state: state, heads: numHeads, headDim: headDim, groups: numGroups,
+                            stateDim: ssmStateSize, steps: keep, writeOutput: output,
+                            decay: fused.decay)
+                        checks.append((reference.finalState.view(dtype: .uint32)
+                            .== candidate.finalState.view(dtype: .uint32)).all())
+                        if output {
+                            checks.append((reference.output.view(dtype: .uint16)
+                                .== candidate.output.view(dtype: .uint16)).all())
+                        }
+                    }
+                    eval(checks)
+                    if !checks.allSatisfy({ $0.item(Bool.self) }) { return false }
+                }
+                return true
+            }
+        } catch { return false }
+    }
+
     func cbv2ForwardCaptured(
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation], prepared: MLXArray? = nil
@@ -124,10 +182,11 @@ extension NemotronHMamba2Mixer {
             hiddenStates, convState: convState, initialSSM: initialSSM, prepared: prepared,
             owner: self)
         let (padded, convolution, dt, finalSSM) = (arrays[1], arrays[2], arrays[3], arrays[4])
+        let decay: MLXArray? = arrays.count > 5 ? arrays[5] : nil
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
-        let tape = [padded, convolution, dt]
+        let tape = [padded, convolution, dt] + (decay.map { [$0] } ?? [])
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
         do {
             try evaluation.stagePrefixReplay(
@@ -144,7 +203,7 @@ extension NemotronHMamba2Mixer {
                         ssm: nemotronMTPSSMCompact(
                             convolution: convolution, ALog: logA, D: skip, dt: dt,
                             state: initialSSM, heads: heads, headDim: dim, groups: groups,
-                            stateDim: state, steps: keep, writeOutput: false).finalState)
+                            stateDim: state, steps: keep, writeOutput: false, decay: decay).finalState)
                 })
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
@@ -165,16 +224,20 @@ extension NemotronHMamba2Mixer {
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let rawDt = parts[2].reshaped(batch, length, numHeads)
-        let (convolution, padded, dt) = packedConvDt(convState, input, rawDt) ?? {
+        let fusedDecay = packedConvDtDecay(convState, input, rawDt)
+        let (convolution, padded, dt) = fusedDecay.map {
+            ($0.convolution, $0.padded, $0.dt)
+        } ?? packedConvDt(convState, input, rawDt) ?? {
             let (convolution, padded) = packedConv(convState, input)
             return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
         }()
+        let decay = fusedDecay?.decay
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+            steps: length, writeOutput: true, decay: decay)
         let y = result.output.reshaped(batch, length, heads * dim)
         let normalized: MLXArray
         let prepared: MLXArray?
@@ -197,7 +260,7 @@ extension NemotronHMamba2Mixer {
             prepared = nil
         }
         return [nemotronMTPLinearRows(normalized, outProj, prepared: prepared),
-                padded, convolution, dt, result.finalState]
+                padded, convolution, dt, result.finalState] + (decay.map { [$0] } ?? [])
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -294,8 +357,21 @@ extension NemotronH35Model {
     /// a JIT compile never lands inside a timed decode window. Dummy inputs
     /// use the real parameter dtypes, hence the exact runtime instantiations.
     func warmMTPSSMKernels(activationDType: DType) {
-        guard let mixer = modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first
-        else { return }
+        let mixers = modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard let mixer = mixers.first else { return }
+        if NemotronHMamba2Mixer.convDtDecayEnabled, nemotronMTPCompactSSM {
+            var admitted = 0
+            for layer in mixers {
+                if !layer.mtpConvDtDecayQualificationComplete {
+                    layer.mtpConvDtDecayQualified = layer.qualifyConvDtDecay(
+                        activationDType: activationDType)
+                    layer.mtpConvDtDecayQualificationComplete = true
+                }
+                if layer.mtpConvDtDecayQualified { admitted += 1 }
+            }
+            FileHandle.standardError.write(Data(
+                "MTP conv/dt/decay admission: \(admitted)/\(mixers.count) layers\n".utf8))
+        }
         let history = mixer.convKernelSize - 1
         let (heads, dim, groups, stateDim) =
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)

@@ -84,23 +84,31 @@ let nemotronMTPCompactSSM =
 // recovered at commit by the same kernel run for `L = keep` steps from the
 // same input state, which reproduces the per-position state bit for bit.
 private enum NemotronMTPCompactSSMKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_ssm_compact",
-        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
-        outputNames: ["out", "state_out"],
-        source: """
+    static let vectorState =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_VEC_STATE"] != "0"
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
             constexpr int n_per_t = (Ds + 31) / 32;
+            constexpr bool vec_state = VS && n_per_t == 4 && Ds % 32 == 0;
             auto ds_idx = thread_position_in_threadgroup.x;
             auto d_idx = thread_position_in_grid.y;
             if constexpr (Dh % 8 != 0) { if (d_idx >= Dh) return; }
             float prior[n_per_t];
-            for (int i = 0; i < n_per_t; ++i) {
-                auto s_idx = n_per_t * ds_idx + i;
-                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
-                prior[i] = state_in[n * Dh * Ds + d_idx * Ds + s_idx];
+            if constexpr (vec_state) {
+                const float4 p = *(const device float4*)(
+                    state_in + n * Dh * Ds + d_idx * Ds + n_per_t * ds_idx);
+                prior[0] = p.x;
+                prior[1] = p.y;
+                prior[2] = p.z;
+                prior[3] = p.w;
+            } else {
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    prior[i] = state_in[n * Dh * Ds + d_idx * Ds + s_idx];
+                }
             }
             for (int t = 0; t < L; ++t) {
                 auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
@@ -115,8 +123,10 @@ private enum NemotronMTPCompactSSMKernel {
                     if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
                     auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
                     auto state = dA * prior[i] + dB_by_x;
-                    if (t == L - 1) {
-                        state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                    if constexpr (!vec_state) {
+                        if (t == L - 1) {
+                            state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                        }
                     }
                     prior[i] = static_cast<U>(state);
                     acc += state * C_[s_idx];
@@ -128,7 +138,25 @@ private enum NemotronMTPCompactSSMKernel {
                     }
                 }
             }
-            """)
+            if constexpr (vec_state) {
+                *(device float4*)(state_out + (n * Dh + d_idx) * Ds + n_per_t * ds_idx) =
+                    float4(prior[0], prior[1], prior[2], prior[3]);
+            }
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_v4",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
+        outputNames: ["out", "state_out"],
+        source: source)
+    // Preserve the complete float4/scalar state paths. Only dA's producer moves.
+    static let decayKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_v4_precomputed_decay",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "decay"],
+        outputNames: ["out", "state_out"],
+        source: source.replacingOccurrences(of: """
+                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                auto dA = fast::exp(A * dt_);
+            """, with: "auto dA = decay[t * H + n];"))
 }
 
 /// `convolution` is the window's activated conv output `[1, W, convDim]`
@@ -138,20 +166,23 @@ private enum NemotronMTPCompactSSMKernel {
 func nemotronMTPSSMCompact(
     convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
     state: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int,
-    steps: Int, writeOutput: Bool
+    steps: Int, writeOutput: Bool, decay: MLXArray? = nil
 ) -> (output: MLXArray, finalState: MLXArray) {
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
     precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
-    let outputs = NemotronMTPCompactSSMKernel.kernel(
-        [convolution, ALog, D, dt, state],
+    if let decay { precondition(decay.dtype == .float32 && decay.shape == dt.shape) }
+    let kernel = decay == nil
+        ? NemotronMTPCompactSSMKernel.kernel : NemotronMTPCompactSSMKernel.decayKernel
+    let outputs = kernel(
+        [convolution, ALog, D, dt, state] + (decay.map { [$0] } ?? []),
         template: [("T", convolution.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
                    ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
-                   ("WO", writeOutput)],
+                   ("WO", writeOutput), ("VS", NemotronMTPCompactSSMKernel.vectorState)],
         grid: (32, headDim, heads), threadGroup: (32, 8, 1),
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])

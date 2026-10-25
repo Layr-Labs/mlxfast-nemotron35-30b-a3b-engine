@@ -53,6 +53,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     var attentionMetadata: CBv2AttentionMetadataForward?
     var attentionPacket: CBv2AttentionPacketForward?
 
+    /// Set only on the embedded assistant's private request-owned cache.
+    public var nemotronDraftAttention = false
     public let layerIndex: Int
     public let kind: CBv2LayerKind
     let pool: PagedKVPool
@@ -438,7 +440,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 group: group, rows: descriptors, sinks: preparedSinks(sinks),
                 params: params(scale: scale), softcap: attentionSoftcap != nil,
                 source: pool.kernelSource,
-                dispatchCache: segmentDispatchCache).expandedDimensions(axis: 2)
+                dispatchCache: segmentDispatchCache,
+                draftAttention: nemotronDraftAttention).expandedDimensions(axis: 2)
             let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
             metadata?.finishPaged(
                 group: group, kernelOutputDType: result.dtype, output: output,
@@ -474,7 +477,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 softcap: attentionSoftcap != nil,
                 pageSize: pool.config.pageSize,
                 writeFence: group.writeFence,
-                kernelSource: pool.kernelSource
+                kernelSource: pool.kernelSource,
+                draftAttention: nemotronDraftAttention
             )
         } catch {
             pool.writeValidation.record(error)
@@ -552,7 +556,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 return PagedMTPBatchedColumns.attend(queries: queries, keys: keys, values: values,
                     row: rows[0], group: group, sinks: preparedSinks(sinks), params: params(scale: scale),
                     softcap: attentionSoftcap != nil, source: pool.kernelSource,
-                    dispatchCache: segmentDispatchCache)
+                    dispatchCache: segmentDispatchCache,
+                    draftAttention: nemotronDraftAttention)
             }
         }
         outputs.reserveCapacity(l)
