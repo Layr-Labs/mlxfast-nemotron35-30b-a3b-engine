@@ -349,6 +349,10 @@ private final class NemotronMTPDraftHead {
             }
         }
         screen = plan
+        // The screen's launches bind first-row views of the head and record
+        // arrays they address from the base pointer (`NemotronBankBinding`).
+        NemotronBankBinding.warmDense(nil, extra: [plan.weight, plan.scales, plan.biases]
+            + [plan.records, plan.packed].compactMap { $0 })
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
         // well, so neither builds inside a timed window.

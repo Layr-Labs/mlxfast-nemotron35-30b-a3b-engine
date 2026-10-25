@@ -244,8 +244,11 @@ enum NemotronHResidualRMSNorm {
     /// (first slot, then `slot + total` in slot order, BF16 store) runs here
     /// instead of in its own launch. Every later expression is unchanged.
     private static func sumProductsPreparedSource() -> String {
+        withProductsReduce(sumPreparedSource())
+    }
+
+    private static func withProductsReduce(_ s: String) -> String {
         let add = "T part = rhs[offset + i] + shared[offset + i];"
-        let s = sumPreparedSource()
         precondition(s.components(separatedBy: add).count == 2)
         return s.replacingOccurrences(of: add, with: """
             const size_t column = lid * n_reads + i;
@@ -444,10 +447,47 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
         source: sumSource(), ensureRowContiguous: true)
+    /// The draft tail's join over its six routed slot products ([6 * 2688]
+    /// FP32): the top-six reduce of `sumProductsPreparedSource`, one row.
+    private static let sumProductsKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_products_rms_bf16",
+        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: withProductsReduce(sumSource()), ensureRowContiguous: true)
 
+    /// Load time: the one-row products join against the separate top-six
+    /// reduce plus `applySum`, bit for bit, on seeded rows and the head's norms.
+    static func checkDraftProductsJoin(_ head: Module) -> Bool {
+        let norms = head.modules().compactMap { $0 as? RMSNorm }.filter {
+            type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+        }
+        guard !norms.isEmpty else { return false }
+        var ok = MLXArray(true)
+        for (seed, norm) in norms.enumerated() {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x6a11 + seed)), into: 3)
+            let lhs = MLXRandom.normal([1, 1, 2688], key: keys[0]).asType(.bfloat16)
+            var products = MLXRandom.normal([6 * 2688], scale: 0.05, key: keys[1])
+            if seed % 2 == 1 { products = which(abs(products) .< MLXArray(Float(0.03)), MLXArray(Float(0)), products) }
+            let shared = MLXRandom.normal([1, 1, 2688], scale: 0.1, key: keys[2]).asType(.bfloat16)
+            guard let fused = applySum(lhs, products, shared: shared, norm: norm),
+                  let expected = applySum(lhs, NemotronZSkip.reduceProducts(products, rows: 1),
+                                          shared: shared, norm: norm)
+            else { return false }
+            ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                (fused.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                (fused.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()))
+        }
+        return ok.item(Bool.self)
+    }
+
+    /// `rhs` [6 * 2688] FP32 is the draft tail's routed slot products
+    /// (`NemotronZSkip.draftProducts`); the join sums them itself.
     static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
     {
+        if rhs.shape == [6 * 2688] {
+            return applyProductsSum(lhs, rhs, shared: shared, norm: norm)
+        }
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
             rhs.shape == lhs.shape, shared.shape == lhs.shape, lhs.dtype == .bfloat16,
@@ -462,6 +502,33 @@ enum NemotronHResidualRMSNorm {
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
         guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
         let summed = lhs + (rhs + shared)
+        let ok = MLX.logicalAnd(
+            (result[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
+            (result[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
+        return (which(ok, result[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, result[1], MLXArray(Float.nan).asType(.bfloat16)))
+    }
+
+    private static func applyProductsSum(
+        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray) {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            lhs.shape == [1, 1, 2688], shared.shape == lhs.shape, lhs.dtype == .bfloat16,
+            shared.dtype == .bfloat16, products.dtype == .float32,
+            type(of: norm) == RMSNorm.self,
+            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else {
+            // Not reachable on the draft tail that requested products.
+            let summed = lhs + (NemotronZSkip.reduceProducts(products, rows: 1) + shared)
+            return (summed, norm(summed))
+        }
+        let (axis, eps) = scalars(norm.eps)
+        let result = sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
+        let summed = lhs + (NemotronZSkip.reduceProducts(products, rows: 1) + shared)
         let ok = MLX.logicalAnd(
             (result[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
             (result[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
@@ -4953,3 +5020,5 @@ public struct NemotronHConfiguration: Codable, Sendable {
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
 private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
+
+// Second measurement of jacklightChen's submission c4206a9f-d3a8-40c1-b3b7-df1bc0c718c8; code unchanged.
