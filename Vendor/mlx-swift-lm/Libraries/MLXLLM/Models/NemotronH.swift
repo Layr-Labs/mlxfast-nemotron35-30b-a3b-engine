@@ -64,7 +64,7 @@ let nemotronVerifyFirstSubmit =
 let nemotronVerifySubmitLayers: Set<Int>? = {
     let env = ProcessInfo.processInfo.environment
     guard env["NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL"] == nil else { return nil }
-    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,13,26")
+    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,3,9,18,30")
         .split(separator: ",").compactMap { Int($0) })
 }()
 
