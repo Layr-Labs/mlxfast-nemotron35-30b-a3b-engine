@@ -83,6 +83,8 @@ extension NemotronH35MTPAssistant {
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronMoELeader.warm(target)
+        NemotronFC1SharedUp.verify(target)
+        NemotronFC2SharedDown.verify(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)

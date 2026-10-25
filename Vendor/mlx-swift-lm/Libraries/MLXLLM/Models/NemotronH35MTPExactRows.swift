@@ -877,6 +877,19 @@ enum NemotronHeadPreparedActivation {
         dictLaunch(k: k, n: n, rps: 2) != nil
     }
 
+    /// The body `apply` runs for an R = 3 [k, n] launch at RPS 2, record or
+    /// dictionary form, when that launch is the crown body on (32, 2, 1)
+    /// threadgroups (no decode swap, load form or geometry entry); else nil.
+    static func crownLaunchSource(k: Int, n: Int, dict: Bool) -> String? {
+        let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
+        guard hf.isEmpty, loadForm(k: k, n: n) == 0, preparedGeometry[[k, n]] == nil else { return nil }
+        if dict {
+            guard dictLaunch(k: k, n: n, rps: 2) != nil else { return nil }
+            return nemotronSBDictSource(nemotronHeadPreparedQMVSource)
+        }
+        return nemotronHeadPreparedQMVSource
+    }
+
     /// The real [K, N] of every R = 3 prepared launch: JIT the non-crown
     /// selections at load (crown ones are compiled by the loops above).
     private static let verifyShapes: [[Int]] = [
@@ -1018,7 +1031,7 @@ enum NemotronHeadPreparedActivation {
     }
 }
 
-private let nemotronSharedUpPackHeader = nemotronMultiRowQMVHeader + """
+let nemotronSharedUpPackHeader = nemotronMultiRowQMVHeader + """
 
 template <typename T, typename U, int values_per_thread>
 inline U nmr_load_vector_tg(const threadgroup T* x, thread U* x_thread) {
@@ -1034,7 +1047,7 @@ inline U nmr_load_vector_tg(const threadgroup T* x, thread U* x_thread) {
 }
 """
 
-private func nemotronSharedUpPackSource() -> String {
+func nemotronSharedUpPackSource() -> String {
     let groups = "constexpr int num_simdgroups = 2;"
     let store = "yp[r * out_vec_size + row] = h;"
     precondition(nemotronHeadPreparedQMVSource.components(separatedBy: groups).count == 2)
@@ -1113,6 +1126,30 @@ enum NemotronSharedUpPacking {
             outputShapes: [[3, n], [3, (n / 8 + 31) / 32, 9 * 32]],
             outputDTypes: [.bfloat16, .float32])
         return (outputs[0], outputs[1])
+    }
+
+    /// The load check passed (`verify`): `apply` takes the packing launch.
+    static var isVerified: Bool { verified }
+    /// Whether `q`'s launch reads (scale, bias) through its dictionary.
+    static func usesDict(_ q: QuantizedLinear) -> Bool {
+        NemotronSBDict.enabled && dictKernel != nil && NemotronSBDict.dict(q) != nil
+    }
+    /// The separate packing launch (`nemotron_shared_up_relu2_pack_r3[_sbd]`):
+    /// the reference of `NemotronFC1SharedUp`.
+    static func reference(_ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
+                          sbDict: Bool = true) -> (MLXArray, MLXArray)? {
+        dispatch(x, q, prepared: prepared, sbDict: sbDict)
+    }
+    /// `apply`'s tail on an already-launched (relu2 activation, packed rows).
+    static func finish(_ activated: MLXArray, packed: MLXArray, x: MLXArray,
+                       up: QuantizedLinear, down: Linear, prepared: MLXArray?) -> MLXArray {
+        var activated = activated
+        if NemotronMoELeader.selfTest {
+            activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
+                x.reshaped(3, x.dim(2)), up, relu2: true, rps: 2, prepared: prepared))
+        }
+        return nemotronMTPLinearRows(
+            activated.reshaped(1, 3, up.weight.dim(0)), down, prepared: packed)
     }
 
     static func apply(_ x: MLXArray, up: Linear, down: Linear,
