@@ -89,6 +89,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     /// One immutable metadata plan; never owns segment storage or a write fence.
     let segmentDispatchCache = PagedSegmentDispatchCache()
+    /// Stateless second-draft attention graph; current arrays are explicit inputs.
+    private let nemotronSecondGraph = NemotronDeviceSecondAttention.Graph()
 
     // Kernel params `{softcap, scale, 0…}` are constant across steps for a
     // layer; cache the device array keyed on the scale actually passed.
@@ -200,6 +202,53 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     }
 
     // MARK: - Attention
+
+    /// Read the accepted prefix and the second draft's own K/V without a
+    /// snapshot, concat, slab write or host acceptance readback. This private
+    /// assistant-only route never changes target attention dispatch.
+    public func nemotronDeviceSecondAttention(
+        queries: MLXArray, ownKeys: MLXArray, ownValues: MLXArray,
+        acceptedDrafts: MLXArray, trustedOffset: Int, postVerifyRows: Int, scale: Float
+    ) -> MLXArray? {
+        guard NemotronDeviceSecondAttention.enabled, nemotronDraftAttention,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              pagedRows.count == 1, attentionSoftcap == nil,
+              queries.shape == [1, 32, 128], queries.dtype == .bfloat16,
+              ownKeys.shape == [1, 2, 128], ownValues.shape == ownKeys.shape,
+              ownKeys.dtype == .bfloat16, ownValues.dtype == .bfloat16,
+              acceptedDrafts.shape == [1], acceptedDrafts.dtype == .int32,
+              (2...8).contains(postVerifyRows), trustedOffset >= 0,
+              trustedOffset < Int(Int32.max) - postVerifyRows - 2
+        else { return nil }
+        let row = pagedRows[0]
+        guard row.windowSize == nil, row.baseOffset == 0,
+              row.absoluteOffset == trustedOffset + postVerifyRows else { return nil }
+        let group = pool.group(row.groupKey)
+        guard !group.writeValidation.isFaulted, group.dtype == .bfloat16,
+              group.key.kvHeads == 2, group.key.headDim == 128, group.pageSize == 16
+        else { return nil }
+        let k: MLXArray, v: MLXArray
+        if group.segmentLayout != nil {
+            // One live private backing can cover this request even when the
+            // allocator has reserved later ranges. Every referenced global
+            // page must belong to that zero-based segment; otherwise fall back.
+            guard group.segments.count == 1,
+                  let segment = group.segments[0], segment.pages.lowerBound == 0,
+                  row.table.allSatisfy({ segment.pages.contains(Int($0)) })
+            else { return nil }
+            k = segment.storage[0]
+            v = segment.storage[1]
+        } else {
+            k = group.kSlab
+            v = group.vSlab
+        }
+        return NemotronDeviceSecondAttention.attend(queries: queries,
+            ownKeys: ownKeys, ownValues: ownValues, accepted: acceptedDrafts,
+            trustedOffset: trustedOffset, postVerifyRows: postVerifyRows,
+            kcache: k, vcache: v, tables: deviceTables(rows: [row]),
+            params: params(scale: scale), group: group, source: pool.kernelSource,
+            graph: nemotronSecondGraph)
+    }
 
     /// Append trusted projected K/V and return the native slab-write fence.
     public func appendTrusted(keys: MLXArray, values: MLXArray) -> [MLXArray] {
