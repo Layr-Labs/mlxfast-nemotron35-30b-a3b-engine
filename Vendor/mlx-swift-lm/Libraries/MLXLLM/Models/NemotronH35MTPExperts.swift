@@ -1561,7 +1561,8 @@ private let nemotronZSkipTiledSeqSource = """
   constexpr int PS = OT + 1;
   typedef float U;
   threadgroup float part[32 * PS];
-  threadgroup T xsh[K];
+  threadgroup float xsh[K];
+  threadgroup float csum[chunks];
   threadgroup uchar cmask[chunks];
 
   const int slot = int(threadgroup_position_in_grid.y);
@@ -1575,9 +1576,25 @@ private let nemotronZSkipTiledSeqSource = """
     uint m = 0;
     for (int i = 0; i < 8; i++) {
       m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
-      xsh[8 * c + i] = xs[8 * c + i];
     }
     cmask[c] = uchar(m);
+    // Prepare each live chunk once; all 32 output lanes consume these
+    // exact FP32 terms. Keep the original two four-value sum groups.
+    if (m != 0) {
+      U sum = 0;
+      for (int i = 0; i < 8; i += 4) {
+        const U x0 = xs[8 * c + i];
+        const U x1 = xs[8 * c + i + 1];
+        const U x2 = xs[8 * c + i + 2];
+        const U x3 = xs[8 * c + i + 3];
+        sum += x0 + x1 + x2 + x3;
+        xsh[8 * c + i] = x0;
+        xsh[8 * c + i + 1] = x1 / 16.0f;
+        xsh[8 * c + i + 2] = x2 / 256.0f;
+        xsh[8 * c + i + 3] = x3 / 4096.0f;
+      }
+      csum[c] = sum;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
@@ -1598,14 +1615,10 @@ private let nemotronZSkipTiledSeqSource = """
         continue;
       }
       thread U xt[8];
-      U sum = 0;
-      const threadgroup T* xv = xsh + 8 * c;
-      for (int i = 0; i < 8; i += 4) {
-        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+      const U sum = csum[c];
+      const threadgroup float* xv = xsh + 8 * c;
+      for (int i = 0; i < 8; i++) {
         xt[i] = xv[i];
-        xt[i + 1] = xv[i + 1] / 16.0f;
-        xt[i + 2] = xv[i + 2] / 256.0f;
-        xt[i + 3] = xv[i + 3] / 4096.0f;
       }
       uint u[4];
       for (int i = 0; i < 4; i++) {
