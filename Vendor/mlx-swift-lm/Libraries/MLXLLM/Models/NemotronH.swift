@@ -1398,30 +1398,41 @@ class NemotronHAttention: Module, NemotronHMixer {
         return wo(output)
     }
 
+    /// The Q/K/V projections `cbv2Forward` takes of `x`; reads no cache.
+    func cbv2Projections(
+        _ x: MLXArray, captureMTP: Bool = false, targetQKV: Bool = false, prepared: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let length = x.dim(1)
+        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+           let outputs = NemotronTargetQKV.apply(
+               x, query: wq, key: wk, value: wv, captureMTP: captureMTP, prepared: prepared) {
+            return NemotronMoELeader.selfTest && length == 1
+                ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+                   nemotronBitwiseOrNaN(outputs.2, wv(x)))
+                : outputs
+        }
+        return (
+            captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
+            captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
+            captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
+    }
+
+    /// `projections`, when given, are `cbv2Projections` of this same `x`
+    /// computed earlier (the MTP draft head queues them before its cache is final).
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
         captureMTP: Bool = false,
         targetQKV: Bool = false,
-        prepared: MLXArray? = nil
+        prepared: MLXArray? = nil,
+        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(
-               x, query: wq, key: wk, value: wv, captureMTP: captureMTP, prepared: prepared) {
-            projections = NemotronMoELeader.selfTest && length == 1
-                ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
-                   nemotronBitwiseOrNaN(outputs.2, wv(x)))
-                : outputs
-        } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
-        }
-        let (q, k, v) = projections
+        precondition(precomputed.map { $0.0.dim(0) == batch && $0.0.dim(1) == length } ?? true,
+                     "NemotronH attention projections do not match their input rows")
+        let (q, k, v) = precomputed ?? cbv2Projections(
+            x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
