@@ -2200,11 +2200,20 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    /// Router rows per threadgroup: one (128 threadgroups) instead of the
+    /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
+    /// order do not depend on which rows share a threadgroup, so the gates,
+    /// indices and weights are the same; `qualify` checks them bit for bit.
+    /// NEMOTRON_MTP_ROUTER_ROWS_PER_TG=4 keeps four rows per threadgroup.
+    static let rowsPerThreadgroup =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_ROWS_PER_TG"] == "4" ? 4 : 1
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_mtp_router_rows_select",
         inputNames: ["w", "x", "K", "N", "bias", "counter"],
         outputNames: ["y", "indices", "weights"],
-        source: nemotronMTPRouterRowsSource + nemotronMTPRouterRowsSelectEpilogue,
+        source: nemotronSwapped(nemotronMTPRouterRowsSource, [
+            ("  constexpr int TM = 4;\n", "  constexpr int TM = \(rowsPerThreadgroup);\n", 1),
+        ]) + nemotronMTPRouterRowsSelectEpilogue,
         header: NemotronHRouterSelection.sigmoidHeader,
         ensureRowContiguous: true, mutableInputs: ["counter"])
 
@@ -2226,7 +2235,7 @@ enum NemotronMTPRouterRowsSelect {
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
         let out = kernel([weight, x, kArray, nArray, bias, counter],
             template: [("T", x.dtype), ("R", rows)],
-            grid: (32 * 32, 8, 1), threadGroup: (32, 8, 1),
+            grid: (32 * (128 / rowsPerThreadgroup), 8, 1), threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128], [1, rows, 6], [1, rows, 6]],
             outputDTypes: [x.dtype, .uint32, .float32])
         return (out[1], out[2])
