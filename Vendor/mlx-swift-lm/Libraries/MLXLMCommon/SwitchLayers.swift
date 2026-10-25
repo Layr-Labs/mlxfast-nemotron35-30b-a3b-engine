@@ -825,6 +825,15 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     private let offsetCastCache = ConstantArrayCastCache()
     private let linearBiasCastCache = ConstantArrayCastCache()
 
+    /// The affine parameter arrays when this layer has no separate linear bias.
+    /// This avoids materializing a flattened parameter tree for inference callers.
+    public var affineQuantizedParameters: (
+        weight: MLXArray, scales: MLXArray, biases: MLXArray
+    )? {
+        guard mode == .affine, bias == nil, let biases else { return nil }
+        return (weight, scales, biases)
+    }
+
     @discardableResult
     public override func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],

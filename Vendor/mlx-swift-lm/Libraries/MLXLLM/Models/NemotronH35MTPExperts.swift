@@ -789,18 +789,12 @@ enum NemotronMoELeader {
 
     static func bank(_ layer: SwitchLinear, k: Int, dtype: DType) -> Bank? {
         guard let q = layer as? QuantizedSwitchLinear, q.mode == .affine,
-              q.bits == 4, q.groupSize == 64 else { return nil }
-        var weight: MLXArray?, scales: MLXArray?, biases: MLXArray?
-        for (key, value) in q.parameters().flattened() {
-            switch key {
-            case "weight": weight = value
-            case "scales": scales = value
-            case "biases": biases = value
-            case "bias": return nil
-            default: break
-            }
-        }
-        guard let weight, let scales, let biases, weight.ndim == 3,
+              q.bits == 4, q.groupSize == 64,
+              let arrays = q.affineQuantizedParameters else { return nil }
+        let weight = arrays.weight
+        let scales = arrays.scales
+        let biases = arrays.biases
+        guard weight.ndim == 3,
               weight.dtype == .uint32, weight.dim(2) * 8 == k,
               scales.dtype == dtype, biases.dtype == dtype,
               k % 64 == 0, k % 512 != 0, k > 256, weight.dim(1) % 8 == 0
