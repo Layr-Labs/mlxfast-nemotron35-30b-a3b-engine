@@ -691,6 +691,27 @@ enum NemotronMambaInProjConvDt {
         source: nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
         header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
 
+    private static func decaySource() -> String {
+        let store = "dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);"
+        precondition(nemotronMambaInProjConvDtEpilogue.components(separatedBy: store).count == 2)
+        let added = """
+
+        const float current_dt = metal::isnan(m) ? m : (m < hi ? m : hi);
+        const float current_A = -fast::exp(static_cast<float>(
+            aLog[int64_t(head) * aLog_strides[0]]));
+        decay[t * NH + head] = fast::exp(current_A * current_dt);
+        """
+        return nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue
+            .replacingOccurrences(of: store, with: store + added)
+    }
+
+    private static let decayKernel = MLXFast.metalKernel(
+        name: "nemotron_mamba_in_proj_conv_dt_decay",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                     "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi", "aLog"],
+        outputNames: ["y", "conv", "padded", "dt", "decay"],
+        source: decaySource(), header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
@@ -699,8 +720,10 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int
-    ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
+        convStart: Int, convDim: Int, heads: Int,
+        decayALog: MLXArray? = nil, qualifyingDecay: Bool = false
+    ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray,
+          dt: MLXArray, decay: MLXArray?)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               x.ndim == 2, rows == 3, x.dtype == .bfloat16, k == 2688, k % 512 != 0,
@@ -718,23 +741,37 @@ enum NemotronMambaInProjConvDt {
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        let outputs = kernel(
+        let decayLog: MLXArray?
+        if let aLog = decayALog, heads == 64, aLog.shape == [heads],
+           [DType.bfloat16, .float32].contains(aLog.dtype),
+           qualifyingDecay || NemotronMambaDecayFusion.isQualified(q, aLog: aLog) {
+            decayLog = aLog
+        } else {
+            decayLog = nil
+        }
+        let withDecay = decayLog != nil
+        let selected = withDecay ? decayKernel : kernel
+        let outputs = selected(
             [q.weight, q.scales, biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
-             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)]
+                + (decayLog.map { [$0] } ?? []),
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", 2), ("CS", convStart), ("CC", convDim),
                        ("DS", convStart + convDim), ("NH", heads)],
             grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
-            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
+            outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]]
+                + (withDecay ? [[1, rows, heads]] : []),
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32]
+                + (withDecay ? [.float32] : []))
         // Self-test: the projection against the multi-row route on the same
         // rows (itself checked against the non-prepared multi-row kernel).
         if NemotronMoELeader.selfTest,
            let reference = NemotronMultiRowQMV.apply(x, q, prepared: packed) {
-            return (nemotronBitwiseOrNaN(outputs[0], reference), outputs[1], outputs[2], outputs[3])
+            return (nemotronBitwiseOrNaN(outputs[0], reference), outputs[1], outputs[2], outputs[3],
+                    withDecay ? outputs[4] : nil)
         }
-        return (outputs[0], outputs[1], outputs[2], outputs[3])
+        return (outputs[0], outputs[1], outputs[2], outputs[3], withDecay ? outputs[4] : nil)
     }
 }
 
@@ -2015,6 +2052,7 @@ enum NemotronMTPRouterRows {
     // only weights verified here at load take the fast path. Filled once by
     // warm(), before any compile trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
+    static func isRowMajor(_ weight: MLXArray) -> Bool { rowMajor.contains(ObjectIdentifier(weight)) }
 
     /// Record row-major router weights, then compile every pipeline the
     /// verify window can request (R = 1...4) at load.
@@ -2031,6 +2069,170 @@ enum NemotronMTPRouterRows {
             gates(MLXArray.zeros([1, rows, 2688], dtype: .bfloat16), gate.weight)
         }
         if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
+// The router gemv above with the selection kernel's body as an epilogue of the
+// grid's last threadgroup. Every threadgroup computes and stores its gates
+// exactly as the gemv does (the text above is unchanged); then it orders that
+// store before a device atomic. The threadgroup that takes the last ticket
+// orders every other store before its reads and runs, per verify row in its
+// own SIMD group, `nemotron_h_router_select`'s statements on those BF16
+// gates: the same sigmoid, bias add, six descending picks with the lowest id
+// on ties, sequential sum, divide and scale. It resets the ticket counter.
+private let nemotronMTPRouterRowsSelectEpilogue = """
+
+  threadgroup uint nmr_ticket[1];
+  threadgroup float nmr_original[R * 128];
+  threadgroup float nmr_normalized[R * 6];
+  if (sgN == 0 && simd_lid == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    nmr_ticket[0] = atomic_fetch_add_explicit((device atomic_uint*)counter, 1u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (nmr_ticket[0] != uint(threadgroups_per_grid.x - 1)) { return; }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  const uint lane = simd_lid;
+  const int row = sgN;
+  float corrected[4];
+  bool selected[4] = {false, false, false, false};
+  float chosen[6];
+  if (row < R) {
+    for (uint i = 0; i < 4; ++i) {
+      const uint id = lane + 32 * i;
+      nmr_original[row * 128 + id] = nemotron_h_router_sigmoid(float(y[row * out_vec_size + id]));
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (row < R) {
+    for (uint i = 0; i < 4; ++i) {
+      const uint id = lane + 32 * i;
+      corrected[i] = nmr_original[row * 128 + id] + bias[id];
+    }
+    for (uint slot = 0; slot < 6; ++slot) {
+      uint local_id = 0xffffffff;
+      float local_score = -INFINITY;
+      for (uint i = 0; i < 4; ++i) {
+        if (!selected[i] && (local_id == 0xffffffff
+            || (!metal::isnan(corrected[i])
+                && (metal::isnan(local_score) || corrected[i] > local_score)))) {
+          local_id = lane + 32 * i;
+          local_score = corrected[i];
+        }
+      }
+      const bool ordered = local_id != 0xffffffff && !metal::isnan(local_score);
+      const bool any_ordered = simd_any(ordered);
+      const float maximum = simd_max(ordered ? local_score : -INFINITY);
+      const uint winner = simd_min(
+          ((!any_ordered && local_id != 0xffffffff)
+              || (ordered && local_score == maximum)) ? local_id : 0xffffffff);
+      if (lane == 0) {
+        indices[row * 6 + slot] = winner;
+        chosen[slot] = nmr_original[row * 128 + winner];
+      }
+      for (uint i = 0; i < 4; ++i) {
+        if (lane + 32 * i == winner) { selected[i] = true; }
+      }
+    }
+    if (lane == 0) {
+      float total = 0.0f;
+      for (uint slot = 0; slot < 6; ++slot) { total = chosen[slot] + total; }
+      const float denominator = total + 1e-20f;
+      for (uint slot = 0; slot < 6; ++slot) {
+        nmr_normalized[row * 6 + slot] = chosen[slot] / denominator;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (row < R && lane < 6) { weights[row * 6 + lane] = nmr_normalized[row * 6 + lane] * 2.5f; }
+  if (sgN == 0 && simd_lid == 0) {
+    atomic_store_explicit((device atomic_uint*)counter, 0u, memory_order_relaxed);
+  }
+"""
+
+/// One launch for a verify window's router: `NemotronMTPRouterRows`'s gemv and
+/// `NemotronHRouterSelection`'s top-six selection (see the epilogue above).
+/// Used only after `qualify` found indices, weights and gates bitwise equal to
+/// the two launches. NEMOTRON_MTP_ROUTER_SELECT_FUSED=0 keeps the two launches.
+enum NemotronMTPRouterRowsSelect {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
+    nonisolated(unsafe) static var verified = false
+    nonisolated(unsafe) private static var counter: MLXArray? = nil
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_router_rows_select",
+        inputNames: ["w", "x", "K", "N", "bias", "counter"],
+        outputNames: ["y", "indices", "weights"],
+        source: nemotronMTPRouterRowsSource + nemotronMTPRouterRowsSelectEpilogue,
+        header: NemotronHRouterSelection.sigmoidHeader,
+        ensureRowContiguous: true, mutableInputs: ["counter"])
+
+    /// x: [1, R, 2688] bf16 (R = 1...4), weight: a row-major [128, 2688] bf16
+    /// router, bias: [128] fp32. Returns (indices [1, R, 6] uint32,
+    /// weights [1, R, 6] fp32), or nil outside the qualified shapes.
+    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false)
+        -> (MLXArray, MLXArray)?
+    {
+        guard enabled, force || verified, let counter,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
+              x.dim(2) == 2688, x.dtype == .bfloat16,
+              weight.dtype == .bfloat16, weight.shape == [128, 2688],
+              NemotronMTPRouterRows.isRowMajor(weight),
+              bias.shape == [128], bias.dtype == .float32
+        else { return nil }
+        let rows = x.dim(1)
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
+        let out = kernel([weight, x, kArray, nArray, bias, counter],
+            template: [("T", x.dtype), ("R", rows)],
+            grid: (32 * 32, 8, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[1, rows, 128], [1, rows, 6], [1, rows, 6]],
+            outputDTypes: [x.dtype, .uint32, .float32])
+        return (out[1], out[2])
+    }
+
+    /// Load time: the fused launch against the gemv + selection pair, bit for
+    /// bit, on seeded rows (R = 1...4, twice each so the counter reset is
+    /// exercised) with a real router weight and bias. Engages only if all match.
+    static func qualify(_ model: Module) {
+        verified = false
+        guard enabled else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp router select fused: \(message)\n".utf8))
+        }
+        let routers = model.modules().compactMap { $0 as? NemotronHMoEGate }
+        guard let gate = routers.first(where: { NemotronMTPRouterRows.isRowMajor($0.weight) }),
+              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32
+        else { return report("off (no row-major router)") }
+        let zero = MLXArray.zeros([1], dtype: .uint32)
+        eval(zero)
+        counter = zero
+        var ok = MLXArray(true)
+        do {
+            let matched = try withError { () -> Bool in
+                for rows in 1...4 {
+                    for seed in 0 ..< 2 {
+                        let key = MLXRandom.key(UInt64(0x5e1ec7 + rows * 16 + seed))
+                        let x = MLXRandom.normal([1, rows, 2688], key: key).asType(.bfloat16)
+                        guard let fused = run(x, gate.weight, bias: gate.eSCB, force: true),
+                              let gates = NemotronMTPRouterRows.gates(x, gate.weight),
+                              let reference = NemotronHRouterSelection.apply(
+                                  gates: gates, eSCB: gate.eSCB, topK: 6, nGroup: 1, topkGroup: 1,
+                                  routedScalingFactor: 2.5, normTopkProb: true)
+                        else { return false }
+                        ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                            (fused.0 .== reference.0).all(),
+                            (fused.1.view(dtype: .uint32) .== reference.1.view(dtype: .uint32)).all()))
+                        eval(ok, fused.0, fused.1)
+                    }
+                }
+                return ok.item(Bool.self) && (counter!.item(UInt32.self) == 0)
+            }
+            verified = matched
+        } catch {
+            verified = false
+        }
+        report(verified ? "on (bitwise equal at R = 1...4)" : "off (differs or failed)")
     }
 }
 

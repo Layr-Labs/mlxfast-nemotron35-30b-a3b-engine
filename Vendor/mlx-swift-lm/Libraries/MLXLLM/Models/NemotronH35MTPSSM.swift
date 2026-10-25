@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 private enum NemotronMTPSSMKernel {
     static let kernel = MLXFast.metalKernel(
@@ -91,6 +92,20 @@ private enum NemotronMTPCompactSSMKernel {
         outputNames: ["out", "state_out"],
         source: source)
 
+    private static func decaySource() -> String {
+        let a = "auto A = -fast::exp(static_cast<float>(A_log[h_idx]));"
+        let d = "auto dA = fast::exp(A * dt_);"
+        precondition(source.components(separatedBy: a).count == 2)
+        precondition(source.components(separatedBy: d).count == 2)
+        return source.replacingOccurrences(of: a, with: "")
+            .replacingOccurrences(of: d, with: "auto dA = decay[t * H + n];")
+    }
+
+    static let decayKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_current_decay",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "decay"],
+        outputNames: ["out", "state_out"], source: decaySource())
+
     static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
@@ -141,15 +156,20 @@ private enum NemotronMTPCompactSSMKernel {
 func nemotronMTPSSMCompact(
     convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
     state: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int,
-    steps: Int, writeOutput: Bool
+    steps: Int, writeOutput: Bool, decay: MLXArray? = nil
 ) -> (output: MLXArray, finalState: MLXArray) {
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
     precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
-    let outputs = NemotronMTPCompactSSMKernel.kernel(
-        [convolution, ALog, D, dt, state],
+    let currentDecay: MLXArray? = decay.flatMap { value in
+        value.dtype == .float32 && value.shape == dt.shape ? value : nil
+    }
+    let kernel = currentDecay == nil
+        ? NemotronMTPCompactSSMKernel.kernel : NemotronMTPCompactSSMKernel.decayKernel
+    let outputs = kernel(
+        [convolution, ALog, D, dt, state] + (currentDecay.map { [$0] } ?? []),
         template: [("T", convolution.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
@@ -159,6 +179,119 @@ func nemotronMTPSSMCompact(
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])
     return (outputs[0], outputs[1])
+}
+
+/// Load-time eligibility only. No request state or computed decay is retained.
+/// Every production decay tensor is a current in_proj output and graph edge.
+enum NemotronMambaDecayFusion {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_SSM_DECAY"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var qualified: [ObjectIdentifier: ObjectIdentifier] = [:]
+
+    static func isQualified(_ q: QuantizedLinear, aLog: MLXArray) -> Bool {
+        enabled && lock.withLock { qualified[ObjectIdentifier(q)] == ObjectIdentifier(aLog) }
+    }
+
+    private static let reference = MLXFast.metalKernel(
+        name: "nemotron_mamba_decay_original_expression",
+        inputNames: ["A_log", "dt"], outputNames: ["decay"],
+        source: """
+          const uint i = thread_position_in_grid.x;
+          if (i >= 3 * H) return;
+          const uint h_idx = i % H;
+          auto dt_ = static_cast<float>(dt[i]);
+          auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+          auto dA = fast::exp(A * dt_);
+          decay[i] = dA;
+        """)
+
+    private static func sameBits(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
+        let bits: DType = a.dtype == .float32 ? .uint32 : .uint16
+        return (a.view(dtype: bits) .== b.view(dtype: bits)).all()
+    }
+
+    static func qualify(_ model: Module) {
+        lock.withLock { qualified = [:] }
+        guard enabled, NemotronMTPExecution.batchedM1, nemotronMTPCompactSSM,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return }
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard mixers.count == 23 else { return }
+        var built: [ObjectIdentifier: ObjectIdentifier] = [:]
+        for (layer, mixer) in mixers.enumerated() {
+            guard type(of: mixer) == NemotronHMamba2Mixer.self,
+                  mixer.numHeads == 64, mixer.headDim == 64, mixer.numGroups == 8,
+                  mixer.ssmStateSize == 128, mixer.convKernelSize == 4, mixer.convDim == 6144,
+                  mixer.conv1d.groups == mixer.convDim, mixer.conv1d.stride == 1,
+                  mixer.conv1d.dilation == 1, mixer.conv1d.padding == 0,
+                  type(of: mixer.inProj) == QuantizedLinear.self,
+                  let q = mixer.inProj as? QuantizedLinear, let convBias = mixer.conv1d.bias,
+                  mixer.aLog.shape == [64], isFinite(mixer.aLog).all().item(Bool.self)
+            else { return }
+            let limits: [(Float, Float)] = [mixer.timeStepLimit, (0, 0), (1e-6, 1e-6), (10, 10)]
+            for (test, limit) in limits.enumerated() {
+                let seed = UInt64(0xdec000 + layer * 8 + test)
+                let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 3)
+                let x = MLXRandom.normal([3, 2688], dtype: .bfloat16,
+                                         scale: test == 3 ? 3 : 0.5, key: keys[0])
+                let history = MLXRandom.normal([1, 3, 6144], dtype: .bfloat16, key: keys[1])
+                let state = MLXRandom.normal([1, 64, 64, 128], dtype: .float32,
+                                             scale: 0.1, key: keys[2])
+                let prepared: MLXArray? = test % 2 == 0 ? nil
+                    : NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+                guard let original = NemotronMambaInProjConvDt.apply(
+                    x, q, prepared: prepared, oldState: history,
+                    convWeight: mixer.conv1d.weight, convBias: convBias,
+                    dtBias: mixer.dtBias, timeStepLimit: limit,
+                    convStart: mixer.intermediateSize, convDim: mixer.convDim, heads: 64),
+                      let fused = NemotronMambaInProjConvDt.apply(
+                    x, q, prepared: prepared, oldState: history,
+                    convWeight: mixer.conv1d.weight, convBias: convBias,
+                    dtBias: mixer.dtBias, timeStepLimit: limit,
+                    convStart: mixer.intermediateSize, convDim: mixer.convDim, heads: 64,
+                    decayALog: mixer.aLog, qualifyingDecay: true),
+                      let decay = fused.decay
+                else { return }
+                var same = sameBits(original.projected, fused.projected)
+                same = logicalAnd(same, sameBits(original.convolution, fused.convolution))
+                same = logicalAnd(same, sameBits(original.padded, fused.padded))
+                same = logicalAnd(same, sameBits(original.dt, fused.dt))
+                let expectedDecay = reference(
+                    [mixer.aLog, original.dt], template: [("H", 64)],
+                    grid: (3 * 64, 1, 1), threadGroup: (64, 1, 1),
+                    outputShapes: [[1, 3, 64]], outputDTypes: [.float32])[0]
+                same = logicalAnd(same, sameBits(decay, expectedDecay))
+                for keep in 1 ... 3 {
+                    let expected = nemotronMTPSSMCompact(
+                        convolution: original.convolution, ALog: mixer.aLog, D: mixer.D,
+                        dt: original.dt, state: state, heads: 64, headDim: 64,
+                        groups: 8, stateDim: 128, steps: keep, writeOutput: true)
+                    let got = nemotronMTPSSMCompact(
+                        convolution: fused.convolution, ALog: mixer.aLog, D: mixer.D,
+                        dt: fused.dt, state: state, heads: 64, headDim: 64,
+                        groups: 8, stateDim: 128, steps: keep, writeOutput: true, decay: decay)
+                    let replay = nemotronMTPSSMCompact(
+                        convolution: original.convolution, ALog: mixer.aLog, D: mixer.D,
+                        dt: original.dt, state: state, heads: 64, headDim: 64,
+                        groups: 8, stateDim: 128, steps: keep, writeOutput: false)
+                    same = logicalAnd(same, sameBits(got.output, expected.output))
+                    same = logicalAnd(same, sameBits(got.finalState, expected.finalState))
+                    same = logicalAnd(same, sameBits(got.finalState, replay.finalState))
+                }
+                guard same.item(Bool.self) else {
+                    FileHandle.standardError.write(
+                        Data("nemotron in_proj SSM decay off: layer \(layer), case \(test) bit check\n".utf8))
+                    return
+                }
+            }
+            built[ObjectIdentifier(q)] = ObjectIdentifier(mixer.aLog)
+        }
+        lock.withLock { qualified = built }
+        FileHandle.standardError.write(
+            Data("nemotron in_proj SSM decay on: \(built.count) Mamba layers\n".utf8))
+    }
 }
 
 // MARK: - Grouped strict-prefix replay

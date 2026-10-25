@@ -170,6 +170,7 @@ extension NemotronHMamba2Mixer {
         // The window's conv, padded history and timestep come from in_proj's
         // own epilogue when the shapes allow it (same values, one launch fewer).
         var fusedWindow: (MLXArray, MLXArray, MLXArray)? = nil
+        var fusedDecay: MLXArray? = nil
         let projected: MLXArray
         if batch == 1, hiddenStates.ndim == 3, convKernelSize == 4, conv1d.groups == convDim,
            conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
@@ -179,9 +180,11 @@ extension NemotronHMamba2Mixer {
                hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: inputPrepared,
                oldState: convState, convWeight: conv1d.weight, convBias: convBias,
                dtBias: dtBias, timeStepLimit: timeStepLimit,
-               convStart: intermediateSize, convDim: convDim, heads: numHeads) {
+               convStart: intermediateSize, convDim: convDim, heads: numHeads,
+               decayALog: aLog) {
             projected = fused.projected.reshaped(batch, length, -1)
             fusedWindow = (fused.convolution, fused.padded, fused.dt)
+            fusedDecay = fused.decay
         } else {
             projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
         }
@@ -206,7 +209,7 @@ extension NemotronHMamba2Mixer {
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+            steps: length, writeOutput: true, decay: fusedDecay)
         let y = result.output.reshaped(batch, length, heads * dim)
         let normalized: MLXArray
         let prepared: MLXArray?
