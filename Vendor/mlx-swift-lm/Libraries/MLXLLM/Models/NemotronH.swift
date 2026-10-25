@@ -54,6 +54,13 @@ let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
 
+/// Engine request prefill only: layers between submissions. The host still
+/// waits on the previous chunk only every `nemotronPrefillEvalInterval`
+/// layers, so this adds command-buffer boundaries without adding waits.
+/// `NEMOTRON_PREFILL_COMMIT=0` submits only where it waits.
+let nemotronPrefillCommitInterval =
+    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_COMMIT"] == "0" ? 0 : 1
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -1455,7 +1462,7 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : wo(merged)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
     }
 
     // Protocol conformance
@@ -1505,7 +1512,7 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             if NemotronMoELeader.selfTest {
                 activated = nemotronBitwiseOrNaN(activated, relu2(upProj(x)).reshaped(1, 3712))
             }
-            return downProj(activated.reshaped(1, 1, 3712))
+            return nemotronR1Linear(activated.reshaped(1, 1, 3712), downProj)
         }
         return downProj(relu2(upProj(x)))
     }
@@ -3648,6 +3655,7 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
+        var submittedThrough = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3666,6 +3674,7 @@ private class NemotronHBackbone: Module {
             // interval only adds boundaries and never alters the graph.
             let suppressedNorm = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
+            let multiToken = inputs.dim(1) > 1 && !captureMTP
             let submitsEarly = earlyEvalInterval > 0 && next < layers.count
                 && next % earlyEvalInterval == 0
             let nextNorm = next < layers.count && !suppressedNorm
@@ -3686,11 +3695,24 @@ private class NemotronHBackbone: Module {
             preparedActivation = result.2
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
+            let commitsEarly = recyclePrefillChunks && multiToken
+                && nemotronPrefillCommitInterval > 0 && next < layers.count
+                && next % nemotronPrefillCommitInterval == 0
+            if commitsEarly && !submitsEarly {
+                // Request prefill: submit the finished layers without waiting.
+                let states = recurrentState.flatMap {
+                    $0.stagedEvaluationRoots(in: submittedThrough..<next)
+                }
+                asyncEval([hidden] + states)
+                submittedThrough = next
+            }
             if submitsEarly {
-                if inputs.dim(1) > 1 && !captureMTP {
-                    let group = (next - earlyEvalInterval)..<next
-                    let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
+                if multiToken {
+                    let states = recurrentState.flatMap {
+                        $0.stagedEvaluationRoots(in: submittedThrough..<next)
+                    }
                     asyncEval([hidden] + states)
+                    submittedThrough = next
                     if recyclePrefillChunks {
                         if let previous = submittedPrefillChunk { eval(previous) }
                         submittedPrefillChunk = hidden
