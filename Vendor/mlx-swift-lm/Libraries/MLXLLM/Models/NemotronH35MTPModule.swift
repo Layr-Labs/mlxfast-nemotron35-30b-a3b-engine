@@ -290,6 +290,18 @@ final class NemotronH35MTPExpertBlock: Module {
     @ModuleInfo(key: "mixer") var mixer: NemotronHMoE
     @ModuleInfo(key: "final_layernorm") var finalNorm: RMSNorm
     private let oneTokenTailCache = NemotronH35MTPOneTokenTailCache()
+    fileprivate var sparseDraftDown: NemotronMTPDraftSparseDown?
+
+    /// The loader calls this only for its own mtp.layers.1 after weight update,
+    /// before any expert-tail graph is traced. Target MoEs are never passed.
+    func prepareOwnedSparseDraftDown() {
+        guard mixer.numExpertsPerTok == 6 else {
+            sparseDraftDown = nil
+            return
+        }
+        sparseDraftDown = NemotronMTPDraftSparseDown.prepare(mixer.switchMLP)
+        print("[nemotron-mtp-owned-sparse-fc2] \(sparseDraftDown == nil ? "off" : "on (worker bitwise admission passed)")")
+    }
 
     init(_ args: NemotronHConfiguration) {
         _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
@@ -333,9 +345,10 @@ final class NemotronH35MTPExpertBlock: Module {
     fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
         let h = normalized ?? norm(x)
         let (indices, scores) = mixer.gate(h)
+        let sparse = sparseDraftDown?.run(h, indices, scores, mixer.switchMLP)
         guard let sharedExperts = mixer.sharedExperts,
-              let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP)
+              let routed = sparse ?? NemotronMoELeader.switchRowsAndWeightedReduce(
+                  h, indices, scores, mixer.switchMLP)
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
@@ -369,12 +382,14 @@ private final class NemotronH35MTPOneTokenTailCache {
         // reflective module and parameter identities instead.
         let nativeIdentity = Self.nativeIdentity(owner)
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
-        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
-            + (parameters ?? []).map(ObjectIdentifier.init))
+        let identity = (nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
+            + (parameters ?? []).map(ObjectIdentifier.init)))
+            + (owner.sparseDraftDown.map { [ObjectIdentifier($0)] } ?? [])
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             if let entry = entries[mode], entry.identity == identity { return entry }
-            let state = parameters ?? owner.innerState()
+            let state = (parameters ?? owner.innerState())
+                + (owner.sparseDraftDown?.compilationState ?? [])
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MTP expert-tail owner") }
@@ -516,6 +531,11 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
+        // The engine's request prefill (the scored seed) is the first work
+        // after the worker's between-phase cache drain, so let completed
+        // chunks' buffers be reused within it. Halve the chunk there: the seed
+        // pays for re-faulting its transient live set, the scored prefill does
+        // not.
         let hidden = cbv2Hidden(
             tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
             earlyEvalInterval: nemotronPrefillEvalInterval)
