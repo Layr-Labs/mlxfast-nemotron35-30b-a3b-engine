@@ -2220,6 +2220,11 @@ enum NemotronZSkip {
 
     /// The draft head's R = 1 weighted slot products ([6 * 2688] FP32), or nil
     /// when `owner` has no verified draft copy.
+    /// The draft copies' arrays (decode-only backing for the residency lease).
+    static var draftCopyArrays: [MLXArray] {
+        lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+
     static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               owner: SwitchLinear) -> MLXArray? {
         guard x.shape == [6, 1856], x.dtype == .bfloat16,
@@ -2717,6 +2722,11 @@ enum NemotronSBDict {
     /// index is per expert and addressed from its base like the scales).
     static var indexArrays: [MLXArray] {
         lock.withLock { dicts.values.map { $0.index } }
+    }
+
+    /// Every built dictionary's index and table (decode-only backing for the residency lease).
+    static var allArrays: [MLXArray] {
+        lock.withLock { dicts.values.flatMap { [$0.index, $0.table] } }
     }
 
     /// One tensor's pair dictionary, or nil when its pairs need more than 16
