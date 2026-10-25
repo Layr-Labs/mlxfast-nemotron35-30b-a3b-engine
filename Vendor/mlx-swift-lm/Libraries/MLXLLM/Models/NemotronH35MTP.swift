@@ -397,7 +397,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The next first draft queued behind the verify for the device-picked
         /// row, and the host walk's accept count that decides whether to adopt it.
-        var deviceFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
+        var deviceFirstDraft: (ids: MLXArray, out: MLXArray)?
         var hostAcceptedDrafts: Int?
         /// Committed tokens since the last one in the upper vocabulary half
         /// (prompt tail included); Int.max when none has been seen.
@@ -707,7 +707,16 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // submits it only when the engine has a continuing carry.
         s.nextSecondInputs = speculation == nil ? nil : deviceSecondInputs
         s.nextSecondDraft = speculation == nil ? nil : deviceSecondDraft
-        s.nextFirstDraft = speculation == nil ? nil : deviceFirstDraft
+        if let spec = speculation, let first = deviceFirstDraft {
+            // Acceptance is already known on the host. Keep the original K/V
+            // row as a view instead of materializing two device-index gathers.
+            s.nextFirstDraft = (
+                ids: first.ids, out: first.out,
+                keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
+                values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+        } else {
+            s.nextFirstDraft = nil
+        }
     }
     public func discardRound(requestState: any CBv2MTPRequestState) {
         let s = state(requestState)
@@ -849,9 +858,8 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
 
 extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     /// Queue the next round's first draft for the device-picked row right
-    /// behind `speculateAfterVerify`: the same one-token expert/head tail and
-    /// K/V row the host path takes from `speculation` at finalize, gathered
-    /// with the device index instead of a host one.
+    /// behind `speculateAfterVerify`: the same one-token expert/head tail.
+    /// Its K/V row is selected as a view after host acceptance at finalize.
     public func speculateNextFirstDraft(
         acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState
     ) {
@@ -872,18 +880,17 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
         let out = module.finishPagedAttentionRow(attended)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
-        let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
-        s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        s.deviceFirstDraft = (ids: ids, out: out)
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
         guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
-            asyncEval([ids, out, keys, values])
+            asyncEval([ids, out])
             return
         }
         let inputs = module.pagedDraftInputs(
             hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        var roots = [ids, out, keys, values] + inputs
+        var roots = [ids, out] + inputs
         // The rest of the second draft too: its attention reads the head cache,
         // which still holds every post-verify row (they sit last). Attend over
         // the trusted prefix, post-verify rows 0...n for the device-picked n,
