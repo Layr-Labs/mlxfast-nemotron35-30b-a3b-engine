@@ -1908,6 +1908,36 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+// Stage only the native uint16 pair indices, cooperatively, in the existing
+// activation-staging phase. The original first barrier publishes both arrays.
+// The FP32 pair table remains in device memory and all arithmetic stays intact.
+private func nemotronZSkipPairIndexStageSource(_ source: String) -> String? {
+    let declaration = "  threadgroup uchar cmask[chunks];\n"
+    let pointer = "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;\n"
+    let load = "const device uint2*)(sq + gi * OT)"
+    let barrier = "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    guard source.components(separatedBy: declaration).count == 2,
+          source.components(separatedBy: pointer).count == 2,
+          source.components(separatedBy: load).count > 1,
+          source.components(separatedBy: barrier).count == 3
+    else { return nil }
+    var s = source.replacingOccurrences(of: declaration, with:
+        declaration + "  threadgroup uint2 pair_index_stage[groups * (OT / 4)];\n")
+    guard let firstBarrier = s.range(of: barrier) else { return nil }
+    s.insert(contentsOf: """
+      const ulong pair_tile = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
+      const device uint2* pair_input = (const device uint2*)sk + pair_tile * groups * (OT / 4);
+      for (int word = sg * 32 + lid; word < groups * (OT / 4); word += SGS * 32) {
+        pair_index_stage[word] = pair_input[word];
+      }
+
+    """, at: firstBarrier.lowerBound)
+    s = s.replacingOccurrences(of: pointer, with:
+        "  const threadgroup uint16_t* sq = (const threadgroup uint16_t*)pair_index_stage + 4 * lid;\n")
+    s = s.replacingOccurrences(of: load, with: "const threadgroup uint2*)(sq + gi * OT)")
+    return s
+}
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -2030,9 +2060,34 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
+    private static let tiledPairIndexStageKernel = nemotronZSkipDictSource(nemotronZSkipTiledSeqSource)
+        .flatMap(nemotronZSkipPairIndexStageSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_zskip_fc2_slots_tiled_sbd_pair_stage",
+                inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
+    private static let tiledFastPairIndexStageKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .flatMap(nemotronZSkipPairIndexStageSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_zskip_fc2_slots_tiled_fast_sbd_pair_stage",
+                inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
+    /// Disable only the new staging before trying the baseline fallbacks.
+    nonisolated(unsafe) private static var pairIndexStage =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_PAIR_STAGE"] != "0"
+    private static var pairIndexStageKernel: MLXFast.MLXFastKernel? {
+        fast ? tiledFastPairIndexStageKernel : tiledPairIndexStageKernel
+    }
+    private static var originalDictKernel: MLXFast.MLXFastKernel? {
+        fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
+    }
     /// The slot kernel that reads a dictionary copy (the fast or plain tiled form).
     private static var dictKernel: MLXFast.MLXFastKernel? {
-        fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
+        pairIndexStage ? (pairIndexStageKernel ?? originalDictKernel) : originalDictKernel
     }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
@@ -2102,15 +2157,32 @@ enum NemotronZSkip {
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, usePairIndexStage: Bool = true) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
-        return (copy.dict ? dictKernel! : kernel)(
+        return (copy.dict ? (usePairIndexStage ? dictKernel! : originalDictKernel!) : kernel)(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+    }
+
+    /// Worker load only, before the ordinary rounded-output check: compare
+    /// every FP32 product bit with the unmodified dictionary twin. A Metal
+    /// error is a failed staging admission, not a reason to discard the dict.
+    private static func pairIndexStageMatches(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                                              copy: Copy, rows: Int) -> Bool {
+        guard copy.dict, pairIndexStage, pairIndexStageKernel != nil else { return true }
+        do {
+            return try withError {
+                let staged = products(x, inds, scores, copy: copy, rows: rows)
+                let original = products(x, inds, scores, copy: copy, rows: rows, usePairIndexStage: false)
+                return (staged.view(dtype: .uint32) .== original.view(dtype: .uint32)).all().item(Bool.self)
+            }
+        } catch {
+            return false
+        }
     }
 
     /// The record's top-six reduce of `products` output: [1, rows, 2688] BF16.
@@ -2240,6 +2312,7 @@ enum NemotronZSkip {
                            negativeZero, cases[0]))
         var same = MLXArray(true)
         for act in cases {
+            guard pairIndexStageMatches(act, inds, scores, copy: copy, rows: 1) else { return false }
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 1, bank: bank,
                                                            tail8: NemotronMoELeader.leaderTail8)
             let got = run(act, inds, scores, copy: copy, rows: 1)
@@ -2256,6 +2329,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, sbDict, pairIndexStage {
+            pairIndexStage = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: pair-index staging differs; original dictionary kernel\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
             sbDict = false
@@ -2289,7 +2368,7 @@ enum NemotronZSkip {
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
             FileHandle.standardError.write(
-                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, pair stage \(pairIndexStage && pairIndexStageKernel != nil)\n".utf8))
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
@@ -2350,6 +2429,7 @@ enum NemotronZSkip {
         var same = MLXArray(true)
         for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
             let act = (a * a).asType(.bfloat16)
+            guard pairIndexStageMatches(act, inds, scores, copy: copy, rows: 3) else { return false }
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
