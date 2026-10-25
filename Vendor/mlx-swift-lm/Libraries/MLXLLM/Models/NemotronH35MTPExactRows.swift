@@ -265,7 +265,7 @@ private let nemotronHeadPrepareSource = """
   prepared[base + PV * 32] = total;
 """
 
-private let nemotronHeadPreparedQMVSource = """
+let nemotronHeadPreparedQMVSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
   constexpr int packs_per_thread = FAST ? 2 : 1;
