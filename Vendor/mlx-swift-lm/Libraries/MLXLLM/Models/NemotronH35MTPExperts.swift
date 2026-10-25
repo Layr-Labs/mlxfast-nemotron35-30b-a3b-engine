@@ -471,6 +471,25 @@ func nemotronSBDictSource(_ source: String) -> String? {
     return s
 }
 
+/// Prepared-projection-only packed dictionary twin. Shared dictionary tables
+/// remain available for the FC1 and zero-skip copies and their verification.
+func nemotronPreparedPackedSBDictSource(_ source: String) -> String? {
+    guard var s = nemotronSBDictSource(source) else { return nil }
+    s = s.replacingOccurrences(of: "const device float2* sbt = (const device float2*)biases;",
+                              with: "const device uint* sbt = (const device uint*)biases;")
+    s = s.replacingOccurrences(of: "const float2 sbp = sbt[sl[0]];",
+                              with: "const uint sbp = sbt[sl[0]];")
+    s = s.replacingOccurrences(of: "U s = sbp.x;", with: "U s = as_type<float>(sbp << 16);")
+    s = s.replacingOccurrences(of: "U b = sbp.y;", with: "U b = as_type<float>(sbp & 0xffff0000u);")
+    for field in ["sc[row * in_vec_size_g]", "sc[block_size / group_size + row * in_vec_size_g]"] {
+        s = s.replacingOccurrences(of: "sbt[\(field)].x", with: "as_type<float>(sbt[\(field)] << 16)")
+    }
+    for field in ["bs[row * in_vec_size_g]", "bs[block_size / group_size + row * in_vec_size_g]"] {
+        s = s.replacingOccurrences(of: "sbt[\(field)].y", with: "as_type<float>(sbt[\(field)] & 0xffff0000u)")
+    }
+    return s
+}
+
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
@@ -2647,6 +2666,8 @@ enum NemotronSBDict {
         let index: MLXArray
         /// [pairs, 2] FP32: each pair's scale and bias, widened exactly from BF16.
         let table: MLXArray
+        /// Prepared-projection-only exact BF16 payloads: scale low16, bias high16.
+        let packed: MLXArray
     }
 
     private static let lock = NSLock()
@@ -2712,8 +2733,12 @@ enum NemotronSBDict {
             [scales.reshaped(-1).asType(.float32), biases.reshaped(-1).asType(.float32)], axis: 1)
         guard (decoded.view(dtype: .uint32) .== widened.view(dtype: .uint32)).all().item(Bool.self)
         else { return nil }
-        eval(indexArray, table)
-        return Dict(index: indexArray, table: table)
+        let pairWords = stride(from: 0, to: words.count, by: 2).map {
+            (words[$0] >> 16) | (words[$0 + 1] & 0xffff0000)
+        }
+        let packed = MLXArray(pairWords)
+        eval(indexArray, table, packed)
+        return Dict(index: indexArray, table: table, packed: packed)
     }
 
     /// Load time, before any verify graph is traced or warmed: a dictionary for

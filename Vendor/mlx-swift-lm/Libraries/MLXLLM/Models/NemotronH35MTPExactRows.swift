@@ -691,7 +691,7 @@ enum NemotronMambaInProjConvDt {
         source: nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
         header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
     /// The same launch reading (scale, bias) through `NemotronSBDict`.
-    private static let dictKernel = nemotronSBDictSource(
+    private static let dictKernel = nemotronPreparedPackedSBDictSource(
         nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue).map {
         MLXFast.metalKernel(
             name: "nemotron_mamba_in_proj_conv_dt_sbd",
@@ -731,7 +731,7 @@ enum NemotronMambaInProjConvDt {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
+            [q.weight, dict?.index ?? q.scales, dict?.packed ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -834,7 +834,7 @@ enum NemotronHeadPreparedActivation {
             + (nsg ? "_nsg" : "") + "_sbd"
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = dictVariants[name] { return kernel }
-        let kernel = nemotronSBDictSource(nemotronPreparedVariantSource(
+        let kernel = nemotronPreparedPackedSBDictSource(nemotronPreparedVariantSource(
             half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)).map {
             MLXFast.metalKernel(
                 name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
@@ -920,7 +920,7 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
-            return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
+            return kernel([q.weight, d.index, d.packed, packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
                 grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
@@ -1005,7 +1005,7 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
-            return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
+            return kernel([q.weight, d.index, d.packed, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -1070,7 +1070,7 @@ enum NemotronSharedUpPacking {
         outputNames: ["y", "packed"], source: nemotronSharedUpPackSource(),
         header: nemotronSharedUpPackHeader)
     /// The same launch reading (scale, bias) through `NemotronSBDict`.
-    private static let dictKernel = nemotronSBDictSource(nemotronSharedUpPackSource()).map {
+    private static let dictKernel = nemotronPreparedPackedSBDictSource(nemotronSharedUpPackSource()).map {
         MLXFast.metalKernel(
             name: "nemotron_shared_up_relu2_pack_r3_sbd",
             inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
@@ -1106,7 +1106,7 @@ enum NemotronSharedUpPacking {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
+            [q.weight, dict?.index ?? q.scales, dict?.packed ?? biases, input, args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", true), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
