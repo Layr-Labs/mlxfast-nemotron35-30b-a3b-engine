@@ -41,6 +41,9 @@ private final class NemotronMTPDraftHead {
         /// Packed selected scales/biases (`NemotronHeadScreen.packScalesBiases`),
         /// used once its partial scores matched the gathered ones bitwise.
         var packed: MLXArray? = nil
+        /// Packed selected weight words (`NemotronHeadScreen.packWeights`),
+        /// used once its partial scores matched the packed-record ones bitwise.
+        var packedWeights: MLXArray? = nil
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -56,7 +59,8 @@ private final class NemotronMTPDraftHead {
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
-            upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed)
+            upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
+            packedWeights: screen.packedWeights)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -109,9 +113,9 @@ private final class NemotronMTPDraftHead {
             FileHandle.standardError.write(Data("nemotron mtp head screen: \(message)\n".utf8))
         }
         let environment = ProcessInfo.processInfo.environment
-        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 16
+        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 12
         let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? 1024
-        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? 32
+        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? 16
         let k = NemotronHeadScreen.width, rows = NemotronHeadScreen.rows
         guard (2...16).contains(groupCount), groupCount % 2 == 0,
               [512, 1024, 2048].contains(chunk), keep % 4 == 0, (4...min(chunk / 8, 64)).contains(keep),
@@ -261,6 +265,53 @@ private final class NemotronMTPDraftHead {
                 packedNote = "off (partial scores differ)"
             }
         }
+        // Packed weight words: the same copy-and-verify rule, on top of the
+        // packed scales/biases (the partial pass then reads one record per row).
+        var weightsNote = "off"
+        if let packedSB = plan.packed, NemotronHeadScreen.packedWeightsAvailable {
+            let verified: MLXArray?
+            do {
+                verified = try withError { () -> MLXArray? in
+                    let words = NemotronHeadScreen.packWeights(
+                        weight: head.weight, groups: selected, upperGroups: upper)
+                    eval(words)
+                    var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+                    for trial in 0..<8 {
+                        let t = (0..<k).map { _ -> Float in
+                            state = state &* 6364136223846793005 &+ 1442695040888963407
+                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                        }
+                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                        let useUpper = trial % 2 == 0 ? plan.upperGroups : nil
+                        let upperCount = useUpper == nil ? 0 : plan.upperGroupCount
+                        let a = NemotronHeadScreen.run(
+                            x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                            upperGroups: useUpper, upperGroupCount: upperCount, packed: packedSB)
+                        let b = NemotronHeadScreen.run(
+                            x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                            upperGroups: useUpper, upperGroupCount: upperCount, packed: packedSB,
+                            packedWeights: words)
+                        let equal = MLX.logicalAnd(
+                            (a.scores.view(dtype: .uint32) .== b.scores.view(dtype: .uint32)).all(),
+                            MLX.logicalAnd(
+                                (a.candidateIds .== b.candidateIds).all(), (a.id .== b.id).all()))
+                        if !equal.item(Bool.self) { return nil }
+                    }
+                    return words
+                }
+            } catch {
+                verified = nil
+                weightsNote = "off (\(error))"
+            }
+            if let verified {
+                plan.packedWeights = verified
+                weightsNote = "on (\(verified.nbytes >> 10) KiB, bitwise equal)"
+            } else if weightsNote == "off" {
+                weightsNote = "off (partial scores differ)"
+            }
+        }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed path) here as well, so
@@ -270,11 +321,11 @@ private final class NemotronMTPDraftHead {
             eval(NemotronHeadScreen.run(
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
-                packed: plan.packed).id)
+                packed: plan.packed, packedWeights: plan.packedWeights).id)
         }
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
-            + " packed scales/biases \(packedNote),"
+            + " packed scales/biases \(packedNote), packed weights \(weightsNote),"
             + " qualified (synthetic agreement \(chosen.agree)/4)")
     }
 

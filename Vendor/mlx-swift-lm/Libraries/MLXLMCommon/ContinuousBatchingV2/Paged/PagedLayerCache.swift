@@ -550,7 +550,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
            let keys, let values {
             let group = pool.group(rows[0].groupKey)
-            if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group) {
+            if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group,
+                                               draftAttention: nemotronDraftAttention) {
                 mtpBatchedAttentionCalls += 1
                 return PagedMTPBatchedColumns.attend(queries: queries, keys: keys, values: values,
                     row: rows[0], group: group, sinks: preparedSinks(sinks), params: params(scale: scale),
