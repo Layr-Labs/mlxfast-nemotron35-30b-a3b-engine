@@ -731,7 +731,8 @@ enum NemotronMambaInProjConvDt {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(dict?.index ?? q.scales), dict?.table ?? NemotronBankBinding.bind(biases),
+             packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -920,14 +921,14 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
-            return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
+            return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(d.index), d.table, packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
                 grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
         }
         let (kernel, hf, rps, nsg) = projectLaunch(rows: 3, k: k, n: n, rps: 2)
-        return kernel([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+        return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(q.biases!), packed[0], args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)] + hf,
             grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
@@ -1005,13 +1006,13 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
-            return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
+            return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(d.index), d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
         }
         let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
-        return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+        return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(q.biases!), packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -1106,7 +1107,8 @@ enum NemotronSharedUpPacking {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(dict?.index ?? q.scales), dict?.table ?? NemotronBankBinding.bind(biases),
+             input, args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", true), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
@@ -1274,7 +1276,7 @@ enum NemotronMultiRowQMV {
         let half = rows == 3 && form != 0
         let y = (half ? NemotronMultiRowQMVKernel.shared.attentionOutputAddingHalf
                       : NemotronMultiRowQMVKernel.shared.attentionOutputAdding)(
-            [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
+            [residual.reshaped(rows, 2688), NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(offsets),
              x.reshaped(rows, 4096), k, n],
             template: [("T", x.dtype), ("R", rows), ("FAST", true),
                        ("RELU2", false), ("RPS", rps)] + nemotronHalfTemplate(half, form),
@@ -1336,7 +1338,7 @@ enum NemotronMultiRowQMV {
         let half = rows == 1 && form != 0
         return (half ? NemotronMultiRowQMVKernel.shared.kernelHalf
                      : NemotronMultiRowQMVKernel.shared.kernel)(
-            [w, scales, biases, x, kArray, nArray],
+            [NemotronBankBinding.bind(w), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
             grid: (32, n / rps, 1),
@@ -1484,7 +1486,7 @@ enum NemotronMultiRowQMVRowInputs {
         // The same outputs-per-SIMD-group the stacked call picks for (R, K, N).
         let rps = NemotronMultiRowQMV.resultsPerSimdgroup(rows: rows.count, k: k, n: n)
         return kernel(rows: rows.count)(
-            [q.weight, q.scales, biases] + rows + [kArray, nArray],
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(biases)] + rows + [kArray, nArray],
             template: [("T", DType.bfloat16), ("R", rows.count), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)],
             grid: (32, n / rps, 1),
@@ -2430,7 +2432,7 @@ enum NemotronTargetQKV {
               q.scales.dtype == .bfloat16, q.scales.shape == [rows, 42],
               let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [rows, 42]
         else { return nil }
-        return [q.weight, q.scales, offsets]
+        return [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(offsets)]
     }
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
@@ -3071,16 +3073,17 @@ enum NemotronHeadScreen {
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind(weight), NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? (partialHalf ? partialHalfKernel : partialKernel)(
-            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+            [NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), hidden, groups, upperGroups ?? groups],
+            template: partialTemplate,
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
@@ -3088,7 +3091,7 @@ enum NemotronHeadScreen {
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
             let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
-                [scores, weight, scales, biases, hidden, counter],
+                [scores, NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
                            ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
                 grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
@@ -3097,7 +3100,7 @@ enum NemotronHeadScreen {
             return Result(id: picked[4], scores: scores, candidateIds: picked[0], candidateValues: picked[1])
         }
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
-            [scores, weight, scales, biases, hidden],
+            [scores, NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
                 + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
