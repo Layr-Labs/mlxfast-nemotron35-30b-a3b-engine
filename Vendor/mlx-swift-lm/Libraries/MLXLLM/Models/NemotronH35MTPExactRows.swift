@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 enum NemotronMTPExecution {
@@ -441,7 +442,7 @@ private let nemotronHeadPrepareSource = """
   prepared[base + PV * 32] = total;
 """
 
-private let nemotronHeadPreparedQMVSource = """
+private let nemotronHeadPreparedQMVCrownSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
   constexpr int packs_per_thread = FAST ? 2 : 1;
@@ -577,6 +578,28 @@ private let nemotronHeadPreparedQMVSource = """
   }
 """
 
+// NEMOTRON_MTP_QMV_TAIL8: the prepared QMV's K tail (FAST false) in its
+// constant 8-value form. Every caller has K % 64 == 0 and k advances by a
+// multiple of 256, so a lane's `remaining` is 0 or 8: the record tail's
+// `v < remaining ? x : 0` loads all 8 values and its `i < remaining / 4` loop
+// runs i = 0, 1. Both become their constant forms under the same
+// `if (remaining > 0)`, so the tail is the same block of arithmetic. The
+// runtime-length form indexed x_thread dynamically, which kept the whole
+// array out of registers for the entire kernel. Applied to the body every
+// prepared kernel is built from (crown and HF twins, load forms, the Mamba
+// in_proj conv/dt kernel, the fused Q/K/V launches); decode lines untouched.
+let nemotronHeadPreparedQMVTail8 =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_TAIL8"] != "0"
+let nemotronHeadPreparedQMVTail8Swaps: [(String, String, Int)] = [
+    ("x_thread[r][v] = v < remaining ? prepared[base + v * 32] : 0;",
+     "x_thread[r][v] = prepared[base + v * 32];", 1),
+    ("for (int i = 0; i < remaining / 4; i++) {",
+     "for (int i = 0; i < values_per_thread / 4; i++) {", 1),
+]
+private let nemotronHeadPreparedQMVSource = nemotronHeadPreparedQMVTail8
+    ? nemotronSwapped(nemotronHeadPreparedQMVCrownSource, nemotronHeadPreparedQMVTail8Swaps)
+    : nemotronHeadPreparedQMVCrownSource
+
 /// Mamba verify in_proj (R = 3 prepared QMV) whose epilogue also produces the
 /// window's conv + SiLU, padded history and timestep transform. After the
 /// stock store, lane 0 of each simdgroup reads back its own just-stored BF16
@@ -694,6 +717,12 @@ enum NemotronMambaInProjConvDt {
             grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
+        // Self-test: the projection against the multi-row route on the same
+        // rows (itself checked against the non-prepared multi-row kernel).
+        if NemotronMoELeader.selfTest,
+           let reference = NemotronMultiRowQMV.apply(x, q, prepared: packed) {
+            return (nemotronBitwiseOrNaN(outputs[0], reference), outputs[1], outputs[2], outputs[3])
+        }
         return (outputs[0], outputs[1], outputs[2], outputs[3])
     }
 }
@@ -2067,6 +2096,34 @@ enum NemotronTargetQKV {
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
         outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronHeadPreparedQMVSource + "\n}",
         header: nemotronMultiRowQMVHeader)
+    // CBV2_KV_IN_PLACE_APPEND: the prepared launch above, whose K and V tiles
+    // also store each BF16 result into the layer's contiguous cache
+    // [1, 2, cap, 128] at token kvpos[0] + r (kvpos = [offset, capacity]).
+    // The stored value is the same `h` the body writes to ky/vy; every other
+    // instruction is the prepared body's.
+    private static let storeLine = "yp[r * out_vec_size + row] = h;"
+    private static let storeAndCache = """
+        yp[r * out_vec_size + row] = h;
+                if (tile >= q_tiles) {
+                  const uint n_out = uint(out_row) + uint(row);
+                  device T* cache = tile < q_tiles + kv_tiles ? kcache : vcache;
+                  cache[((size_t)(n_out / 128) * (size_t)kvpos[1]
+                         + (size_t)(kvpos[0] + r)) * 128 + (n_out % 128)] = h;
+                }
+        """
+    private static let preparedWritingKVKernel: MLXFast.MLXFastKernel = {
+        precondition(nemotronHeadPreparedQMVSource.components(separatedBy: storeLine).count == 2,
+                     "NemotronTargetQKV: prepared body store not unique")
+        return MLXFast.metalKernel(
+            name: "nemotron_target_qkv_prepared_kv_affine4_gs64",
+            inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K",
+                         "kcache", "vcache", "kvpos"],
+            outputNames: ["qy", "ky", "vy"],
+            source: tilePrefix
+                + nemotronHeadPreparedQMVSource.replacingOccurrences(of: storeLine, with: storeAndCache)
+                + "\n}",
+            header: nemotronMultiRowQMVHeader, mutableInputs: ["kcache", "vcache"])
+    }()
 
     /// Kill switch (code constant; 0 = crown kernel): decode form of the
     /// R = 1 fused Q/K/V launch (MTP draft attention). The R = 3 prepared
@@ -2172,6 +2229,68 @@ enum NemotronTargetQKV {
         return (outputs[0], outputs[1], outputs[2])
     }
 
+    /// `apply` for the captured [1, 3] verify window on the prepared launch,
+    /// also storing the K/V rows straight into the layer's contiguous cache
+    /// `[1, 2, capacity, 128]` at tokens `offset ..< offset + 3` (mutable
+    /// inputs; the caller orders later reads after this launch). Returns the
+    /// usual (q, k, v), or nil (nothing launched) when the shapes, dtypes or
+    /// switches do not fit.
+    static func applyWritingKV(
+        _ x: MLXArray, query: Linear, key: Linear, value: Linear,
+        prepared packed: MLXArray?, kCache: MLXArray, vCache: MLXArray,
+        offset: Int, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard CBv2CriticalPathCuts.kvInPlaceAppend,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3, x.dim(2) == 2688, x.dtype == .bfloat16,
+              NemotronMTPExecution.batchedM1, NemotronMultiRowQMV.enabled,
+              preparedEnabled, resultsPerSimdgroup(rows: 3) == 2,
+              kCache.dtype == .bfloat16, vCache.dtype == .bfloat16,
+              kCache.shape == [1, 2, capacity, 128], vCache.shape == kCache.shape,
+              offset >= 0, offset + 3 <= capacity,
+              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
+              let v = buffers(value, rows: 256)
+        else { return nil }
+        let activations = NemotronHeadPreparedActivation.compatible(packed, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        var outputs = preparedWritingKVKernel(
+            q + k + v + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
+                         kCache, vCache, MLXArray([Int32(offset), Int32(capacity)])],
+            template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)],
+            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, 4096], [1, 3, 256], [1, 3, 256]],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        if NemotronMoELeader.selfTest {
+            let expected = dispatch(q + k + v, x, rps: 4)
+            outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
+        }
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// Load-time JIT of the cache-writing launch (scratch caches only).
+    static func warmWritingKV() -> [MLXArray] {
+        guard CBv2CriticalPathCuts.kvInPlaceAppend, preparedEnabled,
+              resultsPerSimdgroup(rows: 3) == 2 else { return [] }
+        let weights = [4096, 256, 256].flatMap { n in
+            [MLXArray.zeros([n, 336], dtype: .uint32),
+             MLXArray.zeros([n, 42], dtype: .bfloat16),
+             MLXArray.zeros([n, 42], dtype: .bfloat16)]
+        }
+        let x = MLXArray.zeros([1, 3, 2688], dtype: .bfloat16)
+        let cache = { MLXArray.zeros([1, 2, 16, 128], dtype: .bfloat16) }
+        let kc = cache(), vc = cache()
+        eval(kc, vc)
+        return preparedWritingKVKernel(
+            weights + [NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688)),
+                       NemotronMultiRowQMV.scalarPair(2688, 4096).0, kc, vc,
+                       MLXArray([Int32(0), Int32(16)])],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", false),
+                       ("RPS", 2)],
+            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, 4096], [1, 3, 256], [1, 3, 256]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16])
+    }
+
     /// Narrow pipelines for the widths that use them (R = 3, 4).
     static func warmNarrow() -> [MLXArray] {
         let weights = [4096, 256, 256].flatMap { n in
@@ -2186,6 +2305,7 @@ enum NemotronTargetQKV {
             outputs += dispatch(weights, MLXArray.zeros([1, 3, 2688], dtype: .bfloat16),
                                 rps: 2, prepared: true)
         }
+        outputs += warmWritingKV()
         return outputs
     }
 }

@@ -129,6 +129,11 @@ extension NemotronHMamba2Mixer {
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
+        // NEMOTRON_MTP_SSM_REPLAY_GROUP: replay with this forward's other
+        // Mamba layers in grouped launches (same per-layer statements).
+        let grouped = NemotronMTPReplayGroup.join(evaluation, .init(
+            convolution: convolution, dt: dt, aLog: logA, D: skip, state: initialSSM,
+            heads: heads, headDim: dim, groups: groups, stateDim: state))
         do {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
@@ -141,7 +146,8 @@ extension NemotronHMamba2Mixer {
                 replay: { keep in
                     CBv2RecurrentLayerState(
                         conv: padded[0..., keep ..< (keep + history), 0...],
-                        ssm: nemotronMTPSSMCompact(
+                        ssm: grouped.map { $0.group.finalState(slot: $0.slot, keep: keep) }
+                            ?? nemotronMTPSSMCompact(
                             convolution: convolution, ALog: logA, D: skip, dt: dt,
                             state: initialSSM, heads: heads, headDim: dim, groups: groups,
                             stateDim: state, steps: keep, writeOutput: false).finalState)
@@ -355,6 +361,15 @@ extension NemotronH35Model {
                     timeStepLimit: mixer.timeStepLimit)
                 roots += [window.output, window.capturedStates]
             }
+        }
+        if nemotronMTPCompactSSM {
+            let mambaLayers = modules().lazy.filter { $0 is NemotronHMamba2Mixer }.count
+            roots += NemotronMTPReplayGroupKernel.warm(
+                layerCount: mambaLayers,
+                convolution: silu(mixer.conv1d(
+                    MLXArray.zeros([1, history + 8, mixer.convDim], dtype: activationDType))),
+                aLog: mixer.aLog, D: mixer.D,
+                heads: heads, headDim: dim, groups: groups, stateDim: stateDim)
         }
         let packed = mixer.packedConv(
             MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),

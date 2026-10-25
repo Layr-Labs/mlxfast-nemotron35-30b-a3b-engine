@@ -1496,6 +1496,41 @@ class NemotronHAttention: Module, NemotronHMixer {
         let length = x.dim(1)
         precondition(precomputed.map { $0.0.dim(0) == batch && $0.0.dim(1) == length } ?? true,
                      "NemotronH attention projections do not match their input rows")
+        // CBV2_KV_IN_PLACE_APPEND: on the captured [1, 3] verify window the
+        // fused Q/K/V launch also stores the K/V rows straight into this
+        // layer's contiguous cache (the slice-update copies of K and V go
+        // away); the serialized SDPA calls then read the cache behind that
+        // launch. Same stored bytes, same attention.
+        if precomputed == nil, captureMTP, targetQKV, batch == 1, length == 3,
+           NemotronMTPAttentionDirect.enabled,
+           numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+           let layerCache = cache as? CBv2LayerCache,
+           let target = layerCache.mtpInPlaceKVTarget(
+               count: length, dtype: x.dtype, headDim: headDim),
+           let qkv = NemotronTargetQKV.applyWritingKV(
+               x, query: wq, key: wk, value: wv, prepared: prepared,
+               kCache: target.keys, vCache: target.values,
+               offset: target.offset, capacity: target.capacity)
+        {
+            var queries = qkv.0.reshaped(batch, length, numHeads, headDim).transposed(0, 2, 1, 3)
+            if NemotronMoELeader.selfTest {
+                // The cache rows just written must be bitwise the K/V rows
+                // the stock slice update would store; poison on a difference.
+                let span = target.offset ..< (target.offset + length)
+                let stored = [target.keys, target.values].map {
+                    depends(input: $0[0..., 0..., span, 0...], dependencies: [qkv.0])
+                }
+                let expected = [qkv.1, qkv.2].map {
+                    $0.reshaped(batch, length, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+                }
+                let same = all(stored[0].view(dtype: .uint16) .== expected[0].view(dtype: .uint16))
+                    .&& all(stored[1].view(dtype: .uint16) .== expected[1].view(dtype: .uint16))
+                queries = which(same, queries, MLXArray(Float.nan).asType(queries.dtype))
+            }
+            let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
+                queries: queries, written: qkv.0, scale: scale, sinks: nil)
+            return NemotronMTPAttentionDirect.project(rows, wo)
+        }
         let (q, k, v) = precomputed ?? cbv2Projections(
             x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
         let queries = q.reshaped(

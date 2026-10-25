@@ -162,6 +162,48 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         )
     }
 
+    /// CBV2_KV_IN_PLACE_APPEND: the storage a producer kernel may write the
+    /// next `n` tokens' K/V into directly (`[1, kvHeads, capacity, headDim]`,
+    /// row-contiguous), with the append position and capacity. nil unless
+    /// the buffers exist, are evaluated, are this row's only owners of their
+    /// bytes (no view or snapshot can observe the write), match `dtype` and
+    /// `headDim`, and the append fits without growth. Nothing changes until
+    /// `commitInPlaceAppend`.
+    func inPlaceAppendTarget(count n: Int, dtype: DType, headDim d: Int)
+        -> (keys: MLXArray, values: MLXArray, offset: Int, capacity: Int)?
+    {
+        guard CBv2CriticalPathCuts.kvInPlaceAppend, n > 0, let keys, let values,
+            d == headDim, keys.dtype == dtype, values.dtype == dtype,
+            keys.shape == [1, kvHeads, capacity, headDim], values.shape == keys.shape,
+            absoluteOffset + n <= capacity, absoluteOffset + n <= maxLength
+        else { return nil }
+        // Exclusive, materialized, row-contiguous storage only: an in-place
+        // write is then visible to nothing that predates it.
+        guard let kInfo = try? keys.evaluatedBufferInfo(), kInfo.isUnique, kInfo.isRowContiguous,
+            let vInfo = try? values.evaluatedBufferInfo(), vInfo.isUnique, vInfo.isRowContiguous
+        else { return nil }
+        return (keys, values, absoluteOffset, capacity)
+    }
+
+    /// After a kernel wrote tokens `[offset, offset + n)` into the buffers
+    /// `inPlaceAppendTarget` returned (`written` is any output of that
+    /// kernel): advance exactly as `update` advances and return the same
+    /// views, each ordered after the write by a dependency edge on `written`.
+    /// The Depends nodes are built on the views (Slice primitives on the
+    /// caller's stream), so the edge stays on that stream. Later rounds read
+    /// the buffers only after this round's readback.
+    func commitInPlaceAppend(count n: Int, written: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(keys != nil && values != nil && absoluteOffset + n <= capacity,
+            "CBv2FullSequenceKV: in-place append without a target")
+        absoluteOffset += n
+        let k = keys![.ellipsis, ..<absoluteOffset, 0...]
+        let v = values![.ellipsis, ..<absoluteOffset, 0...]
+        return (
+            depends(input: k, dependencies: [written]),
+            depends(input: v, dependencies: [written])
+        )
+    }
+
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
         guard let keys, let values else {
             return (
