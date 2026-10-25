@@ -454,7 +454,7 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
+        result[r] += nml_qdot<U, values_per_thread, true>(wl, x_thread, s, b, sum);
       }
       ws += block_size / 2;
       sc += block_size / 64;
@@ -471,7 +471,7 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
+        result[r] += nml_qdot_safe<U, values_per_thread, true>(
             wl, x_thread, s, b, sum, remaining);
       }
     }
@@ -500,7 +500,7 @@ private let nemotronMoELeaderSource = """
         U s = sl[0];
         U b = bl[0];
         U value0, value1;
-        nml_qdot_pair<U, values_per_thread, R == 3>(
+        nml_qdot_pair<U, values_per_thread, true>(
             wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
         result0[r] += value0;
         result1[r] += value1;
@@ -523,7 +523,7 @@ private let nemotronMoELeaderSource = """
         U s = sl[0];
         U b = bl[0];
         U value0, value1;
-        nml_qdot_pair<U, values_per_thread, R == 3>(
+        nml_qdot_pair<U, values_per_thread, true>(
             wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
         result0[r] += value0;
         result1[r] += value1;
@@ -641,7 +641,7 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
+          result[r] += nml_qdot<U, values_per_thread, true>(wl, x_thread, s, b, sum);
         }
         ws += block_size / 2;
         sc += block_size / 64;
@@ -658,7 +658,7 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
+          result[r] += nml_qdot_safe<U, values_per_thread, true>(
               wl, x_thread, s, b, sum, remaining);
         }
       }
@@ -686,7 +686,7 @@ private let nemotronMoELeaderWeightedSource = """
           U s = sl[0];
           U b = bl[0];
           U value0, value1;
-          nml_qdot_pair<U, values_per_thread, R == 3>(
+          nml_qdot_pair<U, values_per_thread, true>(
               wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
           result0[r] += value0;
           result1[r] += value1;
@@ -709,7 +709,7 @@ private let nemotronMoELeaderWeightedSource = """
           U s = sl[0];
           U b = bl[0];
           U value0, value1;
-          nml_qdot_pair<U, values_per_thread, R == 3>(
+          nml_qdot_pair<U, values_per_thread, true>(
               wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
           result0[r] += value0;
           result1[r] += value1;
