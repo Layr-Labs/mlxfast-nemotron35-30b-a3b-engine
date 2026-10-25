@@ -1880,13 +1880,15 @@ private let nemotronZSkipTiledFastSource = """
 // entry is the exact BF16 -> FP32 widening of the pair, so `sv` and `bv` hold
 // the same bits as the shifted BF16 words and every product is unchanged.
 // Nil when the source no longer has the expected statements.
-private func nemotronZSkipDictSource(_ source: String) -> String? {
+private func nemotronZSkipDictSource(_ source: String, packed12: Bool = false) -> String? {
     var s = source
     let pointers = "  const device T* sq = sk + tb * groups * OT + 4 * lid;\n"
         + "  const device T* bq = bk + tb * groups * OT + 4 * lid;\n"
     guard s.components(separatedBy: pointers).count == 2 else { return nil }
     s = s.replacingOccurrences(of: pointers, with:
-        "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;\n"
+        (packed12
+         ? "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * (OT * 3 / 4) + 3 * lid;\n"
+         : "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;\n")
         + "  const device float2* sbt = (const device float2*)bk;\n")
     var replaced = 0
     for indent in ["      ", "        "] {
@@ -1894,7 +1896,13 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
             + indent + "const uint2 br = *((const device uint2*)(bq + gi * OT));\n"
             + indent + "const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};\n"
             + indent + "const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};\n"
-        let to = indent + "const uint2 ir = *((const device uint2*)(sq + gi * OT));\n"
+        let indexLoad = packed12
+            ? indent + "const uint p0 = sq[gi * (OT * 3 / 4)];\n"
+                + indent + "const uint p1 = sq[gi * (OT * 3 / 4) + 1];\n"
+                + indent + "const uint p2 = sq[gi * (OT * 3 / 4) + 2];\n"
+                + indent + "const uint2 ir = uint2((p0 & 0xfffu) | (((p0 >> 12) | ((p1 & 0xffu) << 4)) << 16), ((p1 >> 8) | ((p2 & 0xfu) << 8)) | ((p2 >> 4) << 16));\n"
+            : indent + "const uint2 ir = *((const device uint2*)(sq + gi * OT));\n"
+        let to = indexLoad
             + indent + "const float2 e0 = sbt[ir.x & 0xffffu];\n"
             + indent + "const float2 e1 = sbt[ir.x >> 16];\n"
             + indent + "const float2 e2 = sbt[ir.y & 0xffffu];\n"
@@ -1980,6 +1988,8 @@ enum NemotronZSkip {
         /// The tile-major biases, or with `dict` the bank's FP32 pair table.
         let biases: MLXArray
         var dict = false
+        /// Four 12-bit pair IDs occupy three uint16 words in tile-major order.
+        var packed12 = false
     }
 
     private static let lock = NSLock()
@@ -2034,6 +2044,64 @@ enum NemotronZSkip {
     private static var dictKernel: MLXFast.MLXFastKernel? {
         fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
     }
+    private static let tiledPacked12SlotKernel = nemotronZSkipDictSource(
+        nemotronZSkipTiledSeqSource, packed12: true).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_sbd12",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"],
+            source: $0, header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static let tiledFastPacked12SlotKernel = nemotronZSkipDictSource(
+        nemotronZSkipTiledFastSource, packed12: true).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd12",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"],
+            source: $0, header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static var packed12Kernel: MLXFast.MLXFastKernel? {
+        fast ? tiledFastPacked12SlotKernel : tiledPacked12SlotKernel
+    }
+    nonisolated(unsafe) private static var packed12Enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SB_PACK12"] != "0"
+    private static let pack12 = MLXFast.metalKernel(
+        name: "nemotron_zskip_pack12", inputNames: ["index", "count"], outputNames: ["packed"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i >= uint(count[0])) return;
+            const uint a = index[4 * i], b = index[4 * i + 1];
+            const uint c = index[4 * i + 2], d = index[4 * i + 3];
+            packed[3 * i] = ushort(a | (b << 12));
+            packed[3 * i + 1] = ushort((b >> 4) | (c << 8));
+            packed[3 * i + 2] = ushort((c >> 8) | (d << 4));
+            """)
+    private static let unpack12 = MLXFast.metalKernel(
+        name: "nemotron_zskip_unpack12", inputNames: ["packed", "count"], outputNames: ["index"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i >= uint(count[0])) return;
+            const uint a = packed[3 * i], b = packed[3 * i + 1], c = packed[3 * i + 2];
+            index[4 * i] = ushort(a & 0xfffu);
+            index[4 * i + 1] = ushort((a >> 12) | ((b & 0xffu) << 4));
+            index[4 * i + 2] = ushort((b >> 8) | ((c & 0xfu) << 8));
+            index[4 * i + 3] = ushort(c >> 4);
+            """)
+    /// Load-time lossless encoding and full round-trip check. Never called in a trace.
+    private static func packedIndex(_ index: MLXArray) -> MLXArray? {
+        guard index.dtype == .uint16, index.ndim == 4, index.dim(3) == 128,
+              index.size > 0, index.size / 4 <= Int(Int32.max) else { return nil }
+        let count = index.size / 4
+        let countArray = MLXArray([Int32(count)])
+        var shape = index.shape
+        shape[3] = 96
+        let packed = pack12([index, countArray], grid: (count, 1, 1), threadGroup: (256, 1, 1),
+                            outputShapes: [shape], outputDTypes: [.uint16])[0]
+        let decoded = unpack12([packed, countArray], grid: (count, 1, 1), threadGroup: (256, 1, 1),
+                               outputShapes: [index.shape], outputDTypes: [.uint16])[0]
+        guard (decoded .== index).all().item(Bool.self) else { return nil }
+        return packed
+    }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
     /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
@@ -2080,7 +2148,12 @@ enum NemotronZSkip {
             }
             if sbDict, dictKernel != nil,
                let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
-                return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
+                let index = tileMajor(d.index)
+                if packed12Enabled, packed12Kernel != nil, d.table.dim(0) <= 4096,
+                   let packed = packedIndex(index) {
+                    return Copy(codes: codes, scales: packed, biases: d.table, dict: true, packed12: true)
+                }
+                return Copy(codes: codes, scales: index, biases: d.table, dict: true)
             }
             return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
         }
@@ -2105,7 +2178,7 @@ enum NemotronZSkip {
                                  copy: Copy, rows: Int) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
-        return (copy.dict ? dictKernel! : kernel)(
+        return (copy.packed12 ? packed12Kernel! : (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
@@ -2256,6 +2329,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, packed12Enabled {
+            packed12Enabled = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: packed12 slot kernel differs; uint16 dictionary copy\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
             sbDict = false
@@ -2288,8 +2367,9 @@ enum NemotronZSkip {
         case .built(let built):
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
+            let packed = built.values.filter(\.packed12).count
             FileHandle.standardError.write(
-                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, \(packed) packed12\n".utf8))
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
