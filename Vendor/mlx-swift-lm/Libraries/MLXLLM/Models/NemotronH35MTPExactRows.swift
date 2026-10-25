@@ -301,7 +301,7 @@ func nemotronPreparedVariantSource(_ base: String, load: Int, nsg: Bool) -> Stri
     return s
 }
 
-private let nemotronMultiRowQMVSource = """
+private let nemotronMultiRowQMVCrownSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
   constexpr int packs_per_thread = FAST ? 2 : 1;
@@ -428,6 +428,17 @@ private let nemotronMultiRowQMVSource = """
     }
   }
 """
+
+let nemotronMultiRowQMVTail8 =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_MULTIROW_TAIL8"] != "0"
+private let nemotronMultiRowQMVSource = nemotronMultiRowQMVTail8
+    ? nemotronSwapped(nemotronMultiRowQMVCrownSource, [
+        ("nmr_load_vector_safe<T, U, values_per_thread>(\n            xp + r * in_vec_size, x_thread[r], remaining);",
+         "nmr_load_vector<T, U, values_per_thread>(\n            xp + r * in_vec_size, x_thread[r]);", 1),
+        ("for (int i = 0; i < remaining / 4; i++) {",
+         "for (int i = 0; i < values_per_thread / 4; i++) {", 1),
+    ])
+    : nemotronMultiRowQMVCrownSource
 
 
 private let nemotronHeadPrepareSource = """
@@ -2406,7 +2417,7 @@ enum NemotronHeadScreen {
     // simdgroups rescore 4 kept rows each with the stock non-fast qmv per-row
     // body (K = 2688: ten 256-blocks plus a 128-value tail), as
     // nemotronMultiRowQMVSource does for R = 1, and round to T.
-    private static let selectSource = """
+    private static let selectCrownSource = """
       constexpr int P1 = CH / 32;
       constexpr int RPSG = 4;
       constexpr int in_vec_size = 2688;
@@ -2552,6 +2563,14 @@ enum NemotronHeadScreen {
         }
       }
     """
+    private static let selectSource = nemotronMultiRowQMVTail8
+        ? nemotronSwapped(selectCrownSource, [
+            ("sum = nmr_load_vector_safe<T, U, values_per_thread>(xp, x_thread, remaining);",
+             "sum = nmr_load_vector<T, U, values_per_thread>(xp, x_thread);", 1),
+            ("for (int i = 0; i < remaining / 4; i++) {",
+             "for (int i = 0; i < values_per_thread / 4; i++) {", 1),
+        ])
+        : selectCrownSource
 
     private static let finalSource = """
       const int lane = int(thread_index_in_simdgroup);
