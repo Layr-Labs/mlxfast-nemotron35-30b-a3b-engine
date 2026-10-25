@@ -1578,6 +1578,9 @@ enum NemotronZSkip {
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
     private static var kernel: MLXFast.MLXFastKernel { staged ? stagedSlotKernel : recordSlotKernel }
+    // Current-call launch geometry only; both use the exact retained source.
+    nonisolated(unsafe) private static var stagedGroups =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] == "8" ? 8 : 4
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
         source: nemotronZSkipReduceSource)
@@ -1602,12 +1605,14 @@ enum NemotronZSkip {
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, simdgroups: Int? = nil) -> MLXArray {
         let slots = rows * 6
+        let sgs = staged ? (simdgroups ?? stagedGroups) : 8
+        let threads = 32 * sgs
         return kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
-            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8)],
-            grid: (256 * (2688 / 128), slots, 1), threadGroup: (256, 1, 1),
+            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+            grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
     }
 
@@ -1657,6 +1662,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, staged, stagedGroups == 4 {
+            stagedGroups = 8
+            FileHandle.standardError.write(
+                Data("nemotron zskip: four-SIMD check missed; verified eight-SIMD staging\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, staged {
             // The staged twin missed a check: the original slot kernel, every layer again.
             staged = false
@@ -1731,6 +1742,14 @@ enum NemotronZSkip {
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+            if staged && stagedGroups == 4 {
+                let reference = products(act, inds, scores, copy: copy, rows: 3, simdgroups: 8)
+                for _ in 0..<2 {
+                    let candidate = products(act, inds, scores, copy: copy, rows: 3, simdgroups: 4)
+                    same = logicalAnd(same,
+                        (candidate.view(dtype: .uint32) .== reference.view(dtype: .uint32)).all())
+                }
+            }
         }
         return same.item(Bool.self)
     }
