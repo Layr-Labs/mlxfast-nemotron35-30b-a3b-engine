@@ -496,6 +496,7 @@ extension EngineLoopV2 {
         cacheInnerState: inout [MLXArray]
     ) throws -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
+        mtp.beginDecodeMemoryPreparation()
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")

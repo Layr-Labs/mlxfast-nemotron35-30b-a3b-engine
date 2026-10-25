@@ -229,6 +229,14 @@ struct CBv2MTPSeedCostLedger {
 /// Engine-side MTP state: drafter binding, carries, plan marks, metrics.
 final class CBv2MTPRoundDriver {
 
+    private var memoryPreparation: (any CBv2MTPMemoryLease)?
+    func beginDecodeMemoryPreparation() { memoryPreparation?.beginDecode() }
+    func finishMemoryPreparation() {
+        memoryPreparation?.finish()
+        memoryPreparation = nil
+    }
+    deinit { memoryPreparation?.finish() }
+
     let config: CBv2MTPConfig
     let drafter: any CBv2MTPDrafter
     /// The engine's model, downcast once at build (verify forwards go
@@ -337,6 +345,7 @@ final class CBv2MTPRoundDriver {
                 && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
         self.metrics.maxAutomaticRectangularTokens = self.config.maxAutomaticRectangularTokens
+        self.memoryPreparation = (drafter as? any CBv2MTPMemoryPreparing)?.beginMTPMemoryPreparation()
     }
 
     /// Build the driver, or nil when MTP cannot activate: config off (or the
@@ -757,6 +766,7 @@ final class CBv2MTPRoundDriver {
     /// Drain/shutdown drops every request trace and adaptive workload while
     /// retaining cumulative metrics for a final poll.
     func removeAllRequestState() {
+        finishMemoryPreparation()
         invalidateWorkload()
         carries.removeAll(keepingCapacity: false)
         rawCostEstimators.removeAll(keepingCapacity: false)

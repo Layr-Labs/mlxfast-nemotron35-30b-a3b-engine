@@ -23,8 +23,8 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
-    private var entries: [Entry?] = [nil, nil, nil, nil]
+    /// Slot = prepared + 2 * parts + 4 * original-bank fallback.
+    private var entries: [Entry?] = Array(repeating: nil, count: 8)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
@@ -48,6 +48,7 @@ final class NemotronH35MTPGraphCache {
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
         let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
+            + (NemotronZSkip.needsOriginal(owner.switchMLP.fc2) ? 4 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -1139,7 +1140,7 @@ enum NemotronMoELeader {
             return which(ok, prod, MLXArray(Float.nan))
         }
         var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
-            ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: balancePlan,
+            ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: NemotronZSkip.needsOriginal(mlp.fc2) ? nil : balancePlan,
                 tail8: leaderTail8)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
@@ -1990,6 +1991,56 @@ enum NemotronZSkip {
         lock.withLock { copies.values.flatMap { $0.dict ? [$0.codes, $0.scales] : [$0.codes, $0.scales, $0.biases] } }
     }
 
+    nonisolated(unsafe) private static var copyReady: [ObjectIdentifier: Bool] = [:]
+    nonisolated(unsafe) private static var roundOriginal: Set<ObjectIdentifier> = []
+    static func beginCopyReadiness(_ owners: [ObjectIdentifier]) {
+        lock.withLock {
+            copyReady = Dictionary(uniqueKeysWithValues: owners.map { ($0, false) })
+            roundOriginal = Set(owners)
+        }
+    }
+    static func markCopyReady(_ owners: [ObjectIdentifier]) {
+        lock.withLock { for owner in owners { copyReady[owner] = true } }
+    }
+    static func snapshotCopyReadiness() -> Int {
+        lock.withLock {
+            roundOriginal = Set(copyReady.compactMap { $0.value ? nil : $0.key })
+            return roundOriginal.count
+        }
+    }
+    static func endCopyReadiness() {
+        lock.withLock { copyReady = [:]; roundOriginal = [] }
+    }
+    static func needsOriginal(_ owner: SwitchLinear) -> Bool {
+        lock.withLock { roundOriginal.contains(ObjectIdentifier(owner)) }
+    }
+    static func decodeCopyOwners(_ model: Module) -> [ObjectIdentifier] {
+        let supported = lock.withLock { Set(copies.keys) }
+        return model.namedModules().compactMap { name, module -> (Int, ObjectIdentifier)? in
+            let parts = name.split(separator: ".")
+            guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count,
+                  let n = Int(parts[i + 1]), let moe = module as? NemotronHMoE,
+                  supported.contains(ObjectIdentifier(moe.switchMLP.fc2)) else { return nil }
+            return (n, ObjectIdentifier(moe.switchMLP.fc2))
+        }.sorted { $0.0 < $1.0 }.map { $0.1 }
+    }
+
+    /// Numeric backbone order, independent of dictionary iteration order.
+    static func decodeCopyLayers(_ model: Module) -> [[MLXArray]] {
+        let layers = model.namedModules().compactMap { name, module -> (Int, NemotronHMoE)? in
+            let parts = name.split(separator: ".")
+            guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count,
+                  let n = Int(parts[i + 1]), let moe = module as? NemotronHMoE else { return nil }
+            return (n, moe)
+        }.sorted { $0.0 < $1.0 }
+        return lock.withLock {
+            layers.compactMap { _, moe in
+                guard let c = copies[ObjectIdentifier(moe.switchMLP.fc2)] else { return nil }
+                return c.dict ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
+            }
+        }
+    }
+
     private static let layout = MLXFast.metalKernel(
         name: "nemotron_zskip_kmajor_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipLayoutSource)
@@ -2135,7 +2186,7 @@ enum NemotronZSkip {
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  owner: SwitchLinear) -> MLXArray? {
-        guard joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
+        guard !needsOriginal(owner), joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
               x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
@@ -2145,7 +2196,7 @@ enum NemotronZSkip {
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
                          owner: SwitchLinear) -> MLXArray? {
-        guard rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
+        guard !needsOriginal(owner), rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
         return run(x, inds, scores, copy: copy)
