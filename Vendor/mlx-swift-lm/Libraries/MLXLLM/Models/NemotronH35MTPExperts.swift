@@ -1125,14 +1125,14 @@ enum NemotronMoELeader {
         }
         let weights = scores.reshaped(rows * 6)
         // `products`: the unreduced slot products for the captured verify's
-        // join kernel, which sums them itself (same expressions and order).
-        if products, rows == 3,
-           let prod = NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2) {
+        if products, let prod = rows == 3
+            ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
+            : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
                 .sum(axis: -2).asType(original.dtype)
-            let ok = (NemotronZSkip.reduceProducts(prod, rows: 3).view(dtype: .uint16)
+            let ok = (NemotronZSkip.reduceProducts(prod, rows: rows).view(dtype: .uint16)
                 .== expected.view(dtype: .uint16)).all()
             return which(ok, prod, MLXArray(Float.nan))
         }
@@ -1783,6 +1783,68 @@ enum NemotronBankBinding {
         eval(made.values.map { $0.1 })
         lock.withLock { views.merge(made) { _, new in new } }
     }
+
+    static let denseEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DENSE_VIEWS"] != "0"
+
+    private static let denseAliasCheck = MLXFast.metalKernel(
+        name: "nemotron_dense_native_alias_check",
+        inputNames: ["original", "prefix"], outputNames: ["same"],
+        source: "same[0] = original == prefix ? uint(1) : uint(0);",
+        ensureRowContiguous: false)
+
+    private static func denseRowMajor(_ array: MLXArray) -> Bool {
+        var stride = 1
+        for (length, actual) in zip(array.shape, array.strides).reversed() {
+            if length > 1 && actual != stride { return false }
+            stride *= length
+        }
+        return true
+    }
+
+    static func warmDense(_ model: Module?, extra: [MLXArray] = []) {
+        guard enabled, denseEnabled else { return }
+        var arrays = extra
+        for module in model?.modules() ?? [] {
+            if NemotronHEmbeddingRows.bindTableViews, type(of: module) == QuantizedEmbedding.self,
+               let e = module as? QuantizedEmbedding {
+                arrays.append(e.weight)
+                arrays.append(e.scales)
+                if let biases = e.biases { arrays.append(biases) }
+                continue
+            }
+            guard type(of: module) == QuantizedLinear.self,
+                  let q = module as? QuantizedLinear else { continue }
+            arrays.append(q.weight)
+            arrays.append(q.scales)
+            if let biases = q.biases { arrays.append(biases) }
+        }
+        var made: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        var seen = Set<ObjectIdentifier>()
+        for array in arrays where array.ndim >= 1 && array.dim(0) > 1
+            && array.size >= 8 && denseRowMajor(array) {
+            guard seen.insert(ObjectIdentifier(array)).inserted else { continue }
+            let perRow = max(1, array.size / array.dim(0))
+            let rows = min(array.dim(0), (8 + perRow - 1) / perRow)
+            made[ObjectIdentifier(array)] = (array, array[0 ..< rows])
+        }
+        var qualified: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for (key, pair) in made {
+            guard pair.1.size >= 8, denseRowMajor(pair.1) else { continue }
+            do {
+                let same = try withError { () -> Bool in
+                    eval(pair.0, pair.1)
+                    return denseAliasCheck([pair.0, pair.1],
+                        grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.uint32])[0].item(UInt32.self) == 1
+                }
+                if same { qualified[key] = pair }
+            } catch {
+                continue
+            }
+        }
+        lock.withLock { views.merge(qualified) { _, new in new } }
+    }
 }
 
 enum NemotronZSkip {
@@ -1924,6 +1986,89 @@ enum NemotronZSkip {
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
         return run(x, inds, scores, copy: copy)
+    }
+
+    //
+    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ZSKIP"] != "0"
+    nonisolated(unsafe) private static var draftCopies: [ObjectIdentifier: Copy] = [:]
+
+    static var draftCopyArrays: [MLXArray] {
+        lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+
+    static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                              owner: SwitchLinear) -> MLXArray? {
+        guard x.shape == [6, 1856], x.dtype == .bfloat16,
+              inds.shape == [6], scores.shape == [6], scores.dtype == .float32,
+              let copy = lock.withLock({ draftCopies[ObjectIdentifier(owner)] }) else { return nil }
+        return products(x, inds, scores, copy: copy, rows: 1)
+    }
+
+    static func prepareDraft(_ head: Module) {
+        guard draftEnabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
+        var built: [ObjectIdentifier: Copy] = [:]
+        for module in head.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  moe.numExpertsPerTok == 6, type(of: moe.switchMLP.fc2) == QuantizedSwitchLinear.self,
+                  let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                  down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
+                  down.biases.shape == down.scales.shape else { continue }
+            let copy = makeCopy(down)
+            eval(copy.codes, copy.scales, copy.biases)
+            guard finite(down), matchesOneRow(down, copy, seed: built.count) else {
+                FileHandle.standardError.write(
+                    Data("nemotron draft zskip off: the draft head differs from the record kernel\n".utf8))
+                return
+            }
+            built[ObjectIdentifier(moe.switchMLP.fc2)] = copy
+        }
+        guard !built.isEmpty else {
+            FileHandle.standardError.write(Data("nemotron draft zskip off: no 4-bit routed fc2 bank\n".utf8))
+            return
+        }
+        guard NemotronHResidualRMSNorm.checkDraftProductsJoin(head) else {
+            FileHandle.standardError.write(
+                Data("nemotron draft zskip off: the products join differs from reduce + join\n".utf8))
+            return
+        }
+        lock.withLock { draftCopies = built }
+        FileHandle.standardError.write(Data("nemotron draft zskip on: \(built.count) MoE layers\n".utf8))
+    }
+
+    private static func matchesOneRow(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
+        let offset = UInt32(seed) * 7
+        var routes: [UInt32] = [3, 17, 42, 77, 100, 121]
+        for i in routes.indices {
+            routes[i] = (routes[i] + offset) % 128
+        }
+        let inds = MLXArray(routes)
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x25d0 + seed)), into: 4)
+        let h = abs(MLXRandom.normal([6, 1856], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [6, 1856], key: keys[1]) .< MLXArray(Float(0.09))
+        let slot = MLXArray((0 ..< 6).map(Int32.init)).reshaped(6, 1)
+        let column = MLXArray((0 ..< 1856).map(Int32.init)).reshaped(1, 1856)
+        let zero = MLXArray(Float(0))
+        let oneHot = which(column .== MLXArray(Int32(1800)), MLXArray(Float(1.5)), zero)
+        let sparse = which(slot .== MLXArray(Int32(2)), zero,
+                           which(slot .== MLXArray(Int32(3)), oneHot, which(keep, h, zero)))
+        let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
+        let scores = MLXRandom.uniform(Float(0) ..< 1, [6], key: keys[2])
+        let negative = MLXRandom.uniform(Float(0) ..< 1, [6, 1856], key: keys[3]) .< MLXArray(Float(0.05))
+        let negativeZero = MLXArray(Float(-0.0)).asType(.bfloat16)
+        var cases: [MLXArray] = []
+        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
+            cases.append((a * a).asType(.bfloat16))
+        }
+        cases.append(which(logicalAnd(cases[0] .== MLXArray(Float(0)).asType(.bfloat16), negative),
+                           negativeZero, cases[0]))
+        var same = MLXArray(true)
+        for act in cases {
+            let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 1, bank: bank,
+                                                           tail8: NemotronMoELeader.leaderTail8)
+            let got = run(act, inds, scores, copy: copy, rows: 1)
+            same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+        }
+        return same.item(Bool.self)
     }
 
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
