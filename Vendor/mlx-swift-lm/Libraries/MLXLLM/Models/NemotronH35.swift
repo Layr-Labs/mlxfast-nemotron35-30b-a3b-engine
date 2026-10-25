@@ -23,7 +23,13 @@ public struct NemotronH35Configuration: Codable, Sendable {
         case timeStepMax = "time_step_max"
     }
 
+    private static let commandBufferBudgets: Void = {
+        setenv("MLX_MAX_OPS_PER_BUFFER", "1000", 0)
+        setenv("MLX_MAX_MB_PER_BUFFER", "400", 0)
+    }()
+
     public init(from decoder: Decoder) throws {
+        _ = Self.commandBufferBudgets
         let container = try decoder.container(keyedBy: CodingKeys.self)
         guard container.contains(.layersBlockType) else {
             throw DecodingError.keyNotFound(
