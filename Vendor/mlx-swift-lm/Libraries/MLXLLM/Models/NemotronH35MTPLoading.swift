@@ -74,6 +74,7 @@ extension NemotronH35MTPAssistant {
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
+        NemotronMTPSSMGatedJoin.qualify(target)
         CBv2MTPDeviceAcceptWalk.warm()
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
@@ -81,6 +82,7 @@ extension NemotronH35MTPAssistant {
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
+        NemotronMTPRouterRowsSelect.qualify(target)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
