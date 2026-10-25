@@ -203,6 +203,36 @@ extension NemotronHMamba2Mixer {
         }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
+        // NEMOTRON_SSM_GATED_FUSED: the compact SSM window, the gated RMS norm
+        // and out_proj's prepared activation in one launch (see
+        // NemotronHCompactSSMGated); the same normed rows, prepared activation
+        // and final state as the two launches below.
+        if length == 3, NemotronMTPExecution.batchedNorm,
+           let q = outProj as? QuantizedLinear, q.mode == .affine,
+           q.bits == 4, q.groupSize == 64, q.bias == nil,
+           q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+           q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+           q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
+           var fused = norm.compactSSMPreparedRows(
+               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+               projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state) {
+            if NemotronMoELeader.selfTest {
+                // Reference: the two launches (compact SSM, then the gated
+                // norm with the prepared output) on the same operands.
+                let reference = nemotronMTPSSMCompact(
+                    convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                    heads: heads, headDim: dim, groups: groups, stateDim: state,
+                    steps: length, writeOutput: true)
+                if let pair = norm.preparedRows(
+                    reference.output.reshaped(batch, length, heads * dim), gate: gate) {
+                    fused = (nemotronBitwiseOrNaN(fused.0, pair.0),
+                             nemotronBitwiseOrNaN(fused.1, pair.1),
+                             nemotronBitwiseOrNaN(fused.2, reference.finalState))
+                }
+            }
+            return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
+                    padded, convolution, dt, fused.2]
+        }
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
@@ -333,6 +363,20 @@ extension NemotronH35Model {
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
         let normInput = MLXArray.zeros([1, 1, heads * dim], dtype: activationDType)
         var roots: [MLXArray] = [mixer.norm(normInput, gate: normInput)]
+        // NEMOTRON_SSM_GATED_FUSED: the zeroed arrival counters and the
+        // fused launch's pipeline, here at load (zero operands leave the
+        // counters at zero).
+        NemotronHCompactSSMGated.prepareCounter()
+        if let fused = mixer.norm.compactSSMPreparedRows(
+            convolution: MLXArray.zeros([1, 3, mixer.convDim], dtype: .bfloat16),
+            ALog: mixer.aLog, D: mixer.D,
+            dt: MLXArray.zeros([1, 3, heads], dtype: .float32),
+            state: MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32),
+            projected: MLXArray.zeros(
+                [1, 3, mixer.intermediateSize + mixer.convDim + heads], dtype: .bfloat16),
+            heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
+            eval(fused.0, fused.1, fused.2)
+        }
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = silu(mixer.conv1d(padded))
