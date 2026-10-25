@@ -1,0 +1,55 @@
+import Foundation
+import MLX
+
+public enum NemotronDraftAttentionGeometry {
+    struct Plan { let hpt: Int; let ptok: Int }
+    static let environment = ProcessInfo.processInfo.environment
+    static let enabled = environment["NEMOTRON_MTP_DRAFT_HPT"] != "0"
+    static let selectedHPT = 4
+    static let selectedPTOK = 0
+    static func select(enabled requested: Bool, dtype: DType, queryHeads: Int,
+                       kvHeads: Int, headDim: Int, pageSize: Int,
+                       length: Int, batch: Int) -> Plan? {
+        guard requested, enabled, dtype == .bfloat16, queryHeads == 32,
+              kvHeads == 2, headDim == 128, pageSize == 16 else { return nil }
+        return plan(hpt: selectedHPT, fixed: selectedPTOK, length: length, batch: batch)
+    }
+    static func plan(hpt: Int, fixed: Int, length: Int, batch: Int) -> Plan {
+        Plan(hpt: hpt, ptok: fixed == 256 ? 256 : PagedAttentionKernel.partitionTokensForDispatch(
+            maxAttendLength: length, batch: batch, kvHeads: 2,
+            headSplits: 2, pageSize: 16))
+    }
+    public static func warm() throws {
+        guard enabled else { return }
+        let kind = CBv2LayerKind(attention: .full, headDim: 128, kvHeads: 2, queryHeads: 32)
+        let backend = try PagedKVBackend(layerKinds: [kind], config: .init(
+            capacityBytes: 8 << 20, dtype: .bfloat16, maxPrefillChunk: 512,
+            nominalMaxSequenceLength: 2048, segmentSizeBytes: 8 << 20))
+        let states = try backend.makeSequenceState(layerKinds: [kind], promptLength: 0, maxLength: 2048)
+        let row = states[0] as! PagedSequenceKV
+        let group = backend.pool.group(row.groupKey)
+        defer { backend.release(states) }
+        while row.absoluteOffset < 1400 {
+            let count = min(512, 1400 - row.absoluteOffset)
+            let tile = MLXArray.zeros([2, count, 128], dtype: .bfloat16)
+            row.write(keys: tile, values: tile)
+            eval(group.writeFence)
+        }
+        let q = MLXArray.ones([1, 32, 128], dtype: .bfloat16)
+        let k = MLXArray.zeros([1, 2, 128], dtype: .bfloat16)
+        let params = MLXArray([Float(1), Float(1 / sqrt(128.0)), 0, 0, 0, 0, 0, 0])
+        for ptok in [64, 128, 256] {
+            for write in [true, false] {
+                let descriptor = PagedSegmentDispatchPlan.Row(pages: row.table,
+                    info: row.seqInfoRow(attending: (start: 0, length: 1400),
+                        writeTarget: write ? row.prepareDecodeWrite() : nil))
+                let out = PagedSegmentAttention.decode(queries: q,
+                    newKeys: write ? k : nil, newValues: write ? k : nil,
+                    group: group, rows: [descriptor], sinks: nil, params: params,
+                    softcap: false, source: backend.pool.kernelSource,
+                    geometryOverride: Plan(hpt: selectedHPT, ptok: ptok))
+                eval(out, group.writeFence)
+            }
+        }
+    }
+}
