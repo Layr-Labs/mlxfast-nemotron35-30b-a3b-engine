@@ -4469,7 +4469,13 @@ private class NemotronHBackbone: Module {
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
             : nil
         defer { observation?.end() }
-        var hidden = embeddings(inputs)
+        var hidden: MLXArray
+        if let rows = NemotronHEmbeddingRows.apply(inputs, embeddings) {
+            hidden = NemotronMoELeader.selfTest
+                ? nemotronBitwiseOrNaN(rows, embeddings(inputs)) : rows
+        } else {
+            hidden = embeddings(inputs)
+        }
         let entry = NemotronHResidualRMSNorm.normPreparedRows(hidden, norm: first.norm)
         var preparedNorm: MLXArray? = entry?.0
         var preparedActivation: MLXArray? = entry?.1
