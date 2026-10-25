@@ -45,6 +45,11 @@ private protocol NemotronHMixer: Module {
 /// Layers between early asyncEval calls in the CBv2 forward (0 disables).
 let nemotronEarlyEvalInterval = 4
 
+/// Captured verify only: amortize submission overhead across larger chunks.
+/// The first-layer submission remains; =4 restores the original cadence.
+let nemotronVerifySubmitInterval = max(0,
+    Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL"] ?? "") ?? 13)
+
 /// Captured verify only: also submit after the first layer.
 /// `NEMOTRON_MTP_VERIFY_FIRST_SUBMIT=0` keeps the plain interval.
 let nemotronVerifyFirstSubmit =
@@ -4164,7 +4169,7 @@ private class NemotronHBackbone: Module {
     /// Captured verify forward ([1, 3] window) with one join launch per
     /// layer: every residual add, block norm (including the early-eval
     /// boundaries and norm_f) and K=2688 activation prepare share one kernel.
-    /// The same early asyncEval layers as `cbv2Forward`; the submitted root
+    /// Early asyncEval uses the captured-verify interval; the submitted root
     /// is the join's residual output. Returns (norm_f rows, their prepared
     /// activation for the head), or nil before building anything when the
     /// window or weights are not the fused shape.
@@ -4210,11 +4215,10 @@ private class NemotronHBackbone: Module {
             hidden = result.0
             preparedNorm = result.1
             preparedActivation = result.2
-            // Same submission layers as `cbv2Forward`, plus one after the
-            // first layer so the GPU starts the verify while the host builds
-            // the rest of the chunk (evaluation order only).
-            if nemotronEarlyEvalInterval > 0 && next < layers.count
-                && (next % nemotronEarlyEvalInterval == 0
+            // Start after the first layer, then amortize host submissions
+            // over larger chunks. All numerical graph dependencies remain.
+            if nemotronVerifySubmitInterval > 0 && next < layers.count
+                && (next % nemotronVerifySubmitInterval == 0
                     || (next == 1 && nemotronVerifyFirstSubmit)) {
                 asyncEval(hidden)
             }
