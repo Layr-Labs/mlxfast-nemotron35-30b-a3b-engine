@@ -535,6 +535,10 @@ public enum CBv2MTPFirstDraftPrestage {
 /// Head-chain submissions grouped into fewer `asyncEval` calls (evaluation
 /// order only): finalize's prestaged drafts and the round-build draft steps
 /// ride the verify's first submission, so the host reaches that submission
+/// with no separate submit before it. Each `asyncEval` ends its command
+/// buffer with an event. The acceptance packet and the post-verify head
+/// graphs keep their own submissions. `NEMOTRON_MTP_MERGE_SUBMITS=0` submits
+/// each graph on its own.
 public enum CBv2MTPSubmitMerge {
     public static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MERGE_SUBMITS"] != "0"
@@ -578,8 +582,6 @@ extension EngineLoopV2 {
         let draftCount = batch * verify.k
         let targets = verify.acceptancePacket[draftCount ..< (draftCount + batch * width)]
             .reshaped([batch, width])
-        CBv2MTPSubmitMerge.begin()
-        defer { CBv2MTPSubmitMerge.flush() }
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
             speculator.speculateAfterVerify(
