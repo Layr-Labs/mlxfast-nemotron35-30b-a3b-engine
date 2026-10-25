@@ -282,7 +282,7 @@ private final class NemotronMTPDraftHead {
     /// tokens for its drafts to screen the upper vocabulary half
     /// (NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW; 0 screens it always).
     static let upperWindow = Int(
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW"] ?? "") ?? 32
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW"] ?? "") ?? 128
     static func usesUpper(tokensSinceUpper: Int) -> Bool {
         upperWindow == 0 || tokensSinceUpper < upperWindow
     }
@@ -480,6 +480,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 layerKinds: [kind], promptLength: 0, maxLength: storageLength)
             row = state[0] as! PagedSequenceKV
             cache = backend.makeLayerCaches()[0]
+            cache.nemotronDraftAttention = true
             cache.setRows([row])
         }
 
