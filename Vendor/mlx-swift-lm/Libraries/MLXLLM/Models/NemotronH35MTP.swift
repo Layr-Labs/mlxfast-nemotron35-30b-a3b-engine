@@ -48,6 +48,10 @@ private final class NemotronMTPDraftHead {
         /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
         /// two-launch path bitwise.
         var counter: MLXArray? = nil
+        /// nmr_half_decode4 form of the partial and select kernels
+        /// (`NemotronHeadScreen.halfDecodeForm`), set once its outputs matched
+        /// the crown decode bitwise; 0 keeps the crown kernels.
+        var halfForm = 0
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -65,7 +69,7 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records,
-            counter: screen.counter)
+            counter: screen.counter, halfForm: screen.halfForm)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -348,6 +352,57 @@ private final class NemotronMTPDraftHead {
                 fusedNote = "off (fused id differs)"
             }
         }
+        // Half decode of the partial pass and the select rescore: adopted only
+        // if, on synthetic inputs and for each half the plan screens, its
+        // partial scores, candidates, values and id equal the crown decode's
+        // bitwise on the final plan (records, fused final).
+        var halfNote = "off"
+        if NemotronHeadScreen.halfDecodeEnabled {
+            let form = NemotronHeadScreen.halfDecodeForm
+            func same(_ a: NemotronHeadScreen.Result, _ b: NemotronHeadScreen.Result) -> Bool {
+                MLX.logicalAnd(
+                    MLX.logicalAnd(
+                        (a.scores.view(dtype: .uint32) .== b.scores.view(dtype: .uint32)).all(),
+                        (a.id .== b.id).all()),
+                    MLX.logicalAnd(
+                        (a.candidateIds .== b.candidateIds).all(),
+                        (a.candidateValues.view(dtype: .uint32)
+                            .== b.candidateValues.view(dtype: .uint32)).all())).item(Bool.self)
+            }
+            do {
+                let equal = try withError { () -> Bool in
+                    var state: UInt64 = 0xBB67_AE85_84CA_A73B
+                    for _ in 0..<4 {
+                        let t = (0..<k).map { _ -> Float in
+                            state = state &* 6364136223846793005 &+ 1442695040888963407
+                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                        }
+                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                        for half in plan.upperGroups == nil ? [false] : [false, true] {
+                            func screened(_ halfForm: Int) -> NemotronHeadScreen.Result {
+                                NemotronHeadScreen.run(
+                                    x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                    groups: plan.groups, groupCount: groupCount, chunk: chunk,
+                                    keep: keep, upperGroups: half ? plan.upperGroups : nil,
+                                    upperGroupCount: half ? plan.upperGroupCount : 0,
+                                    packed: plan.packed, records: plan.records, counter: plan.counter,
+                                    halfForm: halfForm)
+                            }
+                            if !same(screened(0), screened(form)) { return false }
+                        }
+                    }
+                    return true
+                }
+                if equal {
+                    plan.halfForm = form
+                    halfNote = "on (form \(form), bitwise equal)"
+                } else {
+                    halfNote = "off (half decode differs)"
+                }
+            } catch {
+                halfNote = "off (\(error))"
+            }
+        }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -357,11 +412,13 @@ private final class NemotronMTPDraftHead {
             eval(NemotronHeadScreen.run(
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
-                packed: plan.packed, records: plan.records, counter: plan.counter).id)
+                packed: plan.packed, records: plan.records, counter: plan.counter,
+                halfForm: plan.halfForm).id)
         }
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
             + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
+            + " half decode \(halfNote),"
             + " qualified (synthetic agreement \(chosen.agree)/4)")
     }
 

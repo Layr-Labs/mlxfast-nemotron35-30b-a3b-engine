@@ -2930,11 +2930,12 @@ enum NemotronHeadScreen {
         name: "nemotron_head_screen_final",
         inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
 
-    /// Kill switches (code constants; 0 = crown int -> float decode and the
-    /// crown kernel objects): the draft screen's partial pass (gathered and
-    /// packed) and its exact select rescore.
-    static let partialHalfDecodeForm = 0
-    static let selectHalfDecodeForm = 0
+    /// NEMOTRON_MTP_SCREEN_HALF_DECODE=0 keeps the crown int -> float decode;
+    /// otherwise the load-time plan takes `halfDecodeForm` for the partial
+    /// pass and the select rescore once their outputs matched it bitwise.
+    static let halfDecodeEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_HALF_DECODE"] != "0"
+    static let halfDecodeForm = 1
     static let partialHalfSwaps: [(String, String, Int)] = [
         ("const uint16_t q = ws[i];", "const float4 hq = nmr_half_decode4<HF>(ws, i);", 1),
         ("float(q & 0x000f)", "hq.x", 1),
@@ -3054,12 +3055,13 @@ enum NemotronHeadScreen {
     /// `records` (`packRecords`) wins over `packed` (`packScalesBiases`); each
     /// must be built from the same groups and upper groups.
     /// `counter` (`makeCounter`): one fused select + final launch.
+    /// `halfForm`: nmr_half_decode4 form of the partial and select twins (0: crown).
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil,
-        counter: MLXArray? = nil,
+        counter: MLXArray? = nil, halfForm: Int = 0,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
@@ -3067,8 +3069,8 @@ enum NemotronHeadScreen {
             ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
             ("NSG", simdgroups), ("LO", Self.rows),
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
-        let partialHalf = partialHalfDecodeForm != 0
-        let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
+        let partialHalf = halfForm != 0
+        let partialTemplate = template + nemotronHalfTemplate(partialHalf, halfForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
@@ -3085,12 +3087,12 @@ enum NemotronHeadScreen {
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
         let selectGroups = 8
-        let selectHalf = selectHalfDecodeForm != 0
+        let selectHalf = halfForm != 0
         if let counter {
             let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
                 [scores, weight, scales, biases, hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
-                           ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
+                           ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, halfForm),
                 grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
                 outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks], [1]],
                 outputDTypes: [.int32, .float32, .float32, .int32, .int32])
@@ -3099,7 +3101,7 @@ enum NemotronHeadScreen {
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
-                + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
+                + nemotronHalfTemplate(selectHalf, halfForm),
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
             outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
             outputDTypes: [.int32, .float32, .float32, .int32])
