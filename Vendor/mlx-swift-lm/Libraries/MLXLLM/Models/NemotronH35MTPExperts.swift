@@ -142,6 +142,10 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
+        if let sharedExperts, let fused = NemotronRoutedSharedLaunch.apply(
+            x, indices, scores, switchMLP, sharedExperts, prepared: packed) {
+            return parts ? [fused.0, fused.1] : [fused.0 + fused.1]
+        }
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP, prepared: packed) {
@@ -553,18 +557,21 @@ private final class NemotronMoELeaderKernel: Sendable {
     }
 }
 
+private let nmlPreparedFC1Source = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
+    ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+     "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+    ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+     "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+])
+
+
 private final class NemotronMoELeaderPreparedKernels: Sendable {
     static let shared = NemotronMoELeaderPreparedKernels()
     let gateUp: MLXFast.MLXFastKernel?
     let gateUpAndPlan: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
-        let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
-            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
-             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
-            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
-             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
-        ])
+        let preparedSource = nmlPreparedFC1Source
         gateUp = preparedSource.map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
@@ -1167,4 +1174,650 @@ private func nmlFC1WithBalancePlanSource(_ preparedFC1: String) -> String {
         \(plan)
       }
     """
+}
+
+// MARK: - Assistant-owned sparse FC2 and same-dispatch FC1 live mask
+// The only caller is mtp.layers.1 after its verified weight load. Target MoE
+// banks never enter this helper. The immutable neuron-major copy belongs to
+// this assistant instance; current-call activations/masks are never cached.
+private func nmlDraftFC1MaskSource() -> String {
+    let store = "y0[r] = nml_store<T, RELU2>(result[r]);"
+    precondition(nemotronMoELeaderSource.components(separatedBy: store).count == 2)
+    let body = nemotronMoELeaderSource.replacingOccurrences(of: store, with: """
+        const T stored = nml_store<T, RELU2>(result[r]);
+        y0[r] = stored;
+        live_bits |= (stored != static_cast<T>(0) ? 1u : 0u) << r;
+        """)
+    // R=1, RPS=4 and N divisible by8: both SIMD groups are always leaders,
+    // own one four-output nibble each and reach the unconditional barrier.
+    return """
+      threadgroup uchar live_nibbles[2];
+      uint live_bits = 0;
+      """ + body + """
+
+      if (simd_lid == 0) { live_nibbles[simd_gid] = uchar(live_bits); }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (simd_gid == 0 && simd_lid == 0) {
+        mask[slot * (N / 8) + tid.y] = live_nibbles[0] | (live_nibbles[1] << 4);
+      }
+      """
+}
+
+private let nmlDraftNibbleQdotHeader = """
+template <typename U, int values_per_thread>
+inline U nml_qdot_nibbles(
+    const thread uint* v, const thread U* x_thread, U scale, U bias, U sum) {
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const U a = U(v[4 * i]);
+    const U b1 = U(v[4 * i + 1] << 4);
+    const U c = U(v[4 * i + 2] << 8);
+    const U d = U(v[4 * i + 3] << 12);
+    accum +=
+        (x_thread[4 * i] * a +
+         x_thread[4 * i + 1] * b1 +
+         x_thread[4 * i + 2] * c +
+         x_thread[4 * i + 3] * d);
+  }
+  return scale * accum + sum * bias;
+}
+"""
+
+// Adapted from838a38d4's sparse dot to the assistant's single row. Original
+// lane/term/affine order, BF16 cast and top-six product order are retained.
+// The producer mask skips an all-zero eight-input block BEFORE input, weight,
+// scale or bias reads. NaNs compare nonzero in the producer and remain live.
+private let nmlDraftSparseDownSource = """
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = 256;
+  constexpr int in_vec_size_g = K / 64;
+  constexpr int wt_row = N / 8;
+  constexpr int TILE = 64;
+  typedef float U;
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint t = thread_position_in_threadgroup.x;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const int lane = int(t / 8);
+  const int word = int(t % 8);
+  const int tile_out = int(tid.x) * TILE;
+  const int slot = int(tid.z);
+  const uint expert = inds[slot];
+  threadgroup float acc_tg[TILE * 32];
+  const int out0 = tile_out + word * 8;
+  const device uint32_t* wq = wt +
+      ((ulong)expert * K + lane * values_per_thread) * wt_row + out0 / 8;
+  const device T* sc = scales + ((ulong)expert * N + out0) * in_vec_size_g + lane / 8;
+  const device T* bs = biases + ((ulong)expert * N + out0) * in_vec_size_g + lane / 8;
+  const device T* x0 = x + slot * K + lane * values_per_thread;
+  thread U result[8] = {0};
+  for (int k = 0; k < K; k += block_size) {
+    if (k + lane * values_per_thread < K) {
+      const uchar active = mask[slot * (K / 8) + k / 8 + lane];
+      if (active != 0) {
+        thread U x_thread[values_per_thread];
+        U sum = nml_load_vector<T, U, values_per_thread>(x0 + k, x_thread);
+        uint q[values_per_thread];
+        for (int j = 0; j < values_per_thread; j++) {
+          q[j] = (active & (1u << j)) != 0 ? wq[(ulong)(k + j) * wt_row] : 0u;
+        }
+        for (int r = 0; r < 8; r++) {
+          U s = sc[r * in_vec_size_g + k / 64];
+          U b = bs[r * in_vec_size_g + k / 64];
+          uint v[values_per_thread];
+          for (int j = 0; j < values_per_thread; j++) {
+            v[j] = (q[j] >> (4 * r)) & 0xfu;
+          }
+          result[r] += nml_qdot_nibbles<U, values_per_thread>(v, x_thread, s, b, sum);
+        }
+      }
+    }
+  }
+  for (int r = 0; r < 8; r++) {
+    acc_tg[(word * 8 + r) * 32 + lane] = result[r];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 0; i < TILE / 8; i++) {
+    const int o = int(simd_gid) * (TILE / 8) + i;
+    U value = simd_sum(acc_tg[o * 32 + simd_lid]);
+    if (simd_lid == 0) {
+      const T h = nml_store<T, false>(value);
+      products[slot * N + tile_out + o] = float(h) * scores[slot] + 0.0f;
+    }
+  }
+"""
+
+private let nmlDraftSparseReduceSource = """
+  const uint o = thread_position_in_grid.x;
+  if (o >= uint(N)) { return; }
+  float total = products[o];
+  for (int j = 1; j < 6; j++) { total = products[j * N + o] + total; }
+  y[o] = static_cast<T>(total);
+"""
+
+private final class NemotronMTPDraftSparseKernels: Sendable {
+    static let shared = NemotronMTPDraftSparseKernels()
+    let fc1 = MLXFast.metalKernel(
+        name: "nemotron_mtp_owned_fc1_relu2_live_mask",
+        inputNames: ["w", "scales", "biases", "x", "inds"],
+        outputNames: ["y", "mask"], source: nmlDraftFC1MaskSource(),
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+    let partials = MLXFast.metalKernel(
+        name: "nemotron_mtp_owned_fc2_sparse_mask_partials",
+        inputNames: ["wt", "scales", "biases", "x", "inds", "scores", "mask"],
+        outputNames: ["products"], source: nmlDraftSparseDownSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nmlDraftNibbleQdotHeader,
+        ensureRowContiguous: true)
+    let reduce = MLXFast.metalKernel(
+        name: "nemotron_mtp_owned_fc2_sparse_top6",
+        inputNames: ["products"], outputNames: ["y"], source: nmlDraftSparseReduceSource,
+        ensureRowContiguous: true)
+}
+
+/// Only immutable assistant parameters live here, never target parameters or
+/// request outputs. Preparation and admission occur before expert-tail tracing.
+final class NemotronMTPDraftSparseDown: @unchecked Sendable {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_OWNED_SPARSE_FC2"] != "0"
+    private let ownerIdentity: [ObjectIdentifier]
+    private let up: NemotronMoELeader.Bank
+    private let down: NemotronMoELeader.Bank
+    let neuronMajor: MLXArray
+    var compilationState: [MLXArray] { [neuronMajor] }
+    // Written only during private load admission, before any compiled tail.
+    private(set) var foldJoinQualified = false
+
+    private init(_ mlp: NemotronHSwitchMLP, up: NemotronMoELeader.Bank,
+                 down: NemotronMoELeader.Bank, neuronMajor: MLXArray) {
+        self.ownerIdentity = [ObjectIdentifier(mlp), ObjectIdentifier(mlp.fc1), ObjectIdentifier(mlp.fc2)]
+        self.up = up
+        self.down = down
+        self.neuronMajor = neuronMajor
+    }
+
+    func compatible(_ mlp: NemotronHSwitchMLP) -> Bool {
+        ownerIdentity == [ObjectIdentifier(mlp), ObjectIdentifier(mlp.fc1), ObjectIdentifier(mlp.fc2)]
+    }
+
+    private func activate(_ x: MLXArray, _ ids: MLXArray) -> [MLXArray] {
+        NemotronMTPDraftSparseKernels.shared.fc1(
+            [up.weight, up.scales, up.biases, x, ids],
+            template: [("T", x.dtype), ("R", 1), ("TOPK", 6), ("K", up.k),
+                       ("N", up.n), ("XSLOT", false), ("RELU2", true), ("RPS", 4)],
+            grid: (32, up.n / 4, 6), threadGroup: (32, 2, 1),
+            outputShapes: [[6, up.n], [6, up.n / 8]], outputDTypes: [x.dtype, .uint8])
+    }
+
+    private func partials(_ activation: MLXArray, _ mask: MLXArray,
+                          _ ids: MLXArray, _ scores: MLXArray) -> MLXArray {
+        NemotronMTPDraftSparseKernels.shared.partials(
+            [neuronMajor, down.scales, down.biases, activation, ids, scores, mask],
+            template: [("T", activation.dtype), ("K", down.k), ("N", down.n)],
+            grid: (256 * (down.n / 64), 1, 6), threadGroup: (256, 1, 1),
+            outputShapes: [[6, down.n]], outputDTypes: [.float32])[0]
+    }
+
+    private func reduceProducts(_ products: MLXArray, dtype: DType) -> MLXArray {
+        NemotronMTPDraftSparseKernels.shared.reduce(
+            [products], template: [("T", dtype), ("N", down.n)],
+            grid: (down.n, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 1, down.n]], outputDTypes: [dtype])[0]
+    }
+
+    private func reduce(_ activation: MLXArray, _ mask: MLXArray,
+                        _ ids: MLXArray, _ scores: MLXArray) -> MLXArray {
+        reduceProducts(partials(activation, mask, ids, scores), dtype: activation.dtype)
+    }
+
+    func productsForJoinedTail(_ h: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
+                               _ mlp: NemotronHSwitchMLP) -> MLXArray? {
+        guard foldJoinQualified, compatible(mlp),
+              h.shape == [1, 1, 2688], h.dtype == .bfloat16,
+              indices.shape == [1, 1, 6], indices.dtype == .uint32,
+              scores.shape == indices.shape, scores.dtype == .float32 else { return nil }
+        let ids = indices.reshaped(6)
+        let a = activate(h.reshaped(1, 2688), ids)
+        return partials(a[0], a[1], ids, scores.reshaped(6))
+    }
+
+    func run(_ h: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
+             _ mlp: NemotronHSwitchMLP) -> MLXArray? {
+        guard compatible(mlp), h.shape == [1, 1, 2688], h.dtype == .bfloat16,
+              indices.shape == [1, 1, 6], indices.dtype == .uint32,
+              scores.shape == indices.shape, scores.dtype == .float32 else { return nil }
+        let ids = indices.reshaped(6)
+        let a = activate(h.reshaped(1, 2688), ids)
+        return reduce(a[0], a[1], ids, scores.reshaped(6))
+    }
+
+    /// Called exclusively on the loaded assistant's mtp.layers.1. All array
+    /// execution below is official-worker load-time admission, never local.
+    static func prepare(_ mlp: NemotronHSwitchMLP, finalNorm: RMSNorm)
+        -> NemotronMTPDraftSparseDown? {
+        guard enabled, NemotronMoELeader.enabled, NemotronMoELeader.fuseRelu2,
+              !NemotronMoELeader.selfTest,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: mlp) == NemotronHSwitchMLP.self,
+              type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+              type(of: mlp.fc2) == QuantizedSwitchLinear.self,
+              let up = NemotronMoELeader.bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+              let down = NemotronMoELeader.bank(mlp.fc2, k: 1856, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336], up.scales.shape == [128, 1856, 42],
+              up.biases.shape == up.scales.shape,
+              down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
+              down.biases.shape == down.scales.shape else { return nil }
+        do {
+            return try withError { () -> NemotronMTPDraftSparseDown? in
+                let shifts = MLXArray((0..<8).map { UInt32(4 * $0) })
+                let nibbleMask = MLXArray(UInt32(15))
+                var chunks: [MLXArray] = []
+                for start in stride(from: 0, to: 128, by: 8) {
+                    let nibbles = bitwiseAnd(
+                        down.weight[start..<(start + 8)].expandedDimensions(axis: -1) >> shifts,
+                        nibbleMask).asType(.uint8).reshaped(8, down.n, down.k)
+                    let columns = nibbles.transposed(0, 2, 1)
+                        .reshaped(8, down.k, down.n / 8, 8).asType(.uint32)
+                    var packed = columns[.ellipsis, 0]
+                    for j in 1..<8 {
+                        packed = bitwiseOr(packed, columns[.ellipsis, j] << MLXArray(UInt32(4 * j)))
+                    }
+                    eval(packed)
+                    chunks.append(packed)
+                }
+                let packed = concatenated(chunks, axis: 0)
+                eval(packed)
+                let candidate = NemotronMTPDraftSparseDown(mlp, up: up, down: down, neuronMajor: packed)
+                guard candidate.qualify() else { return nil }
+                candidate.foldJoinQualified = candidate.qualifyFoldJoin(norm: finalNorm)
+                return candidate
+            }
+        } catch {
+            // A compiler/kernel/admission error keeps the complete original
+            // exact one-token tail; no process-wide weight cache is installed.
+            return nil
+        }
+    }
+
+    /// An independent worker-only comparison of the fused fold/three-input
+    /// join against the already admitted sparse reduce and original join.
+    /// Failure leaves sparse FC2 plus the original separate join in use.
+    private func qualifyFoldJoin(norm: RMSNorm) -> Bool {
+        guard NemotronHResidualRMSNorm.draftExpertFold,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16 else { return false }
+        do {
+            return try withError {
+                let residual = MLXArray((0..<2688).map { Float(($0 % 13) - 6) / 32 })
+                    .asType(.bfloat16).reshaped(1, 1, 2688)
+                let shared = MLXArray((0..<2688).map { Float(($0 % 19) - 9) / 64 })
+                    .asType(.bfloat16).reshaped(1, 1, 2688)
+                let scores = MLXArray([Float(0.05), 0.1, 0.15, 0.2, 0.225, 0.275])
+                for first in stride(from: 0, to: 128, by: 6) {
+                    let ids = MLXArray((0..<6).map { UInt32((first + $0) % 128) })
+                    for probe in 0..<3 {
+                        let x = MLXArray((0..<up.k).map { i -> Float in
+                            Float(((i + 3 * probe) % 17) - 8) / 16
+                        }).asType(.bfloat16).reshaped(1, up.k)
+                        let a = activate(x, ids)
+                        let products = partials(a[0], a[1], ids, scores)
+                        let routed = reduceProducts(products, dtype: .bfloat16)
+                        guard let expected = NemotronHResidualRMSNorm.applySum(
+                            residual, routed, shared: shared, norm: norm),
+                              let actual = NemotronHResidualRMSNorm.applyDraftExpertFold(
+                            residual, products: products, shared: shared, norm: norm)
+                        else { return false }
+                        let same = MLX.logicalAnd(
+                            (actual.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                            (actual.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all())
+                        if !same.item(Bool.self) { return false }
+                    }
+                }
+                let zero = MLXArray.zeros([6, 2688], dtype: .float32)
+                let routed = reduceProducts(zero, dtype: .bfloat16)
+                guard let expected = NemotronHResidualRMSNorm.applySum(
+                    residual, routed, shared: shared, norm: norm),
+                      let actual = NemotronHResidualRMSNorm.applyDraftExpertFold(
+                    residual, products: zero, shared: shared, norm: norm) else { return false }
+                return MLX.logicalAnd(
+                    (actual.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                    (actual.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()).item(Bool.self)
+            }
+        } catch {
+            return false
+        }
+    }
+
+    private func qualify() -> Bool {
+        let scores = MLXArray([Float(0.05), 0.1, 0.15, 0.2, 0.225, 0.275])
+        let probes: [MLXArray] = [
+            MLXArray.zeros([1, up.k], dtype: .bfloat16),
+            MLXArray((0..<up.k).map { $0 % 2 == 0 ? Float(0.125) : Float(-0.375) })
+                .asType(.bfloat16).reshaped(1, up.k),
+            MLXArray((0..<up.k).map { Float(($0 % 17) - 8) / 16 })
+                .asType(.bfloat16).reshaped(1, up.k),
+        ]
+        // Every expert id is covered; duplicates in the final six slots are
+        // harmless at R=1, whose FC1/sparse FC2 never deduplicate within a row.
+        for first in stride(from: 0, to: 128, by: 6) {
+            let ids = MLXArray((0..<6).map { UInt32((first + $0) % 128) })
+            for x in probes {
+                let referenceAct = NemotronMoELeader.apply(
+                    x, ids, rows: 1, topK: 6, bank: up, perSlot: false, relu2: true)
+                let got = activate(x, ids)
+                var expectedMask = MLXArray.zeros([6, up.n / 8], dtype: .uint32)
+                let live = (referenceAct.reshaped(6, up.n / 8, 8) .!= MLXArray(0)).asType(.uint32)
+                for j in 0..<8 {
+                    expectedMask = bitwiseOr(expectedMask, live[.ellipsis, j] << MLXArray(UInt32(j)))
+                }
+                let reference = NemotronMoELeader.applyWeighted(
+                    referenceAct, ids, scores, rows: 1, bank: down)
+                let actual = reduce(got[0], got[1], ids, scores)
+                let equal = MLX.logicalAnd(
+                    (got[0].view(dtype: .uint16) .== referenceAct.view(dtype: .uint16)).all(),
+                    MLX.logicalAnd((got[1] .== expectedMask.asType(.uint8)).all(),
+                        (actual.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()))
+                if !equal.item(Bool.self) { return false }
+            }
+        }
+        // Exercise the completely dead mask independently of FC1's bias.
+        let zero = MLXArray.zeros([6, down.k], dtype: .bfloat16)
+        let mask = MLXArray.zeros([6, down.k / 8], dtype: .uint8)
+        let ids = MLXArray((0..<6).map { UInt32($0) })
+        let reference = NemotronMoELeader.applyWeighted(zero, ids, scores, rows: 1, bank: down)
+        let actual = reduce(zero, mask, ids, scores)
+        return (actual.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all().item(Bool.self)
+    }
+}
+
+
+// Shared/routed launch composition from authenticated pending61.
+// Exact source3cc packing arithmetic; only output pointer is renamed.
+private let nmlSharedPackedEpilogue = """
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const uint local = simd_gid * 32 + simd_lid;
+          if (local < R) {
+            const int r = int(local);
+            const int chunk = int(tid.y);
+            const int tiles = (out_vec_size / 8 + 31) / 32;
+            const int base = (r * tiles + chunk / 32) * 9 * 32 + chunk % 32;
+            float total = 0;
+            for (int i = 0; i < 8; i += 4) {
+              total += float(values[r * 8 + i]) + float(values[r * 8 + i + 1])
+                  + float(values[r * 8 + i + 2]) + float(values[r * 8 + i + 3]);
+              spacked[base + i * 32] = float(values[r * 8 + i]);
+              spacked[base + (i + 1) * 32] = float(values[r * 8 + i + 1]) / 16.0f;
+              spacked[base + (i + 2) * 32] = float(values[r * 8 + i + 2]) / 256.0f;
+              spacked[base + (i + 3) * 32] = float(values[r * 8 + i + 3]) / 4096.0f;
+            }
+            spacked[base + 8 * 32] = total;
+          }
+"""
+
+private func nmlSharedExpertBranch(condition: String, tile: String, simdgroups: Int,
+                                   prepared: String?, packSharedUp: Bool = false) -> String {
+    let groups = "constexpr int num_simdgroups = 2;"
+    let inSize = "const int in_vec_size = K;"
+    let outSize = "const int out_vec_size = N;"
+    for text in [groups, inSize, outSize] {
+        precondition(nemotronHeadPreparedQMVSource.components(separatedBy: text).count == 2)
+    }
+    var body = nemotronHeadPreparedQMVSource
+        .replacingOccurrences(of: groups, with: "constexpr int num_simdgroups = \(simdgroups);")
+        .replacingOccurrences(of: inSize, with: "const int in_vec_size = SK;")
+        .replacingOccurrences(of: outSize, with: "const int out_vec_size = SN;")
+    if packSharedUp {
+        // Routed FC1 still has TWO SIMD groups. Four shared outputs per
+        // SIMD make a complete eight-value chunk without changing its TG.
+        let changes = [
+            ("constexpr int results_per_simdgroup = RPS;",
+             "constexpr int results_per_simdgroup = 4;"),
+            ("device T* yp = y + out_row;",
+             "device T* yp = y + out_row;\n  threadgroup T values[R * 8];"),
+            ("yp[r * out_vec_size + row] = h;",
+             "yp[r * out_vec_size + row] = h;\n        values[r * 8 + simd_gid * 4 + row] = h;")
+        ]
+        for (old, new) in changes {
+            precondition(body.components(separatedBy: old).count == 2)
+            body = body.replacingOccurrences(of: old, with: new)
+        }
+        // SN3712 is divisible by8 and one added z-slice owns every chunk.
+        // No thread returns before the shared-only local barrier.
+        body += "\n" + nmlSharedPackedEpilogue
+    }
+    let input = prepared.map { "const device float* prepared = \($0);" } ?? ""
+    return """
+      if (\(condition)) {
+        const uint shared_tile = \(tile);
+        {
+          const uint3 threadgroup_position_in_grid = uint3(0, shared_tile, 0);
+          const device uint32_t* w = sw;
+          const device T* scales = ss;
+          const device T* biases = sb;
+          device T* y = sy;
+          \(input)
+    \(body)
+        }
+        return;
+      }
+
+    """
+}
+
+private final class NMLRoutedSharedKernels: Sendable {
+    static let shared = NMLRoutedSharedKernels()
+    let up: MLXFast.MLXFastKernel?
+    let packedUp: MLXFast.MLXFastKernel?
+    let down: MLXFast.MLXFastKernel
+    private init() {
+        let upBranch = nmlSharedExpertBranch(
+            condition: "threadgroup_position_in_grid.z >= uint(R * TOPK)",
+            tile: "(threadgroup_position_in_grid.z - uint(R * TOPK)) * uint(N / (2 * RPS))"
+                + " + threadgroup_position_in_grid.y",
+            simdgroups: 2, prepared: nil)
+        up = nmlPreparedFC1Source.map {
+            MLXFast.metalKernel(
+                name: "nml_fc1_plan_with_shared_up",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "sw", "ss", "sb"],
+                outputNames: ["y", "plan", "sy"],
+                source: upBranch + nmlFC1WithBalancePlanSource($0),
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore
+                    + nemotronMoELeaderPreparedHeader)
+        }
+        let packedUpBranch = nmlSharedExpertBranch(
+            condition: "threadgroup_position_in_grid.z >= uint(R * TOPK)",
+            tile: "threadgroup_position_in_grid.y", simdgroups: 2, prepared: nil,
+            packSharedUp: true)
+        packedUp = nmlPreparedFC1Source.map {
+            MLXFast.metalKernel(
+                name: "nml_fc1_plan_shared_up_packed_epilogue_rps4",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "sw", "ss", "sb"],
+                outputNames: ["y", "plan", "sy", "spacked"],
+                source: packedUpBranch + nmlFC1WithBalancePlanSource($0),
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore
+                    + nemotronMoELeaderPreparedHeader)
+        }
+        let downBranch = nmlSharedExpertBranch(
+            condition: "threadgroup_position_in_grid.x >= uint(N / 4)",
+            tile: "threadgroup_position_in_grid.x - uint(N / 4)",
+            simdgroups: 6, prepared: "sprep")
+        down = MLXFast.metalKernel(
+            name: "nml_fc2_balanced_with_shared_down",
+            inputNames: ["w", "scales", "biases", "x", "inds", "scores", "plan",
+                         "sw", "ss", "sb", "sprep"],
+            outputNames: ["y", "sy"], source: downBranch + nmlBalanceWeightedSource,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+            ensureRowContiguous: true)
+    }
+}
+
+enum NemotronRoutedSharedLaunch {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTED_SHARED_LAUNCH"] != "0"
+    nonisolated(unsafe) private static var verified = false
+    static let packedEnabled = ProcessInfo.processInfo.environment[
+        "NEMOTRON_MTP_ROUTED_SHARED_PREPARE"] != "0"
+    nonisolated(unsafe) private static var packedVerified = false
+
+    private static func buffers(_ linear: Linear, n: Int, k: Int) -> [MLXArray]? {
+        guard type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [n, k / 8],
+              q.scales.dtype == .bfloat16, q.scales.shape == [n, k / 64],
+              let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == q.scales.shape
+        else { return nil }
+        return [q.weight, q.scales, offsets]
+    }
+
+    private static func run(
+        _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
+        _ mlp: NemotronHSwitchMLP, _ sharedMLP: NemotronHMLP, prepared: MLXArray?,
+        packSharedUp: Bool = false, inspectPacked: ((MLXArray, MLXArray) -> Void)? = nil
+    ) -> (MLXArray, MLXArray)? {
+        guard enabled, NemotronMoELeader.enabled, NemotronMoELeader.fuseRelu2,
+              NemotronMoELeader.fuseBalancePlan, NemotronMoELeader.preparedGateUp,
+              !NemotronMoELeader.selfTest,
+              NemotronMoELeader.leaderResultsPerSimdgroup(rows: 3) == 2,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              NemotronMultiRowQMV.headRPS(n: 3712) == 2, NemotronMultiRowQMV.headRPS(n: 2688) == 2,
+              NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: mlp) == NemotronHSwitchMLP.self,
+              type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+              type(of: mlp.fc2) == QuantizedSwitchLinear.self,
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              indices.dtype == .uint32, indices.shape == [1, 3, 6],
+              scores.dtype == .float32, scores.shape == [1, 3, 6],
+              let up = NemotronMoELeader.bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+              let down = NemotronMoELeader.bank(mlp.fc2, k: 1856, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336],
+              up.scales.shape == [128, 1856, 42], up.biases.shape == up.scales.shape,
+              down.weight.shape == [128, 2688, 232],
+              down.scales.shape == [128, 2688, 29], down.biases.shape == down.scales.shape,
+              let sharedUp = buffers(sharedMLP.upProj, n: 3712, k: 2688),
+              let sharedDown = buffers(sharedMLP.downProj, n: 2688, k: 3712),
+              let upKernel = packSharedUp ? NMLRoutedSharedKernels.shared.packedUp
+                : NMLRoutedSharedKernels.shared.up
+        else { return nil }
+        let flat = indices.reshaped(18)
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
+        let first = upKernel([up.weight, up.scales, up.biases, packed, flat] + sharedUp,
+            template: [("T", DType.bfloat16), ("R", 3), ("TOPK", 6),
+                       ("K", 2688), ("N", 1856), ("XSLOT", false),
+                       ("RELU2", true), ("RPS", 2), ("FAST", false),
+                       ("SK", 2688), ("SN", 3712)],
+            grid: (32, 1856 / 2, packSharedUp ? 19 : 20), threadGroup: (32, 2, 1),
+            outputShapes: [[18, 1856], [36], [3, 3712]]
+                + (packSharedUp ? [[3, 15, 9 * 32]] : []),
+            outputDTypes: [.bfloat16, .int32, .bfloat16]
+                + (packSharedUp ? [.float32] : []))
+        let sharedPrepared = packSharedUp ? first[3]
+            : NemotronHeadPreparedActivation.prepareContiguousRows(first[2], pv: 8)
+        // Non-nil ONLY in official-worker load admission, never in inference.
+        if packSharedUp { inspectPacked?(first[2], sharedPrepared) }
+        let second = NMLRoutedSharedKernels.shared.down(
+            [down.weight, down.scales, down.biases, first[0], flat, scores.reshaped(18), first[1]]
+                + sharedDown + [sharedPrepared],
+            template: [("T", DType.bfloat16), ("R", 3), ("TOPK", 6),
+                       ("K", 1856), ("N", 2688),
+                       ("RELU2", false), ("RPS", 2), ("FAST", false),
+                       ("SK", 3712), ("SN", 2688)],
+            grid: (32 * (2688 / 4 + 2688 / 12), 6, 1), threadGroup: (32, 6, 1),
+            outputShapes: [[1, 3, 2688], [3, 2688]],
+            outputDTypes: [.bfloat16, .bfloat16])
+        return (second[0], second[1].reshaped(1, 3, 2688))
+    }
+
+    static func apply(
+        _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
+        _ mlp: NemotronHSwitchMLP, _ sharedMLP: NemotronHMLP, prepared: MLXArray?
+    ) -> (MLXArray, MLXArray)? {
+        guard verified else { return nil }
+        if packedVerified, let fused = run(x, indices, scores, mlp, sharedMLP,
+            prepared: prepared, packSharedUp: true) { return fused }
+        return run(x, indices, scores, mlp, sharedMLP, prepared: prepared)
+    }
+
+    static func verify(_ model: Module) {
+        verified = false
+        packedVerified = false
+        guard enabled,
+              let moe = model.modules().lazy.compactMap({ $0 as? NemotronHMoE })
+                .first(where: { $0.sharedExperts != nil }),
+              let sharedMLP = moe.sharedExperts
+        else { return }
+        var matches = true
+        for seed in 0 ..< 3 {
+            let x = MLXRandom.normal(
+                [1, 3, 2688], dtype: .bfloat16, key: MLXRandom.key(UInt64(0x5d0e + seed)))
+            let scores = MLXRandom.normal(
+                [1, 3, 6], key: MLXRandom.key(UInt64(0x5d1e + seed))).asType(.float32)
+            let values: [UInt32] = (0 ..< 3).flatMap { row in
+                (0 ..< 6).map { slot in UInt32((17 * (slot + row) + 9 * seed) % 128) }
+            }
+            let indices = MLXArray(values).reshaped(1, 3, 6)
+            guard let fused = run(x, indices, scores, moe.switchMLP, sharedMLP, prepared: nil),
+                  let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
+                      x, indices, scores, moe.switchMLP, prepared: nil)
+            else { return }
+            let shared = sharedMLP.mtpForwardRows(x, prepared: nil)
+            let sameRouted = (fused.0.view(dtype: .uint16) .== routed.view(dtype: .uint16)).all()
+            let sameShared = (fused.1.view(dtype: .uint16) .== shared.view(dtype: .uint16)).all()
+            matches = matches && sameRouted.item(Bool.self) && sameShared.item(Bool.self)
+        }
+        verified = matches
+        if matches && packedEnabled {
+            packedVerified = qualifyPacked(moe, shared: sharedMLP)
+        }
+        print("[nemotron-routed-shared-packed] \(packedVerified ? "on (worker bitwise admission passed)" : "off")")
+    }
+
+    /// Official-worker load admission ONLY, before any MoE compiler trace.
+    /// Compare valid packed FP32 bits, BF16 up and BOTH final outputs against
+    /// original separate preparation. Padding is excluded just as in down.
+    private static func qualifyPacked(_ moe: NemotronHMoE, shared: NemotronHMLP) -> Bool {
+        do {
+            return try withError {
+                for seed in 0 ..< 3 {
+                    let random = MLXRandom.normal([1, 3, 2688], dtype: .bfloat16,
+                        key: MLXRandom.key(UInt64(0x8c30 + seed)))
+                    let ids = MLXArray((0 ..< 3).flatMap { row in
+                        (0 ..< 6).map { UInt32((17 * ($0 + row) + 9 * seed) % 128) }
+                    }).reshaped(1, 3, 6)
+                    let scores = MLXRandom.normal([1, 3, 6],
+                        key: MLXRandom.key(UInt64(0x8c40 + seed))).asType(.float32)
+                    for amplitude in [Float(0), Float(1), Float(8)] {
+                        let x = (random * MLXArray(amplitude)).asType(.bfloat16)
+                        let expectedUp = nemotronMTPLinearRelu2Rows(x, shared.upProj)
+                            .reshaped(3, 3712)
+                        let expectedPacked = NemotronHeadPreparedActivation
+                            .prepareContiguousRows(expectedUp, pv: 8)
+                        var packedOK = false
+                        guard let got = run(x, ids, scores, moe.switchMLP, shared,
+                            prepared: nil, packSharedUp: true, inspectPacked: { up, packed in
+                                func valid(_ a: MLXArray) -> MLXArray {
+                                    a.reshaped(3, 15, 9, 32).transposed(0, 1, 3, 2)
+                                        .reshaped(3, 480, 9)[0..., 0 ..< 464, 0...]
+                                }
+                                let sameUp = (up.view(dtype: .uint16)
+                                    .== expectedUp.view(dtype: .uint16)).all()
+                                let samePacked = (valid(packed).view(dtype: .uint32)
+                                    .== valid(expectedPacked).view(dtype: .uint32)).all()
+                                packedOK = sameUp.item(Bool.self) && samePacked.item(Bool.self)
+                            }),
+                              let expected = run(x, ids, scores, moe.switchMLP, shared, prepared: nil)
+                        else { return false }
+                        let routedOK = (got.0.view(dtype: .uint16)
+                            .== expected.0.view(dtype: .uint16)).all()
+                        let sharedOK = (got.1.view(dtype: .uint16)
+                            .== expected.1.view(dtype: .uint16)).all()
+                        if !packedOK || !routedOK.item(Bool.self) || !sharedOK.item(Bool.self) {
+                            return false
+                        }
+                    }
+                }
+                return true
+            }
+        } catch { return false }
+    }
 }

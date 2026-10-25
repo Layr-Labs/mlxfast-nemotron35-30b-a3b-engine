@@ -172,6 +172,68 @@ final class NemotronH35MTPAttentionBlock: Module {
         return [front[0], front[1], q, k, v]
     }
 
+    /// `pagedForwardRows`' cache-free front: the fused residual rows and their
+    /// Q [1, heads, L, headDim] and K/V [1, kvHeads, L, headDim].
+    func frontRows(hidden: MLXArray, embedding: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        let joined = joinedNorms(hidden: hidden, embedding: embedding)
+        let fused = nemotronMTPLinearRows(joined, projection)
+        let x = norm(fused)
+        let batch = x.dim(0), length = x.dim(1)
+        let queries = nemotronMTPLinearRows(x, mixer.wq)
+            .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let keys = nemotronMTPLinearRows(x, mixer.wk)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let values = nemotronMTPLinearRows(x, mixer.wv)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        return (fused, queries, keys, values)
+    }
+
+    /// One row's attention-block output (residual + projected attention) from
+    /// its query [1, heads, 1, headDim] over explicit K/V with an additive mask.
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries.asType(keys.dtype), keys: keys, values: values,
+            scale: mixer.scale, mask: .array(mask))
+        let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
+        return fused + nemotronMTPLinearRows(merged, mixer.wo)
+    }
+
+    /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
+    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
+        (inputs[3].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3),
+         inputs[4].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3))
+    }
+
+    /// The attention of `pagedForwardParts(inputs:)` over explicit `keys` and
+    /// `values` with an additive `mask` (no cache access); output projected.
+    func maskedDraftAttention(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let queries = inputs[2].reshaped(1, 1, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+            .asType(keys.dtype)
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: mixer.scale, mask: .array(mask))
+        return mixer.wo(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1))
+    }
+
+    func devicePagedSecondAttention(
+        inputs: [MLXArray], cache: PagedLayerCache, accepted: MLXArray,
+        trustedOffset: Int, postVerifyRows: Int
+    ) -> MLXArray? {
+        let own = draftKeyValues(inputs: inputs)
+        let queries = inputs[2].reshaped(1, mixer.numHeads, mixer.headDim)
+        guard let output = cache.nemotronDeviceSecondAttention(
+            queries: queries, ownKeys: own.keys.squeezed(axis: 2),
+            ownValues: own.values.squeezed(axis: 2), acceptedDrafts: accepted,
+            trustedOffset: trustedOffset, postVerifyRows: postVerifyRows, scale: mixer.scale)
+        else { return nil }
+        return mixer.wo(output.reshaped(1, 1, -1))
+    }
+
     /// `pagedForwardParts` from `pagedDraftInputs` of the same inputs.
     func pagedForwardParts(
         inputs: [MLXArray], cache: any CBv2AttendingLayerCache
@@ -290,6 +352,19 @@ final class NemotronH35MTPExpertBlock: Module {
     @ModuleInfo(key: "mixer") var mixer: NemotronHMoE
     @ModuleInfo(key: "final_layernorm") var finalNorm: RMSNorm
     private let oneTokenTailCache = NemotronH35MTPOneTokenTailCache()
+    fileprivate var sparseDraftDown: NemotronMTPDraftSparseDown?
+
+    /// The loader calls this only for its own mtp.layers.1 after weight update,
+    /// before any expert-tail graph is traced. Target MoEs are never passed.
+    func prepareOwnedSparseDraftDown() {
+        guard mixer.numExpertsPerTok == 6 else {
+            sparseDraftDown = nil
+            return
+        }
+        sparseDraftDown = NemotronMTPDraftSparseDown.prepare(mixer.switchMLP, finalNorm: finalNorm)
+        print("[nemotron-mtp-owned-sparse-fc2] \(sparseDraftDown == nil ? "off" : "on (worker bitwise admission passed)")")
+        print("[nemotron-mtp-owned-fc2-fold-rms] \(sparseDraftDown?.foldJoinQualified == true ? "on (worker bitwise admission passed)" : "off")")
+    }
 
     init(_ args: NemotronHConfiguration) {
         _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
@@ -317,6 +392,18 @@ final class NemotronH35MTPExpertBlock: Module {
         return self(residual + attention)
     }
 
+    /// Same operations as the joined entry above, without a nested compiled
+    /// cache. The whole-second graph supplies all parameter/copy handles.
+    fileprivate func uncompiledJoinedTail(residual: MLXArray, attention: MLXArray) -> MLXArray {
+        if exactTailAvailable(residual), attention.shape == residual.shape,
+           let joined = NemotronHResidualRMSNorm.apply(residual, attention, norm: norm) {
+            return exactOneTokenTail(joined.0, normalized: joined.1)
+        }
+        let x = residual + attention
+        return exactTailAvailable(x) ? exactOneTokenTail(x, normalized: nil)
+            : uncompiledOneTokenTail(x)
+    }
+
     fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
         finalNorm(x + mixer(norm(x)))
     }
@@ -333,9 +420,17 @@ final class NemotronH35MTPExpertBlock: Module {
     fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
         let h = normalized ?? norm(x)
         let (indices, scores) = mixer.gate(h)
+        if let plan = sparseDraftDown, plan.foldJoinQualified,
+           let sharedExperts = mixer.sharedExperts,
+           let products = plan.productsForJoinedTail(h, indices, scores, mixer.switchMLP),
+           let joined = NemotronHResidualRMSNorm.applyDraftExpertFold(
+               x, products: products, shared: sharedExperts(h), norm: finalNorm) {
+            return joined.1
+        }
+        let sparse = sparseDraftDown?.run(h, indices, scores, mixer.switchMLP)
         guard let sharedExperts = mixer.sharedExperts,
-              let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP)
+              let routed = sparse ?? NemotronMoELeader.switchRowsAndWeightedReduce(
+                  h, indices, scores, mixer.switchMLP)
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
@@ -355,6 +450,7 @@ final class NemotronH35MTPExpertBlock: Module {
 private final class NemotronH35MTPOneTokenTailCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
+        let usesFoldJoin: Bool
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
@@ -369,12 +465,16 @@ private final class NemotronH35MTPOneTokenTailCache {
         // reflective module and parameter identities instead.
         let nativeIdentity = Self.nativeIdentity(owner)
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
-        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
-            + (parameters ?? []).map(ObjectIdentifier.init))
+        let identity = (nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
+            + (parameters ?? []).map(ObjectIdentifier.init)))
+            + (owner.sparseDraftDown.map { [ObjectIdentifier($0)] } ?? [])
+        let usesFoldJoin = owner.sparseDraftDown?.foldJoinQualified == true
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
-            if let entry = entries[mode], entry.identity == identity { return entry }
-            let state = parameters ?? owner.innerState()
+            if let entry = entries[mode], entry.identity == identity,
+               entry.usesFoldJoin == usesFoldJoin { return entry }
+            let state = (parameters ?? owner.innerState())
+                + (owner.sparseDraftDown?.compilationState ?? [])
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MTP expert-tail owner") }
@@ -384,7 +484,7 @@ private final class NemotronH35MTPOneTokenTailCache {
                 default: return [owner.exactOneTokenTail(arrays[0], normalized: arrays[1])]
                 }
             }
-            let replacement = Entry(identity: identity, function: function)
+            let replacement = Entry(identity: identity, usesFoldJoin: usesFoldJoin, function: function)
             retired = entries[mode]
             entries[mode] = replacement
             return replacement
@@ -402,7 +502,7 @@ private final class NemotronH35MTPOneTokenTailCache {
         return result[0]
     }
 
-    private static func nativeIdentity(_ owner: NemotronH35MTPExpertBlock) -> [ObjectIdentifier]? {
+    fileprivate static func nativeIdentity(_ owner: NemotronH35MTPExpertBlock) -> [ObjectIdentifier]? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -428,9 +528,70 @@ private final class NemotronH35MTPOneTokenTailCache {
     }
 }
 
+/// Bounded model-owned execution graph, with no request/pool/cache captured.
+/// The common plan supplies its ten request inputs; the residual is eleventh.
+/// Attention fence publication and all KV/transaction updates stay outside.
+private final class NemotronH35MTPWholeSecondCache {
+    static let enabled = ProcessInfo.processInfo.environment[
+        "NEMOTRON_MTP_DEVICE_SECOND_WHOLE_GRAPH"] != "0"
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_GRAPH"] != "0"
+    private struct Entry {
+        let key: [Int]
+        let identity: [ObjectIdentifier]
+        let usesFoldJoin: Bool
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    func run(_ plan: NemotronDeviceSecondAttentionPlan, residual: MLXArray,
+             attention: NemotronH35MTPAttentionBlock, expert: NemotronH35MTPExpertBlock)
+        -> [MLXArray]
+    {
+        let expertIdentity = NemotronH35MTPOneTokenTailCache.nativeIdentity(expert)
+        let parameters = expertIdentity == nil ? expert.innerState() : nil
+        let identity = [ObjectIdentifier(attention), ObjectIdentifier(attention.mixer),
+                        ObjectIdentifier(attention.mixer.wo)]
+            + (expertIdentity ?? (expert.modules().map(ObjectIdentifier.init)
+                + (parameters ?? []).map(ObjectIdentifier.init)))
+            + (expert.sparseDraftDown.map { [ObjectIdentifier($0)] } ?? [])
+        let usesFoldJoin = expert.sparseDraftDown?.foldJoinQualified == true
+        // Bind the pure builder, NEVER `plan`, which also owns current arrays.
+        let buildAttention = plan.build
+        let build: ([MLXArray]) -> [MLXArray] = {
+            [weak attention, weak expert] arrays in
+            guard let attention, let expert else {
+                preconditionFailure("Released Nemotron whole-second graph owner")
+            }
+            let result = buildAttention(Array(arrays.prefix(10)))
+            let projected = attention.mixer.wo(result[0].reshaped(1, 1, -1))
+            let hidden = expert.uncompiledJoinedTail(residual: arrays[10], attention: projected)
+            return [hidden, result[1]]
+        }
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.key == plan.key, entry.identity == identity,
+               entry.usesFoldJoin == usesFoldJoin { return entry }
+            let state = attention.mixer.wo.innerState()
+                + (parameters ?? expert.innerState())
+                + (expert.sparseDraftDown?.compilationState ?? [])
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state], build)
+            let replacement = Entry(key: plan.key, identity: identity,
+                usesFoldJoin: usesFoldJoin, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        let inputs = plan.inputs + [residual]
+        let result = withExtendedLifetime(retired) { current.function(inputs) }
+        return result.count == 2 ? result : build(inputs)
+    }
+}
+
 final class NemotronH35MTPModule: Module {
     // Heterogeneous array preserves the official mtp.layers.{0,1} namespace.
     @ModuleInfo(key: "layers") var layers: [Module]
+    private let wholeSecondCache = NemotronH35MTPWholeSecondCache()
     init(_ args: NemotronHConfiguration) {
         _layers.wrappedValue = [NemotronH35MTPAttentionBlock(args), NemotronH35MTPExpertBlock(args)]
     }
@@ -453,6 +614,86 @@ final class NemotronH35MTPModule: Module {
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
+    }
+    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).draftKeyValues(inputs: inputs)
+    }
+    func frontRows(hidden: MLXArray, embedding: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding)
+    }
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowOutput(
+            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+    }
+    /// The one-token draft step from `pagedDraftInputs` with its attention over
+    /// explicit, masked K/V instead of the paged head cache.
+    func maskedSecondDraft(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedDraftAttention(
+            inputs: inputs, keys: keys, values: values, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
+    }
+    /// Read the post-verify selected row through the same native, explicit
+    /// attention/WO/expert graph. Its own K/V is already one of the slab rows.
+    func devicePagedPickedFirstDraft(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray,
+        cache: PagedLayerCache, accepted: MLXArray, trustedOffset: Int, postVerifyRows: Int
+    ) -> MLXArray? {
+        guard NemotronH35MTPPickedFirstAttention.nativePaged else { return nil }
+        let block = layers[0] as! NemotronH35MTPAttentionBlock
+        return devicePagedDraft(residual: fused,
+            queries: queries.reshaped(1, block.mixer.numHeads, block.mixer.headDim),
+            ownKeys: keys.squeezed(axis: 2), ownValues: values.squeezed(axis: 2),
+            cache: cache, accepted: accepted, trustedOffset: trustedOffset,
+            postVerifyRows: postVerifyRows, ownRowDelta: 1)
+    }
+
+    func devicePagedSecondDraft(
+        inputs: [MLXArray], cache: PagedLayerCache, accepted: MLXArray,
+        trustedOffset: Int, postVerifyRows: Int
+    ) -> MLXArray? {
+        guard inputs.count == 5 else { return nil }
+        let block = layers[0] as! NemotronH35MTPAttentionBlock
+        let own = block.draftKeyValues(inputs: inputs)
+        return devicePagedDraft(residual: inputs[0],
+            queries: inputs[2].reshaped(1, block.mixer.numHeads, block.mixer.headDim),
+            ownKeys: own.keys.squeezed(axis: 2), ownValues: own.values.squeezed(axis: 2),
+            cache: cache, accepted: accepted, trustedOffset: trustedOffset,
+            postVerifyRows: postVerifyRows, ownRowDelta: 2)
+    }
+
+    /// All current data is passed to the common plan; only immutable model
+    /// state joins the trace. First/second semantics live in explicit config.
+    private func devicePagedDraft(
+        residual: MLXArray, queries: MLXArray, ownKeys: MLXArray, ownValues: MLXArray,
+        cache: PagedLayerCache, accepted: MLXArray, trustedOffset: Int,
+        postVerifyRows: Int, ownRowDelta: Int
+    ) -> MLXArray? {
+        let attention = layers[0] as! NemotronH35MTPAttentionBlock
+        let expert = layers[1] as! NemotronH35MTPExpertBlock
+        let execution: ((NemotronDeviceSecondAttentionPlan) -> [MLXArray])?
+        if NemotronH35MTPWholeSecondCache.enabled,
+           residual.shape == [1, 1, 2688], residual.dtype == .bfloat16,
+           (type(of: attention.mixer.wo) == Linear.self
+                || type(of: attention.mixer.wo) == QuantizedLinear.self) {
+            execution = { plan in
+                self.wholeSecondCache.run(plan, residual: residual, attention: attention, expert: expert)
+            }
+        } else {
+            execution = nil
+        }
+        guard let result = cache.nemotronDeviceSecondAttention(
+            queries: queries, ownKeys: ownKeys, ownValues: ownValues,
+            acceptedDrafts: accepted, trustedOffset: trustedOffset,
+            postVerifyRows: postVerifyRows, scale: attention.mixer.scale,
+            ownRowDelta: ownRowDelta, execution: execution) else { return nil }
+        if execution != nil { return result }
+        return expert(residual: residual, attention: attention.mixer.wo(result.reshaped(1, 1, -1)))
     }
     func pagedForward(inputs: [MLXArray], cache: any CBv2AttendingLayerCache) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
