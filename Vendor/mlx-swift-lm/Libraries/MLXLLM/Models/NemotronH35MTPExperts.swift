@@ -1737,6 +1737,10 @@ private let nemotronZSkipTiledSeqSource = """
 // The chunk sum likewise reduces to x1 (+ x2), and the closing
 // scale * accum + sum * bias keeps the record's form. Chunks with three or
 // more non-zero values take the tiled kernel's statements unchanged.
+// In the sparse paths the nibble shift cancels the activation's power-of-two
+// scale exactly when the BF16 magnitude is at least 2^-110 and finite. Smaller
+// or non-finite values retain the complete tiled arithmetic below, avoiding
+// flush-to-zero differences from cancelling a subnormal intermediate.
 private let nemotronZSkipTiledFastSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
@@ -1758,12 +1762,16 @@ private let nemotronZSkipTiledFastSource = """
   const device T* xs = x + slot * K;
   for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
     const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
-    uint m = 0;
+    uint m = 0, unsafe = 0;
     for (int i = 0; i < 8; i++) {
-      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      const uint ab = uint(xb[i]) & 0x7fffu;
+      m |= ab != 0 ? (1u << i) : 0u;
+      unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
       xsh[8 * c + i] = xs[8 * c + i];
     }
-    cmask[c] = uchar(m);
+    // A full-mask sentinel sends tiny/nonfinite chunks to the unchanged dense
+    // arithmetic, without a second shared array or per-output exponent tests.
+    cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
@@ -1786,8 +1794,7 @@ private let nemotronZSkipTiledFastSource = """
       if (popcount(m) == 1) {
         const int j1 = ctz(m);
         const T xvj = xsh[8 * c + j1];
-        const int jq = j1 & 3;
-        const U xtj = jq == 0 ? U(xvj) : (jq == 1 ? xvj / 16.0f : (jq == 2 ? xvj / 256.0f : xvj / 4096.0f));
+        const U xtj = U(xvj);
         const U sum1 = U(xvj);
         const uint w = uint(wq[(8 * c + j1) * 32]);
         const int gi = c / 8;
@@ -1796,7 +1803,7 @@ private let nemotronZSkipTiledFastSource = """
         const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
         const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
         for (int o = 0; o < 4; o++) {
-          const uint code = ((w >> (4 * o)) & 0xfu) << (4 * jq);
+          const uint code = ((w >> (4 * o)) & 0xfu);
           U accum = 0;
           accum += xtj * U(int(code));
           p[o] += as_type<float>(sv[o]) * accum + sum1 * as_type<float>(bv[o]);
@@ -1810,10 +1817,8 @@ private let nemotronZSkipTiledFastSource = """
         const uint w2 = uint(wq[(8 * c + j2) * 32]);
         const T xv1 = xsh[8 * c + j1];
         const T xv2 = xsh[8 * c + j2];
-        const int q1 = j1 & 3;
-        const int q2 = j2 & 3;
-        const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
-        const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
         const U sum2 = U(xv1) + U(xv2);
         const int gi = c / 8;
         const uint2 sr = *((const device uint2*)(sq + gi * OT));
@@ -1821,8 +1826,8 @@ private let nemotronZSkipTiledFastSource = """
         const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
         const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
         for (int o = 0; o < 4; o++) {
-          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
-          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
           const U accum = xt1 * c1 + xt2 * c2;
           p[o] += as_type<float>(sv[o]) * accum + sum2 * as_type<float>(bv[o]);
         }
@@ -1860,6 +1865,160 @@ private let nemotronZSkipTiledFastSource = """
     }
     for (int o = 0; o < 4; o++) {
       part[l * PS + 4 * lid + o] = p[o];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int q = 0; q < OT / SGS; q++) {
+    const int n = sg * (OT / SGS) + q;
+    const U r = simd_sum(part[lid * PS + n]);
+    if (lid == 0) {
+      const T h = nml_store<T, false>(r);
+      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;
+    }
+  }
+"""
+
+// The fast slot kernel with each SIMD group owning LPS consecutive lane
+// partials (l = LPS * sg + ll) instead of l = sg + SGS * ll. In each round j
+// their chunks (l + 32 * j, or the tail chunk 224 + l) lie in one 64-input
+// group, so the group's scale and bias load once per round for all of them.
+// Every partial still sums its own chunks in ascending j with the fast
+// kernel's per-chunk statements, and `part` is keyed by l, so the closing
+// reduction is unchanged. The slot row is staged with one 16-byte load per
+// chunk.
+private let nemotronZSkipTiledPairSource = """
+  constexpr int OT = 128;
+  constexpr int LPS = 32 / SGS;
+  constexpr int chunks = K / 8;
+  constexpr int tail = chunks - 224;
+  constexpr int halves = N / 4;
+  constexpr int groups = K / 64;
+  constexpr int PS = OT + 1;
+  typedef float U;
+  threadgroup float part[32 * PS];
+  threadgroup T xsh[K];
+  threadgroup uchar cmask[chunks];
+
+  const int slot = int(threadgroup_position_in_grid.y);
+  const int n0 = int(threadgroup_position_in_grid.x) * OT;
+  const int lid = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const uint expert = inds[slot];
+  const device T* xs = x + slot * K;
+  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+    const uint4 xw = *((const device uint4*)(xs + 8 * c));
+    const thread uint16_t* xb = (const thread uint16_t*)&xw;
+    const thread T* xw8 = (const thread T*)&xw;
+    uint m = 0, unsafe = 0;
+    for (int i = 0; i < 8; i++) {
+      const uint ab = uint(xb[i]) & 0x7fffu;
+      m |= ab != 0 ? (1u << i) : 0u;
+      unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+      xsh[8 * c + i] = xw8[i];
+    }
+    // newjordan's full-mask sentinel (2fa7ec19): tiny/nonfinite chunks take the dense arithmetic.
+    cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
+  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;
+  const device T* sq = sk + tb * groups * OT + 4 * lid;
+  const device T* bq = bk + tb * groups * OT + 4 * lid;
+  const int l0 = LPS * sg;
+  thread U p[LPS][4];
+  _Pragma("clang loop unroll(full)")
+  for (int ll = 0; ll < LPS; ll++) {
+    for (int o = 0; o < 4; o++) {
+      p[ll][o] = 0;
+    }
+  }
+  const int count = l0 < tail ? 8 : 7;
+  for (int j = 0; j < count; j++) {
+    const int cb = j < 7 ? l0 + 32 * j : 224 + l0;
+    uint any = 0;
+    _Pragma("clang loop unroll(full)")
+    for (int ll = 0; ll < LPS; ll++) {
+      any |= cmask[cb + ll];
+    }
+    if (any == 0) {
+      continue;
+    }
+    {
+      const int gi = cb / 8;
+      const uint2 sr = *((const device uint2*)(sq + gi * OT));
+      const uint2 br = *((const device uint2*)(bq + gi * OT));
+      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+      _Pragma("clang loop unroll(full)")
+      for (int ll = 0; ll < LPS; ll++) {
+        const int c = cb + ll;
+          const uint m = cmask[c];
+          if (m == 0) {
+            continue;
+          }
+          if (popcount(m) == 1) {
+            const int j1 = ctz(m);
+            const T xvj = xsh[8 * c + j1];
+            const U xtj = U(xvj);
+            const U sum1 = U(xvj);
+            const uint w = uint(wq[(8 * c + j1) * 32]);
+            for (int o = 0; o < 4; o++) {
+              const uint code = ((w >> (4 * o)) & 0xfu);
+              U accum = 0;
+              accum += xtj * U(int(code));
+              p[ll][o] += as_type<float>(sv[o]) * accum + sum1 * as_type<float>(bv[o]);
+            }
+            continue;
+          }
+          if (popcount(m) == 2) {
+            const int j1 = ctz(m);
+            const int j2 = ctz(m & (m - 1));
+            const uint w1 = uint(wq[(8 * c + j1) * 32]);
+            const uint w2 = uint(wq[(8 * c + j2) * 32]);
+            const T xv1 = xsh[8 * c + j1];
+            const T xv2 = xsh[8 * c + j2];
+            const U xt1 = U(xv1);
+            const U xt2 = U(xv2);
+            const U sum2 = U(xv1) + U(xv2);
+            for (int o = 0; o < 4; o++) {
+              const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+              const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
+              const U accum = xt1 * c1 + xt2 * c2;
+              p[ll][o] += as_type<float>(sv[o]) * accum + sum2 * as_type<float>(bv[o]);
+            }
+            continue;
+          }
+          thread U xt[8];
+          U sum = 0;
+          const threadgroup T* xv = xsh + 8 * c;
+          for (int i = 0; i < 8; i += 4) {
+            sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+            xt[i] = xv[i];
+            xt[i + 1] = xv[i + 1] / 16.0f;
+            xt[i + 2] = xv[i + 2] / 256.0f;
+            xt[i + 3] = xv[i + 3] / 4096.0f;
+          }
+          uint u[4];
+          for (int i = 0; i < 4; i++) {
+            const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+            const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+            u[i] = lo | (hi << 16);
+          }
+          nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+          nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+          nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+          nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+          for (int o = 0; o < 4; o++) {
+            const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+            p[ll][o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+          }
+      }
+    }
+  }
+  _Pragma("clang loop unroll(full)")
+  for (int ll = 0; ll < LPS; ll++) {
+    for (int o = 0; o < 4; o++) {
+      part[(l0 + ll) * PS + 4 * lid + o] = p[ll][o];
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2023,6 +2182,24 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
+    private static let tiledPairSlotKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_slots_tiled_pair", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipTiledPairSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    private static let tiledPairDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledPairSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_pair_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    /// The fast slot kernel with paired lane partials (one scale/bias load per
+    /// round for a SIMD group's partials) unless NEMOTRON_MTP_ZSKIP_PAIRED=0.
+    /// `prepare` falls back to the fast kernel (and re-checks every layer) if
+    /// the paired kernel misses a bit check.
+    nonisolated(unsafe) private static var paired =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_PAIRED"] != "0"
     private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
@@ -2032,7 +2209,7 @@ enum NemotronZSkip {
     }
     /// The slot kernel that reads a dictionary copy (the fast or plain tiled form).
     private static var dictKernel: MLXFast.MLXFastKernel? {
-        fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
+        fast ? (paired ? tiledPairDictSlotKernel : tiledFastDictSlotKernel) : tiledDictSlotKernel
     }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
@@ -2061,7 +2238,8 @@ enum NemotronZSkip {
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
     private static var kernel: MLXFast.MLXFastKernel {
-        tiled ? (fast ? tiledFastSlotKernel : tiledSlotKernel) : (staged ? stagedSlotKernel : recordSlotKernel)
+        tiled ? (fast ? (paired ? tiledPairSlotKernel : tiledFastSlotKernel) : tiledSlotKernel)
+            : (staged ? stagedSlotKernel : recordSlotKernel)
     }
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
@@ -2256,6 +2434,13 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, fast, paired {
+            // The paired kernel missed a check: the fast kernel, every layer again.
+            paired = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: paired slot kernel differs; fast slot kernel\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
             sbDict = false
