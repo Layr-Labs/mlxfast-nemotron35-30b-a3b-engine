@@ -61,6 +61,7 @@ extension EngineLoopV2 {
         }
         mtp.recordSeedSteps(graph.seedRows.count)
 
+        CBv2MTPSubmitMerge.flush()
         asyncEval(graph.asyncEvalTargets)
         if let verify = graph.verify { mtpSpeculateAfterVerify(verify, driver: mtp) }
         if CBv2StepProfiler.enabled {

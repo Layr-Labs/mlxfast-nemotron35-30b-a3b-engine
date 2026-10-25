@@ -280,6 +280,7 @@ extension EngineLoopV2 {
                     let fixed = mtp.config.fixedDraftTokens ?? 0
                     let depth = CBv2MTPFirstDraftPrestage.chained
                         && rec.request.maxTokens - rec.generatedTokenCount >= fixed ? fixed : 1
+                    CBv2MTPSubmitMerge.begin()
                     prestager.prestageDrafts(
                         token: kept[confirmed - 1], hidden: hidden, requestState: state,
                         depth: depth)
@@ -531,6 +532,41 @@ public enum CBv2MTPFirstDraftPrestage {
         && ProcessInfo.processInfo.environment["CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT"] != "0"
 }
 
+/// Head-chain submissions grouped into fewer `asyncEval` calls (evaluation
+/// order only): finalize's prestaged drafts and the round-build draft steps
+/// ride the verify's first submission, so the host reaches that submission
+/// with no separate submit before it, and the two post-verify head graphs
+/// share one. Each `asyncEval` ends its command buffer with an event. The
+/// acceptance packet keeps its own submission. `NEMOTRON_MTP_MERGE_SUBMITS=0`
+/// submits each graph on its own.
+public enum CBv2MTPSubmitMerge {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MERGE_SUBMITS"] != "0"
+    nonisolated(unsafe) private static var held: [MLXArray]? = nil
+
+    /// Start holding submissions (engine thread only).
+    public static func begin() {
+        if enabled && held == nil { held = [] }
+    }
+
+    /// `asyncEval(arrays)`, or hold them for the next `take`/`flush`.
+    public static func submit(_ arrays: [MLXArray]) {
+        if held != nil { held!.append(contentsOf: arrays) } else { asyncEval(arrays) }
+    }
+
+    /// The held arrays (empty when none); holding ends.
+    public static func take() -> [MLXArray] {
+        defer { held = nil }
+        return held ?? []
+    }
+
+    /// Submit the held arrays on their own; holding ends.
+    public static func flush() {
+        let arrays = take()
+        if !arrays.isEmpty { asyncEval(arrays) }
+    }
+}
+
 extension EngineLoopV2 {
     /// Queue the drafter's acceptance-independent work behind a submitted
     /// verify. It depends on the verify outputs, so it runs after them; it is
@@ -546,6 +582,10 @@ extension EngineLoopV2 {
         let draftCount = batch * verify.k
         let targets = verify.acceptancePacket[draftCount ..< (draftCount + batch * width)]
             .reshaped([batch, width])
+        // Both post-verify head graphs go to the GPU in one submission; they
+        // queue behind the verify the GPU is still running.
+        CBv2MTPSubmitMerge.begin()
+        defer { CBv2MTPSubmitMerge.flush() }
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
             speculator.speculateAfterVerify(
