@@ -25,6 +25,7 @@ final class NemotronH35MTPGraphCache {
     private let lock = NSLock()
     /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
     private var entries: [Entry?] = [nil, nil, nil, nil]
+    private var joinedEntry: Entry?
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
@@ -68,6 +69,61 @@ final class NemotronH35MTPGraphCache {
         // evaluation owns a separate global/per-function lock ordering.
         return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
     }
+
+    /// Stateless captured MoE plus its existing residual/norm/preparation join.
+    /// Current activations are explicit inputs; only module parameters persist.
+    func joinedOutputs(
+        _ x: MLXArray, residual: MLXArray, prepared: MLXArray?,
+        norm: RMSNorm, owner: NemotronHMoE
+    ) -> [MLXArray]? {
+        guard Self.joinedEnabled, NemotronMTPExecution.compiledMoE,
+              NemotronHResidualRMSNorm.plumbingAvailable, owner.sharedExperts != nil,
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              residual.shape == x.shape, residual.dtype == x.dtype,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16,
+              let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688),
+              let native = Self.nativeIdentity(owner)
+        else { return nil }
+        let identity = native + [ObjectIdentifier(norm)]
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            calls += 1
+            if let entry = joinedEntry, entry.identity == identity { return entry }
+            let state = owner.innerState() + norm.innerState()
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak owner, weak norm] arrays in
+                guard let owner, let norm else {
+                    preconditionFailure("Released Nemotron joined MoE graph owner")
+                }
+                let parts = owner.mtpForwardRowsUncompiledOutputs(
+                    arrays[0], prepared: arrays[2], parts: true)
+                guard parts.count == 2, let joined = NemotronHResidualRMSNorm.applyPreparedRows(
+                    arrays[1], parts[0], shared: parts[1], norm: norm)
+                else { return [] }
+                return [joined.0, joined.1, joined.2]
+            }
+            let replacement = Entry(identity: identity, usesPrepared: true, function: function)
+            retired = joinedEntry
+            joinedEntry = replacement
+            generations += 1
+            return replacement
+        }
+        let result = withExtendedLifetime(retired) { current.function([x, residual, packed]) }
+        guard result.count == 3 else { return nil }
+        guard NemotronMoELeader.selfTest else { return result }
+        let parts = outputs(x, prepared: packed, parts: true, owner: owner)
+        guard parts.count == 2, let expected = NemotronHResidualRMSNorm.applyPreparedRows(
+            residual, parts[0], shared: parts[1], norm: norm) else { return nil }
+        // Prepared buffers contain unused padding. Compare their source rows,
+        // not padding bytes, and poison every output on any disagreement.
+        let ok = (result[0].view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all()
+            .&& (result[1].view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()
+        return result.map { which(ok, $0, MLXArray(Float.nan).asType($0.dtype)) }
+    }
+
+    private static let joinedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MOE_JOIN"] != "0"
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
         func linear(_ value: Linear) -> Bool {

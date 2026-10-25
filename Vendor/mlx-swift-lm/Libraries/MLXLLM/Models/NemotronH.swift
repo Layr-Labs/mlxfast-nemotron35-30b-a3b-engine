@@ -3958,6 +3958,10 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
+            if let joined = moe.mtpCompiledRowsCache.joinedOutputs(
+                hidden, residual: x, prepared: prepared, norm: nextNorm, owner: moe) {
+                return (joined[0], joined[1], joined[2])
+            }
             if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
                 output = parts.0
                 shared = parts.1
