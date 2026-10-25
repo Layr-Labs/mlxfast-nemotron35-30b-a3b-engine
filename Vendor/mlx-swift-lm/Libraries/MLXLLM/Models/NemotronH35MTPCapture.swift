@@ -161,16 +161,54 @@ extension NemotronHMamba2Mixer {
         prepared inputPrepared: MLXArray? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
-        let projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
+        // The window's conv, padded history and timestep come from in_proj's
+        // own epilogue when the shapes allow it (same values, one launch fewer).
+        var fusedWindow: (MLXArray, MLXArray, MLXArray)? = nil
+        let projected: MLXArray
+        if batch == 1, hiddenStates.ndim == 3, convKernelSize == 4, conv1d.groups == convDim,
+           conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
+           let convBias = conv1d.bias, let q = inProj as? QuantizedLinear,
+           type(of: q) == QuantizedLinear.self,
+           let fused = NemotronMambaInProjConvDt.apply(
+               hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: inputPrepared,
+               oldState: convState, convWeight: conv1d.weight, convBias: convBias,
+               dtBias: dtBias, timeStepLimit: timeStepLimit,
+               convStart: intermediateSize, convDim: convDim, heads: numHeads) {
+            projected = fused.projected.reshaped(batch, length, -1)
+            fusedWindow = (fused.convolution, fused.padded, fused.dt)
+        } else {
+            projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
+        }
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let rawDt = parts[2].reshaped(batch, length, numHeads)
-        let (convolution, padded, dt) = packedConvDt(convState, input, rawDt) ?? {
-            let (convolution, padded) = packedConv(convState, input)
-            return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
-        }()
+        func separateWindow() -> (MLXArray, MLXArray, MLXArray) {
+            packedConvDt(convState, input, rawDt) ?? {
+                let (convolution, padded) = packedConv(convState, input)
+                return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
+            }()
+        }
+        var (convolution, padded, dt) = fusedWindow ?? separateWindow()
+        if fusedWindow != nil, NemotronMambaInProjConvDt.check {
+            let reference = separateWindow()
+            convolution = nemotronBitwiseOrNaN(convolution, reference.0)
+            padded = nemotronBitwiseOrNaN(padded, reference.1)
+            dt = nemotronBitwiseOrNaN(dt, reference.2)
+        }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
+        if length == 3, NemotronMTPExecution.batchedNorm,
+           let q = outProj as? QuantizedLinear, q.mode == .affine,
+           q.bits == 4, q.groupSize == 64, q.bias == nil,
+           q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+           q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+           q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
+           let fused = norm.compactSSMPreparedRows(
+               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+               projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state) {
+            return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
+                    padded, convolution, dt, fused.2]
+        }
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
