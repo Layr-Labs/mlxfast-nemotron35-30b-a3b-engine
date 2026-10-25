@@ -1130,17 +1130,26 @@ private final class NMLBalancePlan: Sendable {
 }
 private final class NMLBalanceWeighted: Sendable {
     static let shared = NMLBalanceWeighted()
+    /// Outputs per SIMD group (output rows per threadgroup): 6, so the
+    /// 2688-row bank runs 448 threadgroups instead of 672. Every output keeps
+    /// its lane split, block order, BF16 product and six-term sum.
+    /// NEMOTRON_MTP_FC2_WIDE=0 keeps four.
+    static let outputsPerSimdgroup =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_WIDE"] == "0" ? 4 : 6
     let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced",
         inputNames: ["w","scales","biases","x","inds","scores","plan"],
-        outputNames: ["y"], source: nmlBalanceWeightedSource,
+        outputNames: ["y"], source: nmlBalanceWeightedSource.replacingOccurrences(
+            of: "constexpr int results_per_simdgroup = 4;",
+            with: "constexpr int results_per_simdgroup = RPSW;"),
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
              _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
         let plan = plan ?? NMLBalancePlan.shared.make(ids)
+        let rpsw = bank.n % Self.outputsPerSimdgroup == 0 ? Self.outputsPerSimdgroup : 4
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
-            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
-            grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
+            template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n),("RPSW",rpsw)],
+            grid: (32*(bank.n/rpsw),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
     }
 }
