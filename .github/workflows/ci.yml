@@ -265,6 +265,10 @@ jobs:
         # toolchain, weights, GPU, or network.
         run: tools/test-resident-up.sh
 
+      - name: Leaked residents stop only while the GPU lock is free
+        # Hermetic: fake current-user residents, process groups and lock waits.
+        run: tools/test-stop-leaked-residents.sh
+
       - name: Worker build cache keys, misses, hits and refuses corruption
         # Drives the REAL tools/build-cache.sh in a scratch clone with stub
         # products: key stability, key change on a source change, empty-cache
