@@ -997,6 +997,41 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
+    /// Draft-only routed experts for one row: the first `topK` of the router's
+    /// six picks (its descending selection order), each weighted by its router
+    /// weight. Six-entry `indices` / `scores` are passed whole; the kernels read
+    /// only slots `0 ..< topK`. Drafts are verified by the target.
+    static func draftRowWeightedReduce(
+        _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
+        _ mlp: NemotronHSwitchMLP, topK: Int
+    ) -> MLXArray? {
+        guard enabled, (1 ..< 6).contains(topK), type(of: mlp) == NemotronHSwitchMLP.self,
+              type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+              type(of: mlp.fc2) == QuantizedSwitchLinear.self,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              indices.dtype == .uint32, indices.shape == [1, 1, 6],
+              scores.dtype == .float32, scores.shape == indices.shape,
+              let up = bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+              let down = bank(mlp.fc2, k: 1856, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336],
+              down.weight.shape == [128, 2688, 232]
+        else { return nil }
+        let flat = indices.reshaped(6)
+        let act = apply(x.reshaped(1, 2688), flat, rows: 1, topK: topK, bank: up,
+            perSlot: false, relu2: true, tail8: leaderTail8)
+        let weighted = (leaderTail8 ? NemotronMoELeaderWeightedKernel.shared.tail8 : nil)
+            ?? NemotronMoELeaderWeightedKernel.shared.kernel
+        return weighted(
+            [down.weight, down.scales, down.biases, act, flat, scores.reshaped(6)],
+            template: [("T", x.dtype), ("R", 1), ("TOPK", topK),
+                       ("K", down.k), ("N", down.n)],
+            grid: (32 * (down.n / 4), topK, 1),
+            threadGroup: (32, topK, 1),
+            outputShapes: [[1, 1, down.n]],
+            outputDTypes: [x.dtype])[0]
+    }
+
     /// The router produces six distinct indices per token. Keep its original
     /// slot order and the accepted cross-row leader pairs. Row-contiguous
     /// kernel copies support arbitrary input strides without weight changes.

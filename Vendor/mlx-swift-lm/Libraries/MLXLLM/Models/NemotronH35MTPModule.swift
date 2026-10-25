@@ -473,11 +473,20 @@ final class NemotronH35MTPExpertBlock: Module {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
+    /// Routed experts a draft step reads: the first `draftExperts` of the
+    /// router's six picks. NEMOTRON_MTP_DRAFT_EXPERTS=6 reads all six.
+    static let draftExperts =
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_EXPERTS"] ?? "") ?? 4
+
     fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
         let h = normalized ?? norm(x)
         let (indices, scores) = mixer.gate(h)
+        let reduced = Self.draftExperts < 6
+            ? NemotronMoELeader.draftRowWeightedReduce(
+                h, indices, scores, mixer.switchMLP, topK: Self.draftExperts)
+            : nil
         guard let sharedExperts = mixer.sharedExperts,
-              let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
+              let routed = reduced ?? NemotronMoELeader.switchRowsAndWeightedReduce(
                 h, indices, scores, mixer.switchMLP)
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
