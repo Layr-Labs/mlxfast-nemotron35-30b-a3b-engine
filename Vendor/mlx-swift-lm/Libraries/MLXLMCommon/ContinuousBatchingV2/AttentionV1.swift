@@ -768,11 +768,11 @@ enum CBv2AttentionV1 {
     /// the L new tokens' K/V into `row`'s storage in place (the target from
     /// `CBv2FullSequenceKV.inPlaceAppendTarget`; `written` is an output of
     /// that kernel). The append is committed behind that write; the per-query
-    /// SDPA calls are unchanged.
     static func attendSerialQueryRowsWritten(
         row: CBv2FullSequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, written: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
     ) -> [MLXArray] {
         precondition(
             queries.dim(0) == 1 && queries.dim(2) > 1,
@@ -781,6 +781,10 @@ enum CBv2AttentionV1 {
             sinks, kind: kind, queries: queries, softcap: softcap)
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.commitInPlaceAppend(count: L, written: written)
+        if let attendRows, window(of: kind) == nil, effectiveSinks == nil, softcap == nil,
+           let outputs = attendRows(queries, cachedKeys, cachedValues, scale) {
+            return outputs
+        }
         return queryBlockOutputs(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
