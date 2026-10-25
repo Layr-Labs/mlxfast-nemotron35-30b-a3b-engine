@@ -79,6 +79,7 @@ extension NemotronH35MTPAssistant {
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
