@@ -405,6 +405,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     let target: NemotronH35Model
     private let draftHead: NemotronMTPDraftHead
     private let kvOnlyHistory: Bool
+    private static let batchedHistoryReplay = true
     private let primePromptHistory: Bool
     private let draftLimit: Int
     /// The head cache's K/V dtype, probed once from the loaded weights.
@@ -729,6 +730,13 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 asyncEval(primed)
                 s.roots = primed
             }
+        } else if kvOnlyHistory && Self.batchedHistoryReplay
+                    && (2...8).contains(s.pendingTokens.reduce(0) { $0 + $1.dim(1) }) {
+            let ids = concatenated(s.pendingTokens, axis: 1)
+            let rows = concatenated(s.pendingHidden, axis: 1)
+            s.roots += module.appendTrustedKVRows(
+                hidden: rows, embedding: target.mtpEmbedding(ids), cache: s.cache)
+            asyncEval(s.roots)
         } else {
             // Post-prefill accepted target rows retain one-token arithmetic.
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
