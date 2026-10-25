@@ -1,15 +1,10 @@
 import Foundation
 import MLX
 
-/// Only changes launch geometry for the embedded assistant. All other caches
-/// and shapes retain the original selectors. NSG stays four so HPT alone
-/// cannot change the per-head SIMD or partition reduction tree.
 public enum NemotronDraftAttentionGeometry {
     struct Plan { let hpt: Int; let ptok: Int }
     static let environment = ProcessInfo.processInfo.environment
     static let enabled = environment["NEMOTRON_MTP_DRAFT_HPT"] != "0"
-    // Production choice: HPT4, NSG4, main15 partition target64 policy.
-    // NEMOTRON_MTP_DRAFT_HPT=0 restores the original dispatch geometry.
     static let selectedHPT = 4
     static let selectedPTOK = 0
     static func select(enabled requested: Bool, dtype: DType, queryHeads: Int,
@@ -24,8 +19,6 @@ public enum NemotronDraftAttentionGeometry {
             maxAttendLength: length, batch: batch, kvHeads: 2,
             headSplits: 2, pageSize: 16))
     }
-    /// Warm bounded part/merge signatures on throwaway state before the final
-    /// cache drain. Neither model inputs nor request state are retained.
     public static func warm() throws {
         guard enabled else { return }
         let kind = CBv2LayerKind(attention: .full, headDim: 128, kvHeads: 2, queryHeads: 32)
