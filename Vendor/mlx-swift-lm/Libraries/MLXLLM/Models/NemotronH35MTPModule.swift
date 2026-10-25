@@ -126,7 +126,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     private func fuse(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
-        projection(joinedNorms(hidden: hidden, embedding: embedding))
+        nemotronR1Linear(joinedNorms(hidden: hidden, embedding: embedding), projection)
     }
 
     private func joinedNorms(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
