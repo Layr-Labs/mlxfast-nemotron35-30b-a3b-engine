@@ -1316,19 +1316,67 @@ private let nemotronZSkipReduceSource = """
   y[row * N + n] = static_cast<T>(total);
 """
 
+private let nemotronZSkipFusedStore = "prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;"
+private let nemotronZSkipFusedSource: String = {
+    let part = "threadgroup float part[32 * PS];"
+    precondition(nemotronZSkipSource.components(separatedBy: part).count == 2)
+    precondition(nemotronZSkipSource.components(separatedBy: nemotronZSkipFusedStore).count == 2)
+    return nemotronZSkipSource
+        .replacingOccurrences(of: part, with: part + "\n  threadgroup uint nmz_ticket[1];")
+        .replacingOccurrences(
+            of: nemotronZSkipFusedStore,
+            with: """
+                const float v = float(h) * scores[slot] + 0.0f;
+                      atomic_store_explicit((device atomic_uint*)(prod + slot * N + n0 + n),
+                          as_type<uint>(v), memory_order_relaxed);
+                """)
+        + "\n" + """
+          threadgroup_barrier(mem_flags::mem_device);
+          const int tid = sg * 32 + lid;
+          const int row = slot / TOPK;
+          const uint group = uint(row) * uint(N / OT) + threadgroup_position_in_grid.x;
+          if (tid == 0) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            nmz_ticket[0] = atomic_fetch_add_explicit(
+                (device atomic_uint*)(counter + group), 1u, memory_order_relaxed);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (nmz_ticket[0] == uint(TOPK - 1)) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            if (tid < OT) {
+              const int n = n0 + tid;
+              float total = as_type<float>(atomic_load_explicit(
+                  (device atomic_uint*)(prod + (row * TOPK) * N + n), memory_order_relaxed));
+              for (int j = 1; j < TOPK; j++) {
+                total = as_type<float>(atomic_load_explicit(
+                    (device atomic_uint*)(prod + (row * TOPK + j) * N + n), memory_order_relaxed)) + total;
+              }
+              y[row * N + n] = static_cast<T>(total);
+            }
+            if (tid == 0) {
+              atomic_store_explicit((device atomic_uint*)(counter + group), 0u, memory_order_relaxed);
+            }
+          }
+
+        """
+}()
+
 enum NemotronZSkip {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP"] != "0"
     /// Local hosts without room for the whole copy: zero-skip only the first N MoE layers.
     static let layerLimit = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_LAYERS"] ?? "") ?? Int.max
+    static let fusedTop6 = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_FUSED_TOP6"] != "0"
 
     struct Copy {
         let codes: MLXArray
         let scales: MLXArray
         let biases: MLXArray
+        let counter: MLXArray
     }
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+    nonisolated(unsafe) private static var fusedVerified = false
 
     private static let layout = MLXFast.metalKernel(
         name: "nemotron_zskip_kmajor_codes", inputNames: ["w"], outputNames: ["wk"],
@@ -1341,6 +1389,12 @@ enum NemotronZSkip {
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
         source: nemotronZSkipReduceSource)
+    private static let fusedKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_slots_top6",
+        inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "counter"],
+        outputNames: ["prod", "y"], source: nemotronZSkipFusedSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true, mutableInputs: ["counter"])
 
     static func makeCopy(_ bank: NemotronMoELeader.Bank) -> Copy {
         let experts = bank.weight.dim(0)
@@ -1348,12 +1402,21 @@ enum NemotronZSkip {
             [bank.weight], template: [("N", bank.n), ("K", bank.k)],
             grid: (bank.n / 8, bank.k, experts), threadGroup: (32, 8, 1),
             outputShapes: [[experts, bank.k, bank.n / 8]], outputDTypes: [.uint32])[0]
+        let counter = MLXArray.zeros([3 * (2688 / 128)], dtype: .uint32)
         return Copy(codes: codes, scales: bank.scales.swappedAxes(1, 2).contiguous(),
-                    biases: bank.biases.swappedAxes(1, 2).contiguous())
+                    biases: bank.biases.swappedAxes(1, 2).contiguous(), counter: counter)
     }
 
     /// x: [18, 1856] relu2 rows per slot; inds, scores: [18]. Returns [1, 3, 2688].
-    static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy) -> MLXArray {
+    static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy,
+                    fused: Bool = false) -> MLXArray {
+        if fused {
+            return fusedKernel(
+                [copy.codes, copy.scales, copy.biases, x, inds, scores, copy.counter],
+                template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8), ("TOPK", 6)],
+                grid: (256 * (2688 / 128), 18, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[18 * 2688], [1, 3, 2688]], outputDTypes: [.float32, x.dtype])[1]
+        }
         let prod = kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8)],
@@ -1369,9 +1432,10 @@ enum NemotronZSkip {
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
                          owner: SwitchLinear) -> MLXArray? {
         guard rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
-              let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+              inds.shape == [18], scores.shape == [18], scores.dtype == .float32 else { return nil }
+        let (found, fused) = lock.withLock { (copies[ObjectIdentifier(owner)], fusedVerified) }
+        guard let copy = found else { return nil }
+        return run(x, inds, scores, copy: copy, fused: fused)
     }
 
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
@@ -1382,6 +1446,7 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var built: [ObjectIdentifier: Copy] = [:]
+        var fusedAll = true
         for module in model.modules() {
             guard built.count < layerLimit, let moe = module as? NemotronHMoE,
                   moe.numExpertsPerTok == 6, type(of: moe.switchMLP.fc2) == QuantizedSwitchLinear.self,
@@ -1389,17 +1454,24 @@ enum NemotronZSkip {
                   down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
                   down.biases.shape == down.scales.shape else { continue }
             let copy = makeCopy(down)
-            eval(copy.codes, copy.scales, copy.biases)
-            guard finite(down), matches(down, copy, seed: built.count) else {
+            eval(copy.codes, copy.scales, copy.biases, copy.counter)
+            let checked = finite(down) ? matches(down, copy, seed: built.count) : (record: false, fused: false)
+            guard checked.record else {
                 lock.withLock { copies = [:] }
                 FileHandle.standardError.write(
                     Data("nemotron zskip off: layer \(built.count) differs from the record kernel\n".utf8))
                 return
             }
             built[ObjectIdentifier(moe.switchMLP.fc2)] = copy
+            fusedAll = fusedAll && checked.fused
         }
-        lock.withLock { copies = built }
-        FileHandle.standardError.write(Data("nemotron zskip on: \(built.count) MoE layers\n".utf8))
+        let fused = fusedTop6 && fusedAll && !built.isEmpty
+        lock.withLock {
+            copies = built
+            fusedVerified = fused
+        }
+        FileHandle.standardError.write(
+            Data("nemotron zskip on: \(built.count) MoE layers, fused top6 \(fused ? "on" : "off")\n".utf8))
     }
 
     private static func finite(_ bank: NemotronMoELeader.Bank) -> Bool {
@@ -1407,7 +1479,8 @@ enum NemotronZSkip {
         return logicalAnd((abs(bank.scales) .< limit).all(), (abs(bank.biases) .< limit).all()).item(Bool.self)
     }
 
-    private static func matches(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
+    private static func matches(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int)
+        -> (record: Bool, fused: Bool) {
         let offset = UInt32(seed) * 7
         var routes: [UInt32] = [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127]
         for i in routes.indices {
@@ -1426,12 +1499,22 @@ enum NemotronZSkip {
         let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
         let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[2])
         var same = MLXArray(true)
+        var fusedSame = MLXArray(true)
         for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
             let act = (a * a).asType(.bfloat16)
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+            for _ in 0 ..< 2 {
+                let fused = run(act, inds, scores, copy: copy, fused: true)
+                fusedSame = logicalAnd(
+                    fusedSame, (fused.view(dtype: .uint16) .== got.view(dtype: .uint16)).all())
+            }
         }
-        return same.item(Bool.self)
+        eval(same, fusedSame)
+        let record = same.item(Bool.self)
+        guard record, fusedTop6, fusedSame.item(Bool.self) else { return (record, false) }
+        let reset = (copy.counter .== MLXArray(UInt32(0))).all().item(Bool.self)
+        return (record, reset)
     }
 }
