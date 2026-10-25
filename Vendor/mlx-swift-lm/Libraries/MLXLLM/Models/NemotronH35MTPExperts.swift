@@ -1762,10 +1762,10 @@ enum NemotronZSkip {
             outputShapes: [[1, rows, 2688]], outputDTypes: [.bfloat16])[0]
     }
 
-    /// NEMOTRON_MTP_ZSKIP_JOIN=0 keeps the top-six reduce as its own launch in
-    /// the captured verify; otherwise the MoE layer's join kernel sums the six
-    /// slot products itself (`NemotronHResidualRMSNorm.applyPreparedRows`).
-    static let joinReduce = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] != "0"
+    /// The top-six reduce stays its own launch in the captured verify by
+    /// default; NEMOTRON_MTP_ZSKIP_JOIN=1 lets the MoE layer's join kernel sum
+    /// the six slot products itself (`NemotronHResidualRMSNorm.applyPreparedRows`).
+    static let joinReduce = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] == "1"
 
     /// True when `owner` (a target layer's routed FC2) has a verified copy.
     static func covers(_ owner: SwitchLinear) -> Bool {
