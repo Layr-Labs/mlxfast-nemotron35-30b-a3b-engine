@@ -106,9 +106,14 @@ private enum NemotronMTPCompactSSMKernel {
                 auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
                 auto C_ = conv + t * CD + CO + g_idx * Ds;
                 auto B_ = conv + t * CD + BO + g_idx * Ds;
-                auto dt_ = static_cast<float>(dt[t * H + n]);
-                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
-                auto dA = fast::exp(A * dt_);
+                auto dt_ = static_cast<float>(dt[t * DTS + n]);
+                float dA;
+                if constexpr (PD) {
+                    dA = dt[t * DTS + H + n];
+                } else {
+                    auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                    dA = fast::exp(A * dt_);
+                }
                 float acc = 0.0;
                 for (int i = 0; i < n_per_t; ++i) {
                     auto s_idx = n_per_t * ds_idx + i;
@@ -132,7 +137,8 @@ private enum NemotronMTPCompactSSMKernel {
 }
 
 /// `convolution` is the window's activated conv output `[1, W, convDim]`
-/// (x | B | C), `dt` the transformed timestep `[1, W, heads]` (FP32). Runs
+/// (x | B | C), `dt` the transformed timestep `[1, W, heads]` (FP32), or packed
+/// `[dt | decay]` of width `2 * heads` from the conv-dt kernel. Runs
 /// the first `steps <= W` positions from `state`. With `writeOutput` the
 /// result's `output` holds y for those positions `[1, steps, heads, headDim]`.
 func nemotronMTPSSMCompact(
@@ -143,7 +149,8 @@ func nemotronMTPSSMCompact(
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
-    precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
+    let preparedDecay = dt.shape == [1, width, 2 * heads]
+    precondition(dt.dtype == .float32 && (preparedDecay || dt.shape == [1, width, heads]))
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
     let outputs = NemotronMTPCompactSSMKernel.kernel(
         [convolution, ALog, D, dt, state],
@@ -151,7 +158,7 @@ func nemotronMTPSSMCompact(
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),
                    ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
-                   ("WO", writeOutput)],
+                   ("WO", writeOutput), ("DTS", dt.dim(2)), ("PD", preparedDecay)],
         grid: (32, headDim, heads), threadGroup: (32, 8, 1),
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])

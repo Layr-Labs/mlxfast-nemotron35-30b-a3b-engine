@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXRandom
 
 /// Stage cuts in the draft head's per-round chain. Each one removes a
 /// dependent dispatch and leaves every draft value bitwise unchanged; the
@@ -22,7 +23,13 @@ public enum NemotronMTPDraftChainCleanup {
 /// and shapes retain the original selectors. NSG stays four so HPT alone
 /// cannot change the per-head SIMD or partition reduction tree.
 public enum NemotronDraftAttentionGeometry {
-    struct Plan { let hpt: Int; let ptok: Int }
+    struct Plan {
+        let hpt: Int
+        let ptok: Int
+        var schedule = NemotronDraftAttentionSchedule.Variant()
+        var isStock: Bool { hpt == NemotronDraftAttentionGeometry.selectedHPT && schedule.isStock }
+        var stockTwin: Plan { Plan(hpt: NemotronDraftAttentionGeometry.selectedHPT, ptok: ptok) }
+    }
     static let environment = ProcessInfo.processInfo.environment
     static let enabled = environment["NEMOTRON_MTP_DRAFT_HPT"] != "0"
     // Production choice: HPT4, NSG4, main15 partition target64 policy.
@@ -34,7 +41,10 @@ public enum NemotronDraftAttentionGeometry {
                        length: Int, batch: Int) -> Plan? {
         guard requested, enabled, dtype == .bfloat16, queryHeads == 32,
               kvHeads == 2, headDim == 128, pageSize == 16 else { return nil }
-        return plan(hpt: selectedHPT, fixed: selectedPTOK, length: length, batch: batch)
+        let stock = plan(hpt: selectedHPT, fixed: selectedPTOK, length: length, batch: batch)
+        // exp35: the qualified schedule keeps the stock PTOK selection.
+        guard let active = NemotronDraftAttentionSchedule.active else { return stock }
+        return Plan(hpt: active.hpt, ptok: stock.ptok, schedule: active.variant)
     }
     static func plan(hpt: Int, fixed: Int, length: Int, batch: Int) -> Plan {
         Plan(hpt: hpt, ptok: fixed == 256 ? 256 : PagedAttentionKernel.partitionTokensForDispatch(
@@ -55,10 +65,16 @@ public enum NemotronDraftAttentionGeometry {
         defer { backend.release(states) }
         while row.absoluteOffset < 1400 {
             let count = min(512, 1400 - row.absoluteOffset)
-            let tile = MLXArray.zeros([2, count, 128], dtype: .bfloat16)
-            row.write(keys: tile, values: tile)
+            // Seeded random K/V: the schedule qualification below reads them.
+            let keys = MLXRandom.normal([2, count, 128], key: MLXRandom.key(UInt64(350 + row.absoluteOffset)))
+                .asType(.bfloat16)
+            let values = MLXRandom.normal([2, count, 128], key: MLXRandom.key(UInt64(360 + row.absoluteOffset)))
+                .asType(.bfloat16)
+            row.write(keys: keys, values: values)
             eval(group.writeFence)
         }
+        NemotronDraftAttentionSchedule.qualifyOnce(row: row, group: group,
+            source: backend.pool.kernelSource)
         let q = MLXArray.ones([1, 32, 128], dtype: .bfloat16)
         let k = MLXArray.zeros([1, 2, 128], dtype: .bfloat16)
         let params = MLXArray([Float(1), Float(1 / sqrt(128.0)), 0, 0, 0, 0, 0, 0])
@@ -73,6 +89,14 @@ public enum NemotronDraftAttentionGeometry {
                     softcap: false, source: backend.pool.kernelSource,
                     geometryOverride: Plan(hpt: selectedHPT, ptok: ptok))
                 eval(out, group.writeFence)
+                if let active = NemotronDraftAttentionSchedule.active {
+                    let warmed = PagedSegmentAttention.decode(queries: q,
+                        newKeys: write ? k : nil, newValues: write ? k : nil,
+                        group: group, rows: [descriptor], sinks: nil, params: params,
+                        softcap: false, source: backend.pool.kernelSource,
+                        geometryOverride: Plan(hpt: active.hpt, ptok: ptok, schedule: active.variant))
+                    eval(warmed, group.writeFence)
+                }
             }
         }
     }
