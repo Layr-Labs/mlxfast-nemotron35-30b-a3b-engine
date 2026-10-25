@@ -71,10 +71,13 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        NemotronZeroSkipDown.prepare([target, assistant.module])
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
+        NemotronZSkip.prepare(target)
+        NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMultiRowQMV.warmNarrow()

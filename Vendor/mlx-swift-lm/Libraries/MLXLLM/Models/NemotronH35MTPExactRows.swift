@@ -725,6 +725,256 @@ func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {
     return which(ok, y, MLXArray(Float.nan).asType(y.dtype))
 }
 
+// Shared-expert down projection (K 3712 -> N 2688) over a load-time K-major
+// copy of the layer's own codes, scales and biases: the same bytes, only in
+// memory order k-row by k-row. Each lane keeps the multi-row qmv's chunks
+// (lane + 32 j), their order, coefficient decode, qdot, per-row accumulators
+// and closing simd_sum. A k whose activation is +-0 in every row only adds
+// +-0 * (finite coefficient) = +-0 to its chunk sum, so its codes are not read
+// and a zero nibble stands in. A chunk that is +-0 in every row adds
+// s * (+0) + b * (+0) = +-0 to an accumulator that starts at +0 and so can
+// never be -0; it is skipped together with its scales and biases.
+private let nemotronZeroSkipLayoutSource = """
+  const uint word = thread_position_in_grid.x;
+  const uint k = thread_position_in_grid.y;
+  const uint shift = 4 * (k % 8);
+  const device uint* src = w + (word * 8) * (K / 8) + k / 8;
+  uint v = 0;
+  for (uint o = 0; o < 8; o++) {
+    v |= ((src[o * (K / 8)] >> shift) & 0xfu) << (4 * o);
+  }
+  wk[k * (N / 8) + word] = v;
+"""
+
+private let nemotronZeroSkipDownSource = """
+  constexpr int values_per_thread = 8;
+  constexpr int chunks = K / values_per_thread;
+  constexpr int words = N / 8;
+  typedef float U;
+
+  const int lane = int(thread_index_in_simdgroup);
+  const int n0 = (int(threadgroup_position_in_grid.x) * SPT + int(simdgroup_index_in_threadgroup)) * OPS;
+  if (n0 >= N) {
+    return;
+  }
+  thread U result[R][OPS];
+  for (int r = 0; r < R; r++) {
+    for (int o = 0; o < OPS; o++) {
+      result[r][o] = 0;
+    }
+  }
+  for (int c = lane; c < chunks; c += 32) {
+    thread U x_thread[R][values_per_thread];
+    U sum[R];
+    uint live = 0;
+    for (int r = 0; r < R; r++) {
+      const device T* xr = x + r * K + c * values_per_thread;
+      sum[r] = nmr_load_vector<T, U, values_per_thread>(xr, x_thread[r]);
+      const device uint16_t* xb = (const device uint16_t*)xr;
+      for (int i = 0; i < values_per_thread; i++) {
+        live |= ((xb[i] & 0x7fff) != 0 ? 1u : 0u) << i;
+      }
+    }
+    if (live == 0) {
+      continue;
+    }
+    uint code[OPS];
+    for (int o = 0; o < OPS; o++) {
+      code[o] = 0;
+    }
+    const device uint* wr = wk + (c * values_per_thread) * words + n0 / 8;
+    for (uint m = live; m != 0; m &= m - 1) {
+      const int kk = ctz(m);
+      for (int q = 0; q < OPS / 8; q++) {
+        const uint v = wr[kk * words + q];
+        for (int o = 0; o < 8; o++) {
+          code[8 * q + o] = insert_bits(code[8 * q + o], extract_bits(v, uint(4 * o), 4u), uint(4 * kk), 4u);
+        }
+      }
+    }
+    const device T* sl = sk + (c / 8) * N + n0;
+    const device T* bl = bk + (c / 8) * N + n0;
+    for (int o = 0; o < OPS; o++) {
+      U s = sl[o];
+      U b = bl[o];
+      thread U accum[R];
+      for (int r = 0; r < R; r++) accum[r] = 0;
+      const uint16_t words16[2] = {uint16_t(code[o] & 0xffffu), uint16_t(code[o] >> 16)};
+      for (int i = 0; i < values_per_thread / 4; i++) {
+        const U a = words16[i] & 0x000f;
+        const U b1 = words16[i] & 0x00f0;
+        const U cc = words16[i] & 0x0f00;
+        const U d = words16[i] & 0xf000;
+        for (int r = 0; r < R; r++) {
+          accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
+              + x_thread[r][4*i+2] * cc + x_thread[r][4*i+3] * d;
+        }
+      }
+      for (int r = 0; r < R; r++) result[r][o] += s * accum[r] + b * sum[r];
+    }
+  }
+  for (int o = 0; o < OPS; o++) {
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][o]);
+      if (lane == 0) {
+        y[r * N + n0 + o] = static_cast<T>(v);
+      }
+    }
+  }
+"""
+
+enum NemotronZeroSkipDown {
+    /// NEMOTRON_MTP_SHARED_ZSKIP=0 keeps every shared down projection on the
+    /// multi-row qmv.
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_ZSKIP"] != "0"
+    private static let outputsPerSimdgroup = 16
+    private static let simdgroups = 4
+
+    final class Copy {
+        let codes: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+        init(codes: MLXArray, scales: MLXArray, biases: MLXArray) {
+            self.codes = codes
+            self.scales = scales
+            self.biases = biases
+        }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+
+    private static let layout = MLXFast.metalKernel(
+        name: "nemotron_shared_down_kmajor_codes", inputNames: ["w"],
+        outputNames: ["wk"], source: nemotronZeroSkipLayoutSource)
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_shared_down_zero_skip", inputNames: ["wk", "sk", "bk", "x"],
+        outputNames: ["y"], source: nemotronZeroSkipDownSource,
+        header: nemotronMultiRowQMVHeader, ensureRowContiguous: true)
+
+    private static func quantized(_ linear: Linear) -> QuantizedLinear? {
+        guard type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [2688, 464],
+              q.scales.dtype == .bfloat16, q.scales.shape == [2688, 58],
+              let offsets = q.biases, offsets.dtype == .bfloat16,
+              offsets.shape == q.scales.shape else { return nil }
+        return q
+    }
+
+    /// activated: [1, 3, 3712] BF16 relu2 rows. Nil unless the load-time
+    /// checks kept a copy of `down`; callers keep the multi-row qmv.
+    static func apply(_ activated: MLXArray, _ down: Linear) -> MLXArray? {
+        guard activated.shape == [1, 3, 3712], activated.dtype == .bfloat16,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              let copy = lock.withLock({ copies[ObjectIdentifier(down)] }) else { return nil }
+        let y = run(activated.reshaped(3, 3712), copy).reshaped(1, 3, 2688)
+        guard NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(y, nemotronMTPLinearRows(activated, down))
+    }
+
+    private static func run(_ x: MLXArray, _ copy: Copy) -> MLXArray {
+        let rows = x.dim(0)
+        let tiles = 2688 / (outputsPerSimdgroup * simdgroups)
+        return kernel(
+            [copy.codes, copy.scales, copy.biases, x],
+            template: [("T", DType.bfloat16), ("R", rows), ("K", 3712), ("N", 2688),
+                       ("OPS", outputsPerSimdgroup), ("SPT", simdgroups)],
+            grid: (32 * tiles, simdgroups, 1), threadGroup: (32, simdgroups, 1),
+            outputShapes: [[rows, 2688]], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// Original words rebuilt from the K-major copy, for the load-time check.
+    private static func restored(_ codes: MLXArray) -> MLXArray {
+        let shifts = MLXArray((0 ..< 8).map { (nibble: Int) -> UInt32 in UInt32(4 * nibble) })
+        let perOutput = rightShift(codes.expandedDimensions(axis: -1), shifts) & MLXArray(UInt32(0xf))
+        let byK = perOutput.reshaped(3712, 2688).transposed(1, 0).reshaped(2688, 464, 8)
+        return leftShift(byK, shifts).sum(axis: -1).asType(.uint32)
+    }
+
+    private static func sample(_ seed: UInt64, dead: Float, liveZero: Float) -> MLXArray {
+        let parts = MLXRandom.split(key: MLXRandom.key(seed), into: 3)
+        let h = MLXRandom.normal([3, 3712], scale: 0.5, key: parts[0])
+        let live = MLXRandom.uniform(Float(0) ..< Float(1), [1, 3712], key: parts[1]) .>= MLXArray(dead)
+        let kept = MLX.logicalAnd(
+            live, MLXRandom.uniform(Float(0) ..< Float(1), [3, 3712], key: parts[2]) .>= MLXArray(liveZero))
+        let a = which(kept, MLX.abs(h) + 1e-3, MLXArray(Float(0))).asType(.bfloat16)
+        return (a * a).asType(.bfloat16)
+    }
+
+    /// Seeded relu2-shaped rows: dense, sparse, an all-zero row, one-hot rows,
+    /// only the tail chunks, and all zero.
+    private static func samples() -> [MLXArray] {
+        let zero = MLXArray(Float(0)).asType(.bfloat16)
+        let firstRow = MLXArray([Int32(0), 1, 2]).reshaped(3, 1) .== MLXArray(Int32(0))
+        let tailColumns = MLXArray((0 ..< 3712).map { (column: Int) -> Int32 in Int32(column) }).reshaped(1, 3712) .>= MLXArray(Int32(3584))
+        var hot = [Float](repeating: 0, count: 3 * 3712)
+        for row in 0 ..< 3 { hot[row * 3712 + (1237 * (row + 1)) % 3712] = 1.5 }
+        return [
+            sample(0x5a01, dead: 0, liveZero: 0), sample(0x5a02, dead: 0.7, liveZero: 0.3),
+            sample(0x5a03, dead: 0.98, liveZero: 0.5),
+            which(firstRow, zero, sample(0x5a04, dead: 0.6, liveZero: 0.5)),
+            MLXArray(hot, [3, 3712]).asType(.bfloat16),
+            which(tailColumns, sample(0x5a05, dead: 0, liveZero: 0), zero),
+            MLXArray.zeros([3, 3712], dtype: .bfloat16),
+        ]
+    }
+
+    /// Load time, before any verify graph is traced: copy every shared
+    /// expert's down projection, then keep the copies only if every copy
+    /// restores its original words, every scale and bias is finite, and the
+    /// kernel equals the multi-row qmv bit for bit on seeded rows for every
+    /// layer. Never a timer.
+    static func prepare(_ models: [Module]) {
+        lock.withLock { copies = [:] }
+        guard enabled, NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return }
+        func off(_ reason: String) {
+            FileHandle.standardError.write(Data("nemotron shared zskip off: \(reason)\n".utf8))
+        }
+        var built: [ObjectIdentifier: Copy] = [:]
+        var layers: [(Linear, Copy)] = []
+        for model in models {
+            for module in model.modules() {
+                guard let mlp = module as? NemotronHMLP, type(of: mlp) == NemotronHMLP.self,
+                      let q = quantized(mlp.downProj),
+                      built[ObjectIdentifier(mlp.downProj)] == nil else { continue }
+                let codes = layout(
+                    [q.weight], template: [("K", 3712), ("N", 2688)],
+                    grid: (336, 3712, 1), threadGroup: (32, 8, 1),
+                    outputShapes: [[3712, 336]], outputDTypes: [.uint32])[0]
+                let copy = Copy(codes: codes, scales: contiguous(q.scales.transposed(1, 0)),
+                                biases: contiguous(q.biases!.transposed(1, 0)))
+                eval(copy.codes, copy.scales, copy.biases)
+                let exact = MLX.logicalAnd(
+                    MLX.logicalAnd((restored(copy.codes) .== q.weight).all(),
+                                   (copy.scales.transposed(1, 0) .== q.scales).all()),
+                    MLX.logicalAnd(isFinite(q.scales).all(), isFinite(q.biases!).all()))
+                guard exact.item(Bool.self) else {
+                    return off("layer \(layers.count) copy or scales failed the check")
+                }
+                built[ObjectIdentifier(mlp.downProj)] = copy
+                layers.append((mlp.downProj, copy))
+            }
+        }
+        guard !layers.isEmpty else { return off("no shared expert down projection matched") }
+        let inputs = samples()
+        for (index, layer) in layers.enumerated() {
+            for x in inputs {
+                let y = run(x, layer.1)
+                let expected = nemotronMTPLinearRows(x.reshaped(1, 3, 3712), layer.0).reshaped(3, 2688)
+                guard (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all().item(Bool.self)
+                else { return off("layer \(index) differs from the multi-row qmv") }
+            }
+        }
+        lock.withLock { copies = built }
+        FileHandle.standardError.write(
+            Data("nemotron shared zskip on: \(layers.count) shared down projections\n".utf8))
+    }
+}
+
 // Row-pointer twin of the multi-row qmv: row r reads its activations from its
 // own buffer x<r> instead of from x + r * K. The body is the same source with
 // only the three activation address expressions replaced, so every load,
