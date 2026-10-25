@@ -205,14 +205,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// new K/V into the target from `mtpInPlaceKVTarget` (`written` is any
     /// output of that kernel). Same per-query SDPA calls and offset advance.
     public func updateAndAttendSerialQueryRowsWritten(
-        queries: MLXArray, written: MLXArray, scale: Float, sinks: MLXArray?
+        queries: MLXArray, written: MLXArray, scale: Float, sinks: MLXArray?,
+        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
     ) -> [MLXArray] {
         guard let row = rows[0] as? CBv2FullSequenceKV else {
             preconditionFailure("CBv2LayerCache: in-place KV append on a non-contiguous row")
         }
         let outputs = CBv2AttentionV1.attendSerialQueryRowsWritten(
             row: row, kind: kind, queries: queries, written: written,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap, attendRows: attendRows)
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
         return outputs
     }

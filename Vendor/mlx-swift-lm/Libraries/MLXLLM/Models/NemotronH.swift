@@ -1837,7 +1837,7 @@ class NemotronHAttention: Module, NemotronHMixer {
                kCache: target.keys, vCache: target.values,
                offset: target.offset, capacity: target.capacity)
         {
-            var queries = qkv.0.reshaped(batch, length, numHeads, headDim).transposed(0, 2, 1, 3)
+            var projectedQueries = qkv.0
             if NemotronMoELeader.selfTest {
                 // The cache rows just written must be bitwise the K/V rows
                 // the stock slice update would store; poison on a difference.
@@ -1850,10 +1850,14 @@ class NemotronHAttention: Module, NemotronHMixer {
                 }
                 let same = all(stored[0].view(dtype: .uint16) .== expected[0].view(dtype: .uint16))
                     .&& all(stored[1].view(dtype: .uint16) .== expected[1].view(dtype: .uint16))
-                queries = which(same, queries, MLXArray(Float.nan).asType(queries.dtype))
+                // Poison the projection, not its transposed view, so `queries`
+                // keeps the layout of the production path below.
+                projectedQueries = which(same, projectedQueries, MLXArray(Float.nan).asType(projectedQueries.dtype))
             }
+            let queries = projectedQueries.reshaped(batch, length, numHeads, headDim).transposed(0, 2, 1, 3)
             let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
-                queries: queries, written: qkv.0, scale: scale, sinks: nil)
+                queries: queries, written: qkv.0, scale: scale, sinks: nil,
+                attendRows: NemotronMTPVerifySDPA.rows)
             return NemotronMTPAttentionDirect.project(rows, wo)
         }
         let (q, k, v) = precomputed ?? cbv2Projections(
