@@ -1048,8 +1048,12 @@ enum NemotronSharedUpPacking {
             activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
                 x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
         }
-        return nemotronMTPLinearRows(
-            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+        let rows = activated.reshaped(1, 3, q.weight.dim(0))
+        if let skipped = NemotronSharedZSkip.apply(activated, down: down) {
+            guard NemotronMoELeader.selfTest else { return skipped }
+            return nemotronBitwiseOrNaN(skipped, nemotronMTPLinearRows(rows, down, prepared: fused.1))
+        }
+        return nemotronMTPLinearRows(rows, down, prepared: fused.1)
     }
 
     static func verify(_ model: Module) {
@@ -1075,6 +1079,331 @@ enum NemotronSharedUpPacking {
             matches = matches && sameUp.item(Bool.self) && sameDown.item(Bool.self)
         }
         verified = matches
+    }
+}
+
+// MARK: - Exact-zero skip for the shared expert's down projection (R = 3)
+//
+// relu2 leaves most of the 3712 shared-expert inputs of a verify row exactly
+// +0. A load-time copy holds the same code words, scales and biases in
+// chunk-major order: codes [K / 8, N] (each output's 32-bit word of one chunk
+// of 8 k, unchanged), scales and biases [K / 64, N]. Pass 1: SIMD group = lane
+// partial l of a 128-output tile, 672 threadgroups. It visits the record
+// kernel's chunks l + 32j and 448 + l in the record's order and stores each
+// output's FP32 lane partial. Pass 2 closes every output with the record's
+// simd_sum over the same 32 partials in the same lanes, then the same BF16
+// store. A chunk, or a row of it, with no nonzero input adds
+// scale * (+0) + (+0) * bias = +-0 to a partial that is never -0, so it is
+// skipped (finite scales and biases are checked at load). In a live chunk
+// whose nonzero inputs are all normal BF16 with exponent field 13 to 250,
+// every x * nibble is exact in FP32, so the record's chunk sum equals the
+// in-order sum of the products at k that are nonzero in some row; a +-0
+// product only changes the sign of a zero that the closing add absorbs. Any
+// other chunk runs the record's own chunk expressions.
+private let nemotronSharedZSkipHeader = """
+template <typename T, typename U, int R, int OPT, int K>
+inline void nsz_chunk(thread U (&P)[R][OPT], const thread uint* word, uint m, const thread U* sum,
+                      const thread U* s, const thread U* b, const device T* xc) {
+  constexpr uint ROWBIT = 1u << 8;
+  constexpr uint SLOWBIT = 1u << 11;
+  const uint live = m & 0xffu;
+  if ((m & SLOWBIT) != 0) {
+    for (int r = 0; r < R; r++) {
+      thread U xt[8];
+      nmr_load_vector<T, U, 8>(xc + r * K, xt);
+      for (int o = 0; o < OPT; o++) {
+        const uint code = word[o];
+        const uint16_t ws[2] = {uint16_t(code & 0xffffu), uint16_t(code >> 16)};
+        U accum = 0;
+        for (int i = 0; i < 2; i++) {
+          const U a = ws[i] & 0x000f;
+          const U b1 = ws[i] & 0x00f0;
+          const U cc = ws[i] & 0x0f00;
+          const U d = ws[i] & 0xf000;
+          accum += xt[4*i] * a + xt[4*i+1] * b1 + xt[4*i+2] * cc + xt[4*i+3] * d;
+        }
+        P[r][o] += s[o] * accum + b[o] * sum[r];
+      }
+    }
+    return;
+  }
+  thread U S0[R][OPT];
+  thread U S1[R][OPT];
+  for (int r = 0; r < R; r++) {
+    for (int o = 0; o < OPT; o++) {
+      S0[r][o] = 0;
+      S1[r][o] = 0;
+    }
+  }
+  for (int i = 0; i < 4; i++) {
+    if ((live & (1u << i)) != 0) {
+      U xv[R];
+      for (int r = 0; r < R; r++) {
+        xv[r] = xc[r * K + i];
+      }
+      for (int o = 0; o < OPT; o++) {
+        const U q = U((word[o] >> (4 * i)) & 0xfu);
+        for (int r = 0; r < R; r++) {
+          S0[r][o] += xv[r] * q;
+        }
+      }
+    }
+  }
+  for (int i = 4; i < 8; i++) {
+    if ((live & (1u << i)) != 0) {
+      U xv[R];
+      for (int r = 0; r < R; r++) {
+        xv[r] = xc[r * K + i];
+      }
+      for (int o = 0; o < OPT; o++) {
+        const U q = U((word[o] >> (4 * i)) & 0xfu);
+        for (int r = 0; r < R; r++) {
+          S1[r][o] += xv[r] * q;
+        }
+      }
+    }
+  }
+  for (int r = 0; r < R; r++) {
+    if ((m & (ROWBIT << r)) != 0) {
+      for (int o = 0; o < OPT; o++) {
+        // S0 starts at +0 and is never -0, so +0 + S0 == S0.
+        const U accum = S0[r][o] + S1[r][o];
+        P[r][o] += s[o] * accum + b[o] * sum[r];
+      }
+    }
+  }
+}
+"""
+
+// Lane l reads chunk l + 32j's eight inputs per row up front: their sum (the
+// prepared activation's sum, same expression), which k are nonzero in any row,
+// which rows have any, and whether one falls outside the exact-product range.
+private let nemotronSharedZSkipPartialsSource = """
+  constexpr int OPT = 4;
+  constexpr int OT = 32 * OPT;
+  constexpr int tail = K / 8 - 448;
+  constexpr uint ROWBIT = 1u << 8;
+  constexpr uint SLOWBIT = 1u << 11;
+  typedef float U;
+
+  const int lid = int(thread_index_in_simdgroup);
+  const int tiles = N / OT;
+  const int task = int(threadgroup_position_in_grid.x);
+  const int tile = task % tiles;
+  const int l = task / tiles;
+  const int n0 = tile * OT;
+  const device uint4* wq = (const device uint4*)(wk + n0 + 4 * lid);
+  const device T* sq = sk + n0 + OPT * lid;
+  const device T* bq = bk + n0 + OPT * lid;
+  const int count = l < tail ? 15 : 14;
+
+  thread U P[R][OPT];
+  for (int r = 0; r < R; r++) {
+    for (int o = 0; o < OPT; o++) {
+      P[r][o] = 0;
+    }
+  }
+  uint pm = 0;
+  U ps[R];
+  for (int r = 0; r < R; r++) {
+    ps[r] = 0;
+  }
+  if (lid < count) {
+    const int c = lid < 14 ? l + 32 * lid : 448 + l;
+    for (int r = 0; r < R; r++) {
+      const device T* xr = x + r * K + 8 * c;
+      thread U xt[8];
+      ps[r] = nmr_load_vector<T, U, 8>(xr, xt);
+      const device uint16_t* xb = (const device uint16_t*)xr;
+      for (int i = 0; i < 8; i++) {
+        const uint v = uint(xb[i]) & 0x7fffu;
+        if (v != 0) {
+          const uint e = v >> 7;
+          pm |= (1u << i) | (ROWBIT << r) | ((e < 13 || e > 250) ? SLOWBIT : 0u);
+        }
+      }
+    }
+  }
+  for (int j = 0; j < count; j++) {
+    const uint m = simd_shuffle(pm, ushort(j));
+    if ((m & 0xffu) == 0) {
+      continue;
+    }
+    const int c = j < 14 ? l + 32 * j : 448 + l;
+    const int g = c / 8;
+    const uint4 wv = wq[c * (N / 4)];
+    const uint w[4] = {wv.x, wv.y, wv.z, wv.w};
+    U s[OPT];
+    U b[OPT];
+    const uint2 sv = *(const device uint2*)(sq + g * N);
+    const uint2 bv = *(const device uint2*)(bq + g * N);
+    s[0] = as_type<float>(sv.x << 16);
+    s[1] = as_type<float>(sv.x & 0xffff0000u);
+    s[2] = as_type<float>(sv.y << 16);
+    s[3] = as_type<float>(sv.y & 0xffff0000u);
+    b[0] = as_type<float>(bv.x << 16);
+    b[1] = as_type<float>(bv.x & 0xffff0000u);
+    b[2] = as_type<float>(bv.y << 16);
+    b[3] = as_type<float>(bv.y & 0xffff0000u);
+    U sum[R];
+    for (int r = 0; r < R; r++) {
+      sum[r] = simd_shuffle(ps[r], ushort(j));
+    }
+    nsz_chunk<T, U, R, OPT, K>(P, w, m, sum, s, b, x + 8 * c);
+  }
+  for (int r = 0; r < R; r++) {
+    *(device float4*)(part + (l * R + r) * N + n0 + OPT * lid) = float4(P[r][0], P[r][1], P[r][2], P[r][3]);
+  }
+"""
+
+// y[r][n] = BF16(simd_sum over lanes l of part[l][r][n]), lane l holding
+// lane partial l as in the record kernel; one SIMD group per 8 outputs.
+private let nemotronSharedZSkipCloseSource = """
+  constexpr int OPG = 8;
+  const int lid = int(thread_index_in_simdgroup);
+  const int block = int(threadgroup_position_in_grid.x) * int(simdgroups_per_threadgroup) +
+      int(simdgroup_index_in_threadgroup);
+  const int r = block / (N / OPG);
+  const int nb = (block % (N / OPG)) * OPG;
+  float v[OPG];
+  for (int i = 0; i < OPG; i++) {
+    v[i] = part[(lid * R + r) * N + nb + i];
+  }
+  T mine = T(0);
+  for (int i = 0; i < OPG; i++) {
+    const float s = simd_sum(v[i]);
+    if (lid == i) {
+      mine = static_cast<T>(s);
+    }
+  }
+  if (lid < OPG) {
+    y[r * N + nb + lid] = mine;
+  }
+"""
+
+enum NemotronSharedZSkip {
+    /// NEMOTRON_MTP_SHARED_ZSKIP=0 keeps the record's shared down projection.
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_ZSKIP"] != "0"
+
+    struct Copy {
+        let codes: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+
+    private static let partials = MLXFast.metalKernel(
+        name: "nemotron_shared_zskip_partials", inputNames: ["wk", "sk", "bk", "x"],
+        outputNames: ["part"], source: nemotronSharedZSkipPartialsSource,
+        header: nemotronMultiRowQMVHeader + nemotronSharedZSkipHeader, ensureRowContiguous: true)
+    private static let close = MLXFast.metalKernel(
+        name: "nemotron_shared_zskip_close", inputNames: ["part"], outputNames: ["y"],
+        source: nemotronSharedZSkipCloseSource, ensureRowContiguous: true)
+
+    /// x: [3, 3712] BF16 relu2 rows. Returns [3, 2688] BF16.
+    private static func run(_ x: MLXArray, copy: Copy) -> MLXArray {
+        let part = partials(
+            [copy.codes, copy.scales, copy.biases, x],
+            template: [("T", DType.bfloat16), ("R", 3), ("K", 3712), ("N", 2688)],
+            grid: (32 * 672, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[32 * 3 * 2688]], outputDTypes: [.float32])[0]
+        return close(
+            [part], template: [("T", DType.bfloat16), ("R", 3), ("N", 2688)],
+            grid: (32 * 3 * 336, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[3, 2688]], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// The R = 3 shared down of `down` on relu2 rows x [3, 3712] as
+    /// [1, 3, 2688], or nil when `down` has no verified copy.
+    static func apply(_ x: MLXArray, down: Linear) -> MLXArray? {
+        guard x.shape == [3, 3712], x.dtype == .bfloat16,
+              let copy = lock.withLock({ copies[ObjectIdentifier(down)] }) else { return nil }
+        return run(x, copy: copy).reshaped(1, 3, 2688)
+    }
+
+    private static func projection(_ module: Module) -> QuantizedLinear? {
+        guard let mlp = (module as? NemotronHMoE)?.sharedExperts,
+              type(of: mlp.downProj) == QuantizedLinear.self,
+              let q = mlp.downProj as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [2688, 464],
+              q.scales.dtype == .bfloat16, q.scales.shape == [2688, 58],
+              let biases = q.biases, biases.dtype == .bfloat16, biases.shape == q.scales.shape
+        else { return nil }
+        return q
+    }
+
+    /// Load time, before any verify graph is traced: copy every R = 3 shared
+    /// down projection, then keep the copies only if every one has finite
+    /// scales and biases and the skip kernel equals the record kernel bit for
+    /// bit on seeded rows (sparse relu2-like, a zero row with a one-hot row,
+    /// tail chunks only, dense, and rows outside the exact-product range).
+    static func prepare(_ models: [Module]) {
+        guard enabled, NemotronSharedUpPacking.enabled, Device.defaultDevice().deviceType == .gpu
+        else { return }
+        var built: [ObjectIdentifier: Copy] = [:]
+        var miss: String?
+        search: for model in models {
+            for module in model.modules() {
+                guard let q = projection(module), built[ObjectIdentifier(q)] == nil else { continue }
+                guard finite(q) else {
+                    miss = "projection \(built.count) has non-finite scales or biases"
+                    break search
+                }
+                let copy = Copy(codes: q.weight.transposed().contiguous(),
+                                scales: q.scales.transposed().contiguous(),
+                                biases: q.biases!.transposed().contiguous())
+                eval(copy.codes, copy.scales, copy.biases)
+                guard matches(q, copy, seed: built.count) else {
+                    miss = "projection \(built.count) differs from the record kernel"
+                    break search
+                }
+                built[ObjectIdentifier(q)] = copy
+            }
+        }
+        if let miss {
+            lock.withLock { copies = [:] }
+            FileHandle.standardError.write(Data("nemotron shared zskip off: \(miss)\n".utf8))
+            return
+        }
+        lock.withLock { copies = built }
+        FileHandle.standardError.write(
+            Data("nemotron shared zskip on: \(built.count) shared down projections\n".utf8))
+    }
+
+    private static func finite(_ q: QuantizedLinear) -> Bool {
+        let limit = MLXArray(Float.infinity).asType(.bfloat16)
+        return logicalAnd((abs(q.scales) .< limit).all(), (abs(q.biases!) .< limit).all()).item(Bool.self)
+    }
+
+    private static func matches(_ q: QuantizedLinear, _ copy: Copy, seed: Int) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x52a7 + seed)), into: 3)
+        let h = abs(MLXRandom.normal([3, 3712], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [3, 3712], key: keys[1]) .< MLXArray(Float(0.15))
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        let column = MLXArray((0 ..< 3712).map(Int32.init)).reshaped(1, 3712)
+        let zero = MLXArray(Float(0))
+        let sparse = which(keep, h, zero)
+        let oneHot = which(column .== MLXArray(Int32(3700)), MLXArray(Float(1.5)), zero)
+        let mixedRows = which(row .== MLXArray(Int32(0)), zero,
+                              which(row .== MLXArray(Int32(1)), oneHot, sparse))
+        let tail = which(column .>= MLXArray(Int32(3584)), h, zero)
+        let outside = MLXRandom.uniform(Float(0) ..< 1, [3, 3712], key: keys[2]) .< MLXArray(Float(0.5))
+        let tinyAndHuge = which(outside, sparse * MLXArray(Float(1e-36)), sparse * MLXArray(Float(4e37)))
+        var same = MLXArray(true)
+        for a in [sparse, mixedRows, tail, h] {
+            let act = (a.asType(.bfloat16) * a.asType(.bfloat16)).asType(.bfloat16)
+            let expected = NemotronHeadPreparedActivation.apply(act, q, relu2: false, rps: 2)
+            same = logicalAnd(same, (run(act, copy: copy).view(dtype: .uint16)
+                .== expected.view(dtype: .uint16)).all())
+        }
+        let edge = tinyAndHuge.asType(.bfloat16)
+        let expected = NemotronHeadPreparedActivation.apply(edge, q, relu2: false, rps: 2)
+        same = logicalAnd(same, (run(edge, copy: copy).view(dtype: .uint16)
+            .== expected.view(dtype: .uint16)).all())
+        return same.item(Bool.self)
     }
 }
 

@@ -77,6 +77,7 @@ extension NemotronH35MTPAssistant {
         CBv2MTPDeviceAcceptWalk.warm()
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
+        NemotronSharedZSkip.prepare([target, assistant.module])
         NemotronZSkip.prepare(target)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronMoELeader.warm(target)
