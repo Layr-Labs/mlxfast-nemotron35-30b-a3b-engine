@@ -1976,11 +1976,18 @@ private let nemotronMTPRouterRowsSource = """
 enum NemotronMTPRouterRows {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_ROWS"] != "0"
+    /// Output rows per threadgroup: 1 spreads the 128 gates over 128
+    /// threadgroups instead of 32. Every gate keeps its lanes' K slices, their
+    /// order, the shuffle tree and the SIMD-group sum order, so only the
+    /// row-to-threadgroup map moves. NEMOTRON_MTP_ROUTER_TM=4 keeps four.
+    static let rowsPerGroup =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_TM"] == "4" ? 4 : 1
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_router_rows_gemv_bf16",
+        name: "nemotron_mtp_router_rows_gemv_bf16" + (rowsPerGroup == 4 ? "" : "_tm\(rowsPerGroup)"),
         inputNames: ["w", "x", "K", "N"],
         outputNames: ["y"],
-        source: nemotronMTPRouterRowsSource)
+        source: nemotronMTPRouterRowsSource.replacingOccurrences(
+            of: "  constexpr int TM = 4;\n", with: "  constexpr int TM = \(rowsPerGroup);\n"))
 
     /// x: [1, R, 2688] bf16, weight: [128, 2688] bf16. Returns the gates
     /// [1, R, 128], or nil for any shape the stock gemv parameters above do
@@ -1997,7 +2004,7 @@ enum NemotronMTPRouterRows {
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
         var y = kernel([weight, x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows)],
-            grid: (32 * 32, 8, 1),
+            grid: (32 * (128 / rowsPerGroup), 8, 1),
             threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128]],
             outputDTypes: [x.dtype])[0]
