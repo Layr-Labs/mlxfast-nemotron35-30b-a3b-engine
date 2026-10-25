@@ -604,6 +604,8 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpAndPlan: MLXFast.MLXFastKernel?
     /// The same triple FC1 with its tail block in the constant 8-value form.
     let tripleGateUpAndPlanTail8: MLXFast.MLXFastKernel?
+    /// Identical triple FC1 arithmetic when sparse FC2 needs no pair plan.
+    let tripleGateUpTail8: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -650,6 +652,14 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8 = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_without_pair_plan",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
     }
@@ -979,6 +989,33 @@ enum NemotronMoELeader {
             which(ok, result[1], referencePlan))
     }
 
+    /// Keep the complete triple/tail FC1 traversal, omitting only the unused
+    /// integer pair planner. The caller requires a verified sparse FC2 copy.
+    static func applyWithoutBalancePlan(
+        _ x: MLXArray, _ inds: MLXArray, bank: Bank, prepared: MLXArray?
+    ) -> MLXArray? {
+        guard fuseBalancePlan, preparedGateUp, tripleGateUp, fc1Tail8,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
+              let kernel = NemotronMoELeaderPreparedKernels.shared.tripleGateUpTail8
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let rps = leaderResultsPerSimdgroup(rows: 3)
+        let y = kernel([bank.weight, bank.scales, bank.biases, packed, inds],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
+                       ("RELU2", true), ("RPS", rps)],
+            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+            outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+        guard selfTest, let expected = applyWithBalancePlan(
+            x, inds, bank: bank, relu2: true, prepared: packed)?.activation
+        else { return y }
+        let ok = (y.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+        return which(ok, y, MLXArray(Float.nan).asType(x.dtype))
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -1025,7 +1062,11 @@ enum NemotronMoELeader {
         let act: MLXArray
         let balancePlan: MLXArray?
         if fuseRelu2 {
-            if rows == 3, let fused = applyWithBalancePlan(
+            if rows == 3, NemotronZSkip.covers(mlp.fc2),
+               let plain = applyWithoutBalancePlan(xr, flat, bank: up, prepared: prepared) {
+                act = plain
+                balancePlan = nil
+            } else if rows == 3, let fused = applyWithBalancePlan(
                 xr, flat, bank: up, relu2: true, prepared: prepared) {
                 act = fused.activation
                 balancePlan = fused.plan
@@ -1122,6 +1163,10 @@ enum NemotronMoELeader {
                 let values: [UInt32] = (0..<(rows * topK)).map { UInt32($0 % topK) }
                 let inds = MLXArray(values)
                 let x = MLXArray.zeros([rows, up.k], dtype: .bfloat16)
+                if rows == 3, topK == 6, fuseRelu2,
+                   let plain = applyWithoutBalancePlan(x, inds, bank: up, prepared: nil) {
+                    outputs.append(plain)
+                }
                 let fused = rows == 3 && topK == 6
                     ? applyWithBalancePlan(x, inds, bank: up, relu2: fuseRelu2, prepared: nil) : nil
                 let h = fused?.activation
