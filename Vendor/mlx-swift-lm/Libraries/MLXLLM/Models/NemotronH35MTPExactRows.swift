@@ -1087,11 +1087,15 @@ enum NemotronSharedUpPacking {
                           (a.1.view(dtype: .uint32) .== b.1.view(dtype: .uint32)).all())
     }
 
-    private static func dispatch(_ x: MLXArray, _ q: QuantizedLinear,
-                                 prepared: MLXArray?, sbDict: Bool = true) -> (MLXArray, MLXArray)? {
+    static func dispatch(_ x: MLXArray, _ q: QuantizedLinear,
+                         prepared: MLXArray?, sbDict: Bool = true,
+                         qualifyingFourRows: Bool = false) -> (MLXArray, MLXArray)? {
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              x.ndim == 2, x.dim(0) == 3, x.dtype == .bfloat16,
+              x.ndim == 2,
+              (x.dim(0) == 3 || (x.dim(0) == 4
+                && (qualifyingFourRows || NemotronMTPFourRows.allows(q.weight)))),
+              x.dtype == .bfloat16,
               q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
               let biases = q.biases, q.weight.ndim == 2, q.weight.dtype == .uint32,
               q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
@@ -1101,33 +1105,37 @@ enum NemotronSharedUpPacking {
               n >= 2688, n % 8 == 0, n % 512 != 0, NemotronMultiRowQMV.headRPS(n: n) == 2
         else { return nil }
         let pv = k % 512 == 0 ? 16 : 8
-        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: k)
+        let rows = x.dim(0)
+        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
+        // Preserve the highest's dictionary route at its qualified R3 width.
+        // Newly added R4 uses the original native metadata kernel and oracle.
+        let dict = rows == 3 && sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
-            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+            template: [("T", DType.bfloat16), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", true), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
-            outputShapes: [[3, n], [3, (n / 8 + 31) / 32, 9 * 32]],
+            outputShapes: [[rows, n], [rows, (n / 8 + 31) / 32, 9 * 32]],
             outputDTypes: [.bfloat16, .float32])
         return (outputs[0], outputs[1])
     }
 
     static func apply(_ x: MLXArray, up: Linear, down: Linear,
                       prepared: MLXArray?) -> MLXArray? {
-        guard verified, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
-              let q = up as? QuantizedLinear,
-              let fused = dispatch(x.reshaped(3, x.dim(2)), q, prepared: prepared)
+        guard x.ndim == 3, x.dim(0) == 1, let q = up as? QuantizedLinear,
+              (x.dim(1) == 3 && verified)
+                || (x.dim(1) == 4 && NemotronMTPFourRows.allows(q.weight)),
+              let fused = dispatch(x.reshaped(x.dim(1), x.dim(2)), q, prepared: prepared)
         else { return nil }
         var activated = fused.0
         if NemotronMoELeader.selfTest {
             activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
-                x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
+                x.reshaped(x.dim(1), x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
         }
         return nemotronMTPLinearRows(
-            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+            activated.reshaped(1, x.dim(1), q.weight.dim(0)), down, prepared: fused.1)
     }
 
     static func verify(_ model: Module) {
@@ -1359,7 +1367,8 @@ enum NemotronMultiRowQMV {
         let k = x.dim(1), n = q.weight.dim(0)
         // Stock dispatch_qmv sends K == 64/128 to qmv_quad; skip those.
         guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
-        if narrowEnabled && x.dim(0) == 3 && n >= 2688 {
+        if narrowEnabled && (x.dim(0) == 3
+            || (x.dim(0) == 4 && NemotronMTPFourRows.allows(q.weight))) && n >= 2688 {
             let y = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2,
                 rps: headRPS(n: n), prepared: prepared)
             guard NemotronMoELeader.selfTest else { return y }

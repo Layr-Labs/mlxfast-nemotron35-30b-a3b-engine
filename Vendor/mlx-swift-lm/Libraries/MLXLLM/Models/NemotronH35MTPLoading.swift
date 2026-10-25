@@ -82,6 +82,8 @@ extension NemotronH35MTPAssistant {
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        NemotronZSkip.prepareDraft(assistant.module)
+        NemotronBankBinding.warm(assistant.module, extra: NemotronZSkip.draftCopyArrays)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
@@ -91,6 +93,7 @@ extension NemotronH35MTPAssistant {
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
+        NemotronMTPFourRows.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -117,7 +120,7 @@ extension NemotronH35MTPAssistant {
             warmPostVerifySpeculation()
             return
         }
-        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 2
+        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 3
         let depth = max(1, min(requested, maximumDraftTokens ?? 7, 7))
         let promptLength = max(8, Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PROMPT"] ?? "") ?? 488)
         let prefillLength = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PREFILL"] ?? "") ?? 1024
