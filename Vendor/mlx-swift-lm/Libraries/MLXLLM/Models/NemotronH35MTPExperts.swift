@@ -1828,6 +1828,42 @@ private let nemotronZSkipTiledFastSource = """
         }
         continue;
       }
+      if (popcount(m) == 3) {
+        // The record sums each half of the chunk left to right and then adds
+        // the halves, so three non-zero terms associate as (t1 + t2) + t3
+        // unless only the first lies in the low half: t1 + (t2 + t3).
+        const int j1 = ctz(m);
+        const uint m2 = m & (m - 1);
+        const int j2 = ctz(m2);
+        const int j3 = ctz(m2 & (m2 - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const uint w3 = uint(wq[(8 * c + j3) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const T xv3 = xsh[8 * c + j3];
+        const int q1 = j1 & 3;
+        const int q2 = j2 & 3;
+        const int q3 = j3 & 3;
+        const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
+        const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+        const U xt3 = q3 == 0 ? U(xv3) : (q3 == 1 ? xv3 / 16.0f : (q3 == 2 ? xv3 / 256.0f : xv3 / 4096.0f));
+        const bool split = j1 < 4 && j2 >= 4;
+        const U sum3 = split ? U(xv1) + (U(xv2) + U(xv3)) : (U(xv1) + U(xv2)) + U(xv3);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+          const U c3 = U(int(((w3 >> (4 * o)) & 0xfu) << (4 * q3)));
+          const U accum = split ? xt1 * c1 + (xt2 * c2 + xt3 * c3) : (xt1 * c1 + xt2 * c2) + xt3 * c3;
+          p[o] += as_type<float>(sv[o]) * accum + sum3 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
       thread U xt[8];
       U sum = 0;
       const threadgroup T* xv = xsh + 8 * c;
