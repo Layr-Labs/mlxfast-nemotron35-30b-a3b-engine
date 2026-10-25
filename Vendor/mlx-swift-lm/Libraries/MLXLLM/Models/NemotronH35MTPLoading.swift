@@ -318,10 +318,118 @@ import Metal
 @_silgen_name("nemotron_decode_backing")
 private func nemotronDecodeBacking(_ opaque: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer?
 
+/// Decode-request residency for immutable, already evaluated parameters only.
+/// Private sets leave the allocator's wired-memory manager and budgets alone.
+@available(macOS 15.0, *)
+final class NemotronLoadedWeightResidency: @unchecked Sendable {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_LOADED_WEIGHT_RESIDENCY"] != "0"
+    private let arrays: [MLXArray]
+    private let buffers: [any MTLBuffer]
+    private let sets: [any MTLResidencySet]
+    private let queue = DispatchQueue(label: "nemotron.loaded.weights.memory")
+
+    init?(arrays: [MLXArray], reserved: [any MTLBuffer]) {
+        guard Self.enabled, let device = MTLCreateSystemDefaultDevice(),
+              let recommended = GPU.maxRecommendedWorkingSetBytes(), recommended > 0
+        else { return nil }
+        var buffers: [any MTLBuffer] = []
+        var seen = Set<ObjectIdentifier>()
+        var total = 0
+        // Count the existing decode-only sets in the combined memory bound and
+        // leave their backing exclusively under the original lease policy.
+        for buffer in reserved {
+            if seen.insert(ObjectIdentifier(buffer)).inserted {
+                let (next, overflow) = total.addingReportingOverflow(buffer.length)
+                guard !overflow, next <= recommended else { return nil }
+                total = next
+            }
+        }
+        for array in arrays {
+            guard let ctx = array.ctx.ctx, let ptr = nemotronDecodeBacking(ctx),
+                  let buffer = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue() as? any MTLBuffer
+            else { return nil }
+            if seen.insert(ObjectIdentifier(buffer)).inserted {
+                let (next, overflow) = total.addingReportingOverflow(buffer.length)
+                guard !overflow, next <= recommended else { return nil }
+                total = next
+                buffers.append(buffer)
+            }
+        }
+        guard !buffers.isEmpty else { return nil }
+
+        // Bound normal sets to 5% of the working set, within 64 MiB ... 1 GiB.
+        // An indivisible allocation larger than that cap gets a set of its own.
+        let cap = min(max(recommended / 20, 64 << 20), 1 << 30)
+        var groups: [[any MTLBuffer]] = []
+        var group: [any MTLBuffer] = []
+        var groupBytes = 0
+        for buffer in buffers {
+            if !group.isEmpty && (groupBytes > cap || buffer.length > cap - groupBytes) {
+                groups.append(group)
+                group = []
+                groupBytes = 0
+            }
+            group.append(buffer)
+            groupBytes += buffer.length
+        }
+        if !group.isEmpty { groups.append(group) }
+
+        var sets: [any MTLResidencySet] = []
+        for group in groups {
+            let descriptor = MTLResidencySetDescriptor()
+            descriptor.initialCapacity = group.count
+            guard let set = try? device.makeResidencySet(descriptor: descriptor)
+            else { return nil }
+            for buffer in group { set.addAllocation(buffer) }
+            set.commit()
+            sets.append(set)
+        }
+        self.arrays = arrays
+        self.buffers = buffers
+        self.sets = sets
+    }
+
+    final class Lease: CBv2MTPMemoryLease {
+        private let owner: NemotronLoadedWeightResidency
+        private let decode: (any CBv2MTPMemoryLease)?
+        private var finished = false
+
+        init(_ owner: NemotronLoadedWeightResidency, decode: (any CBv2MTPMemoryLease)?) {
+            self.owner = owner
+            self.decode = decode
+            owner.queue.async {
+                for set in owner.sets { set.requestResidency() }
+            }
+        }
+
+        func beginDecode() {
+            guard !finished else { return }
+            decode?.beginDecode()
+        }
+
+        func finish() {
+            guard !finished else { return }
+            finished = true
+            decode?.finish()
+            let owner = owner
+            owner.queue.sync {
+                for set in owner.sets { set.endResidency() }
+            }
+        }
+
+        deinit { finish() }
+    }
+
+    func begin(decode: (any CBv2MTPMemoryLease)?) -> Lease {
+        Lease(self, decode: decode)
+    }
+}
+
 @available(macOS 15.0, *)
 final class NemotronDecodeResidency: @unchecked Sendable {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_RESIDENCY"] != "0"
-    static let seedLayers = 0
+    static let seedLayers = 2
     let arrays: [MLXArray]
     let buffers: [any MTLBuffer]
     let seedSet: any MTLResidencySet

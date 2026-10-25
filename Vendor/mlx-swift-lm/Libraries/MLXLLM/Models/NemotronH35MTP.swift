@@ -52,6 +52,15 @@ private final class NemotronMTPDraftHead {
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
 
+    /// Qualified immutable screen backing is outside the registered module
+    /// tree. Include it in the existing decode lease, but never the mutable
+    /// fused-selection ticket counter or any request tensor.
+    var decodeResidencyArrays: [MLXArray] {
+        guard let screen else { return [] }
+        return [screen.groups] + [screen.upperGroups, screen.packed, screen.records]
+            .compactMap { $0 }
+    }
+
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
     /// `upper`: also screen the upper vocabulary half (when the plan has it).
@@ -402,16 +411,27 @@ private final class NemotronMTPDraftHead {
 /// proposal and is preserved by the durable prefix checkpoint codec.
 public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, CBv2MTPMemoryPreparing, @unchecked Sendable {
     private var decodeResidency: AnyObject?
+    private var loadedWeightResidency: AnyObject?
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
-            decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 },
+            let decode = NemotronDecodeResidency(
+                head: module.parameters().flattened().map { $0.1 }
+                    + draftHead.decodeResidencyArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target))
+            decodeResidency = decode
+            loadedWeightResidency = NemotronLoadedWeightResidency(
+                arrays: target.parameters().flattened().map { $0.1 }
+                    + module.parameters().flattened().map { $0.1 },
+                reserved: decode?.buffers ?? [])
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
-        if #available(macOS 15.0, *), let p = decodeResidency as? NemotronDecodeResidency {
-            return p.begin()
+        if #available(macOS 15.0, *) {
+            let decode = (decodeResidency as? NemotronDecodeResidency)?.begin()
+            if let weights = loadedWeightResidency as? NemotronLoadedWeightResidency {
+                return weights.begin(decode: decode)
+            }
+            return decode
         }
         return nil
     }
