@@ -163,10 +163,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// `updateAndAttend`. Returns nil, before touching any state, for every
     /// configuration other than: an owning layer in serialized MTP mode, one
     /// bound row, L > 1, no keep mask, no span contexts, no softcap, and no
-    /// attention metadata or packet observation.
+    /// attention metadata or packet observation. `attendRows` may replace the
+    /// per-query SDPA calls with bitwise-equal outputs (see
+    /// `CBv2AttentionV1.updateAndAttendSerialQueryRows`).
     public func updateAndAttendSerialQueryRows(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?
+        scale: Float, sinks: MLXArray?,
+        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
     ) -> [MLXArray]? {
         guard kind.sharesKVWithLayer == nil, mtpSerializesRectangularAttention,
               rows.count == 1, queries.ndim == 4, queries.dim(0) == 1, queries.dim(2) > 1,
@@ -176,7 +179,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         let outputs = CBv2AttentionV1.updateAndAttendSerialQueryRows(
             row: rows[0], kind: kind,
             queries: queries, keys: keys, values: values,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            attendRows: attendRows)
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
         return outputs
     }

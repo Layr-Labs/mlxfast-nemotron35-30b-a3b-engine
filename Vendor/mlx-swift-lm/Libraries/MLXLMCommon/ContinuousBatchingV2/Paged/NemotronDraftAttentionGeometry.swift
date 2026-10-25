@@ -1,10 +1,32 @@
 import Foundation
 import MLX
 
+/// Stage cuts in the draft head's per-round chain. Each one removes a
+/// dependent dispatch and leaves every draft value bitwise unchanged; the
+/// target never reaches these paths.
+/// NEMOTRON_MTP_DRAFT_CHAIN_CLEANUP=0 disables both.
+public enum NemotronMTPDraftChainCleanup {
+    static let environment = ProcessInfo.processInfo.environment
+    static let enabled = environment["NEMOTRON_MTP_DRAFT_CHAIN_CLEANUP"] != "0"
+    /// NEMOTRON_MTP_DRAFT_RETAINED_SEED_ROW=0: the prestaged first draft
+    /// rewrites its seed K/V row again.
+    public static let retainedSeedRow = enabled
+        && environment["NEMOTRON_MTP_DRAFT_RETAINED_SEED_ROW"] != "0"
+    /// NEMOTRON_MTP_DRAFT_HOST_OFFSETS=0: the draft cache advances its
+    /// device position offsets per attention call again.
+    static let hostPositionOffsets = enabled
+        && environment["NEMOTRON_MTP_DRAFT_HOST_OFFSETS"] != "0"
+}
+
+/// Only changes launch geometry for the embedded assistant. All other caches
+/// and shapes retain the original selectors. NSG stays four so HPT alone
+/// cannot change the per-head SIMD or partition reduction tree.
 public enum NemotronDraftAttentionGeometry {
     struct Plan { let hpt: Int; let ptok: Int }
     static let environment = ProcessInfo.processInfo.environment
     static let enabled = environment["NEMOTRON_MTP_DRAFT_HPT"] != "0"
+    // Production choice: HPT4, NSG4, main15 partition target64 policy.
+    // NEMOTRON_MTP_DRAFT_HPT=0 restores the original dispatch geometry.
     static let selectedHPT = 4
     static let selectedPTOK = 0
     static func select(enabled requested: Bool, dtype: DType, queryHeads: Int,
@@ -19,6 +41,8 @@ public enum NemotronDraftAttentionGeometry {
             maxAttendLength: length, batch: batch, kvHeads: 2,
             headSplits: 2, pageSize: 16))
     }
+    /// Warm bounded part/merge signatures on throwaway state before the final
+    /// cache drain. Neither model inputs nor request state are retained.
     public static func warm() throws {
         guard enabled else { return }
         let kind = CBv2LayerKind(attention: .full, headDim: 128, kvHeads: 2, queryHeads: 32)

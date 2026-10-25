@@ -172,6 +172,54 @@ final class NemotronH35MTPAttentionBlock: Module {
         return [front[0], front[1], q, k, v]
     }
 
+    /// `pagedForwardRows`' cache-free front: the fused residual rows and their
+    /// Q [1, heads, L, headDim] and K/V [1, kvHeads, L, headDim].
+    func frontRows(hidden: MLXArray, embedding: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        let joined = joinedNorms(hidden: hidden, embedding: embedding)
+        let fused = nemotronMTPLinearRows(joined, projection)
+        let x = norm(fused)
+        let batch = x.dim(0), length = x.dim(1)
+        let queries = nemotronMTPLinearRows(x, mixer.wq)
+            .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let keys = nemotronMTPLinearRows(x, mixer.wk)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let values = nemotronMTPLinearRows(x, mixer.wv)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        return (fused, queries, keys, values)
+    }
+
+    /// One row's attention-block output (residual + projected attention) from
+    /// its query [1, heads, 1, headDim] over explicit K/V with an additive mask.
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries.asType(keys.dtype), keys: keys, values: values,
+            scale: mixer.scale, mask: .array(mask))
+        let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
+        return fused + nemotronMTPLinearRows(merged, mixer.wo)
+    }
+
+    /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
+    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
+        (inputs[3].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3),
+         inputs[4].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3))
+    }
+
+    /// The attention of `pagedForwardParts(inputs:)` over explicit `keys` and
+    /// `values` with an additive `mask` (no cache access); output projected.
+    func maskedDraftAttention(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let queries = inputs[2].reshaped(1, 1, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+            .asType(keys.dtype)
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: mixer.scale, mask: .array(mask))
+        return mixer.wo(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1))
+    }
+
     /// `pagedForwardParts` from `pagedDraftInputs` of the same inputs.
     func pagedForwardParts(
         inputs: [MLXArray], cache: any CBv2AttendingLayerCache
@@ -454,6 +502,29 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
     }
+    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).draftKeyValues(inputs: inputs)
+    }
+    func frontRows(hidden: MLXArray, embedding: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding)
+    }
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowOutput(
+            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+    }
+    /// The one-token draft step from `pagedDraftInputs` with its attention over
+    /// explicit, masked K/V instead of the paged head cache.
+    func maskedSecondDraft(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedDraftAttention(
+            inputs: inputs, keys: keys, values: values, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
+    }
     func pagedForward(inputs: [MLXArray], cache: any CBv2AttendingLayerCache) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
             inputs: inputs, cache: cache)
@@ -516,9 +587,7 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
-        let hidden = cbv2Hidden(
-            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
-            earlyEvalInterval: nemotronPrefillEvalInterval)
+        let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)

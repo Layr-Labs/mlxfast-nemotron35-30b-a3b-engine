@@ -65,6 +65,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// un-write the ring slots the rolled-back tokens landed in. Eviction is
     /// measured from here — see `oldestValidPosition`.
     private(set) var writtenHighWater: Int = 0
+    /// Bumped by every write or storage adoption, never by rollback. A
+    /// `readvanceRetained` caller passes the value it read right after the
+    /// write it relies on, so any later write to this row refuses the step.
+    public private(set) var writeGeneration: UInt64 = 0
     /// Absolute position before which nothing was ever written here
     /// (nonzero only after `fastForward(to:)` for prefix-adopted rows).
     private(set) var baseOffset: Int = 0
@@ -383,6 +387,25 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         // overwritten before they can re-enter any attendable range.
     }
 
+    /// Advance over the `n` slots just past the frontier WITHOUT writing:
+    /// an append of bytes those slots already hold. Only the caller can know
+    /// that the last write there is exactly what it would append now and
+    /// that nothing has rewritten them since (a rollback that retreated over
+    /// rows it re-appends unchanged). Full rows only. Returns false, with no
+    /// change, when the row was written after `generation`, a slot was never
+    /// written, or its page left the table (a rollback queued it for
+    /// release); the caller then writes as before.
+    func readvanceRetained(_ n: Int, writtenAt generation: UInt64) -> Bool {
+        guard n > 0, writeGeneration == generation, ringPages == nil,
+            absoluteOffset >= frozenHighWater,
+            absoluteOffset + n <= writtenHighWater, absoluteOffset + n <= maxLength,
+            (absoluteOffset + n - 1) / pool.config.pageSize < table.count
+        else { return false }
+        guardSpeculativeSpan(adding: n)
+        absoluteOffset += n
+        return true
+    }
+
     // MARK: - Writes
 
     /// Append `keys`/`values` (`[kvHeads, n, headDim]`) at the current
@@ -413,6 +436,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             // nothing is written.
             absoluteOffset += n
             writtenHighWater = max(writtenHighWater, absoluteOffset)
+            writeGeneration &+= 1
             return
         }
         precondition(
@@ -443,6 +467,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
 
         absoluteOffset += n
         writtenHighWater = max(writtenHighWater, absoluteOffset)
+        writeGeneration &+= 1
     }
 
     /// Reserve the destination for ONE decode token and advance the
@@ -461,6 +486,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         let slot = absoluteOffset % s
         absoluteOffset += 1
         writtenHighWater = max(writtenHighWater, absoluteOffset)
+        writeGeneration &+= 1
         return (page, slot)
     }
 
@@ -652,6 +678,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         absoluteOffset = offset
         baseOffset = offset
         writtenHighWater = offset
+        writeGeneration &+= 1
     }
 
     // MARK: - Page-native prefix sharing
@@ -696,6 +723,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         tableVersion += 1
         absoluteOffset = cursor
         writtenHighWater = storedThrough
+        writeGeneration &+= 1
         frozenHighWater = frozenThrough
     }
 
@@ -712,6 +740,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         tableVersion += 1
         absoluteOffset = storedThrough
         writtenHighWater = storedThrough
+        writeGeneration &+= 1
     }
 
     /// A private complete-checkpoint ring was filled at its absolute slots.
@@ -728,6 +757,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         baseOffset = retainedStart
         absoluteOffset = storedThrough
         writtenHighWater = storedThrough
+        writeGeneration &+= 1
     }
 
     /// A row prepared off-lock but never published owns no pages/reservation.

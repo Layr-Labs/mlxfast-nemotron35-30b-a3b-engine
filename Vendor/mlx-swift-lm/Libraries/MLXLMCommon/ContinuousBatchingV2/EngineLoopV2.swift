@@ -657,6 +657,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// past the stop (contract) or breaking the parity suites.
     let detokQueue = DispatchQueue(
         label: "com.eigen.cbv2.detok", qos: .userInitiated)
+    /// `CBV2_FIRST_TOKEN_INLINE=0` queues a passthrough request's first
+    /// delta on `detokQueue` like every later one.
+    static let firstTokenInline =
+        ProcessInfo.processInfo.environment["CBV2_FIRST_TOKEN_INLINE"] != "0"
 
     // Cross-thread state (stateLock).
     private let stateLock = NSLock()
@@ -3680,11 +3684,23 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // reservation's own lock acquisition (measured in `emit`).
                 stream?.reserveEmission(
                     firstEmissionArmedNanos: firstToken ? readbackDoneNanos : 0)
-                detokQueue.async {
+                // A request's first token has nothing of its own queued on
+                // detokQueue yet (no delta, flush or terminal), and every later
+                // block for it is enqueued after this returns, so emitting it
+                // here keeps its stream order and content and saves one queue
+                // hop to the consumer. `CBV2_FIRST_TOKEN_INLINE=0` defers it.
+                if firstToken && Self.firstTokenInline {
                     let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
                     stream?.emit(
                         .delta(text: text, tokens: [token], logprobs: logprobs),
                         consumingReservation: true)
+                } else {
+                    detokQueue.async {
+                        let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
+                        stream?.emit(
+                            .delta(text: text, tokens: [token], logprobs: logprobs),
+                            consumingReservation: true)
+                    }
                 }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
