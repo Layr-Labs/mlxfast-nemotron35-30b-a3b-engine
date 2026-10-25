@@ -6,6 +6,9 @@ import MLXNN
 extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
+        if let y = NemotronSharedUpPrepared.apply(x, up: upProj, down: downProj, prepared: prepared) {
+            return y
+        }
         let activated = nemotronMTPLinearRelu2Rows(x, upProj, prepared: prepared)
         return nemotronMTPLinearRows(activated, downProj)
     }

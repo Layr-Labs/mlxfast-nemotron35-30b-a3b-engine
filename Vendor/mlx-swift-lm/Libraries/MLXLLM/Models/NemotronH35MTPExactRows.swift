@@ -401,6 +401,82 @@ private let nemotronHeadPreparedQMVSource = """
   }
 """
 
+/// Fuse shared-up's native BF16 ReLU2 epilogue into the exact eight-value
+/// prepared-activation layout. All scratch is local to this dispatch; down
+/// projection keeps the accepted prepared QMV and its original arithmetic.
+enum NemotronSharedUpPrepared {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PREPARE"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_shared_up_prepared_epilogue",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+        outputNames: ["packed"], source: source(), header: nemotronMultiRowQMVHeader)
+
+    private static func source() -> String {
+        var result = nemotronHeadPreparedQMVSource
+        let changes: [(String, String)] = [
+            ("constexpr int num_simdgroups = 2;", "constexpr int num_simdgroups = 8 / RPS;"),
+            ("device T* yp = y + out_row;", "threadgroup T values[R * 8];"),
+            ("yp[r * out_vec_size + row] = h;", "values[r * 8 + simd_gid * RPS + row] = h;")
+        ]
+        for (old, new) in changes {
+            precondition(result.components(separatedBy: old).count == 2,
+                         "shared-up prepare source: \(old)")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        // N is a multiple of eight: every SIMD in a TG reaches this barrier.
+        return result + "\n" + """
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          const uint local = simd_gid * 32 + simd_lid;
+          if (local < R) {
+            const int r = int(local);
+            const int chunk = int(tid.y);
+            const int tiles = (out_vec_size / 8 + 31) / 32;
+            const int base = (r * tiles + chunk / 32) * 9 * 32 + chunk % 32;
+            float total = 0;
+            for (int i = 0; i < 8; i += 4) {
+              total += float(values[r * 8 + i]) + float(values[r * 8 + i + 1])
+                  + float(values[r * 8 + i + 2]) + float(values[r * 8 + i + 3]);
+              packed[base + i * 32] = float(values[r * 8 + i]);
+              packed[base + (i + 1) * 32] = float(values[r * 8 + i + 1]) / 16.0f;
+              packed[base + (i + 2) * 32] = float(values[r * 8 + i + 2]) / 256.0f;
+              packed[base + (i + 3) * 32] = float(values[r * 8 + i + 3]) / 4096.0f;
+            }
+            packed[base + 8 * 32] = total;
+          }
+        """
+    }
+
+    static func apply(_ x: MLXArray, up: Linear, down: Linear,
+                      prepared: MLXArray?) -> MLXArray? {
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              !NemotronMoELeader.selfTest, x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              let u = up as? QuantizedLinear, let d = down as? QuantizedLinear,
+              u.mode == .affine, d.mode == .affine, u.bits == 4, d.bits == 4,
+              u.groupSize == 64, d.groupSize == 64, u.bias == nil, d.bias == nil,
+              u.weight.dtype == .uint32, d.weight.dtype == .uint32,
+              u.weight.shape == [3712, 336], d.weight.shape == [2688, 464],
+              u.scales.dtype == x.dtype, d.scales.dtype == x.dtype,
+              let ub = u.biases, let db = d.biases,
+              ub.dtype == x.dtype, db.dtype == x.dtype,
+              u.scales.shape == [3712, 42], ub.shape == [3712, 42],
+              d.scales.shape == [2688, 58], db.shape == [2688, 58]
+        else { return nil }
+        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
+        let upArgs = NemotronMultiRowQMV.scalarPair(2688, 3712)
+        let packed = kernel([u.weight, u.scales, ub, input, upArgs.0, upArgs.1],
+            template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", true), ("RPS", 2)],
+            grid: (32, 3712 / 2, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[3, 15, 9 * 32]], outputDTypes: [.float32])[0]
+        let downArgs = NemotronMultiRowQMV.scalarPair(3712, 2688)
+        return NemotronHeadPreparedActivation.project([d.weight, d.scales, db, packed,
+                                                       downArgs.0, downArgs.1],
+            template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)],
+            grid: (32, 2688 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, 2688]], outputDTypes: [x.dtype])[0]
+    }
+}
+
 enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
