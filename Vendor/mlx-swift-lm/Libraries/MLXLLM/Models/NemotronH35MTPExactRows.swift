@@ -2630,10 +2630,21 @@ enum NemotronHeadScreen {
                       const device T* sb = (const device T*)(rp + 8 * (upper ? S2 : S));
                 """)
         .replacingOccurrences(of: "sb[size_t(row) * (2 * S) + ", with: "sb[")
+    /// The record body with a lane's eight code words read as one aligned
+    /// 16-byte load (rows are 9 * S or 9 * S2 words, so every lane's 4-word
+    /// half-group starts on 16 bytes); word i is the same 16 bits.
+    private static let recordWideSource = nemotronSwapped(recordPartialSource, [
+        ("const device uint16_t* ws = (const device uint16_t*)(rp + (lane >> 1) * 8 + part * 4);",
+         "const uint4 wv = *((const device uint4*)(rp + (lane >> 1) * 8 + part * 4));", 1),
+        ("const uint16_t q = ws[i];",
+         "const uint16_t q = uint16_t((i & 1) != 0 ? (wv[i >> 1] >> 16) : (wv[i >> 1] & 0xffffu));", 1),
+    ])
+    static let wideRecordLoads =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_WIDE"] != "0"
     private static let recordPartialKernel = MLXFast.metalKernel(
-        name: "nemotron_head_screen_partial_record_affine4_gs64",
+        name: "nemotron_head_screen_partial_record_affine4_gs64" + (wideRecordLoads ? "_w16" : ""),
         inputNames: ["rec", "x", "groups", "groups2"],
-        outputNames: ["scores"], source: recordPartialSource)
+        outputNames: ["scores"], source: wideRecordLoads ? recordWideSource : recordPartialSource)
 
     /// [rows, 2 * groupCount] bf16: each row's selected scales then biases
     /// (rows from `rows` up: the upper group set, zero-padded). Copies of the
