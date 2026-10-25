@@ -50,6 +50,10 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
+/// Layers between early asyncEval calls on the MTP prefill path only. The seed
+/// window is the first request after the engine drains MLX's buffer cache, so a
+/// shorter chunk hands its transient live set back to that cache sooner.
+/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
@@ -578,6 +582,10 @@ enum NemotronHPrefillX5 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_X5"] != "0"
     /// The run gather clones the NAX kernel; without NAX stock runs another one.
     static let runGather = enabled && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    /// The state update `product + exp(cumsum)[-1] * previous` is one kernel.
+    /// `NEMOTRON_PREFILL_SSM_STATE_UPDATE=0` restores the stock pair.
+    static let ssmStateUpdate = enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SSM_STATE_UPDATE"] != "0"
 }
 
 // MARK: - Multi-token SSM scan (copy of SSM.swift ssmAttn, fewer copies)
@@ -591,7 +599,32 @@ private final class NemotronHScanKernels: Sendable {
     let maskedDecay: MLXFast.MLXFastKernel
     let scanDecay: MLXFast.MLXFastKernel
     let windowOut: MLXFast.MLXFastKernel
+    let stateUpdate: MLXFast.MLXFastKernel
     private init() {
+        // nextState = product + ec[..., -1, :, None, None] * previous: the
+        // stock broadcast multiply and add (each one fp32 rounding, in that
+        // order) in one pass over the [B, H, DH, DS] state.
+        stateUpdate = MLXFast.metalKernel(
+            name: "nemotron_ssm_state_update",
+            inputNames: ["prod", "prev", "ec", "n"], outputNames: ["out"],
+            source: """
+                const uint idx = thread_position_in_grid.x * 4;
+                const uint bh = thread_position_in_grid.y;
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                const uint i = idx / DS;
+                const uint k = idx % DS;
+                const float e = ec[bb * ec_strides[0] + (n - 1) * ec_strides[1] + hh * ec_strides[2]];
+                const device float* ps = prev + bb * prev_strides[0] + hh * prev_strides[1]
+                    + i * prev_strides[2];
+                const device float* qs = prod + bb * prod_strides[0] + hh * prod_strides[1]
+                    + i * prod_strides[2];
+                device float* o = out + (size_t(bh) * DH + i) * DS;
+                for (uint j = 0; j < 4; ++j) {
+                    const float p = e * ps[(k + j) * prev_strides[3]];
+                    o[k + j] = qs[(k + j) * prod_strides[3]] + p;
+                }
+            """, ensureRowContiguous: false)
         // One scan window's output, astype(y + ec[..., None] * yPrev, OT) with
         // yPrev = state @ C as the stock broadcast matmul computes it: MLX
         // gemv_float32_bm4_bn1_sm1_sn32_tm4_tn4 for K = 128, i.e. per output
@@ -853,9 +886,21 @@ func nemotronSSMAttn(
 
         let previousState = currentState
         let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
-        nextState =
-            nextState
-            + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
+        if NemotronHPrefillX5.ssmStateUpdate, nextState.dtype == .float32,
+           previousState.dtype == .float32, expDtACumsum.dtype == .float32,
+           nextState.shape == previousState.shape, d % 4 == 0 {
+            precondition(nextState.dim(1) == h && nextState.dim(2) == dh && nextState.dim(3) == d,
+                         "NemotronH SSM state shape")
+            nextState = NemotronHScanKernels.shared.stateUpdate(
+                [nextState, previousState, expDtACumsum, n],
+                template: [("H", h), ("DH", dh), ("DS", d)],
+                grid: (dh * d / 4, b * h, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[b, h, dh, d]], outputDTypes: [.float32])[0]
+        } else {
+            nextState =
+                nextState
+                + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
+        }
         if NemotronHPrefillX5.enabled, d == 128, dh % 32 == 0, h % g == 0,
            previousState.dtype == .float32, yWindow.dtype == .float32,
            expDtACumsum.dtype == .float32 {
@@ -3691,6 +3736,14 @@ private class NemotronHBackbone: Module {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
+                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
+                    // milliseconds while the host builds the next in well under
+                    // one, so without a wait the host encodes, and allocates,
+                    // every layer's intermediates before the first chunk
+                    // completes. Waiting on the previous chunk returns its
+                    // temporaries to MLX's buffer cache for the next chunk; this
+                    // chunk is already queued, so the GPU never waits on the
+                    // host. Evaluation order only; values are unchanged.
                     if recyclePrefillChunks {
                         if let previous = submittedPrefillChunk { eval(previous) }
                         submittedPrefillChunk = hidden
