@@ -995,7 +995,11 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         // the trusted prefix, post-verify rows 0...n for the device-picked n,
         // and the draft's own row; mask out the rows past n.
         if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged {
-            let history = paged.row.snapshot()
+            // No cache write since `rowHistory`: the same views (draft-only).
+            let history = NemotronH35MTPDraftSnapshot.mode == "0" ? paged.row.snapshot()
+                : NemotronH35MTPDraftSnapshot.mode == "neg"
+                    ? (keys: rowHistory.values, values: rowHistory.keys, offset: rowHistory.offset)
+                    : rowHistory
             let length = history.keys.dim(2)
             let firstSpeculated = length - spec.width
             let own = module.draftKeyValues(inputs: inputs)
@@ -1045,6 +1049,13 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 enum NemotronH35MTPDeviceSecondDraft {
     static let enabled = NemotronH35MTPDeviceSecondFront.enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
+}
+
+/// NEMOTRON_MTP_DRAFT_ONE_SNAPSHOT=0 takes the second snapshot of the head
+/// cache again for the device second draft; `neg` (negative control) hands it
+/// the first snapshot with keys and values swapped.
+enum NemotronH35MTPDraftSnapshot {
+    static let mode = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ONE_SNAPSHOT"] ?? "1"
 }
 
 enum NemotronH35MTPDeviceSecondFront {
