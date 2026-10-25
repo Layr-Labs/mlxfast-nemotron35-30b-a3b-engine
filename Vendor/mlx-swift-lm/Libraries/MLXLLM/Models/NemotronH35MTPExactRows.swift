@@ -401,6 +401,127 @@ private let nemotronHeadPreparedQMVSource = """
   }
 """
 
+/// Mamba verify in_proj (R = 3 prepared QMV) whose epilogue also produces the
+/// window's conv + SiLU, padded history and timestep transform. After the
+/// stock store, lane 0 of each simdgroup reads back its own just-stored BF16
+/// outputs and, for the xBC channels, runs the `nemotron_packed_conv_silu`
+/// expressions per position (padded rows too); for the dt channels it runs the
+/// softplus and clip expressions of `nemotron_packed_conv_silu_dt`. Every
+/// channel is produced once, by the simdgroup that computed it; the separate
+/// conv/timestep launch is not needed. The projection itself is unchanged.
+private let nemotronMambaInProjConvDtEpilogue = """
+
+  // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). The
+  // BF16 outputs it needs are read back from this simdgroup's own stores.
+  simdgroup_barrier(mem_flags::mem_device);
+  {
+    const int l = int(simd_lid);
+    if (l < results_per_simdgroup * R) {
+      const int row = l / R;
+      const int t = l % R;
+      const int o = out_row + row;
+      if (o >= CS && o < CS + CC) {
+        const int64_t channel = int64_t(o - CS);
+        if (t < 3) {
+          padded[int64_t(t) * CC + channel] =
+              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        }
+        padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];
+        float acc = 0;
+        for (int i = 0; i < 4; ++i) {
+          int64_t crow = int64_t(t) + int64_t(i);
+          T value = crow < 3
+              ? oldState[crow * oldState_strides[1] + channel * oldState_strides[2]]
+              : yp[(crow - 3) * out_vec_size + row];
+          acc += static_cast<float>(value)
+              * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+        }
+        T convolved = static_cast<T>(acc);
+        T xc = convolved + cb[channel * cb_strides[0]];
+        auto yc = 1 / (1 + metal::exp(metal::abs(xc)));
+        T sigmoid = xc < 0 ? yc : 1 - yc;
+        conv[int64_t(t) * CC + channel] = xc * sigmoid;
+      } else if (o >= DS && o < DS + NH) {
+        const int head = o - DS;
+        float v = static_cast<float>(yp[t * out_vec_size + row])
+            + static_cast<float>(dtBias[int64_t(head) * dtBias_strides[0]]);
+        float sp;
+        if (metal::isnan(v)) {
+          sp = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(v, 0.0f);
+          float minval = metal::min(v, 0.0f);
+          sp = (minval == -inf || maxval == inf)
+              ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        float lo = dtLo;
+        float hi = dtHi;
+        float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+        dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+      }
+    }
+  }
+"""
+
+enum NemotronMambaInProjConvDt {
+    /// NEMOTRON_MTP_INPROJ_CONV=0 keeps the separate conv/timestep launch.
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV"] != "0"
+    /// NEMOTRON_MTP_INPROJ_CONV_CHECK=1 also runs the separate launch on the
+    /// same projection and poisons the outputs with NaN on any bit difference.
+    static let check =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV_CHECK"] == "1"
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mamba_in_proj_conv_dt",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                     "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+        outputNames: ["y", "conv", "padded", "dt"],
+        source: nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
+        header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+
+    /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
+    /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
+    /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
+    /// timestep [1, 3, heads], or nil for any other shape.
+    static func apply(
+        _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
+        oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
+        dtBias: MLXArray, timeStepLimit: (Float, Float),
+        convStart: Int, convDim: Int, heads: Int
+    ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
+        let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              x.ndim == 2, rows == 3, x.dtype == .bfloat16, k == 2688, k % 512 != 0,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.ndim == 2, q.weight.dim(1) * 8 == k,
+              q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16,
+              n == convStart + convDim + heads, n % 4 == 0,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              oldState.shape == [1, 3, convDim], oldState.dtype == .bfloat16,
+              convWeight.shape == [convDim, 4, 1], convWeight.dtype == .bfloat16,
+              convBias.shape == [convDim], convBias.dtype == .bfloat16,
+              dtBias.shape == [heads], [DType.bfloat16, .float32].contains(dtBias.dtype)
+        else { return nil }
+        let pv = 8
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let outputs = kernel(
+            [q.weight, q.scales, biases, packed, args.0, args.1,
+             oldState, convWeight, convBias, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+            template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
+                       ("RPS", 2), ("CS", convStart), ("CC", convDim),
+                       ("DS", convStart + convDim), ("NH", heads)],
+            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+}
+
 enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
