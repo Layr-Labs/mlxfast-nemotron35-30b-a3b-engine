@@ -307,6 +307,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     private let kvOnlyHistory: Bool
     private let primePromptHistory: Bool
     private let draftLimit: Int
+    private var deviceThirdQualified = false
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
         ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_CAPTURE_VERIFY"] != "0"
@@ -373,11 +374,22 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// The second draft chained on the prestaged first one; handed out
         /// only for the first draft's own `hidden` output object.
         var prestagedSecond: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
+        /// Depth-three continuation: only consumed for second's exact hidden.
+        var prestagedThird: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
-        /// Post-verify attention/KV only; finalize selects the one expert row.
-        var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
+        /// Current request only. The selected-row route stores front/Q/K/V;
+        /// the disabled/unsupported route retains original per-row attention.
+        struct Speculation {
+            let attention: MLXArray?
+            let fused: MLXArray?
+            let queries: MLXArray?
+            let keys: MLXArray
+            let values: MLXArray
+            let width: Int
+        }
+        var speculation: Speculation?
         /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The next first draft queued behind the verify for the device-picked
@@ -395,6 +407,21 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// with `nextFirstDraft` once finalize adopts that first draft.
         var deviceSecondInputs: (inputs: [MLXArray], from: MLXArray)?
         var nextSecondInputs: (inputs: [MLXArray], from: MLXArray)?
+        /// The whole second draft on `deviceFirstDraft` (masked attention over
+        /// the head cache's rows as the device-picked count keeps them), with
+        /// its own K/V row; carried with `nextFirstDraft` once adopted.
+        var deviceSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                                from: MLXArray, screenUpper: Bool)?
+        var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                              from: MLXArray, screenUpper: Bool)?
+        var nextSecondDraftOffset: Int?
+        /// Third draft queued before host acceptance, reading the second's
+        /// own K/V through explicit virtual-row inputs. Never writes the slab.
+        var deviceThirdDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                               from: MLXArray, screenUpper: Bool)?
+        var nextThirdDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                             from: MLXArray, screenUpper: Bool)?
+        var nextThirdDraftOffset: Int?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -411,9 +438,20 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             return [snapshot.keys, snapshot.values]
         }
         var arrays: [MLXArray] {
-            (paged?.cache.innerState() ?? [])
-                + pendingTokens + pendingHidden + savedTokens + savedHidden
-                + [frontier, savedFrontier].compactMap { $0 } + roots
+            var result = paged?.cache.innerState() ?? []
+            result += pendingTokens + pendingHidden
+            result += savedTokens + savedHidden
+            result += [frontier, savedFrontier].compactMap { $0 }
+            result += roots
+            if let nextSecondDraft {
+                result += [nextSecondDraft.ids, nextSecondDraft.out, nextSecondDraft.keys,
+                           nextSecondDraft.values, nextSecondDraft.from]
+            }
+            if let nextThirdDraft {
+                result += [nextThirdDraft.ids, nextThirdDraft.out, nextThirdDraft.keys,
+                           nextThirdDraft.values, nextThirdDraft.from]
+            }
+            return result
         }
         var materializedBytes: Int {
             let arraysBytes = arrays.reduce(0) { total, array in
@@ -540,10 +578,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
     public func observeCommittedTarget(_ observation: CBv2MTPCommittedTargetObservation, requestState: any CBv2MTPRequestState) {
         let s = state(requestState)
-        if s.prestagedResult != nil || s.prestagedSecond != nil {
+        if s.prestagedResult != nil || s.prestagedSecond != nil || s.prestagedThird != nil {
             discardRound(requestState: requestState)
         }
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextSecondDraftOffset = nil
+        s.nextThirdDraft = nil; s.nextThirdDraftOffset = nil
         precondition(s.stagedInputCount == 0)
         let n = observation.tokens.dim(1)
         precondition(observation.tokens.shape == [1, n] && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
@@ -572,18 +612,27 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             let carry = s.prestagedHidden
             s.prestagedResult = nil
             s.prestagedHidden = nil
-            let staged = s.prestagedSecond == nil ? 1 : 2
+            let staged = s.prestagedThird != nil ? 3 : (s.prestagedSecond == nil ? 1 : 2)
             if s.stagedInputCount == staged, let carry, carry === hidden { return prestaged }
             discardRound(requestState: requestState)
         } else if let second = s.prestagedSecond {
             // The second call chains on the first draft's own output.
             s.prestagedSecond = nil
-            if s.stagedInputCount == 2, second.parent === hidden {
+            let staged = s.prestagedThird == nil ? 2 : 3
+            if s.stagedInputCount == staged, second.parent === hidden {
                 return (second.tokens, second.hidden)
             }
             discardRound(requestState: requestState)
+        } else if let third = s.prestagedThird {
+            s.prestagedThird = nil
+            if s.stagedInputCount == 3, third.parent === hidden {
+                return (third.tokens, third.hidden)
+            }
+            discardRound(requestState: requestState)
         }
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextSecondDraftOffset = nil
+        s.nextThirdDraft = nil; s.nextThirdDraftOffset = nil
         precondition(s.paged != nil, "Nemotron MTP state requires admitted sequence bound")
         precondition(s.stagedInputCount < draftLimit && tokens.shape == [1, 1] && hidden.shape == [1, 1, target.configuration.hiddenSize])
         let first = s.stagedInputCount == 0
@@ -649,12 +698,16 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Only the first seed used authoritative target hidden. Discard every
         // chained KV row even on full acceptance, then replay accepted inputs
         // using the verifier's true hidden states before the next round.
-        let speculation = s.speculation.flatMap {
-            $0.attention.dim(1) == s.stagedInputCount + 1 && n < $0.attention.dim(1) ? $0 : nil
-        }
-        // Adopt only when the host's accepted prefix is the device-selected row.
+        // A selected-row-only speculation is usable only for the ACTUAL
+        // host-committed count. A stop/truncation mismatch replays known rows.
         let deviceFirstDraft = s.hostAcceptedDrafts == n ? s.deviceFirstDraft : nil
+        let speculation = s.speculation.flatMap {
+            $0.width == s.stagedInputCount + 1 && n < $0.width
+                && ($0.attention != nil || deviceFirstDraft != nil) ? $0 : nil
+        }
         let deviceSecondInputs = deviceFirstDraft == nil ? nil : s.deviceSecondInputs
+        let deviceSecondDraft = deviceFirstDraft == nil ? nil : s.deviceSecondDraft
+        let deviceThirdDraft = deviceSecondDraft == nil ? nil : s.deviceThirdDraft
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
             // target hidden r) after the trusted seed row. Exact-greedy
@@ -679,10 +732,16 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Build the ordinary one-token tail lazily. The existing prestage
         // submits it only when the engine has a continuing carry.
         s.nextSecondInputs = speculation == nil ? nil : deviceSecondInputs
-        s.nextFirstDraft = speculation.map { spec in
+        s.nextSecondDraft = speculation == nil ? nil : deviceSecondDraft
+        // The first-draft prestage appends exactly one row after this rollback.
+        s.nextSecondDraftOffset = s.nextSecondDraft == nil ? nil : s.cacheOffset + 1
+        s.nextThirdDraft = speculation == nil ? nil : deviceThirdDraft
+        s.nextThirdDraftOffset = s.nextThirdDraft == nil ? nil : s.cacheOffset + 2
+        s.nextFirstDraft = speculation.flatMap { spec in
             if let deviceFirstDraft { return deviceFirstDraft }
+            guard let attention = spec.attention else { return nil }
             let out = module.finishPagedAttentionRow(
-                spec.attention[0..., n ..< (n + 1), 0...])
+                attention[0..., n ..< (n + 1), 0...])
             let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
             return (ids: ids, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
@@ -701,15 +760,20 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
     private func clearRound(_ s: State) {
         s.prestagedHidden = nil; s.prestagedResult = nil; s.prestagedSecond = nil
+        s.prestagedThird = nil
         s.speculation = nil
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
         s.deviceFirstDraft = nil; s.hostAcceptedDrafts = nil; s.deviceSecondInputs = nil
+        s.deviceSecondDraft = nil
+        s.deviceThirdDraft = nil
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
         clearRound(s)
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextSecondDraftOffset = nil
+        s.nextThirdDraft = nil; s.nextThirdDraftOffset = nil
         s.paged?.release(); s.paged = nil
         s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil
         s.committedInputCount = 0; s.released = true
@@ -728,7 +792,9 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     ) {
         let s = state(requestState)
         let next = s.nextFirstDraft
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextSecondDraftOffset = nil
+        s.nextThirdDraft = nil; s.nextThirdDraftOffset = nil
         guard s.canPrestageFirstDraft, s.started, s.stagedInputCount == 0,
               s.prestagedResult == nil, s.paged != nil,
               hidden.shape == [1, 1, target.configuration.hiddenSize]
@@ -765,26 +831,61 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
     ) {
         let secondInputs = state(requestState).nextSecondInputs
+        let secondDraft = state(requestState).nextSecondDraft
+        let secondDraftOffset = state(requestState).nextSecondDraftOffset
+        let thirdDraft = state(requestState).nextThirdDraft
+        let thirdDraftOffset = state(requestState).nextThirdDraftOffset
         prestageFirstDraft(token: token, hidden: hidden, requestState: requestState)
         let s = state(requestState)
         guard depth >= 2, draftLimit >= 2, let first = s.prestagedResult,
               s.prestagedSecond == nil, s.stagedInputCount == 1
         else { return }
-        // On the adopted device-picked first draft, its cache-free part is
-        // already queued (`speculateNextFirstDraft`): same inputs, same ops.
-        let out: MLXArray
-        if let secondInputs, secondInputs.from === first.hidden {
-            out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
+        let out: MLXArray, ids: MLXArray
+        if let secondDraft, secondDraft.from === first.hidden,
+           secondDraftOffset == s.cacheOffset, secondDraft.screenUpper == s.draftsScreenUpper {
+            // The whole second draft already ran behind the verify for this
+            // row (`speculateNextFirstDraft`); only its K/V row is appended, at
+            // the position the round-build step would write it.
+            s.roots += s.cache.appendTrusted(keys: secondDraft.keys, values: secondDraft.values)
+            out = secondDraft.out
+            ids = secondDraft.ids
         } else {
-            out = module.pagedForward(
-                hidden: first.hidden,
-                embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+            // On the adopted device-picked first draft, its cache-free part is
+            // already queued (`speculateNextFirstDraft`): same inputs, same ops.
+            if let secondInputs, secondInputs.from === first.hidden {
+                out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
+            } else {
+                out = module.pagedForward(
+                    hidden: first.hidden,
+                    embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+            }
+            ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         }
-        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         s.stagedInputCount += 1
         s.roots.append(contentsOf: [out, ids])
         asyncEval([ids, out] + s.arrays)
         s.prestagedSecond = (tokens: ids, hidden: out, parent: first.hidden)
+        // Exactly the ordinary third draft step, but queued after second's
+        // own K/V was adopted/appended above and before round-build consumes
+        // either prestaged result. The ordinary speculative transaction owns
+        // every chained K/V row; finalize still rolls back and replays them.
+        if depth >= 3, draftLimit >= 3, NemotronMTPFourRows.enabled {
+            let third: MLXArray, thirdIDs: MLXArray
+            if let thirdDraft, thirdDraft.from === out,
+               thirdDraftOffset == s.cacheOffset, thirdDraft.screenUpper == s.draftsScreenUpper {
+                s.roots += s.cache.appendTrusted(keys: thirdDraft.keys, values: thirdDraft.values)
+                third = thirdDraft.out
+                thirdIDs = thirdDraft.ids
+            } else {
+                third = module.pagedForward(
+                    hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])), cache: s.cache)
+                thirdIDs = draftHead.greedy(third, upper: s.draftsScreenUpper)
+            }
+            s.stagedInputCount += 1
+            s.prestagedThird = (tokens: thirdIDs, hidden: third, parent: out)
+            s.roots += [third, thirdIDs]
+            asyncEval([third, thirdIDs] + s.arrays)
+        }
     }
 
     /// Called right after the round's verify graph is submitted (before the
@@ -803,6 +904,21 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         else { return }
         // Chained draft rows are never trusted; drop them before appending.
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
+        if NemotronH35MTPPickedFirstAttention.enabled,
+           let paged = s.paged, paged.row.windowSize == nil,
+           s.trustedOffset >= 0, s.trustedOffset < Int(Int32.max) - width - 2 {
+            // Source04ee: every post-verify K/V row is preserved; only the
+            // eventual device-picked query needs attention/WO/expert work.
+            let rows = module.frontRows(
+                hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens))
+            let written = s.cache.appendTrusted(keys: rows.keys, values: rows.values)
+            s.speculation = State.Speculation(attention: nil, fused: rows.fused,
+                queries: rows.queries, keys: rows.keys, values: rows.values, width: width)
+            let roots = [rows.fused, rows.queries] + written + s.cache.innerState()
+            s.roots += roots
+            asyncEval(roots)
+            return
+        }
         // Attend the rows one query column at a time through the decode
         // kernel the one-token draft already uses (the verify column path):
         // each row is then bitwise a one-token draft step, and the kernel
@@ -818,7 +934,8 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         }
         let rows = module.pagedAttentionRows(
             hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
-        s.speculation = (attention: rows.output, keys: rows.keys, values: rows.values)
+        s.speculation = State.Speculation(attention: rows.output, fused: nil,
+            queries: nil, keys: rows.keys, values: rows.values, width: width)
         let roots = [rows.output] + s.cache.innerState()
         s.roots += roots
         asyncEval(roots)
@@ -835,27 +952,132 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     ) {
         let s = state(requestState)
         guard let spec = s.speculation, acceptedDrafts.shape == [1],
-              spec.attention.dim(1) == s.stagedInputCount + 1
+              spec.width == s.stagedInputCount + 1
         else { return }
         let row = acceptedDrafts.asType(.int32)
-        let out = module.finishPagedAttentionRow(take(spec.attention, row, axis: 1))
-        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
+        let out: MLXArray
+        if let attention = spec.attention {
+            out = module.finishPagedAttentionRow(take(attention, row, axis: 1))
+        } else if let fused = spec.fused, let queries = spec.queries, let paged = s.paged {
+            let selected = take(fused, row, axis: 1)
+            let query = take(queries, row, axis: 2)
+            if let direct = module.devicePagedPickedFirstDraft(
+                fused: selected, queries: query, keys: keys, values: values,
+                cache: s.cache, accepted: row, trustedOffset: s.trustedOffset,
+                postVerifyRows: spec.width) {
+                out = direct
+            } else {
+                // Source04ee masked snapshot fallback, with original KV dtype.
+                let history = paged.row.snapshot()
+                let length = history.keys.dim(2)
+                let first = length - spec.width
+                let keep = MLXArray(Int32(0) ..< Int32(length)) .<= (row + Int32(first))
+                let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                    .asType(history.keys.dtype).reshaped(1, 1, 1, length)
+                let attended = module.maskedRowOutput(fused: selected, queries: query,
+                    keys: history.keys, values: history.values, mask: mask)
+                out = module.finishPagedAttentionRow(attended)
+            }
+        } else {
+            return
+        }
+        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
         guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
+            s.roots += [ids, out, keys, values]
             asyncEval([ids, out, keys, values])
             return
         }
-        let inputs = module.pagedDraftInputs(
-            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
+        let secondEmbedding = target.mtpEmbedding(ids.reshaped([1, 1]))
+        if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged,
+           paged.row.windowSize == nil,
+           s.cacheOffset >= spec.width, s.cacheOffset < Int(Int32.max),
+           let whole = module.devicePagedSecondFromHidden(
+               hidden: out, embedding: secondEmbedding, cache: s.cache,
+               accepted: row, trustedOffset: s.trustedOffset, postVerifyRows: spec.width) {
+            let ids2 = draftHead.greedy(whole.out, upper: s.draftsScreenUpper)
+            s.deviceSecondInputs = nil
+            s.deviceSecondDraft = (ids: ids2, out: whole.out, keys: whole.keys,
+                values: whole.values, from: out, screenUpper: s.draftsScreenUpper)
+            var roots = [ids, out, keys, values, ids2, whole.out, whole.keys, whole.values]
+            roots += deviceThirdDraftRoots(secondIDs: ids2, second: whole.out,
+                keys: whole.keys, values: whole.values, accepted: row,
+                postVerifyRows: spec.width, state: s)
+            s.roots += roots
+            asyncEval(roots)
+            return
+        }
+        let inputs = module.pagedDraftInputs(hidden: out, embedding: secondEmbedding)
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        asyncEval([ids, out, keys, values] + inputs)
+        var roots = [ids, out, keys, values] + inputs
+        // The rest of the second draft too: its attention reads the head cache,
+        // which still holds every post-verify row (they sit last). Attend over
+        // the trusted prefix, post-verify rows 0...n for the device-picked n,
+        // and the draft's own row; mask out the rows past n.
+        if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged,
+           paged.row.windowSize == nil,
+           s.cacheOffset >= spec.width, s.cacheOffset < Int(Int32.max) {
+            let own = module.draftKeyValues(inputs: inputs)
+            let ownKeys: MLXArray, ownValues: MLXArray, out2: MLXArray
+            if let direct = module.devicePagedSecondDraft(inputs: inputs, cache: s.cache,
+                accepted: row, trustedOffset: s.trustedOffset,
+                postVerifyRows: spec.width) {
+                ownKeys = own.keys
+                ownValues = own.values
+                out2 = direct
+            } else {
+                // Original selected6e masked snapshot route remains intact.
+                let history = paged.row.snapshot()
+                let length = history.keys.dim(2)
+                let firstSpeculated = length - spec.width
+                ownKeys = own.keys.asType(history.keys.dtype)
+                ownValues = own.values.asType(history.values.dtype)
+                let position = MLXArray(Int32(0) ..< Int32(length + 1))
+                let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
+                let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                    .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
+                out2 = module.maskedSecondDraft(inputs: inputs,
+                    keys: concatenated([history.keys, ownKeys], axis: 2),
+                    values: concatenated([history.values, ownValues], axis: 2), mask: mask)
+            }
+            let ids2 = draftHead.greedy(out2, upper: s.draftsScreenUpper)
+            s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues,
+                                   from: out, screenUpper: s.draftsScreenUpper)
+            roots += [ids2, out2, ownKeys, ownValues]
+            roots += deviceThirdDraftRoots(secondIDs: ids2, second: out2,
+                keys: ownKeys, values: ownValues, accepted: row,
+                postVerifyRows: spec.width, state: s)
+        }
+        // Request-owned roots retain the submitted snapshot and output graph
+        // through finalize; no lazy slab view survives into a later request.
+        s.roots += roots
+        asyncEval(roots)
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {
         state(requestState).hostAcceptedDrafts = accepted
+    }
+
+    /// Queue all third-draft compute before the acceptance readback. No row
+    /// enters trusted history until ordinary host reconciliation adopts it.
+    private func deviceThirdDraftRoots(
+        secondIDs: MLXArray, second: MLXArray, keys: MLXArray, values: MLXArray,
+        accepted: MLXArray, postVerifyRows: Int, state s: State
+    ) -> [MLXArray] {
+        guard deviceThirdQualified, NemotronH35MTPDeviceThirdDraft.enabled, draftLimit >= 3,
+              NemotronMTPFourRows.enabled, let paged = s.paged, paged.row.windowSize == nil,
+              let third = module.devicePagedSecondFromHidden(
+                hidden: second, embedding: target.mtpEmbedding(secondIDs.reshaped([1, 1])),
+                cache: s.cache, accepted: accepted, trustedOffset: s.trustedOffset,
+                postVerifyRows: postVerifyRows, precedingKeys: keys, precedingValues: values)
+        else { return [] }
+        let ids = draftHead.greedy(third.out, upper: s.draftsScreenUpper)
+        s.deviceThirdDraft = (ids: ids, out: third.out, keys: third.keys, values: third.values,
+                              from: second, screenUpper: s.draftsScreenUpper)
+        return [ids, third.out, third.keys, third.values, second, keys, values]
     }
 }
 
@@ -878,9 +1100,30 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 
 /// NEMOTRON_MTP_DEVICE_SECOND_FRONT=0 builds the whole second draft after
 /// the readback again.
+/// NEMOTRON_MTP_DEVICE_SECOND_DRAFT=0 keeps the second draft's attention and
+/// tail after the readback.
+/// Disable the new row-omission route to retain the complete original
+/// all-row post-verify attention. Native off keeps source04ee masked attention.
+enum NemotronH35MTPPickedFirstAttention {
+    static let enabled = ProcessInfo.processInfo.environment[
+        "NEMOTRON_MTP_PICKED_FIRST_ATTENTION"] != "0"
+    static let nativePaged = ProcessInfo.processInfo.environment[
+        "NEMOTRON_MTP_PICKED_FIRST_NATIVE"] != "0"
+}
+
+enum NemotronH35MTPDeviceSecondDraft {
+    static let enabled = NemotronH35MTPDeviceSecondFront.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
+}
+
 enum NemotronH35MTPDeviceSecondFront {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_FRONT"] != "0"
+}
+
+enum NemotronH35MTPDeviceThirdDraft {
+    static let enabled = NemotronH35MTPDeviceSecondDraft.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_THIRD_DRAFT"] != "0"
 }
 
 enum NemotronH35MTPSpeculation {
@@ -894,6 +1137,78 @@ enum NemotronH35MTPSpeculation {
 }
 
 extension NemotronH35MTPAssistant {
+    /// Official-worker load admission only. Compare the complete virtual-row
+    /// graph to the original one-token draft over a separate materialized
+    /// prefix plus second K/V. Every temporary backend is released here.
+    func qualifyDeviceThirdDraft() {
+        deviceThirdQualified = false
+        guard NemotronH35MTPDeviceThirdDraft.enabled, NemotronMTPFourRows.enabled,
+              draftLimit >= 3, target.configuration.hiddenSize == 2688 else { return }
+        do {
+            deviceThirdQualified = try withError {
+                let kind = CBv2LayerKind(attention: .full, headDim: 128, kvHeads: 2,
+                    queryHeads: 32, modelLayerIndex: 0)
+                let width = 4
+                for (probe, history) in [15, 128, 600].enumerated() {
+                    let length = history + width
+                    let count = 2 * length * 128
+                    let keyData = (0..<count).map { i -> Float in
+                        Float(((i * 3 + probe * 7) % 41) - 20) / 64
+                    }
+                    let valueData = (0..<count).map { i -> Float in
+                        Float(((i * 5 + probe * 11) % 37) - 18) / 32
+                    }
+                    let k = MLXArray(keyData).asType(.bfloat16).reshaped(1, 2, length, 128)
+                    let v = MLXArray(valueData).asType(.bfloat16).reshaped(1, 2, length, 128)
+                    let previousK = MLXArray((0..<256).map { i -> Float in
+                        Float(((i + 7 * probe) % 23) - 11) / 32
+                    }).asType(.bfloat16).reshaped(1, 2, 1, 128)
+                    let previousV = MLXArray((0..<256).map { i -> Float in
+                        Float(((i * 3 + probe) % 29) - 14) / 64
+                    }).asType(.bfloat16).reshaped(1, 2, 1, 128)
+                    let hidden = MLXArray((0..<2688).map { i -> Float in
+                        Float(((i + 5 * probe) % 31) - 15) / 16
+                    }).asType(.bfloat16).reshaped(1, 1, 2688)
+                    let token = MLXArray([Int32(probe)]).reshaped(1, 1)
+                    let embedding = target.mtpEmbedding(token)
+                    for accepted in 0..<width {
+                        let source = try PagedState(kind: kind, dtype: .bfloat16,
+                            maximumSequenceLength: length + 8)
+                        let control = try PagedState(kind: kind, dtype: .bfloat16,
+                            maximumSequenceLength: length + 8)
+                        defer { source.release(); control.release() }
+                        eval(source.cache.appendTrusted(keys: k, values: v))
+                        let prefix = history + accepted + 1
+                        eval(control.cache.appendTrusted(
+                            keys: k[0..., 0..., 0..<prefix, 0...],
+                            values: v[0..., 0..., 0..<prefix, 0...]))
+                        eval(control.cache.appendTrusted(keys: previousK, values: previousV))
+                        let inputs = module.pagedDraftInputs(hidden: hidden, embedding: embedding)
+                        let expectedKV = module.draftKeyValues(inputs: inputs)
+                        let expected = module.pagedForward(inputs: inputs, cache: control.cache)
+                        guard let actual = module.devicePagedSecondFromHidden(
+                            hidden: hidden, embedding: embedding, cache: source.cache,
+                            accepted: MLXArray([Int32(accepted)]), trustedOffset: history,
+                            postVerifyRows: width, precedingKeys: previousK, precedingValues: previousV),
+                              actual.out.dtype == .bfloat16, expected.dtype == .bfloat16,
+                              actual.out.shape == expected.shape else { return false }
+                        let sameHidden = (actual.out.view(dtype: .uint16)
+                            .== expected.view(dtype: .uint16)).all()
+                        let sameKeys = (actual.keys.view(dtype: .uint16)
+                            .== expectedKV.keys.view(dtype: .uint16)).all()
+                        let sameValues = (actual.values.view(dtype: .uint16)
+                            .== expectedKV.values.view(dtype: .uint16)).all()
+                        let same = MLX.logicalAnd(sameHidden, MLX.logicalAnd(sameKeys, sameValues))
+                        if !same.item(Bool.self) { return false }
+                    }
+                }
+                return true
+            }
+        } catch { deviceThirdQualified = false }
+        let status = deviceThirdQualified ? "on (12 full-hidden/K/V bitwise cases)" : "off (original third draft)"
+        FileHandle.standardError.write(Data("nemotron mtp device-third: \(status)\n".utf8))
+    }
+
     /// A private warm-up may replace one synthetic width with the same
     /// post-verify entry over a real target verification graph. This guard
     /// has the original warm-up policy and width cap, not a timed-phase gate.
@@ -947,13 +1262,23 @@ extension NemotronH35MTPAssistant {
             speculateAfterVerify(
                 targetTokens: targets[0 ..< 1], targetHidden: hidden[0 ..< 1],
                 requestState: requestState)
+            // Official-worker load warm-up only: exercise native R3/R4
+            // device-second execution and host adoption before ranked use.
+            if width >= 3 {
+                speculateNextFirstDraft(acceptedDrafts: MLXArray([Int32(drafts)]), requestState: requestState)
+                noteHostAcceptedDrafts(drafts, requestState: requestState)
+            }
             eval(evaluationTargets(for: requestState))
             finalizeRound(
                 requestState: requestState, confirmedInputTokens: drafts + 1,
                 committedDraftTokens: MLXArray.zeros([1, drafts], dtype: .int32),
                 committedTargetHidden: hidden[0..., 0 ..< drafts, 0...])
             let carry = hidden[0..., drafts ..< (drafts + 1), 0...]
-            prestageFirstDraft(token: 0, hidden: carry, requestState: requestState)
+            if width >= 3 {
+                prestageDrafts(token: 0, hidden: carry, requestState: requestState, depth: drafts)
+            } else {
+                prestageFirstDraft(token: 0, hidden: carry, requestState: requestState)
+            }
             let first = draftStep(
                 tokens: MLXArray.zeros([1, 1], dtype: .int32), hidden: carry, shortlist: nil,
                 requestState: requestState)
