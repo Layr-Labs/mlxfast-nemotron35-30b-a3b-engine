@@ -771,7 +771,7 @@ enum NemotronMoELeader {
     static let narrowLeader =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
     static func leaderResultsPerSimdgroup(rows: Int) -> Int {
-        narrowLeader && rows == 3 ? 2 : 4
+        narrowLeader && (rows == 3 || (rows == 1 && NemotronMultiRowQMV.narrowOneRow)) ? 2 : 4
     }
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"

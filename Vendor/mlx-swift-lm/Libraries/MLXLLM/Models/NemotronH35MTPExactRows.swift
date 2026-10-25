@@ -981,6 +981,9 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
     static let narrowEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
+    /// NEMOTRON_MTP_QMV_NARROW_R1=0 keeps four outputs per SIMD group at R = 1.
+    static let narrowOneRow = narrowEnabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW_R1"] != "0"
     /// NEMOTRON_MTP_HEAD_RPS4=0 keeps two outputs per SIMD group on the
     /// 131,072-row target head. Four halves the threadgroups that each
     /// re-read the prepared rows; every output keeps its lane split, block
@@ -1075,6 +1078,7 @@ enum NemotronMultiRowQMV {
     static func resultsPerSimdgroup(rows: Int, k: Int, n: Int) -> Int {
         guard narrowEnabled else { return 4 }
         switch rows {
+        case 1 where NemotronMultiRowQMV.narrowOneRow: return narrowShapes.contains([k, n]) ? 2 : 4
         case 3: return narrowShapes.contains([k, n]) ? 2 : 4
         // R = 4 out_proj / o_proj / wo (4096 -> 2688) measured flat.
         case 4: return narrowShapes.contains([k, n]) && [k, n] != [4096, 2688] ? 2 : 4
@@ -1581,7 +1585,8 @@ enum NemotronTargetQKV {
     /// and 4 (M1 Max: -9 % and -12 %; R = 1 +7 %). Same kill switch as
     /// NemotronMultiRowQMV.
     static func resultsPerSimdgroup(rows: Int) -> Int {
-        NemotronMultiRowQMV.narrowEnabled && (rows == 3 || rows == 4) ? 2 : 4
+        NemotronMultiRowQMV.narrowEnabled
+            && (rows == 3 || rows == 4 || (rows == 1 && NemotronMultiRowQMV.narrowOneRow)) ? 2 : 4
     }
 
     private static func buffers(_ linear: Linear, rows: Int) -> [MLXArray]? {
