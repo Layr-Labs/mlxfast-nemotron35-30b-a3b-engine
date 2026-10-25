@@ -535,10 +535,10 @@ public enum CBv2MTPFirstDraftPrestage {
 /// Head-chain submissions grouped into fewer `asyncEval` calls (evaluation
 /// order only): finalize's prestaged drafts and the round-build draft steps
 /// ride the verify's first submission, so the host reaches that submission
-/// with no separate submit before it. Each `asyncEval` ends its command
-/// buffer with an event. The acceptance packet and the post-verify head
-/// graphs keep their own submissions. `NEMOTRON_MTP_MERGE_SUBMITS=0` submits
-/// each graph on its own.
+/// with no separate submit before it, and the two post-verify head graphs
+/// share one. Each `asyncEval` ends its command buffer with an event. The
+/// acceptance packet keeps its own submission. `NEMOTRON_MTP_MERGE_SUBMITS=0`
+/// submits each graph on its own.
 public enum CBv2MTPSubmitMerge {
     public static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MERGE_SUBMITS"] != "0"
@@ -547,6 +547,13 @@ public enum CBv2MTPSubmitMerge {
     /// Start holding submissions (engine thread only).
     public static func begin() {
         if enabled && held == nil { held = [] }
+    }
+
+    /// A nested helper flushes only the hold it opened (engine thread only).
+    public static func beginIfIdle() -> Bool {
+        guard enabled, held == nil else { return false }
+        held = []
+        return true
     }
 
     /// `asyncEval(arrays)`, or hold them for the next `take`/`flush`.
@@ -582,6 +589,10 @@ extension EngineLoopV2 {
         let draftCount = batch * verify.k
         let targets = verify.acceptancePacket[draftCount ..< (draftCount + batch * width)]
             .reshaped([batch, width])
+        // Both post-verify head graphs go to the GPU in one submission; they
+        // queue behind the verify the GPU is still running.
+        let ownsSubmitHold = CBv2MTPSubmitMerge.beginIfIdle()
+        defer { if ownsSubmitHold { CBv2MTPSubmitMerge.flush() } }
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
             speculator.speculateAfterVerify(

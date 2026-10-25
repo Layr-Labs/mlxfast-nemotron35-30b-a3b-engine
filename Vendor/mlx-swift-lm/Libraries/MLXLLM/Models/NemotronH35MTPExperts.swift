@@ -1966,6 +1966,76 @@ enum NemotronBankBinding {
         eval(made.values.map { $0.1 })
         lock.withLock { views.merge(made) { _, new in new } }
     }
+
+    /// NEMOTRON_MTP_DENSE_VIEWS=0 keeps binding the whole dense projections.
+    static let denseEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DENSE_VIEWS"] != "0"
+
+    /// Load-time only: both operands must retain the original device pointer
+    /// ABI. This checks identity without dereferencing beyond the short view.
+    /// No pointer value is copied to the host, only the equality Boolean.
+    private static let denseAliasCheck = MLXFast.metalKernel(
+        name: "nemotron_dense_native_alias_check",
+        inputNames: ["original", "prefix"], outputNames: ["same"],
+        source: "same[0] = original == prefix ? uint(1) : uint(0);",
+        ensureRowContiguous: false)
+
+    private static func denseRowMajor(_ array: MLXArray) -> Bool {
+        var stride = 1
+        for (length, actual) in zip(array.shape, array.strides).reversed() {
+            if length > 1 && actual != stride { return false }
+            stride *= length
+        }
+        return true
+    }
+
+    /// Load time, outside any trace: record evaluated first-row views of the
+    /// weight, scales and biases of every dense 4-bit projection
+    /// (`QuantizedLinear`) of `model` and of `extra` arrays. Only the decode
+    /// launches that address these arrays from their base pointer with their
+    /// own constants bind the views (`bind`); every other caller still binds
+    /// the whole array.
+    static func warmDense(_ model: Module?, extra: [MLXArray] = []) {
+        guard enabled, denseEnabled else { return }
+        var arrays = extra
+        for module in model?.modules() ?? [] {
+            guard type(of: module) == QuantizedLinear.self,
+                  let q = module as? QuantizedLinear else { continue }
+            arrays.append(q.weight)
+            arrays.append(q.scales)
+            if let biases = q.biases { arrays.append(biases) }
+        }
+        var made: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        var seen = Set<ObjectIdentifier>()
+        for array in arrays where array.ndim >= 1 && array.dim(0) > 1
+            && array.size >= 8 && denseRowMajor(array) {
+            guard seen.insert(ObjectIdentifier(array)).inserted else { continue }
+            // At least eight elements, so MLX keeps binding it in the device
+            // address space (smaller custom-kernel inputs become constant).
+            let perRow = max(1, array.size / array.dim(0))
+            let rows = min(array.dim(0), (8 + perRow - 1) / perRow)
+            made[ObjectIdentifier(array)] = (array, array[0 ..< rows])
+        }
+        // These are immutable loaded weights/records, outside graph tracing.
+        // A copied or unsupported view must never be used as a full-bank base.
+        var qualified: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for (key, pair) in made {
+            guard pair.1.size >= 8, denseRowMajor(pair.1) else { continue }
+            do {
+                let same = try withError { () -> Bool in
+                    eval(pair.0, pair.1)
+                    return denseAliasCheck([pair.0, pair.1],
+                        grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.uint32])[0].item(UInt32.self) == 1
+                }
+                if same { qualified[key] = pair }
+            } catch {
+                // Existing first-expert entries and full-array fallback stay.
+                continue
+            }
+        }
+        lock.withLock { views.merge(qualified) { _, new in new } }
+    }
 }
 
 enum NemotronZSkip {

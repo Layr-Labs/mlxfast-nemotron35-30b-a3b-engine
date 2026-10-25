@@ -301,6 +301,34 @@ func nemotronPreparedVariantSource(_ base: String, load: Int, nsg: Bool) -> Stri
     return s
 }
 
+/// NEMOTRON_HEAD_TAIL_BARRIER: 1 (default) ends the NSG prepared QMV (the
+/// verify head's [2688, 131072] geometry) with one threadgroup barrier, 2
+/// (`neg`) puts it right before the final store loop instead, 0 keeps the
+/// record kernel text. A barrier changes no value. The out-of-range `return`
+/// becomes a guard around the same body, so every thread of the threadgroup
+/// reaches the barrier; the arithmetic, the stores and their order are the
+/// record's. Mode 2 sits inside that guard, which is uniform because the
+/// launch takes a barrier kernel only when N % (NSG * RPS) == 0.
+let nemotronHeadTailBarrier: Int = {
+    let v = ProcessInfo.processInfo.environment["NEMOTRON_HEAD_TAIL_BARRIER"]
+    let mode = v == "0" ? 0 : (v == "neg" ? 2 : 1)
+    FileHandle.standardError.write(
+        Data("nemotron head tail barrier: \(["off", "on", "neg"][mode])\n".utf8))
+    return mode
+}()
+
+func nemotronPreparedTailBarrierSource(_ base: String, mode: Int) -> String {
+    guard mode != 0 else { return base }
+    let exit = "  if (out_row >= out_vec_size) {\n    return;\n  }\n"
+    let store = "  for (int row = 0; row < results_per_simdgroup; row++) {\n    for (int r = 0; r < R; r++) {\n      U v = simd_sum(result[r][row]);"
+    let barrier = "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    precondition(base.components(separatedBy: exit).count == 2
+        && base.components(separatedBy: store).count == 2, "head tail barrier: source moved")
+    var s = base.replacingOccurrences(of: exit, with: "  if (out_row < out_vec_size) {\n")
+    if mode == 2 { s = s.replacingOccurrences(of: store, with: barrier + store) }
+    return s + "\n  }\n" + (mode == 1 ? barrier : "")
+}
+
 private let nemotronMultiRowQMVCrownSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
@@ -731,7 +759,8 @@ enum NemotronMambaInProjConvDt {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(dict?.index ?? q.scales), dict?.table ?? NemotronBankBinding.bind(biases),
+             packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -812,16 +841,17 @@ enum NemotronHeadPreparedActivation {
     nonisolated(unsafe) private static var variants: [String: MLXFast.MLXFastKernel] = [:]
     private static let variantsLock = NSLock()
     /// Prepared QMV twin for (decode form twin, load form, NSG template).
-    static func variantKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel {
+    static func variantKernel(half: Bool, load: Int, nsg: Bool, barrier: Int = 0) -> MLXFast.MLXFastKernel {
         let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
-            + (nsg ? "_nsg" : "")
+            + (nsg ? "_nsg" : "") + ["", "_tb", "_tbn"][barrier]
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = variants[name] { return kernel }
         let kernel = MLXFast.metalKernel(
             name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
             outputNames: ["y"],
-            source: nemotronPreparedVariantSource(
+            source: nemotronPreparedTailBarrierSource(nemotronPreparedVariantSource(
                 half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg),
+                mode: barrier),
             header: variantHeader(half: half, load: load))
         variants[name] = kernel
         return kernel
@@ -829,13 +859,14 @@ enum NemotronHeadPreparedActivation {
     nonisolated(unsafe) private static var dictVariants: [String: MLXFast.MLXFastKernel?] = [:]
     /// The prepared QMV twin reading (scale, bias) through `NemotronSBDict`
     /// (`nemotronSBDictSource` of the same body), or nil.
-    static func dictKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel? {
+    static func dictKernel(half: Bool, load: Int, nsg: Bool, barrier: Int = 0) -> MLXFast.MLXFastKernel? {
         let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
-            + (nsg ? "_nsg" : "") + "_sbd"
+            + (nsg ? "_nsg" : "") + "_sbd" + ["", "_tb", "_tbn"][barrier]
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = dictVariants[name] { return kernel }
-        let kernel = nemotronSBDictSource(nemotronPreparedVariantSource(
-            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)).map {
+        let kernel = nemotronSBDictSource(nemotronPreparedTailBarrierSource(nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg),
+            mode: barrier)).map {
             MLXFast.metalKernel(
                 name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
                 outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
@@ -859,7 +890,9 @@ enum NemotronHeadPreparedActivation {
         guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
-        return (variantKernel(half: !hf.isEmpty, load: load, nsg: nsg), hf + extra, geometry.rps, geometry.nsg)
+        let barrier = tailBarrier(n: n, rps: geometry.rps, nsg: geometry.nsg)
+        return (variantKernel(half: !hf.isEmpty, load: load, nsg: nsg, barrier: barrier),
+                hf + extra, geometry.rps, geometry.nsg)
     }
 
     /// projectLaunch's R = 3 launch with its kernel's dictionary twin, or nil.
@@ -870,8 +903,15 @@ enum NemotronHeadPreparedActivation {
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
-        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
+        let barrier = tailBarrier(n: n, rps: geometry.rps, nsg: geometry.nsg)
+        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg, barrier: barrier)
+        else { return nil }
         return (kernel, hf + extra, geometry.rps, geometry.nsg)
+    }
+    /// The tail-barrier mode of an R = 3 launch: NSG geometries whose grid has
+    /// no out-of-range row (every NSG launch today is the [2688, 131072] head).
+    private static func tailBarrier(n: Int, rps: Int, nsg: Int) -> Int {
+        nsg != 2 && n % (rps * nsg) == 0 ? nemotronHeadTailBarrier : 0
     }
     static func dictLaunchAvailable(k: Int, n: Int) -> Bool {
         dictLaunch(k: k, n: n, rps: 2) != nil
@@ -920,14 +960,14 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
-            return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
+            return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(d.index), d.table, packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
                 grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
         }
         let (kernel, hf, rps, nsg) = projectLaunch(rows: 3, k: k, n: n, rps: 2)
-        return kernel([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+        return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(q.biases!), packed[0], args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)] + hf,
             grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
@@ -1005,13 +1045,13 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
-            return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
+            return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(d.index), d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
         }
         let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
-        return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+        return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(q.biases!), packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -1106,7 +1146,8 @@ enum NemotronSharedUpPacking {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(dict?.index ?? q.scales), dict?.table ?? NemotronBankBinding.bind(biases),
+             input, args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", true), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
@@ -1274,7 +1315,7 @@ enum NemotronMultiRowQMV {
         let half = rows == 3 && form != 0
         let y = (half ? NemotronMultiRowQMVKernel.shared.attentionOutputAddingHalf
                       : NemotronMultiRowQMVKernel.shared.attentionOutputAdding)(
-            [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
+            [residual.reshaped(rows, 2688), NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(offsets),
              x.reshaped(rows, 4096), k, n],
             template: [("T", x.dtype), ("R", rows), ("FAST", true),
                        ("RELU2", false), ("RPS", rps)] + nemotronHalfTemplate(half, form),
@@ -1336,7 +1377,7 @@ enum NemotronMultiRowQMV {
         let half = rows == 1 && form != 0
         return (half ? NemotronMultiRowQMVKernel.shared.kernelHalf
                      : NemotronMultiRowQMVKernel.shared.kernel)(
-            [w, scales, biases, x, kArray, nArray],
+            [NemotronBankBinding.bind(w), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
             grid: (32, n / rps, 1),
@@ -1484,7 +1525,7 @@ enum NemotronMultiRowQMVRowInputs {
         // The same outputs-per-SIMD-group the stacked call picks for (R, K, N).
         let rps = NemotronMultiRowQMV.resultsPerSimdgroup(rows: rows.count, k: k, n: n)
         return kernel(rows: rows.count)(
-            [q.weight, q.scales, biases] + rows + [kArray, nArray],
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(biases)] + rows + [kArray, nArray],
             template: [("T", DType.bfloat16), ("R", rows.count), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)],
             grid: (32, n / rps, 1),
@@ -2430,7 +2471,7 @@ enum NemotronTargetQKV {
               q.scales.dtype == .bfloat16, q.scales.shape == [rows, 42],
               let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [rows, 42]
         else { return nil }
-        return [q.weight, q.scales, offsets]
+        return [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(offsets)]
     }
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
@@ -3071,16 +3112,17 @@ enum NemotronHeadScreen {
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind(weight), NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? (partialHalf ? partialHalfKernel : partialKernel)(
-            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+            [NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), hidden, groups, upperGroups ?? groups],
+            template: partialTemplate,
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
@@ -3088,7 +3130,7 @@ enum NemotronHeadScreen {
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
             let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
-                [scores, weight, scales, biases, hidden, counter],
+                [scores, NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
                            ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
                 grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
@@ -3097,7 +3139,7 @@ enum NemotronHeadScreen {
             return Result(id: picked[4], scores: scores, candidateIds: picked[0], candidateValues: picked[1])
         }
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
-            [scores, weight, scales, biases, hidden],
+            [scores, NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales), NemotronBankBinding.bind(biases), hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
                 + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
