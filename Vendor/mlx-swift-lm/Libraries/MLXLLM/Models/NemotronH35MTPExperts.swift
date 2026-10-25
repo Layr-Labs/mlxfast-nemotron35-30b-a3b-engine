@@ -627,8 +627,12 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
         }
         // Select only the source's R3 FC1 traversal; weighted FC2 retains
         // the complete winner's paired body and original 36-word plan.
+        let rowBase = "tid.y * (2 * results_per_simdgroup)"
+        precondition(nemotronMoETripleGateUpSource.components(separatedBy: rowBase).count == 2,
+                     "triple FC1 source: row base")
         let tripleSource = nemotronMoETripleGateUpSource.replacingOccurrences(
             of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+            .replacingOccurrences(of: rowBase, with: "tid.y * (SGT * results_per_simdgroup)")
         let triplePointers = [
             ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
@@ -942,6 +946,11 @@ enum NemotronMoELeader {
     /// kernels, through production-only kernel copies.
     static let leaderTail8 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEADER_TAIL8"] != "0"
+    /// SIMD groups per threadgroup of the R3 triple FC1 (each keeps its own
+    /// RPS output rows and arithmetic; only their grouping into threadgroups
+    /// changes). NEMOTRON_MTP_FC1_SGT=2 keeps the base's two.
+    static let fc1SimdgroupsPerThreadgroup = max(1, min(16,
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_SGT"] ?? "") ?? 4))
 
     /// The ordinary prepared R3/top-six FC1 arithmetic plus the original
     /// integer FC2 plan, emitted by just the first leader/output tile.
@@ -962,11 +971,15 @@ enum NemotronMoELeader {
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = leaderResultsPerSimdgroup(rows: 3)
+        let triple = tripleGateUp && kernel !== NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+        let sgt = triple && (bank.n / rps) % fc1SimdgroupsPerThreadgroup == 0
+            ? fc1SimdgroupsPerThreadgroup : 2
+        var template: [(String, any KernelTemplateArg)] = [("T", x.dtype), ("R", 3), ("TOPK", 6),
+            ("K", bank.k), ("N", bank.n), ("XSLOT", false), ("RELU2", relu2), ("RPS", rps)]
+        if triple { template.append(("SGT", sgt)) }
         let result = kernel([bank.weight, bank.scales, bank.biases, packed, inds],
-            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
-                       ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+            template: template,
+            grid: (32, bank.n / rps, 18), threadGroup: (32, sgt, 1),
             outputShapes: [[18, bank.n], [36]], outputDTypes: [x.dtype, .int32])
         guard selfTest else { return (result[0], result[1]) }
         let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
