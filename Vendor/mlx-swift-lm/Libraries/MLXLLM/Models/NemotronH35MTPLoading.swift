@@ -71,10 +71,20 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        // The pinned metadata and every original tensor have already bound.
+        // This helper receives only the assistant; target/shared weights are
+        // inaccessible. It runs before any private layout or graph is built.
+        try nemotronRequantizeMTPAttention(assistant.module)
+        (assistant.module.layers[0] as? NemotronH35MTPAttentionBlock)?
+            .prepareJoinedDraftQKV()
+        (assistant.module.layers[1] as? NemotronH35MTPExpertBlock)?
+            .prepareOwnedSparseDraftDown()
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
+        NemotronRoutedSharedLaunch.verify(target)
+        NemotronRoutedSharedFourRows.verify(target)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMultiRowQMV.warmNarrow()
@@ -90,6 +100,100 @@ extension NemotronH35MTPAssistant {
     }
 }
 
+/// Contract 3.3/4.4 permits on-load re-quantization of mtp.* head weights.
+/// This fixed five-projection allowlist excludes embeddings, LM head, all
+/// target layers, and even the assistant's existing 4-bit sparse expert bank.
+/// New proposals are lossy; target verification still decides emitted tokens.
+private func nemotronRequantizeMTPAttention(_ module: NemotronH35MTPModule) throws {
+    let requested = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_ATTENTION_BITS"] ?? "3"
+    guard requested == "3", Device.defaultDevice().deviceType == .gpu,
+          StreamOrDevice.default == .gpu,
+          let block = module.layers.first as? NemotronH35MTPAttentionBlock
+    else {
+        print("[nemotron-mtp-attention-bits] original checkpoint layout")
+        return
+    }
+    let paths = ["layers.0.eh_proj", "layers.0.mixer.q_proj", "layers.0.mixer.k_proj",
+                 "layers.0.mixer.v_proj", "layers.0.mixer.o_proj"]
+    let dimensions = [(2688, 5376), (4096, 2688), (256, 2688), (256, 2688), (2688, 4096)]
+    func current() -> [Linear] {
+        [block.projection, block.mixer.wq, block.mixer.wk, block.mixer.wv, block.mixer.wo]
+    }
+    let originals = current()
+    var replacements: [QuantizedLinear]?
+    do {
+        replacements = try withError { () -> [QuantizedLinear]? in
+            var prepared: [QuantizedLinear] = []
+            for index in paths.indices {
+                let (n, k) = dimensions[index]
+                guard type(of: originals[index]) == QuantizedLinear.self,
+                      let old = originals[index] as? QuantizedLinear,
+                      old.mode == .affine, old.groupSize == 64, old.bits == 4, old.bias == nil,
+                      old.weight.dtype == .uint32, old.weight.shape == [n, k / 8],
+                      old.scales.dtype == .bfloat16, old.scales.shape == [n, k / 64],
+                      let offsets = old.biases, offsets.dtype == .bfloat16,
+                      offsets.shape == old.scales.shape else { return nil }
+                // Reconstruct one bounded projection at a time using its
+                // actual 4-bit metadata. Never treat packed UInt32 as dense.
+                let dense = dequantized(old.weight, scales: old.scales, biases: offsets,
+                    groupSize: old.groupSize, bits: old.bits, mode: old.mode)
+                let next = QuantizedLinear(weight: dense, bias: nil,
+                    groupSize: 64, bits: 3, mode: .affine)
+                eval(next)
+                guard next.weight.dtype == .uint32, next.weight.shape == [n, k * 3 / 32],
+                      next.scales.dtype == .bfloat16, next.scales.shape == [n, k / 64],
+                      let nextOffsets = next.biases, nextOffsets.dtype == .bfloat16,
+                      nextOffsets.shape == next.scales.shape else { return nil }
+                let rebuilt = dequantized(next.weight, scales: next.scales, biases: nextOffsets,
+                    groupSize: next.groupSize, bits: next.bits, mode: next.mode)
+                let originalFloat = dense.asType(.float32)
+                let delta = rebuilt.asType(.float32) - originalFloat
+                let energy = (originalFloat * originalFloat).sum().item(Float.self)
+                let error = (delta * delta).sum().item(Float.self)
+                // A bounded reconstruction sanity guard, not a token gate or
+                // a claim that the 3-bit proposals equal the 4-bit proposals.
+                guard energy.isFinite, energy > 0, error.isFinite, error <= energy * 0.0625,
+                      isFinite(rebuilt).all().item(Bool.self) else { return nil }
+                for seed in 0..<3 {
+                    let x = MLXRandom.normal([1, 1, k], dtype: .bfloat16,
+                        key: MLXRandom.key(UInt64(0x3b710 + 7 * index + seed)))
+                    let output = next(x)
+                    guard output.shape == [1, 1, n], output.dtype == .bfloat16,
+                          isFinite(output).all().item(Bool.self) else { return nil }
+                }
+                prepared.append(next)
+            }
+            return prepared
+        }
+    } catch {
+        print("[nemotron-mtp-attention-bits] original layout (3-bit preparation error)")
+        return
+    }
+    guard let replacements, replacements.count == paths.count else {
+        print("[nemotron-mtp-attention-bits] original layout (3-bit sanity guard declined)")
+        return
+    }
+    let updates: [(String, Module)] = paths.indices.map { (paths[$0], replacements[$0]) }
+    do {
+        try module.update(modules: ModuleChildren.unflattened(updates), verify: [.noUnusedKeys])
+        guard zip(current(), replacements).allSatisfy({ ObjectIdentifier($0.0) == ObjectIdentifier($0.1) })
+        else { throw NemotronH35MTPError.invalidArtifact("MTP attention replacement identity") }
+    } catch {
+        // A failed partial update may not leave a mixed head installed.
+        let restore: [(String, Module)] = paths.indices.map { (paths[$0], originals[$0]) }
+        do {
+            try module.update(modules: ModuleChildren.unflattened(restore), verify: [.noUnusedKeys])
+            guard zip(current(), originals).allSatisfy({ ObjectIdentifier($0.0) == ObjectIdentifier($0.1) })
+            else { throw NemotronH35MTPError.invalidArtifact("MTP attention restoration identity") }
+        } catch {
+            throw NemotronH35MTPError.invalidArtifact("MTP attention restoration failed")
+        }
+        print("[nemotron-mtp-attention-bits] original layout (replacement restored)")
+        return
+    }
+    print("[nemotron-mtp-attention-bits] 3 (five lossy assistant projections; target verification required)")
+}
+
 // Load-time warm-up of every decode/verify shape, outside any timed window.
 // The first MTP rounds of a fresh process otherwise pay the metalKernel JIT
 // (multi-row qmv per R/FAST, windowed SSM per L, top-two), the compile()
@@ -102,12 +206,14 @@ extension NemotronH35MTPAssistant {
 // The allocator's free-buffer cache is then dropped (Memory.clearCache()).
 extension NemotronH35MTPAssistant {
     func warmUpExactShapes() {
+        qualifyDeviceHeadGraph()
+        qualifyDeviceThirdDraft()
         let environment = ProcessInfo.processInfo.environment
         guard environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP"] != "0" else {
             warmPostVerifySpeculation()
             return
         }
-        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 2
+        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 3
         let depth = max(1, min(requested, maximumDraftTokens ?? 7, 7))
         let promptLength = max(8, Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PROMPT"] ?? "") ?? 488)
         let prefillLength = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PREFILL"] ?? "") ?? 1024
@@ -293,6 +399,21 @@ extension NemotronH35MTPAssistant {
                     requestState: draftState)
             }
             eval([seed, carry] + evaluationTargets(for: draftState))
+        }
+        // Official-worker private load smoke for the new three-entry prestage
+        // protocol. Consume the exact chained hidden objects, then discard its
+        // ordinary transaction. No request state or warm tokens escape.
+        if depth == 3, NemotronMTPFourRows.enabled {
+            prestageDrafts(token: Int(seed.item(Int32.self)), hidden: carry,
+                requestState: draftState, depth: 3)
+            var tokens = seed, hidden = carry
+            for _ in 0..<3 {
+                let next = draftStep(tokens: tokens, hidden: hidden, shortlist: nil,
+                    requestState: draftState)
+                tokens = next.tokens.reshaped(1, 1)
+                hidden = next.hidden
+            }
+            eval([tokens, hidden] + evaluationTargets(for: draftState))
         }
         // Depth one has no shallower round to consume the prestaged row.
         // Release that private transaction through the ordinary discard path.
