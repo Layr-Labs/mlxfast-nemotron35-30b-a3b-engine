@@ -269,6 +269,11 @@ jobs:
         # Hermetic: fake current-user residents, process groups and lock waits.
         run: tools/test-stop-leaked-residents.sh
 
+      - name: Reference checkpoint stamp survives a device-number change
+        # Extracts the real setup.sh matcher and drives it with two-file
+        # manifests and stamps. Hermetic: no model, network, root, or sudo.
+        run: tools/test-reference-stamp.sh
+
       - name: Worker build cache keys, misses, hits and refuses corruption
         # Drives the REAL tools/build-cache.sh in a scratch clone with stub
         # products: key stability, key change on a source change, empty-cache
