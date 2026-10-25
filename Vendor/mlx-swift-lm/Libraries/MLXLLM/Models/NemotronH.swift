@@ -50,11 +50,10 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
-/// Layers per submitted chunk in a multi-token (prompt prefill) CBv2 forward,
-/// where each chunk also waits for the previous one so its temporaries return
-/// to MLX's buffer cache before the next chunk allocates. Every prompt prefill
-/// (engine request prefill and teacher-forced stepper alike) runs this one
-/// path. `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
+/// Layers between early asyncEval calls on the MTP prefill path only. The seed
+/// window is the first request after the engine drains MLX's buffer cache, so a
+/// shorter chunk hands its transient live set back to that cache sooner.
+/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
@@ -1536,10 +1535,7 @@ enum NemotronHRouterSelection {
         }
         """
 
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_h_router_select",
-        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
-        source: """
+    static let selectSource = """
             const uint lane = thread_index_in_simdgroup;
             const uint row = threadgroup_position_in_grid.y;
             threadgroup float original[128];
@@ -1592,8 +1588,71 @@ enum NemotronHRouterSelection {
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }
-            """,
+            """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: selectSource,
         header: sigmoidHeader, ensureRowContiguous: true)
+
+    /// Draft-only twin: the same six-expert selection, then the KEEP largest
+    /// weights (ties to the earlier slot) rescaled to the six-expert total,
+    /// compacted to KEEP slots. Draft experts never decide an emitted token.
+    private static func draftSelectSource() -> String {
+        let store = "indices[row * 6 + slot] = winner;"
+        let close = "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "if (lane < 6) { weights[row * 6 + lane] = normalized[lane] * 2.5f; }"
+        precondition(selectSource.components(separatedBy: store).count == 2)
+        precondition(selectSource.components(separatedBy: close).count == 2)
+        let keep = """
+            if (lane == 0) {
+                bool kept[6] = {false, false, false, false, false, false};
+                float kept_weight[KEEP];
+                float kept_sum = 0.0f;
+                float six_sum = 0.0f;
+                for (uint slot = 0; slot < 6; ++slot) { six_sum = normalized[slot] + six_sum; }
+                for (uint k = 0; k < KEEP; ++k) {
+                    int best = -1;
+                    for (int slot = 0; slot < 6; ++slot) {
+                        if (!kept[slot] && (best < 0 || normalized[slot] > normalized[best])) {
+                            best = slot;
+                        }
+                    }
+                    kept[best] = true;
+                    kept_weight[k] = normalized[best];
+                    kept_sum = kept_weight[k] + kept_sum;
+                    indices[row * KEEP + k] = chosen_id[best];
+                }
+                for (uint k = 0; k < KEEP; ++k) {
+                    weights[row * KEEP + k] = kept_weight[k] * (six_sum / kept_sum) * 2.5f;
+                }
+            }
+
+"""
+        return "uint chosen_id[6];\n" + selectSource
+            .replacingOccurrences(of: store, with: "chosen_id[slot] = winner;")
+            .replacingOccurrences(of: close, with: keep)
+    }
+    private static let draftKernel = MLXFast.metalKernel(
+        name: "nemotron_h_router_select_draft",
+        inputNames: ["gates", "bias"], outputNames: ["indices", "weights"],
+        source: draftSelectSource(),
+        header: sigmoidHeader, ensureRowContiguous: true)
+
+    /// One draft row's router: (indices, weights) of shape [1, 1, keep].
+    static func applyDraft(gates: MLXArray, eSCB: MLXArray, keep: Int) -> (MLXArray, MLXArray)? {
+        guard (1 ..< 6).contains(keep), Device.defaultDevice().deviceType == .gpu,
+            StreamOrDevice.default == .gpu,
+            gates.shape == [1, 1, 128], gates.dtype == .bfloat16,
+            eSCB.shape == [128], eSCB.dtype == .float32
+        else { return nil }
+        let shape = [1, 1, keep]
+        let result = draftKernel(
+            [gates, eSCB], template: [("KEEP", keep)], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [shape, shape], outputDTypes: [.uint32, .float32])
+        return (result[0], result[1])
+    }
 
     static func apply(
         gates: MLXArray, eSCB: MLXArray, topK: Int, nGroup: Int, topkGroup: Int,
@@ -3640,7 +3699,9 @@ private class NemotronHBackbone: Module {
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3651,8 +3712,6 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
-        let prefillChunks = inputs.dim(1) > 1 && !captureMTP
-        let earlyEvalInterval = prefillChunks ? nemotronPrefillEvalInterval : nemotronEarlyEvalInterval
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3692,20 +3751,22 @@ private class NemotronHBackbone: Module {
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
-                if prefillChunks {
+                if inputs.dim(1) > 1 && !captureMTP {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
-                    // Every prompt prefill. A chunk runs for milliseconds while
-                    // the host builds the next in well under one, so without a
-                    // wait the host encodes, and allocates, every layer's
-                    // intermediates before the first chunk completes. Waiting on
-                    // the previous chunk returns its temporaries to MLX's buffer
-                    // cache for the next chunk; this chunk is already queued, so
-                    // the GPU never waits on the host. Evaluation order only;
-                    // values are unchanged.
-                    if let previous = submittedPrefillChunk { eval(previous) }
-                    submittedPrefillChunk = hidden
+                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
+                    // milliseconds while the host builds the next in well under
+                    // one, so without a wait the host encodes, and allocates,
+                    // every layer's intermediates before the first chunk
+                    // completes. Waiting on the previous chunk returns its
+                    // temporaries to MLX's buffer cache for the next chunk; this
+                    // chunk is already queued, so the GPU never waits on the
+                    // host. Evaluation order only; values are unchanged.
+                    if recyclePrefillChunks {
+                        if let previous = submittedPrefillChunk { eval(previous) }
+                        submittedPrefillChunk = hidden
+                    }
                 } else {
                     asyncEval(hidden)
                 }
@@ -3955,7 +4016,9 @@ public class NemotronHModel:
         _ inputs: MLXArray,
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3964,7 +4027,8 @@ public class NemotronHModel:
             return attending
         }
         return backbone.cbv2Forward(
-            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP)
+            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
+            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.

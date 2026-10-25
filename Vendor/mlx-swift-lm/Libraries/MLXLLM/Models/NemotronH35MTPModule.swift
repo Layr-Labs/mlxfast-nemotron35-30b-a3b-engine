@@ -14,6 +14,12 @@ enum NemotronMTPDraftTail {
     }
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
+    /// Routed experts per draft row: the largest `topK` of the router's six
+    /// weights, rescaled to their total. NEMOTRON_MTP_DRAFT_TOPK=6 keeps six.
+    static let topK: Int = {
+        let value = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_TOPK"] ?? "") ?? 3
+        return (1 ... 6).contains(value) ? value : 6
+    }()
 }
 
 enum NemotronMTPFrontNorms {
@@ -332,16 +338,31 @@ final class NemotronH35MTPExpertBlock: Module {
 
     fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
         let h = normalized ?? norm(x)
-        let (indices, scores) = mixer.gate(h)
         guard let sharedExperts = mixer.sharedExperts,
-              let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP)
+              let routed = draftRouted(h) ?? {
+                  let (indices, scores) = mixer.gate(h)
+                  return NemotronMoELeader.switchRowsAndWeightedReduce(
+                      h, indices, scores, mixer.switchMLP)
+              }()
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
             return joined.1
         }
         return finalNorm(x + (routed + shared))
+    }
+
+    /// The draft row's routed experts through its `NemotronMTPDraftTail.topK`
+    /// largest router weights; nil keeps all six.
+    private func draftRouted(_ h: MLXArray) -> MLXArray? {
+        let keep = NemotronMTPDraftTail.topK
+        guard keep < 6, h.shape == [1, 1, 2688],
+              let (indices, scores) = NemotronHRouterSelection.applyDraft(
+                gates: MLX.matmul(h, mixer.gate.weight.transposed()),
+                eSCB: mixer.gate.eSCB, keep: keep)
+        else { return nil }
+        return NemotronMoELeader.draftRowWeightedReduce(
+            h, indices, scores, mixer.switchMLP, topK: keep)
     }
 
     /// Row-batched twin of `callAsFunction` through the verify MoE row path.
@@ -516,7 +537,14 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
-        let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
+        // The engine's request prefill (the scored seed) is the first work
+        // after the worker's between-phase cache drain, so let completed
+        // chunks' buffers be reused within it. Halve the chunk there: the seed
+        // pays for re-faulting its transient live set, the scored prefill does
+        // not.
+        let hidden = cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
+            earlyEvalInterval: nemotronPrefillEvalInterval)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)

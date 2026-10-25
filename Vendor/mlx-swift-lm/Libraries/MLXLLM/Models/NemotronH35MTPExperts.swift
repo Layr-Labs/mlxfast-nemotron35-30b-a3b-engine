@@ -888,6 +888,34 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
+    /// One draft row through `topK` routed experts (the draft router's kept
+    /// slots): the same leader gate/up with the fused ReLU2 store and the same
+    /// weighted down kernel, with `topK` slots instead of six. Drafts only.
+    static func draftRowWeightedReduce(
+        _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, _ mlp: NemotronHSwitchMLP,
+        topK: Int
+    ) -> MLXArray? {
+        guard enabled, fuseRelu2, type(of: mlp) == NemotronHSwitchMLP.self,
+              type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+              type(of: mlp.fc2) == QuantizedSwitchLinear.self,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16, (1 ..< 6).contains(topK),
+              indices.dtype == .uint32, indices.shape == [1, 1, topK],
+              scores.dtype == .float32, scores.shape == indices.shape,
+              let up = bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+              let down = bank(mlp.fc2, k: 1856, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336], down.weight.shape == [128, 2688, 232]
+        else { return nil }
+        let flat = indices.reshaped(topK)
+        let act = apply(x.reshaped(1, 2688), flat, rows: 1, topK: topK, bank: up,
+                        perSlot: false, relu2: true)
+        return NemotronMoELeaderWeightedKernel.shared.kernel(
+            [down.weight, down.scales, down.biases, act, flat, scores.reshaped(topK)],
+            template: [("T", x.dtype), ("R", 1), ("TOPK", topK), ("K", down.k), ("N", down.n)],
+            grid: (32 * (down.n / 4), topK, 1), threadGroup: (32, topK, 1),
+            outputShapes: [[1, 1, down.n]], outputDTypes: [x.dtype])[0]
+    }
+
     /// The router produces six distinct indices per token. Keep its original
     /// slot order and the accepted cross-row leader pairs. Row-contiguous
     /// kernel copies support arbitrary input strides without weight changes.
