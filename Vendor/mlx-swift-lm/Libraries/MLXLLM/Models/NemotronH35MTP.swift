@@ -349,6 +349,8 @@ private final class NemotronMTPDraftHead {
             }
         }
         screen = plan
+        NemotronBankBinding.warmDense(nil, extra: [plan.weight, plan.scales, plan.biases]
+            + [plan.records, plan.packed].compactMap { $0 })
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
         // well, so neither builds inside a timed window.
