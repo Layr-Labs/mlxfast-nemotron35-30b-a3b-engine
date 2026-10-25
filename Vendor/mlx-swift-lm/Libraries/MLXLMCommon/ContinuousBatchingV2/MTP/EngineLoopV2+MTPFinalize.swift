@@ -80,6 +80,7 @@ extension EngineLoopV2 {
         // fallback in `EngineLoopV2+MTPExecution`).
         CBv2MTPReadbackSpin.awaitAvailable(verify.acceptancePacket)
         let host = verify.acceptancePacket.asArray(Int32.self)
+        CBv2MTPBoundaryProbeSpin.run()
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost: [Float]?
         if CBv2MTPPolicyPacket.enabled {
@@ -513,6 +514,23 @@ enum CBv2MTPReadbackSpin {
             }
             if CFAbsoluteTimeGetCurrent() - start > capSeconds { return }
         }
+    }
+}
+
+/// PREMISE PROBE (not an optimization): a fixed host busy-spin right after
+/// the acceptance readback of every MTP verify round. It delays only when the
+/// next round's work is submitted, never what is computed, so tokens are
+/// unchanged. It measures whether the round boundary is host-bound: if it is,
+/// the decode window grows by about `micros` per round. Set `micros` to 0 to
+/// disable.
+enum CBv2MTPBoundaryProbeSpin {
+    static let micros: Double = 150
+
+    @inline(never)
+    static func run() {
+        guard micros > 0 else { return }
+        let end = CFAbsoluteTimeGetCurrent() + micros * 1e-6
+        while CFAbsoluteTimeGetCurrent() < end {}
     }
 }
 
