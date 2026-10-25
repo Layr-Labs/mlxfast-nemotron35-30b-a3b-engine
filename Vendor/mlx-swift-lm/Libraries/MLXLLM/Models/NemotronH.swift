@@ -1505,7 +1505,8 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             if NemotronMoELeader.selfTest {
                 activated = nemotronBitwiseOrNaN(activated, relu2(upProj(x)).reshaped(1, 3712))
             }
-            return downProj(activated.reshaped(1, 1, 3712))
+            return NemotronZeroSkipDown.applyOneRow(activated, downProj)
+                ?? downProj(activated.reshaped(1, 1, 3712))
         }
         return downProj(relu2(upProj(x)))
     }
