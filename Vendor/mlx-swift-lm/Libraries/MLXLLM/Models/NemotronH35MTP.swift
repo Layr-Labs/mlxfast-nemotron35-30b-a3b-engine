@@ -513,6 +513,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                                 from: MLXArray)?
         var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
                               from: MLXArray)?
+        /// The prestaged second draft's K/V row, held back until a third draft
+        /// would attend it; every other path rolls it back unread.
+        var deferredSecondRow: (keys: MLXArray, values: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -750,6 +753,14 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.pendingTokens = []
         s.pendingHidden = []
         s.frontier = nil
+        if let row = s.deferredSecondRow {
+            s.deferredSecondRow = nil
+            let poison = NemotronH35MTPDeferSecondRow.mode == .negative
+                ? MLXArray(Float.nan).asType(row.keys.dtype) : nil
+            s.roots += s.cache.appendTrusted(
+                keys: poison.map { row.keys * $0 } ?? row.keys,
+                values: poison.map { row.values * $0 } ?? row.values)
+        }
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
@@ -821,7 +832,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
         s.deviceFirstDraft = nil; s.hostAcceptedDrafts = nil; s.deviceSecondInputs = nil
-        s.deviceSecondDraft = nil
+        s.deviceSecondDraft = nil; s.deferredSecondRow = nil
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
@@ -902,7 +913,11 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             // The whole second draft already ran behind the verify for this
             // row (`speculateNextFirstDraft`); only its K/V row is appended, at
             // the position the round-build step would write it.
-            s.roots += s.cache.appendTrusted(keys: secondDraft.keys, values: secondDraft.values)
+            if NemotronH35MTPDeferSecondRow.mode == .off {
+                s.roots += s.cache.appendTrusted(keys: secondDraft.keys, values: secondDraft.values)
+            } else {
+                s.deferredSecondRow = (secondDraft.keys, secondDraft.values)
+            }
             out = secondDraft.out
             ids = secondDraft.ids
         } else {
@@ -938,6 +953,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
               targetHidden.shape == [1, width, target.configuration.hiddenSize]
         else { return }
         // Chained draft rows are never trusted; drop them before appending.
+        s.deferredSecondRow = nil
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
         // Every row's K/V goes to the head cache; only the row the device
         // picks is attended (`speculateNextFirstDraft`).
@@ -980,10 +996,9 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
                 .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
         }
-        let attended = module.maskedRowOutput(
+        let out = module.finishMaskedRow(
             fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
-        let out = module.finishPagedAttentionRow(attended)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
@@ -1107,6 +1122,34 @@ enum NemotronMTPDraftMasks {
             outputDTypes: [dtype, dtype])
         return (out[0], out[1])
     }
+}
+
+/// NEMOTRON_MTP_DEFER_SECOND_ROW=0 appends the prestaged second draft's K/V
+/// row at prestage again. Otherwise the append waits for a third draft, the
+/// only reader before `speculateAfterVerify` rolls the row back.
+/// =neg writes it as NaN (control: a third draft then misreads).
+enum NemotronH35MTPDeferSecondRow {
+    enum Mode { case off, on, negative }
+    static let mode: Mode = {
+        switch ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEFER_SECOND_ROW"] {
+        case "0": return .off
+        case "neg": return .negative
+        default: return .on
+        }
+    }()
+}
+
+/// NEMOTRON_MTP_FIRST_DRAFT_JOIN=0 keeps the device-picked first draft's
+/// stock residual add and norm; =neg doubles its attention (control).
+enum NemotronH35MTPFirstDraftJoin {
+    enum Mode { case off, on, negative }
+    static let mode: Mode = {
+        switch ProcessInfo.processInfo.environment["NEMOTRON_MTP_FIRST_DRAFT_JOIN"] {
+        case "0": return .off
+        case "neg": return .negative
+        default: return .on
+        }
+    }()
 }
 
 enum NemotronH35MTPDeviceSecondFront {
