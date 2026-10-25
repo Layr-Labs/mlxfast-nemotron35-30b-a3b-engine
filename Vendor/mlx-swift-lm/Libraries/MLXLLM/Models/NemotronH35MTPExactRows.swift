@@ -1011,7 +1011,8 @@ enum NemotronHeadPreparedActivation {
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
         }
         let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
-        return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+        return kernel([NemotronNarrowBinding.bind(q.weight), NemotronNarrowBinding.bind(q.scales),
+                       NemotronNarrowBinding.bind(q.biases!), packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -3088,7 +3089,8 @@ enum NemotronHeadScreen {
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
             let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
-                [scores, weight, scales, biases, hidden, counter],
+                [scores, NemotronNarrowBinding.bind(weight), NemotronNarrowBinding.bind(scales),
+                 NemotronNarrowBinding.bind(biases), hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
                            ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
                 grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
@@ -3097,7 +3099,8 @@ enum NemotronHeadScreen {
             return Result(id: picked[4], scores: scores, candidateIds: picked[0], candidateValues: picked[1])
         }
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
-            [scores, weight, scales, biases, hidden],
+            [scores, NemotronNarrowBinding.bind(weight), NemotronNarrowBinding.bind(scales),
+             NemotronNarrowBinding.bind(biases), hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
                 + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),

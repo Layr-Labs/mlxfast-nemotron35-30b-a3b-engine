@@ -71,7 +71,9 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        target.registerNarrowBindings()
         assistant.prepareDraftHeadScreen()
+        target.prepareVerifyEntry()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
