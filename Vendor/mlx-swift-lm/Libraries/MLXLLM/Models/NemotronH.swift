@@ -215,6 +215,35 @@ enum NemotronHResidualRMSNorm {
         return s.replacingOccurrences(of: add, with: "T sum = lhs[offset + i];")
             .replacingOccurrences(of: store, with: "")
     }
+    /// `x + (top6(prod) + s)`: the zero skip's fp32 slot products [3 * 6, 2688]
+    /// are summed here in its reduce's order (`total = p0`, then
+    /// `total = p_j + total`) and narrowed with the same `static_cast<T>`,
+    /// instead of by a separate reduce launch. `NEMOTRON_MTP_ZSKIP_JOIN=0`
+    /// keeps the separate reduce.
+    private static func productsSumPreparedSource() -> String {
+        let add = "T part = rhs[offset + i] + shared[offset + i];"
+        let offset = "const size_t offset = size_t(gid) * axis_size + lid * n_reads;"
+        let s = sumPreparedSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        precondition(s.components(separatedBy: offset).count == 2)
+        return s.replacingOccurrences(of: offset, with: offset
+                + "\n            const size_t pbase = size_t(gid) * 6 * axis_size + lid * n_reads;")
+            .replacingOccurrences(of: add, with: """
+                float total = prod[pbase + i];
+                                for (int j = 1; j < 6; j++) {
+                                    total = prod[pbase + size_t(j) * axis_size + i] + total;
+                                }
+                                T part = static_cast<T>(total) + shared[offset + i];
+                """)
+    }
+    private static let productsSumPreparedKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_top6_sum_rms_prepared_bf16",
+        inputNames: ["lhs", "prod", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: productsSumPreparedSource(), ensureRowContiguous: true)
+    static let productsJoinEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] != "0"
+
     private static let sumPreparedKernel = MLXFast.metalKernel(
         name: "nemotron_h_residual_sum_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
@@ -261,14 +290,21 @@ enum NemotronHResidualRMSNorm {
     static func applyPreparedRows(
         _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray)? {
+        let products = rhs.dtype == .float32 && rhs.shape == [18 * 2688]
         guard plumbingRows(lhs, norm: norm),
-              rhs.shape == lhs.shape, rhs.dtype == .bfloat16,
-              shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
+              products || (rhs.shape == lhs.shape && rhs.dtype == .bfloat16),
+              shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16),
+              !products || shared != nil
         else { return nil }
         let (axis, eps) = scalars(norm.eps)
         let shapes = [lhs.shape, lhs.shape, [3, 11, 9 * 32]]
         let outputs: [MLXArray]
-        if let shared {
+        if products, let shared {
+            outputs = productsSumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
+        } else if let shared {
             outputs = sumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
                 grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
@@ -3599,6 +3635,7 @@ private class NemotronHBlock: Module {
             return (triple.0, triple.1, triple.2)
         }
         // Original arithmetic: stock shared Add, residual Add, stock RMSNorm.
+        if output.dtype == .float32 { output = NemotronZSkip.reduceProducts(output, dtype: .bfloat16) }
         if let shared { output = output + shared }
         let residual = x + output
         return (residual, nemotronMTPNormRows(residual) { nextNorm($0) }, nil)

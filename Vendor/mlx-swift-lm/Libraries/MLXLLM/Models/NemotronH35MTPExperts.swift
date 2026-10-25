@@ -146,8 +146,12 @@ extension NemotronHMoE {
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
         var y: MLXArray
+        // The captured-verify join can apply the zero skip's top-six reduce
+        // itself; then `y` is the fp32 slot products [18 * 2688].
+        let unreduced = parts && sharedExperts != nil && NemotronHResidualRMSNorm.productsJoinEnabled
+            && NemotronHResidualRMSNorm.plumbingAvailable
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed) {
+            x, indices, scores, switchMLP, prepared: packed, unreduced: unreduced) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
@@ -896,7 +900,7 @@ enum NemotronMoELeader {
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil
+        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, unreduced: Bool = false
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -936,7 +940,8 @@ enum NemotronMoELeader {
             balancePlan = nil
         }
         let weights = scores.reshaped(rows * 6)
-        var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
+        var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2,
+                                       unreduced: unreduced && !selfTest)
             ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: balancePlan)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
@@ -1353,25 +1358,33 @@ enum NemotronZSkip {
     }
 
     /// x: [18, 1856] relu2 rows per slot; inds, scores: [18]. Returns [1, 3, 2688].
-    static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy) -> MLXArray {
+    static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy,
+                    unreduced: Bool = false) -> MLXArray {
         let prod = kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8)],
             grid: (256 * (2688 / 128), 18, 1), threadGroup: (256, 1, 1),
             outputShapes: [[18 * 2688]], outputDTypes: [.float32])[0]
-        return reduce(
-            [prod], template: [("T", x.dtype), ("TOPK", 6), ("N", 2688)],
+        return unreduced ? prod : reduceProducts(prod, dtype: x.dtype)
+    }
+
+    /// The top-six reduce of fp32 slot products [18 * 2688] into [1, 3, 2688].
+    static func reduceProducts(_ prod: MLXArray, dtype: DType) -> MLXArray {
+        reduce(
+            [prod], template: [("T", dtype), ("TOPK", 6), ("N", 2688)],
             grid: (2688, 3, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, 3, 2688]], outputDTypes: [x.dtype])[0]
+            outputShapes: [[1, 3, 2688]], outputDTypes: [dtype])[0]
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
+    /// `unreduced` returns the fp32 slot products [18 * 2688] for a consumer
+    /// that applies the top-six reduce itself.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
-                         owner: SwitchLinear) -> MLXArray? {
+                         owner: SwitchLinear, unreduced: Bool = false) -> MLXArray? {
         guard rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        return run(x, inds, scores, copy: copy, unreduced: unreduced)
     }
 
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
