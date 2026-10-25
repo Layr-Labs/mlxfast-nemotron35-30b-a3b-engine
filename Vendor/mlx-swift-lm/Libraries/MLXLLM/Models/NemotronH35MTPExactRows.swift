@@ -597,8 +597,9 @@ enum NemotronMultiRowQMV {
         let rps = resultsPerSimdgroup(rows: rows, k: 4096, n: 2688)
         let (k, n) = scalarPair(4096, 2688)
         let y = NemotronMultiRowQMVKernel.shared.attentionOutputAdding(
-            [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
-             x.reshaped(rows, 4096), k, n],
+            [residual.reshaped(rows, 2688)]
+                + [q.weight, q.scales, offsets].map { nemotronWeightAnchor($0, rows: rows) }
+                + [x.reshaped(rows, 4096), k, n],
             template: [("T", x.dtype), ("R", rows), ("FAST", true),
                        ("RELU2", false), ("RPS", rps)],
             grid: (32, 2688 / rps, 1), threadGroup: (32, 2, 1),
@@ -656,7 +657,7 @@ enum NemotronMultiRowQMV {
         let rows = x.dim(0), k = x.dim(1), n = w.dim(0)
         let (kArray, nArray) = scalarPair(k, n)
         return NemotronMultiRowQMVKernel.shared.kernel(
-            [w, scales, biases, x, kArray, nArray],
+            [w, scales, biases].map { nemotronWeightAnchor($0, rows: rows) } + [x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", relu2), ("RPS", rps)],
             grid: (32, n / rps, 1),
@@ -1187,6 +1188,12 @@ enum NemotronTargetQKV {
 enum NemotronHeadScreen {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN"] != "0"
     static let check = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_CHECK"] == "1"
+    /// NEMOTRON_MTP_HEAD_SCREEN_PACKED=0 gathers scales/biases from the head rows.
+    static var packedScalesBiases: Bool {
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_PACKED"] != "0"
+            && packedPartialSource.components(separatedBy: "sb[size_t(row) * (2 * S)").count == 3
+            && !packedPartialSource.contains("scales[") && !packedPartialSource.contains("biases[")
+    }
     static let width = 2688
     static let wordsPerRow = 336
     static let groupsPerRow = 42
@@ -1428,6 +1435,43 @@ enum NemotronHeadScreen {
         name: "nemotron_head_screen_partial_affine4_gs64",
         inputNames: ["w", "scales", "biases", "x", "groups", "groups2"],
         outputNames: ["scores"], source: partialSource)
+    /// The same body reading each row's selected scales and biases from one
+    /// packed bf16 record ([selected scales, selected biases], 2 * S per row;
+    /// upper rows use their first 2 * S2) instead of gathering them from the
+    /// 42-group rows: the same values in the same order, so scores are bitwise
+    /// equal (checked at load).
+    private static let packedPartialSource = partialSource
+        .replacingOccurrences(
+            of: "const float sc = float(scales[size_t(row) * KG + g]);",
+            with: "const float sc = float(sb[size_t(row) * (2 * S) + (lane >> 1)]);")
+        .replacingOccurrences(
+            of: "const float bi = float(biases[size_t(row) * KG + g]);",
+            with: "const float bi = float(sb[size_t(row) * (2 * S) + (upper ? S2 : S) + (lane >> 1)]);")
+    private static let packedPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_packed_affine4_gs64",
+        inputNames: ["w", "sb", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: packedPartialSource)
+
+    /// [rows, 2 * groupCount] bf16: each row's selected scales then biases
+    /// (rows from `rows` up: the upper group set, zero-padded). Copies of the
+    /// head's own bytes, built once at load for the draft screen only.
+    static func packScalesBiases(
+        scales: MLXArray, biases: MLXArray, groups: [Int], groupCount: Int,
+        upperGroups: [Int]?
+    ) -> MLXArray {
+        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
+            let index = MLXArray(selected.map { Int32($0) })
+            var parts = [take(scales[range], index, axis: 1), take(biases[range], index, axis: 1)]
+            if selected.count < groupCount {
+                parts.append(MLXArray.zeros(
+                    [range.count, 2 * (groupCount - selected.count)], dtype: scales.dtype))
+            }
+            return concatenated(parts, axis: 1)
+        }
+        let lower = pack(0..<rows, groups)
+        guard let upperGroups else { return lower }
+        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
+    }
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -1452,20 +1496,28 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
+        packed: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
-        let scores = partialKernel(
-            [weight, scales, biases, hidden, groups, upperGroups ?? groups],
-            template: [("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
-                       ("NSG", simdgroups), ("LO", Self.rows),
-                       ("S2", upperGroups == nil ? groupCount : upperGroupCount)],
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
+            ("NSG", simdgroups), ("LO", Self.rows),
+            ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
+        let scores = (packed.map {
+            packedPartialKernel(
+                [nemotronWeightAnchor(weight, rows: 1), $0, hidden, groups, upperGroups ?? groups], template: template,
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])
+        } ?? partialKernel(
+            [weight, scales, biases].map { nemotronWeightAnchor($0, rows: 1) }
+                + [hidden, groups, upperGroups ?? groups], template: template,
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[rows]], outputDTypes: [.float32])[0]
+            outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
         let selectGroups = 8
         let picked = selectKernel(
-            [scores, weight, scales, biases, hidden],
+            [scores] + [weight, scales, biases].map { nemotronWeightAnchor($0, rows: 1) } + [hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
             outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],

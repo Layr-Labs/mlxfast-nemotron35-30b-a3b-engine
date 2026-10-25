@@ -164,6 +164,23 @@ final class NemotronH35MTPAttentionBlock: Module {
             front[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV))
     }
 
+    /// The part of `pagedForwardParts` that reads no cache: the fused
+    /// residual, its norm and that norm's Q/K/V, as [residual, norm, q, k, v].
+    func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
+        let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
+        let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
+        return [front[0], front[1], q, k, v]
+    }
+
+    /// `pagedForwardParts` from `pagedDraftInputs` of the same inputs.
+    func pagedForwardParts(
+        inputs: [MLXArray], cache: any CBv2AttendingLayerCache
+    ) -> (residual: MLXArray, attention: MLXArray) {
+        (inputs[0], mixer.cbv2Forward(
+            inputs[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV,
+            projections: (inputs[2], inputs[3], inputs[4])))
+    }
+
     fileprivate func uncompiledDraftFront(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         let fused = fuse(hidden: hidden, embedding: embedding)
         return [fused, norm(fused)]
@@ -430,6 +447,16 @@ final class NemotronH35MTPModule: Module {
     ) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
             hidden: hidden, embedding: embedding, cache: cache)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(
+            residual: parts.residual, attention: parts.attention)
+    }
+    func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
+            hidden: hidden, embedding: embedding)
+    }
+    func pagedForward(inputs: [MLXArray], cache: any CBv2AttendingLayerCache) -> MLXArray {
+        let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
+            inputs: inputs, cache: cache)
         return (layers[1] as! NemotronH35MTPExpertBlock)(
             residual: parts.residual, attention: parts.attention)
     }

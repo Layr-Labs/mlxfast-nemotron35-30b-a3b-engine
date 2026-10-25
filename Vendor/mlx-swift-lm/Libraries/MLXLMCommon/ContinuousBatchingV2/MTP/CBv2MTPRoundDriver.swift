@@ -160,6 +160,8 @@ final class CBv2MTPRoundInFlight {
 enum CBv2MTPPrefillCarry {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFILL_CARRY"] != "0"
+    static let prestage =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFILL_PRESTAGE"] != "0"
 }
 
 enum CBv2MTPPolicyPacket {

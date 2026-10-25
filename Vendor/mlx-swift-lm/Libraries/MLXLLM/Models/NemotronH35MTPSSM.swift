@@ -84,11 +84,7 @@ let nemotronMTPCompactSSM =
 // recovered at commit by the same kernel run for `L = keep` steps from the
 // same input state, which reproduces the per-position state bit for bit.
 private enum NemotronMTPCompactSSMKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_ssm_compact",
-        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
-        outputNames: ["out", "state_out"],
-        source: """
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -128,7 +124,20 @@ private enum NemotronMTPCompactSSMKernel {
                     }
                 }
             }
-            """)
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in"],
+        outputNames: ["out", "state_out"],
+        source: source)
+    static let decayKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_precomputed_decay",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "decay"],
+        outputNames: ["out", "state_out"],
+        source: source.replacingOccurrences(of: """
+                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                auto dA = fast::exp(A * dt_);
+            """, with: "auto dA = decay[t * H + n];"))
 }
 
 /// `convolution` is the window's activated conv output `[1, W, convDim]`
@@ -138,15 +147,18 @@ private enum NemotronMTPCompactSSMKernel {
 func nemotronMTPSSMCompact(
     convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
     state: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int,
-    steps: Int, writeOutput: Bool
+    steps: Int, writeOutput: Bool, decay: MLXArray? = nil
 ) -> (output: MLXArray, finalState: MLXArray) {
     let width = convolution.dim(1), convDim = convolution.dim(2)
     precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && (1...width).contains(steps))
     precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
     precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
     precondition(state.dtype == .float32 && state.shape == [1, heads, headDim, stateDim])
-    let outputs = NemotronMTPCompactSSMKernel.kernel(
-        [convolution, ALog, D, dt, state],
+    if let decay { precondition(decay.dtype == .float32 && decay.shape == dt.shape) }
+    let kernel = decay == nil
+        ? NemotronMTPCompactSSMKernel.kernel : NemotronMTPCompactSSMKernel.decayKernel
+    let outputs = kernel(
+        [convolution, ALog, D, dt, state] + (decay.map { [$0] } ?? []),
         template: [("T", convolution.dtype), ("U", DType.float32),
                    ("Dh", headDim), ("Ds", stateDim), ("H", heads),
                    ("G", heads / groups), ("L", steps), ("CD", convDim),

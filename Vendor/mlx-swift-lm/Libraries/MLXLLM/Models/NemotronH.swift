@@ -58,6 +58,100 @@ let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
 
+// Input-independent eight-element device views, restricted to the draft's
+// one-row custom kernels. No global request flag or target compiled slot.
+enum NemotronDraftWeightAnchor {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_WEIGHT_ANCHOR"] != "0"
+}
+
+func nemotronWeightAnchor(_ a: MLXArray, rows: Int) -> MLXArray {
+    guard rows == 1, NemotronDraftWeightAnchor.enabled else { return a }
+    return NemotronWeightAnchors.shared.anchor(a, rows: rows)
+}
+
+final class NemotronWeightAnchors: @unchecked Sendable {
+    static let shared = NemotronWeightAnchors()
+    private let lock = NSLock()
+    // Keyed by object identity; the entry retains the source so the
+    // identifier cannot be reused while the entry exists.
+    private var entries: [ObjectIdentifier: (source: MLXArray, anchor: MLXArray, singleRow: Bool)] =
+        [:]
+
+    /// A one-row launch binds an anchor only for arrays marked `singleRow`:
+    /// the MTP head's own weights and the target head / embedding tables
+    /// that only the draft's one-row kernels read here. Target weights at one
+    /// row (the non-captured stepper's Q/K/V and shared up) keep full bindings.
+    func anchor(_ a: MLXArray, rows: Int) -> MLXArray {
+        guard let entry = lock.withLock({ entries[ObjectIdentifier(a)] }),
+              rows > 1 || entry.singleRow else { return a }
+        return entry.anchor
+    }
+
+    /// Mark already-prepared arrays as eligible for one-row launches.
+    func allowSingleRow(_ arrays: [MLXArray]) {
+        lock.withLock {
+            for a in arrays {
+                if var entry = entries[ObjectIdentifier(a)] {
+                    entry.singleRow = true
+                    entries[ObjectIdentifier(a)] = entry
+                }
+            }
+        }
+    }
+
+    /// Only a row-contiguous array flattens to a view of its own buffer
+    /// (prepare_reshape: row_contiguous -> shared buffer, no copy); any other
+    /// layout would be copied whole, so it is never anchored. Size-1 dims are
+    /// ignored, as in MLX's own contiguity check.
+    private static func isRowContiguous(_ a: MLXArray) -> Bool {
+        var expected = 1
+        for (dim, stride) in zip(a.shape, a.strides).reversed() where dim != 1 {
+            if stride != expected { return false }
+            expected *= dim
+        }
+        return true
+    }
+
+    /// Input-independent, load-time: one view per row-contiguous weight,
+    /// scales and biases array of every quantized linear, expert bank and
+    /// embedding in `model`. Call sites decide what is anchored (decode-window
+    /// kernels only). Never copies: non-row-contiguous arrays are skipped.
+    func prepare(_ model: Module, singleRow: Bool) {
+        guard NemotronDraftWeightAnchor.enabled else { return }
+        var built: [(MLXArray, MLXArray)] = []
+        var skipped = 0, bytes = 0
+        for module in model.modules() where module is QuantizedLinear
+            || module is QuantizedSwitchLinear || module is QuantizedEmbedding {
+            for (key, value) in module.parameters().flattened()
+            where ["weight", "scales", "biases"].contains(key) && value.size > 8 {
+                eval(value)
+                guard Self.isRowContiguous(value) else { skipped += 1; continue }
+                built.append((value, value.reshaped(-1)[0 ..< 8]))
+                bytes += value.nbytes
+            }
+        }
+        eval(built.map { $0.1 })
+        lock.withLock {
+            for (source, view) in built {
+                guard let sourceInfo = try? source.evaluatedBufferInfo(),
+                      let viewInfo = try? view.evaluatedBufferInfo(),
+                      sourceInfo.isRowContiguous, viewInfo.isRowContiguous,
+                      sourceInfo.allocatedBytes == viewInfo.allocatedBytes,
+                      sourceInfo.dataOffset == viewInfo.dataOffset,
+                      viewInfo.dataElements == 8
+                else { continue }
+                entries[ObjectIdentifier(source)] = (source, view, singleRow)
+            }
+        }
+        if ProcessInfo.processInfo.environment["NEMOTRON_WEIGHT_ANCHOR_LOG"] == "1" {
+            FileHandle.standardError.write(Data((
+                "nemotron weight anchors: \(built.count) anchored (\(bytes >> 20) MiB), "
+                    + "\(skipped) skipped (not row-contiguous)\n").utf8))
+        }
+    }
+}
+
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
     let y = MLX.maximum(x, MLXArray(0))
@@ -397,7 +491,8 @@ enum NemotronHEmbeddingRows {
               biases.shape == q.scales.shape, (dims / 2) % 64 == 0
         else { return nil }
         let count = tokens.dim(1)
-        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
+        return kernel([tokens.reshaped(count)]
+            + [q.weight, q.scales, biases].map { nemotronWeightAnchor($0, rows: count) },
             template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
                        ("G", dims / 64)],
             grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
@@ -952,11 +1047,7 @@ private enum NemotronPackedConvKernel {
 /// `nemotronCompiledPrefillDt`. One launch instead of two; the conv threads
 /// run the packed-conv text unchanged.
 private enum NemotronPackedConvDtKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_packed_conv_silu_dt",
-        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi"],
-        outputNames: ["out", "padded", "dt"],
-        source: """
+    static let source = """
             int64_t channel = int64_t(thread_position_in_grid.x);
             int64_t position = int64_t(thread_position_in_grid.y);
             if (channel >= C) {
@@ -1003,7 +1094,26 @@ private enum NemotronPackedConvDtKernel {
             auto y = 1 / (1 + metal::exp(metal::abs(x)));
             T sigmoid = x < 0 ? y : 1 - y;
             out[position * C + channel] = x * sigmoid;
-            """, ensureRowContiguous: false)
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_dt",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi"],
+        outputNames: ["out", "padded", "dt"],
+        source: source, ensureRowContiguous: false)
+}
+
+private enum NemotronPackedConvDtDecayKernel {
+    private static let store = "dt[position * H + head] = metal::isnan(m) ? m : (m < hi ? m : hi);"
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_dt_decay",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A_log"],
+        outputNames: ["out", "padded", "dt", "decay"],
+        source: NemotronPackedConvDtKernel.source.replacingOccurrences(of: store, with: """
+            float dtValue = metal::isnan(m) ? m : (m < hi ? m : hi);
+            dt[position * H + head] = dtValue;
+            auto A = -fast::exp(static_cast<float>(A_log[head * A_log_strides[0]]));
+            decay[position * H + head] = fast::exp(A * dtValue);
+            """), ensureRowContiguous: false)
 }
 
 private enum NemotronRequestConvHistory {
@@ -1134,6 +1244,39 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         return (arrays[0], arrays[1], arrays[2])
+    }
+    // Qualified only during official-worker model warm-up, before graph traces.
+    var mtpConvDtDecayQualified = false
+    var mtpConvDtDecayQualificationComplete = false
+    static let convDtDecayEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_CONV_DT_DECAY"] != "0"
+
+    func packedConvDtDecay(_ oldState: MLXArray, _ input: MLXArray, _ dt: MLXArray,
+        qualifying: Bool = false)
+        -> (convolution: MLXArray, padded: MLXArray, dt: MLXArray, decay: MLXArray)? {
+        guard Self.convDtDecayEnabled, (qualifying || mtpConvDtDecayQualified),
+            aLog.shape == [numHeads], [DType.float32, .bfloat16].contains(aLog.dtype),
+            Self.convDtEnabled, convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, (2...4).contains(input.dim(1)),
+            input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
+            conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
+            conv1d.padding == 0, let bias = conv1d.bias,
+            bias.dtype == .bfloat16, bias.shape == [convDim],
+            dt.shape == [1, input.dim(1), numHeads], dt.dtype == .bfloat16,
+            dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return nil }
+        let length = input.dim(1)
+        let arrays = NemotronPackedConvDtDecayKernel.kernel(
+            [oldState, input, conv1d.weight, bias, dt, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), aLog],
+            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads)],
+            grid: (convDim + numHeads, length, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads],
+                           [1, length, numHeads]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32, .float32])
+        return (arrays[0], arrays[1], arrays[2], arrays[3])
     }
     static let convDtEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_CONV_DT"] != "0"
@@ -1398,30 +1541,41 @@ class NemotronHAttention: Module, NemotronHMixer {
         return wo(output)
     }
 
+    /// The Q/K/V projections `cbv2Forward` takes of `x`; reads no cache.
+    func cbv2Projections(
+        _ x: MLXArray, captureMTP: Bool = false, targetQKV: Bool = false, prepared: MLXArray? = nil
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let length = x.dim(1)
+        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+           let outputs = NemotronTargetQKV.apply(
+               x, query: wq, key: wk, value: wv, captureMTP: captureMTP, prepared: prepared) {
+            return NemotronMoELeader.selfTest && length == 1
+                ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+                   nemotronBitwiseOrNaN(outputs.2, wv(x)))
+                : outputs
+        }
+        return (
+            captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
+            captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
+            captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
+    }
+
+    /// `projections`, when given, are `cbv2Projections` of this same `x`
+    /// computed earlier (the MTP draft head queues them before its cache is final).
     func cbv2Forward(
         _ x: MLXArray,
         cache: any CBv2AttendingLayerCache,
         captureMTP: Bool = false,
         targetQKV: Bool = false,
-        prepared: MLXArray? = nil
+        prepared: MLXArray? = nil,
+        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
-        let projections: (MLXArray, MLXArray, MLXArray)
-        if targetQKV, numHeads == 32, numKeyValueHeads == 2, headDim == 128,
-           let outputs = NemotronTargetQKV.apply(
-               x, query: wq, key: wk, value: wv, captureMTP: captureMTP, prepared: prepared) {
-            projections = NemotronMoELeader.selfTest && length == 1
-                ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
-                   nemotronBitwiseOrNaN(outputs.2, wv(x)))
-                : outputs
-        } else {
-            projections = (
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
-        }
-        let (q, k, v) = projections
+        precondition(precomputed.map { $0.0.dim(0) == batch && $0.0.dim(1) == length } ?? true,
+                     "NemotronH attention projections do not match their input rows")
+        let (q, k, v) = precomputed ?? cbv2Projections(
+            x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
         let queries = q.reshaped(
             batch, length, numHeads, headDim
         ).transposed(0, 2, 1, 3)
@@ -3982,6 +4136,15 @@ public class NemotronHModel:
             return lmHead(hidden)
         }
         return backbone.embeddings.asLinear(hidden)
+    }
+
+    /// Weight, scales and biases of the target head and embedding tables:
+    /// the draft's one-row head screen and embedding rows read these.
+    var draftSharedTables: [MLXArray] {
+        [lmHead as Module?, backbone.embeddings as Module?].compactMap { $0 }.flatMap { module in
+            module.parameters().flattened()
+                .filter { ["weight", "scales", "biases"].contains($0.0) }.map { $0.1 }
+        }
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {

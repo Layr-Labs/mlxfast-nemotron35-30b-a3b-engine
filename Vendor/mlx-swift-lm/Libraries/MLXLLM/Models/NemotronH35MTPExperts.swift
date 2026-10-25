@@ -692,6 +692,9 @@ enum NemotronMoELeader {
         let biases: MLXArray
         let k: Int
         let n: Int
+        func anchored(rows: Int) -> [MLXArray] {
+            [weight, scales, biases].map { nemotronWeightAnchor($0, rows: rows) }
+        }
     }
 
     static func bank(_ layer: SwitchLinear, k: Int, dtype: DType) -> Bank? {
@@ -726,7 +729,7 @@ enum NemotronMoELeader {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
             return kernel(
-                [bank.weight, bank.scales, bank.biases, packed, inds],
+                bank.anchored(rows: rows) + [packed, inds],
                 template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                            ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                            ("RELU2", relu2), ("RPS", rps)],
@@ -736,7 +739,7 @@ enum NemotronMoELeader {
                 outputDTypes: [x.dtype])[0]
         }
         return NemotronMoELeaderKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds],
+            bank.anchored(rows: rows) + [x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                        ("RELU2", relu2), ("RPS", rps)],
@@ -789,7 +792,7 @@ enum NemotronMoELeader {
                               rows: Int, bank: Bank, plan: MLXArray? = nil) -> MLXArray {
         if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+            bank.anchored(rows: rows) + [x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n)],
             grid: (32 * (bank.n / 4), 6, 1),

@@ -71,6 +71,10 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        // Views are prepared/admitted before existing synthetic qualification.
+        NemotronWeightAnchors.shared.prepare(target, singleRow: false)
+        NemotronWeightAnchors.shared.prepare(assistant.module, singleRow: true)
+        NemotronWeightAnchors.shared.allowSingleRow(target.draftSharedTables)
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
@@ -287,9 +291,9 @@ extension NemotronH35MTPAssistant {
             seed = ids[0..., (keep - 1)..<keep, 0].reshaped(1, 1)
             carry = verify.lastHidden[0..., (keep - 1)..<keep, 0...]
             if warmPostVerify {
-                prestageFirstDraft(
+                prestageDrafts(
                     token: Int(hostPacket[k + keep - 1]), hidden: carry,
-                    requestState: draftState)
+                    requestState: draftState, depth: depth)
             }
             eval([seed, carry] + evaluationTargets(for: draftState))
         }

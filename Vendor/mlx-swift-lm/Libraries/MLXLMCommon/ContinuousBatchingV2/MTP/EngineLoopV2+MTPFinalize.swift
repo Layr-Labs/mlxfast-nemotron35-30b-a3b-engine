@@ -68,6 +68,22 @@ extension EngineLoopV2 {
             mtp.storeCarry(
                 id: id, token: token, hidden: hidden,
                 tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
+            // The prompt observation was restored above and this hidden is
+            // already fenced. Queue the same request's initial drafts while
+            // finalize and the next scheduler pass run on the host.
+            let fixed = mtp.config.fixedDraftTokens ?? 1
+            if CBv2MTPPrefillCarry.prestage, CBv2MTPFirstDraftPrestage.enabled,
+                fixed > 0, rec.request.maxTokens - rec.generatedTokenCount >= fixed,
+                let prestager = mtp.drafter as? any CBv2MTPPrefillDraftPrestaging,
+                let state = mtp.takeAssistantState(for: id)
+            {
+                (mtp.drafter as? any CBv2MTPCommittedTokenObserving)?
+                    .observeCommittedTokens([token], requestState: state)
+                prestager.prestagePrefillDrafts(
+                    token: token, hidden: hidden, requestState: state,
+                    depth: CBv2MTPFirstDraftPrestage.chained ? fixed : 1)
+                mtp.restoreAssistantState(state, for: id)
+            }
         }
 
         guard let verify = round.verify else { return }
@@ -227,6 +243,11 @@ extension EngineLoopV2 {
             // draft inputs and their trusted target hidden rows; every
             // speculative head suffix is discarded.
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
+            if let observer = mtp.drafter as? any CBv2MTPCommittedTokenObserving,
+                let state = metadata.assistantState
+            {
+                observer.observeCommittedTokens(kept, requestState: state)
+            }
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
@@ -437,6 +458,14 @@ extension EngineLoopV2 {
     }
 }
 
+/// Optional request-stateful drafter capability: the target tokens a request
+/// commits, on the host, in order (the prompt's chunks at prefill, then each
+/// round's confirmed tokens at finalize). Drafters may use them only to choose
+/// how they draft; the target still verifies every proposal.
+public protocol CBv2MTPCommittedTokenObserving: AnyObject {
+    func observeCommittedTokens(_ tokens: [Int], requestState: any CBv2MTPRequestState)
+}
+
 /// Optional request-stateful drafter capability: submit the next round's
 /// first draft from finalize, as soon as its carry (token, target hidden) is
 /// final. The drafter must hand that draft out only to the next first
@@ -456,6 +485,13 @@ public protocol CBv2MTPFirstDraftPrestaging: AnyObject {
     /// round would chain on it. The same hand-out and discard rules apply to
     /// every prestaged draft.
     func prestageDrafts(
+        token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int)
+}
+
+/// Optional initial-round submission after a completed prompt. The carry is
+/// the exact same hidden object later supplied to the first draftStep.
+public protocol CBv2MTPPrefillDraftPrestaging: CBv2MTPFirstDraftPrestaging {
+    func prestagePrefillDrafts(
         token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int)
 }
 
