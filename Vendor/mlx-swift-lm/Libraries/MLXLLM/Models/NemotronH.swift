@@ -4246,7 +4246,7 @@ private class NemotronHBackbone: Module {
                     && (next % nemotronVerifySubmitInterval == 0
                         || (next == 1 && nemotronVerifyFirstSubmit)))
             if submit && next < layers.count {
-                asyncEval(hidden)
+                asyncEval([hidden] + CBv2MTPSubmitMerge.take())
             }
         }
         precondition(
