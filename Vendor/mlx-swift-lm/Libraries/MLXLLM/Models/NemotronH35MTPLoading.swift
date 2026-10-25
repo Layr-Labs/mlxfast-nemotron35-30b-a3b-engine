@@ -81,8 +81,11 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
+        NemotronBankBinding.warmDense(target)
+        NemotronBankBinding.warmDense(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronBankBinding.warm(assistant.module, extra: NemotronZSkip.draftCopyArrays)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
@@ -90,6 +93,7 @@ extension NemotronH35MTPAssistant {
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
+        target.prepareVerifyEntry()
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
