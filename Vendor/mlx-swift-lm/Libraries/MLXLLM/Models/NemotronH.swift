@@ -2151,6 +2151,10 @@ class NemotronHMoEGate: Module {
     /// sigmoid/selection/normalization over the complete verification window.
     /// The multi-row kernel repeats the M=1 gemv per row in one launch.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if topK == 6, nGroup == 1, topkGroup == 1, normTopkProb, routedScalingFactor == 2.5,
+           let fused = NemotronMTPRouterRowsSelect.run(x, weight, bias: eSCB) {
+            return fused
+        }
         let gates = NemotronMTPRouterRows.gates(x, weight)
             ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
