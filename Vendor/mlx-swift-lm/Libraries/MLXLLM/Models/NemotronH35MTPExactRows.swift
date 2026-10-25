@@ -907,27 +907,36 @@ enum NemotronHeadPreparedActivation {
         }
     }
 
+    /// The prepared activation `applyRows` feeds its projection from three
+    /// serialized SDPA rows of K elements each.
+    static func prepareRowInputs(_ rows: [MLXArray], k: Int) -> MLXArray {
+        let pv = k % 512 == 0 ? 16 : 8
+        return prepareRows(rows,
+            template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
+            grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+    }
+
     /// Feed the winner's prepared projection directly from the serialized
     /// SDPA rows. Same preparation arithmetic; only the source address moves.
+    /// Rows from the verify SDPA launch that also wrote their prepared
+    /// activation skip the preparation launch.
     static func applyRows(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray {
         precondition(rows.count == 3)
         let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
-        let pv = k % 512 == 0 ? 16 : 8
-        let packed = prepareRows(rows,
-            template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
-            grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+        let packed = compatible(NemotronMTPVerifySDPA.takePrepared(rows), rows: 3, k: k)
+            ?? prepareRowInputs(rows, k: k)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
-            return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
+            return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
                 grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
         }
         let (kernel, hf, rps, nsg) = projectLaunch(rows: 3, k: k, n: n, rps: 2)
-        return kernel([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+        return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)] + hf,
             grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
@@ -1770,6 +1779,32 @@ private let nemotronMTPVerifySDPAUnroll4Loop = """
   for (; i < N; i += BN) {
 """
 
+// The R = 3 launch's second output: the attention o_proj's prepared
+// activation (K = PK, PV values per chunk), so the separate prepare launch
+// goes away. Each (head, row) threadgroup stages the V BF16 values `out`
+// receives and V / PV lanes write their chunks with `nmr_load_vector`'s
+// statements at the prepare kernel's address.
+private let nemotronMTPVerifySDPAPrepareEpilogue = """
+
+  threadgroup T prep_vals[V];
+  if (simd_lid == 0) {
+    for (int i = 0; i < v_per_thread; i++) {
+      prep_vals[simd_gid * v_per_thread + i] = static_cast<T>(o[i]);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  constexpr int prep_chunks = V / PV;
+  if (simd_gid == 0 && simd_lid < uint(prep_chunks)) {
+    float prep_values[PV];
+    const float total = nmr_load_vector_tg<T, float, PV>(prep_vals + simd_lid * PV, prep_values);
+    const int chunk = int(tid.x) * prep_chunks + int(simd_lid);
+    const int tiles = (PK / PV + 31) / 32;
+    const int base = (int(tid.z) * tiles + chunk / 32) * (PV + 1) * 32 + chunk % 32;
+    for (int i = 0; i < PV; i++) prepared[base + i * 32] = prep_values[i];
+    prepared[base + PV * 32] = total;
+  }
+"""
+
 enum NemotronMTPVerifySDPA {
     /// NEMOTRON_MTP_VERIFY_SDPA_MERGED=0 keeps the per-row stock launches;
     /// NEMOTRON_MTP_VERIFY_SDPA_UNROLL4=0 keeps the stock key loop in the
@@ -1778,7 +1813,13 @@ enum NemotronMTPVerifySDPA {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_MERGED"] != "0"
     static let unroll4 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_UNROLL4"] != "0"
+    /// NEMOTRON_MTP_SDPA_PREP=0 keeps the separate prepare launch between the
+    /// R = 3 launch and the attention o_proj.
+    static let prepEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SDPA_PREP"] != "0"
     nonisolated(unsafe) private static var verified = false
+    nonisolated(unsafe) private static var prepVerified = false
+    nonisolated(unsafe) private static var handoff: (rows: [MLXArray], prepared: MLXArray)?
 
     private static func source() -> String {
         guard unroll4 else { return nemotronMTPVerifySDPASource }
@@ -1792,6 +1833,11 @@ enum NemotronMTPVerifySDPA {
         name: unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows",
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out"],
         source: source(), ensureRowContiguous: false)
+    private static let prepKernel = MLXFast.metalKernel(
+        name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_prep",
+        inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
+        source: source() + nemotronMTPVerifySDPAPrepareEpilogue,
+        header: nemotronSharedUpPackHeader, ensureRowContiguous: false)
 
     nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
     private static let lock = NSLock()
@@ -1807,23 +1853,45 @@ enum NemotronMTPVerifySDPA {
     /// views [1, 2, history + R, 128]. Returns [R, 32, 128], or nil where the
     /// stock per-query calls would not all be one-pass sdpa_vector: MLX
     /// switches to the two-pass kernel from 1024 keys ('d'/'s' GPUs) or 4096
-    /// (GQA elsewhere), so every row stays below 1024 keys.
+    /// (GQA elsewhere), so every row stays below 1024 keys. With `prep`
+    /// (R = 3 only) the launch also returns the o_proj's prepared activation
+    /// [3, 8, 544].
     private static func merged(
-        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
-    ) -> MLXArray? {
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float,
+        prep: Bool = false
+    ) -> [MLXArray]? {
         let rows = queries.ndim == 4 ? queries.dim(2) : 0
         guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               queries.ndim == 4, queries.dim(0) == 1, queries.dim(1) == 32,
-              (2...4).contains(rows), queries.dim(3) == 128,
+              (2...4).contains(rows), !prep || rows == 3, queries.dim(3) == 128,
               keys.ndim == 4, keys.dim(0) == 1, keys.dim(1) == 2, keys.dim(3) == 128,
               values.shape == keys.shape, (rows ..< 1024).contains(keys.dim(2)),
               queries.dtype == .bfloat16, keys.dtype == .bfloat16, values.dtype == .bfloat16
         else { return nil }
-        return kernel(
+        var template: [(String, any KernelTemplateArg)] = [("T", DType.bfloat16), ("D", 128), ("V", 128)]
+        var shapes = [[rows, 32, 128]]
+        var dtypes = [DType.bfloat16]
+        if prep {
+            template += [("PV", 16), ("PK", 32 * 128)]
+            shapes.append([rows, 8, 17 * 32])
+            dtypes.append(.float32)
+        }
+        return (prep ? prepKernel : kernel)(
             [queries, keys, values, scaleArray(scale)],
-            template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
+            template: template,
             grid: (32 * 1024, 1, rows), threadGroup: (1024, 1, 1),
-            outputShapes: [[rows, 32, 128]], outputDTypes: [DType.bfloat16])[0]
+            outputShapes: shapes, outputDTypes: dtypes)
+    }
+
+    /// The prepared activation the R = 3 launch wrote beside `rows`, taken
+    /// once; nil for any other rows (array identity).
+    static func takePrepared(_ rows: [MLXArray]) -> MLXArray? {
+        lock.lock(); defer { lock.unlock() }
+        guard let staged = handoff else { return nil }
+        handoff = nil
+        guard staged.rows.count == rows.count, zip(staged.rows, rows).allSatisfy({ $0 === $1 })
+        else { return nil }
+        return staged.prepared
     }
 
     /// The per-query calls `CBv2AttentionV1.queryBlockOutputs` makes for the
@@ -1853,7 +1921,14 @@ enum NemotronMTPVerifySDPA {
     static func rows(
         _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
     ) -> [MLXArray]? {
-        guard verified, let out = merged(queries, keys, values, scale) else { return nil }
+        guard verified else { return nil }
+        if prepVerified, !NemotronMoELeader.selfTest,
+           let launch = merged(queries, keys, values, scale, prep: true) {
+            let outputs = split(launch[0])
+            lock.lock(); handoff = (outputs, launch[1]); lock.unlock()
+            return outputs
+        }
+        guard let out = merged(queries, keys, values, scale)?[0] else { return nil }
         let outputs = split(out)
         guard NemotronMoELeader.selfTest else { return outputs }
         return zip(outputs, stock(queries, keys, values, scale)).map { nemotronBitwiseOrNaN($0, $1) }
@@ -1868,6 +1943,8 @@ enum NemotronMTPVerifySDPA {
     /// keeps the stock launches. Also JITs the pipeline outside any request.
     static func qualify(_ target: Module) {
         verified = false
+        prepVerified = false
+        handoff = nil
         func report(_ message: String) {
             FileHandle.standardError.write(Data("nemotron mtp verify sdpa merged: \(message)\n".utf8))
         }
@@ -1908,7 +1985,7 @@ enum NemotronMTPVerifySDPA {
                             let queries = q.reshaped(1, rows, 32, 128).transposed(0, 2, 1, 3)
                             let keys = k[.ellipsis, ..<(history + rows), 0...]
                             let values = v[.ellipsis, ..<(history + rows), 0...]
-                            guard let out = merged(queries, keys, values, scale) else { return false }
+                            guard let out = merged(queries, keys, values, scale)?[0] else { return false }
                             var same = MLXArray(true)
                             for (row, expected) in zip(split(out), stock(queries, keys, values, scale)) {
                                 same = same .&& (row.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
@@ -1927,6 +2004,63 @@ enum NemotronMTPVerifySDPA {
         report(verified
             ? "on (\(checked) cases bitwise equal, key loop \(unroll4 ? "unroll4" : "stock"))"
             : "off (outputs differ from the stock launches after \(checked) cases)")
+        if verified { qualifyPrep(scaleBits) }
+    }
+
+    /// Load-time bit check of the R = 3 launch with the prepared epilogue on
+    /// `qualify`'s R = 3 cases: its rows against the stock per-query launches
+    /// and its prepared activation against the prepare launch over the merged
+    /// rows (the pair it replaces). Engages only if every byte matches; an MLX
+    /// error keeps the prepare launch and leaves the merged launch on.
+    private static func qualifyPrep(_ scaleBits: Set<UInt32>) {
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp sdpa prep: \(message)\n".utf8))
+        }
+        guard prepEnabled else { return report("off (setting)") }
+        guard NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled, NemotronMTPExecution.batchedM1
+        else { return report("off (no prepared o_proj route)") }
+        let histories = [0, 1, 29, 30, 31, 92, 93, 94, 125, 126, 127, 254, 488, 552, 616, 1020]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        var checked = 0
+        do {
+            prepVerified = try withError { () -> Bool in
+                for bits in scaleBits.sorted() {
+                    let scale = Float(bitPattern: bits)
+                    for (i, history) in histories.enumerated() {
+                        let seed = UInt64(0x5d9a_0000 + 3 * 256 + i)
+                        let (qScale, kvScale) = inputScales[i % inputScales.count]
+                        let capacity = history + 3 + 37
+                        let q = MLXRandom.normal(
+                            [1, 3, 4096], dtype: .bfloat16, scale: qScale, key: MLXRandom.key(seed))
+                        let k = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                            key: MLXRandom.key(seed &+ 0x100))
+                        let v = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                            key: MLXRandom.key(seed &+ 0x200))
+                        let queries = q.reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+                        let keys = k[.ellipsis, ..<(history + 3), 0...]
+                        let values = v[.ellipsis, ..<(history + 3), 0...]
+                        guard let launch = merged(queries, keys, values, scale, prep: true),
+                              let out = merged(queries, keys, values, scale)?[0]
+                        else { return false }
+                        let expected = NemotronHeadPreparedActivation.prepareRowInputs(split(out), k: 4096)
+                        var same = (launch[1].view(dtype: .uint32) .== expected.view(dtype: .uint32)).all()
+                        for (row, reference) in zip(split(launch[0]), stock(queries, keys, values, scale)) {
+                            same = same .&& (row.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()
+                        }
+                        if !same.item(Bool.self) { return false }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        report(prepVerified
+            ? "on (\(checked) cases bitwise equal: rows and prepared activation)"
+            : "off (differs from the prepare launch after \(checked) cases)")
     }
 }
 
