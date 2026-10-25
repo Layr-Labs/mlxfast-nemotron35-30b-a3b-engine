@@ -1737,6 +1737,10 @@ private let nemotronZSkipTiledSeqSource = """
 // The chunk sum likewise reduces to x1 (+ x2), and the closing
 // scale * accum + sum * bias keeps the record's form. Chunks with three or
 // more non-zero values take the tiled kernel's statements unchanged.
+// In the sparse paths the nibble shift cancels the activation's power-of-two
+// scale exactly when the BF16 magnitude is at least 2^-110 and finite. Smaller
+// or non-finite values retain the complete tiled arithmetic below, avoiding
+// flush-to-zero differences from cancelling a subnormal intermediate.
 private let nemotronZSkipTiledFastSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
@@ -1758,12 +1762,16 @@ private let nemotronZSkipTiledFastSource = """
   const device T* xs = x + slot * K;
   for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
     const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
-    uint m = 0;
+    uint m = 0, unsafe = 0;
     for (int i = 0; i < 8; i++) {
-      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      const uint ab = uint(xb[i]) & 0x7fffu;
+      m |= ab != 0 ? (1u << i) : 0u;
+      unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
       xsh[8 * c + i] = xs[8 * c + i];
     }
-    cmask[c] = uchar(m);
+    // A full-mask sentinel sends tiny/nonfinite chunks to the unchanged dense
+    // arithmetic, without a second shared array or per-output exponent tests.
+    cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
@@ -1786,8 +1794,7 @@ private let nemotronZSkipTiledFastSource = """
       if (popcount(m) == 1) {
         const int j1 = ctz(m);
         const T xvj = xsh[8 * c + j1];
-        const int jq = j1 & 3;
-        const U xtj = jq == 0 ? U(xvj) : (jq == 1 ? xvj / 16.0f : (jq == 2 ? xvj / 256.0f : xvj / 4096.0f));
+        const U xtj = U(xvj);
         const U sum1 = U(xvj);
         const uint w = uint(wq[(8 * c + j1) * 32]);
         const int gi = c / 8;
@@ -1796,7 +1803,7 @@ private let nemotronZSkipTiledFastSource = """
         const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
         const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
         for (int o = 0; o < 4; o++) {
-          const uint code = ((w >> (4 * o)) & 0xfu) << (4 * jq);
+          const uint code = ((w >> (4 * o)) & 0xfu);
           U accum = 0;
           accum += xtj * U(int(code));
           p[o] += as_type<float>(sv[o]) * accum + sum1 * as_type<float>(bv[o]);
@@ -1810,10 +1817,8 @@ private let nemotronZSkipTiledFastSource = """
         const uint w2 = uint(wq[(8 * c + j2) * 32]);
         const T xv1 = xsh[8 * c + j1];
         const T xv2 = xsh[8 * c + j2];
-        const int q1 = j1 & 3;
-        const int q2 = j2 & 3;
-        const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
-        const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
         const U sum2 = U(xv1) + U(xv2);
         const int gi = c / 8;
         const uint2 sr = *((const device uint2*)(sq + gi * OT));
@@ -1821,8 +1826,8 @@ private let nemotronZSkipTiledFastSource = """
         const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
         const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
         for (int o = 0; o < 4; o++) {
-          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
-          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
           const U accum = xt1 * c1 + xt2 * c2;
           p[o] += as_type<float>(sv[o]) * accum + sum2 * as_type<float>(bv[o]);
         }
