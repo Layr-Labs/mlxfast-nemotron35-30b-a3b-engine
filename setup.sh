@@ -1271,6 +1271,8 @@ reference_cache_lock_matches_manifest_snapshot() {
   local file_path
   local actual_size
   local actual_signature
+  local expected_device
+  local actual_device
   local manifest_entry
   local manifest_expected_hash
   local manifest_expected_size
@@ -1322,7 +1324,14 @@ reference_cache_lock_matches_manifest_snapshot() {
     if ! actual_signature="$(file_metadata_signature "${file_path}")"; then
       return 1
     fi
-    [[ "${actual_signature}" == "${expected_signature}" ]] || return 1
+    expected_device="${expected_signature%%:*}"
+    actual_device="${actual_signature%%:*}"
+    [[ "${expected_device}" =~ ^[0-9]+$ ]] || return 1
+    [[ "${actual_device}" =~ ^[0-9]+$ ]] || return 1
+    # st_dev is not stable across macOS restarts. Inode, size, mtime, ctime,
+    # and generation still bind the file in this operator-owned reference
+    # directory, which is read-only to the job account.
+    [[ "${actual_signature#*:}" == "${expected_signature#*:}" ]] || return 1
 
     actual_file_count=$((actual_file_count + 1))
     actual_byte_count=$((actual_byte_count + actual_size))
