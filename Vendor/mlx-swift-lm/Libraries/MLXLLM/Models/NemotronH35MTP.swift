@@ -400,22 +400,7 @@ private final class NemotronMTPDraftHead {
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
 /// proposal and is preserved by the durable prefix checkpoint codec.
-public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, CBv2MTPMemoryPreparing, @unchecked Sendable {
-    private var decodeResidency: AnyObject?
-    func prepareDecodeResidency() {
-        if #available(macOS 15.0, *) {
-            decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 },
-                layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target))
-        }
-    }
-    public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
-        if #available(macOS 15.0, *), let p = decodeResidency as? NemotronDecodeResidency {
-            return p.begin()
-        }
-        return nil
-    }
-
+public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
     let module: NemotronH35MTPModule
     let target: NemotronH35Model
     private let draftHead: NemotronMTPDraftHead
