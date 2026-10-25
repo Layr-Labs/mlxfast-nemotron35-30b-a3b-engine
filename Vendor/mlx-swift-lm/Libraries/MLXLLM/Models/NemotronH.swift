@@ -64,7 +64,7 @@ let nemotronVerifyFirstSubmit =
 let nemotronVerifySubmitLayers: Set<Int>? = {
     let env = ProcessInfo.processInfo.environment
     guard env["NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL"] == nil else { return nil }
-    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,13,26")
+    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,13,26,39")
         .split(separator: ",").compactMap { Int($0) })
 }()
 
@@ -4246,7 +4246,7 @@ private class NemotronHBackbone: Module {
                     && (next % nemotronVerifySubmitInterval == 0
                         || (next == 1 && nemotronVerifyFirstSubmit)))
             if submit && next < layers.count {
-                asyncEval(hidden)
+                asyncEval([hidden] + CBv2MTPSubmitMerge.take())
             }
         }
         precondition(
