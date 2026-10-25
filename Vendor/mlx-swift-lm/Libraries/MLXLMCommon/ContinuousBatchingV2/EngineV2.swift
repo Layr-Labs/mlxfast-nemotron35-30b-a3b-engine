@@ -400,10 +400,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
-        if let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
-            let cap = Int(raw), cap >= 0
-        {
+        if let cap = Self.mixedStepPrefillTokenCap {
             scheduler.mixedStepPrefillTokenCap = cap
             log.info(
                 "CBv2 mixed-step prefill cap: \(cap, privacy: .public) tokens")
@@ -486,6 +483,14 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
             gauges: gauges)
         loop.start()
     }
+
+    /// `DARKBLOOM_CBV2_MIXED_PREFILL_CAP`, read once per process.
+    private static let mixedStepPrefillTokenCap: Int? = {
+        guard let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
+            let cap = Int(raw), cap >= 0
+        else { return nil }
+        return cap
+    }()
 
     /// Structural safety check for the (backend, prefix-cache) pairing,
     /// enforced by `init` as a precondition: a backend whose donated
