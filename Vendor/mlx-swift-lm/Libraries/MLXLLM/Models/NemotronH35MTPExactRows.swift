@@ -124,6 +124,146 @@ inline U nmr_qdot_safe(
 }
 """
 
+let nemotronHalfDecodeHeader = """
+template <int HF>
+inline float4 nmr_half_decode4(const device uint16_t* words, int i) {
+  const ushort q = words[i];
+  if (HF == 0) {
+    return float4(float(q & 0x000f), float(q & 0x00f0), float(q & 0x0f00), float(q & 0xf000));
+  }
+  if (HF == 1) {
+    return float4(float(half(ushort(q & 0x000f))), float(half(ushort(q & 0x00f0))),
+                  float(half(ushort(q & 0x0f00))), float(half(ushort(q & 0xf000))));
+  }
+  const uint w2 = ((const device uint*)words)[i / 2];
+  const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+  const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+  if (HF == 2) {
+    return float4(float(h0[i % 2]), float(h1[i % 2]),
+                  float(half(ushort(q & 0x0f00))), float(half(ushort(q & 0xf000))));
+  }
+  const half2 h2 = (as_type<half2>(((w2 >> 8) & 0x000f000fu) | 0x64006400u)
+      - half2(1024.0h)) * half2(256.0h);
+  const half2 h3 = (as_type<half2>(((w2 >> 12) & 0x000f000fu) | 0x64006400u)
+      - half2(1024.0h)) * half2(4096.0h);
+  return float4(float(h0[i % 2]), float(h1[i % 2]), float(h2[i % 2]), float(h3[i % 2]));
+}
+"""
+
+func nemotronSwapped(_ source: String, _ swaps: [(String, String, Int)]) -> String {
+    var s = source
+    for (old, new, occurrences) in swaps {
+        precondition(s.components(separatedBy: old).count - 1 == occurrences,
+                     "nemotron half decode source: \(old)")
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    return s
+}
+
+func nemotronHalfTemplate(_ on: Bool, _ form: Int) -> [(String, any KernelTemplateArg)] {
+    on ? [("HF", form)] : []
+}
+
+let nemotronMultiRowHalfSwaps: [(String, String, Int)] = [
+    ("const U a = words[i] & 0x000f;",
+     "const float4 hq = nmr_half_decode4<HF>(words, i);\n        const U a = hq.x;", 2),
+    ("const U b1 = words[i] & 0x00f0;", "const U b1 = hq.y;", 2),
+    ("const U c = words[i] & 0x0f00;", "const U c = hq.z;", 2),
+    ("const U d = words[i] & 0xf000;", "const U d = hq.w;", 2),
+]
+
+let nemotronPreparedHalfSwaps: [(String, String, Int)] = [
+    ("constexpr bool half_decode = !FAST && R == 3;",
+     "// Decode form: template HF (nmr_half_decode4).", 1),
+    ("const U a = half_decode ? U(half(ushort(words[i] & 0x000f))) : U(words[i] & 0x000f);",
+     "const float4 hq = nmr_half_decode4<HF>(words, i);\n        const U a = hq.x;", 2),
+    ("const U b1 = half_decode ? U(half(ushort(words[i] & 0x00f0))) : U(words[i] & 0x00f0);",
+     "const U b1 = hq.y;", 2),
+    ("const U c = half_decode ? U(half(ushort(words[i] & 0x0f00))) : U(words[i] & 0x0f00);",
+     "const U c = hq.z;", 2),
+    ("const U d = half_decode ? U(half(ushort(words[i] & 0xf000))) : U(words[i] & 0xf000);",
+     "const U d = hq.w;", 2),
+]
+
+let nemotronPreparedLoadHeader = """
+template <int PPT>
+inline void nmr_load_words(const device uint8_t* wl, thread ushort* wv) {
+  if (PPT == 2) {
+    const uint2 v = *((const device uint2*)wl);
+    wv[0] = ushort(v.x);
+    wv[1] = ushort(v.x >> 16);
+    wv[2] = ushort(v.y);
+    wv[3] = ushort(v.y >> 16);
+  } else {
+    const uint v = *((const device uint*)wl);
+    wv[0] = ushort(v);
+    wv[1] = ushort(v >> 16);
+  }
+}
+"""
+
+let nemotronHalfDecodeThreadHeader = """
+template <int HF>
+inline float4 nmr_half_decode4(const thread ushort* words, int i) {
+  const ushort q = words[i];
+  if (HF == 0) {
+    return float4(float(q & 0x000f), float(q & 0x00f0), float(q & 0x0f00), float(q & 0xf000));
+  }
+  if (HF == 1) {
+    return float4(float(half(ushort(q & 0x000f))), float(half(ushort(q & 0x00f0))),
+                  float(half(ushort(q & 0x0f00))), float(half(ushort(q & 0xf000))));
+  }
+  const uint w2 = uint(words[i & ~1]) | (uint(words[i | 1]) << 16);
+  const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+  const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+  if (HF == 2) {
+    return float4(float(h0[i % 2]), float(h1[i % 2]),
+                  float(half(ushort(q & 0x0f00))), float(half(ushort(q & 0xf000))));
+  }
+  const half2 h2 = (as_type<half2>(((w2 >> 8) & 0x000f000fu) | 0x64006400u)
+      - half2(1024.0h)) * half2(256.0h);
+  const half2 h3 = (as_type<half2>(((w2 >> 12) & 0x000f000fu) | 0x64006400u)
+      - half2(1024.0h)) * half2(4096.0h);
+  return float4(float(h0[i % 2]), float(h1[i % 2]), float(h2[i % 2]), float(h3[i % 2]));
+}
+"""
+
+let nemotronPreparedW32Swaps: [(String, String, Int)] = [
+    ("accum[r] = 0;\n      const device uint16_t* words = (const device uint16_t*)wl;\n",
+     "accum[r] = 0;\n      thread ushort wv1[values_per_thread / 4];\n      nmr_load_words<packs_per_thread>(wl, wv1);\n      const thread ushort* words = wv1;\n", 1),
+]
+
+let nemotronPreparedHoistSwaps: [(String, String, Int)] = [
+    ("    for (int r = 0; r < R; r++) {\n      const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;\n      sum[r] = prepared[base + values_per_thread * 32];\n      for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = prepared[base + v * 32];\n    }\n    for (int row = 0; row < results_per_simdgroup; row++) {\n      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);\n      const device T* sl = sc + row * in_vec_size_g;\n      const device T* bl = bs + row * in_vec_size_g;\n      U s = sl[0];\n      U b = bl[0];\n",
+     "    thread ushort wv[results_per_simdgroup][values_per_thread / 4];\n    thread U sv[results_per_simdgroup];\n    thread U bv[results_per_simdgroup];\n    for (int row = 0; row < results_per_simdgroup; row++) {\n      nmr_load_words<packs_per_thread>(ws + row * in_vec_size_w, wv[row]);\n      sv[row] = sc[row * in_vec_size_g];\n      bv[row] = bs[row * in_vec_size_g];\n    }\n    for (int r = 0; r < R; r++) {\n      const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;\n      sum[r] = prepared[base + values_per_thread * 32];\n      for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = prepared[base + v * 32];\n    }\n    for (int row = 0; row < results_per_simdgroup; row++) {\n      U s = sv[row];\n      U b = bv[row];\n", 1),
+    ("accum[r] = 0;\n      const device uint16_t* words = (const device uint16_t*)wl;\n",
+     "accum[r] = 0;\n      const thread ushort* words = wv[row];\n", 1),
+]
+
+let nemotronPreparedPrefetchSwaps: [(String, String, Int)] = [
+    ("  const int k_end = FAST ? in_vec_size : in_vec_size - block_size;\n  for (; k < k_end; k += block_size) {\n",
+     "  const int k_end = FAST ? in_vec_size : in_vec_size - block_size;\n  thread ushort wv[results_per_simdgroup][values_per_thread / 4];\n  thread U sv[results_per_simdgroup];\n  thread U bv[results_per_simdgroup];\n  if (k < k_end) {\n    for (int row = 0; row < results_per_simdgroup; row++) {\n      nmr_load_words<packs_per_thread>(ws + row * in_vec_size_w, wv[row]);\n      sv[row] = sc[row * in_vec_size_g];\n      bv[row] = bs[row * in_vec_size_g];\n    }\n  }\n  for (; k < k_end; k += block_size) {\n    thread ushort wn[results_per_simdgroup][values_per_thread / 4];\n    thread U sn[results_per_simdgroup];\n    thread U bn[results_per_simdgroup];\n    const bool more = k + block_size < k_end;\n    if (more) {\n      for (int row = 0; row < results_per_simdgroup; row++) {\n        nmr_load_words<packs_per_thread>(ws + block_size * bytes_per_pack / pack_factor + row * in_vec_size_w, wn[row]);\n        sn[row] = sc[block_size / group_size + row * in_vec_size_g];\n        bn[row] = bs[block_size / group_size + row * in_vec_size_g];\n      }\n    }\n", 1),
+    ("    for (int r = 0; r < R; r++) {\n      const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;\n      sum[r] = prepared[base + values_per_thread * 32];\n      for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = prepared[base + v * 32];\n    }\n    for (int row = 0; row < results_per_simdgroup; row++) {\n      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);\n      const device T* sl = sc + row * in_vec_size_g;\n      const device T* bl = bs + row * in_vec_size_g;\n      U s = sl[0];\n      U b = bl[0];\n",
+     "    for (int r = 0; r < R; r++) {\n      const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;\n      sum[r] = prepared[base + values_per_thread * 32];\n      for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = prepared[base + v * 32];\n    }\n    for (int row = 0; row < results_per_simdgroup; row++) {\n      U s = sv[row];\n      U b = bv[row];\n", 1),
+    ("accum[r] = 0;\n      const device uint16_t* words = (const device uint16_t*)wl;\n",
+     "accum[r] = 0;\n      const thread ushort* words = wv[row];\n", 1),
+    ("    ws += block_size * bytes_per_pack / pack_factor;\n    sc += block_size / group_size;\n    bs += block_size / group_size;\n\n  }",
+     "    if (more) {\n      for (int row = 0; row < results_per_simdgroup; row++) {\n        for (int i = 0; i < values_per_thread / 4; i++) wv[row][i] = wn[row][i];\n        sv[row] = sn[row];\n        bv[row] = bn[row];\n      }\n    }\n    ws += block_size * bytes_per_pack / pack_factor;\n    sc += block_size / group_size;\n    bs += block_size / group_size;\n\n  }", 1),
+]
+
+let nemotronPreparedNSGSwaps: [(String, String, Int)] = [
+    ("constexpr int num_simdgroups = 2;", "constexpr int num_simdgroups = NSG;", 1),
+]
+
+func nemotronPreparedVariantSource(_ base: String, load: Int, nsg: Bool) -> String {
+    let loads: [Int: [(String, String, Int)]] = [
+        1: nemotronPreparedW32Swaps, 2: nemotronPreparedHoistSwaps, 3: nemotronPreparedPrefetchSwaps]
+    var s = base
+    if load != 0 { s = nemotronSwapped(s, loads[load]!) }
+    if nsg { s = nemotronSwapped(s, nemotronPreparedNSGSwaps) }
+    return s
+}
+
 private let nemotronMultiRowQMVSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
@@ -401,6 +541,112 @@ private let nemotronHeadPreparedQMVSource = """
   }
 """
 
+private let nemotronMambaInProjConvDtEpilogue = """
+
+  // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). The
+  // BF16 outputs it needs are read back from this simdgroup's own stores.
+  simdgroup_barrier(mem_flags::mem_device);
+  {
+    const int l = int(simd_lid);
+    if (l < results_per_simdgroup * R) {
+      const int row = l / R;
+      const int t = l % R;
+      const int o = out_row + row;
+      if (o >= CS && o < CS + CC) {
+        const int64_t channel = int64_t(o - CS);
+        if (t < 3) {
+          padded[int64_t(t) * CC + channel] =
+              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        }
+        padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];
+        float acc = 0;
+        for (int i = 0; i < 4; ++i) {
+          int64_t crow = int64_t(t) + int64_t(i);
+          T value = crow < 3
+              ? oldState[crow * oldState_strides[1] + channel * oldState_strides[2]]
+              : yp[(crow - 3) * out_vec_size + row];
+          acc += static_cast<float>(value)
+              * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+        }
+        T convolved = static_cast<T>(acc);
+        T xc = convolved + cb[channel * cb_strides[0]];
+        auto yc = 1 / (1 + metal::exp(metal::abs(xc)));
+        T sigmoid = xc < 0 ? yc : 1 - yc;
+        conv[int64_t(t) * CC + channel] = xc * sigmoid;
+      } else if (o >= DS && o < DS + NH) {
+        const int head = o - DS;
+        float v = static_cast<float>(yp[t * out_vec_size + row])
+            + static_cast<float>(dtBias[int64_t(head) * dtBias_strides[0]]);
+        float sp;
+        if (metal::isnan(v)) {
+          sp = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(v, 0.0f);
+          float minval = metal::min(v, 0.0f);
+          sp = (minval == -inf || maxval == inf)
+              ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        float lo = dtLo;
+        float hi = dtHi;
+        float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+        dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+      }
+    }
+  }
+"""
+
+enum NemotronMambaInProjConvDt {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV"] != "0"
+    static let check =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV_CHECK"] == "1"
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mamba_in_proj_conv_dt",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                     "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+        outputNames: ["y", "conv", "padded", "dt"],
+        source: nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
+        header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+
+    static func apply(
+        _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
+        oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
+        dtBias: MLXArray, timeStepLimit: (Float, Float),
+        convStart: Int, convDim: Int, heads: Int
+    ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
+        let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              x.ndim == 2, rows == 3, x.dtype == .bfloat16, k == 2688, k % 512 != 0,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.ndim == 2, q.weight.dim(1) * 8 == k,
+              q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16,
+              n == convStart + convDim + heads, n % 4 == 0,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              oldState.shape == [1, 3, convDim], oldState.dtype == .bfloat16,
+              convWeight.shape == [convDim, 4, 1], convWeight.dtype == .bfloat16,
+              convBias.shape == [convDim], convBias.dtype == .bfloat16,
+              dtBias.shape == [heads], [DType.bfloat16, .float32].contains(dtBias.dtype)
+        else { return nil }
+        let pv = 8
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let outputs = kernel(
+            [q.weight, q.scales, biases, packed, args.0, args.1,
+             oldState, convWeight, convBias, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+            template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
+                       ("RPS", 2), ("CS", convStart), ("CC", convDim),
+                       ("DS", convStart + convDim), ("NH", heads)],
+            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+}
+
 enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
@@ -422,6 +668,95 @@ enum NemotronHeadPreparedActivation {
         inputNames: ["x0", "x1", "x2"], outputNames: ["prepared"],
         source: rowSource(), header: nemotronMultiRowQMVHeader)
 
+    static let halfDecodeForm = 1
+    static let fastHalfDecodeForm = 2
+    static let preparedHalfSource = nemotronSwapped(
+        nemotronHeadPreparedQMVSource, nemotronPreparedHalfSwaps)
+    static let preparedHalfHeader = nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader
+    static let projectHalf = MLXFast.metalKernel(
+        name: "nemotron_head_prepared_qmv_hf", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+        outputNames: ["y"], source: preparedHalfSource, header: preparedHalfHeader)
+    static func decodeForm(rows: Int, fast: Bool) -> Int? {
+        guard rows == 3 else { return nil }
+        let form = fast ? fastHalfDecodeForm : halfDecodeForm
+        return form == (fast ? 0 : 1) ? nil : form
+    }
+    private static func projectKernel(rows: Int, fast: Bool)
+        -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)]) {
+        guard let form = decodeForm(rows: rows, fast: fast) else { return (project, []) }
+        return (projectHalf, [("HF", form)])
+    }
+
+    static let loadForm = 0
+    static let fastLoadForm = 0
+    static let qkvLoadForm = 0
+    static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
+    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
+    static func loadForm(k: Int, n: Int) -> Int {
+        loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
+    }
+
+    nonisolated(unsafe) private static var variants: [String: MLXFast.MLXFastKernel] = [:]
+    private static let variantsLock = NSLock()
+    static func variantKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel {
+        let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
+            + (nsg ? "_nsg" : "")
+        variantsLock.lock(); defer { variantsLock.unlock() }
+        if let kernel = variants[name] { return kernel }
+        let kernel = MLXFast.metalKernel(
+            name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y"],
+            source: nemotronPreparedVariantSource(
+                half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg),
+            header: variantHeader(half: half, load: load))
+        variants[name] = kernel
+        return kernel
+    }
+    static func variantHeader(half: Bool, load: Int) -> String {
+        nemotronMultiRowQMVHeader + (half ? nemotronHalfDecodeHeader : "")
+            + (load != 0 ? nemotronPreparedLoadHeader + (half ? nemotronHalfDecodeThreadHeader : "") : "")
+    }
+
+    private static func projectLaunch(rows: Int, k: Int, n: Int, rps: Int)
+        -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int) {
+        let (kernel, hf) = projectKernel(rows: rows, fast: k % 512 == 0)
+        guard rows == 3 else { return (kernel, hf, rps, 2) }
+        let load = loadForm(k: k, n: n)
+        let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
+        guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
+        let nsg = geometry.nsg != 2
+        let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
+        return (variantKernel(half: !hf.isEmpty, load: load, nsg: nsg), hf + extra, geometry.rps, geometry.nsg)
+    }
+
+    private static let verifyShapes: [[Int]] = [
+        [2688, 10304], [2688, 3712], [3712, 2688], [4096, 2688], [5376, 2688], [2688, 4096],
+        [2688, 131072],
+    ]
+    private static func warmVariants(_ outputs: inout [MLXArray]) {
+        for shape in verifyShapes {
+            let k = shape[0], n = shape[1]
+            let base = n == 131072 ? NemotronMultiRowQMV.headRPS(n: n) : 2
+            let (kernel, extra, rps, nsg) = projectLaunch(rows: 3, k: k, n: n, rps: base)
+            guard loadForm(k: k, n: n) != 0 || nsg != 2 || rps != base else { continue }
+            let pv = k % 512 == 0 ? 16 : 8
+            let x = MLXArray.zeros([3, k], dtype: .bfloat16)
+            let w = MLXArray.zeros([16, k / 8], dtype: .uint32)
+            let s = MLXArray.zeros([16, k / 64], dtype: .bfloat16)
+            let packed = prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+                grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+            let args = NemotronMultiRowQMV.scalarPair(k, 16)
+            for relu2 in [false, true] {
+                outputs.append(kernel([w, s, s, packed[0], args.0, args.1],
+                    template: [("T", x.dtype), ("R", 3), ("FAST", k % 512 == 0),
+                               ("RELU2", relu2), ("RPS", rps)] + extra,
+                    grid: (32, 16 / rps, 1), threadGroup: (32, nsg, 1),
+                    outputShapes: [[3, 16]], outputDTypes: [x.dtype])[0])
+            }
+        }
+    }
+
     /// Feed the winner's prepared projection directly from the serialized
     /// SDPA rows. Same preparation arithmetic; only the source address moves.
     static func applyRows(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray {
@@ -433,10 +768,11 @@ enum NemotronHeadPreparedActivation {
             grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
             outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+        let (kernel, hf, rps, nsg) = projectLaunch(rows: 3, k: k, n: n, rps: 2)
+        return kernel([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
-                       ("RELU2", false), ("RPS", 2)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                       ("RELU2", false), ("RPS", rps)] + hf,
+            grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
     }
     // JIT each actual prepare K specialization and the two exact QMV
@@ -453,23 +789,25 @@ enum NemotronHeadPreparedActivation {
                 grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
                 outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
             let args = NemotronMultiRowQMV.scalarPair(k, 8)
+            let (kernel, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
             for relu2 in [false, true] {
-                outputs.append(project([w, s, s, packed[0], args.0, args.1],
+                outputs.append(kernel([w, s, s, packed[0], args.0, args.1],
                     template: [("T", x.dtype), ("R", 3), ("FAST", k % 512 == 0),
-                               ("RELU2", relu2), ("RPS", 2)],
+                               ("RELU2", relu2), ("RPS", 2)] + hf,
                     grid: (32, 4, 1), threadGroup: (32, 2, 1),
                     outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
             }
             // The target head's pipeline (K 2688, no ReLU2) at its own RPS.
             if k == 2688 && NemotronMultiRowQMV.headRPS(n: 131072) != 2 {
                 let rps = NemotronMultiRowQMV.headRPS(n: 131072)
-                outputs.append(project([w, s, s, packed[0], args.0, args.1],
+                outputs.append(kernel([w, s, s, packed[0], args.0, args.1],
                     template: [("T", x.dtype), ("R", 3), ("FAST", false),
-                               ("RELU2", false), ("RPS", rps)],
+                               ("RELU2", false), ("RPS", rps)] + hf,
                     grid: (32, 8 / rps, 1), threadGroup: (32, 2, 1),
                     outputShapes: [[3, 8]], outputDTypes: [x.dtype])[0])
             }
         }
+        warmVariants(&outputs)
         eval(outputs)
     }
 
@@ -507,10 +845,133 @@ enum NemotronHeadPreparedActivation {
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
-        return project([q.weight, q.scales, q.biases!, packed, args.0, args.1],
-            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, n / rps, 1), threadGroup: (32, 2, 1),
+        let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
+        return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+            template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
+            grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+    }
+}
+
+private let nemotronSharedUpPackHeader = nemotronMultiRowQMVHeader + """
+
+template <typename T, typename U, int values_per_thread>
+inline U nmr_load_vector_tg(const threadgroup T* x, thread U* x_thread) {
+  U sum = 0;
+  for (int i = 0; i < values_per_thread; i += 4) {
+    sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 16.0f;
+    x_thread[i + 2] = x[i + 2] / 256.0f;
+    x_thread[i + 3] = x[i + 3] / 4096.0f;
+  }
+  return sum;
+}
+"""
+
+private func nemotronSharedUpPackSource() -> String {
+    let groups = "constexpr int num_simdgroups = 2;"
+    let store = "yp[r * out_vec_size + row] = h;"
+    precondition(nemotronHeadPreparedQMVSource.components(separatedBy: groups).count == 2)
+    precondition(nemotronHeadPreparedQMVSource.components(separatedBy: store).count == 2)
+    let body = nemotronHeadPreparedQMVSource
+        .replacingOccurrences(of: groups, with: "constexpr int num_simdgroups = 4;")
+        .replacingOccurrences(
+            of: store,
+            with: store + "\n        chunk_h[r][simd_gid * results_per_simdgroup + row] = h;")
+    return "  threadgroup T chunk_h[R][8];\n" + body + """
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < uint(R)) {
+    const int r = int(simd_lid);
+    float values[8];
+    const float total = nmr_load_vector_tg<T, float, 8>(&chunk_h[r][0], values);
+    const int chunk = int(tid.y);
+    const int chunk_tiles = (out_vec_size / 8 + 31) / 32;
+    const int base = (r * chunk_tiles + chunk / 32) * (8 + 1) * 32 + chunk % 32;
+    for (int i = 0; i < 8; i++) packed[base + i * 32] = values[i];
+    packed[base + 8 * 32] = total;
+  }
+"""
+}
+
+enum NemotronSharedUpPacking {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PACK"] != "0"
+    nonisolated(unsafe) private static var verified = false
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_shared_up_relu2_pack_r3",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+        outputNames: ["y", "packed"], source: nemotronSharedUpPackSource(),
+        header: nemotronSharedUpPackHeader)
+
+    private static func dispatch(_ x: MLXArray, _ q: QuantizedLinear,
+                                 prepared: MLXArray?) -> (MLXArray, MLXArray)? {
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 2, x.dim(0) == 3, x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, q.weight.ndim == 2, q.weight.dtype == .uint32,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        let k = x.dim(1), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, q.weight.dim(1) * 8 == k,
+              n >= 2688, n % 8 == 0, n % 512 != 0, NemotronMultiRowQMV.headRPS(n: n) == 2,
+              NemotronHeadPreparedActivation.decodeForm(rows: 3, fast: k % 512 == 0) == nil,
+              NemotronHeadPreparedActivation.loadForm(k: k, n: n) == 0,
+              NemotronHeadPreparedActivation.preparedGeometry[[k, n]] == nil
+        else { return nil }
+        let pv = k % 512 == 0 ? 16 : 8
+        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let outputs = kernel([q.weight, q.scales, biases, input, args.0, args.1],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+                       ("RELU2", true), ("RPS", 2)],
+            grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[3, n], [3, (n / 8 + 31) / 32, 9 * 32]],
+            outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    static func apply(_ x: MLXArray, up: Linear, down: Linear,
+                      prepared: MLXArray?) -> MLXArray? {
+        guard verified, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
+              let q = up as? QuantizedLinear,
+              let fused = dispatch(x.reshaped(3, x.dim(2)), q, prepared: prepared)
+        else { return nil }
+        var activated = fused.0
+        if NemotronMoELeader.selfTest {
+            activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
+                x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
+        }
+        return nemotronMTPLinearRows(
+            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+    }
+
+    static func verify(_ model: Module) {
+        verified = false
+        guard enabled,
+              let mlp = model.modules().lazy.compactMap({ ($0 as? NemotronHMoE)?.sharedExperts }).first,
+              let up = mlp.upProj as? QuantizedLinear
+        else { return }
+        var matches = true
+        for seed in 0 ..< 3 {
+            let x = MLXRandom.normal(
+                [3, up.weight.dim(1) * 8], dtype: .bfloat16,
+                key: MLXRandom.key(UInt64(0x5a17 + seed)))
+            guard let fused = dispatch(x, up, prepared: nil) else { return }
+            let activated = NemotronHeadPreparedActivation.apply(
+                x, up, relu2: true, rps: 2, prepared: nil)
+            let lhs = nemotronMTPLinearRows(
+                fused.0.reshaped(1, 3, up.weight.dim(0)), mlp.downProj, prepared: fused.1)
+            let rhs = nemotronMTPLinearRows(
+                activated.reshaped(1, 3, up.weight.dim(0)), mlp.downProj)
+            let sameUp = (fused.0.view(dtype: .uint16) .== activated.view(dtype: .uint16)).all()
+            let sameDown = (lhs.view(dtype: .uint16) .== rhs.view(dtype: .uint16)).all()
+            matches = matches && sameUp.item(Bool.self) && sameDown.item(Bool.self)
+        }
+        verified = matches
     }
 }
 
@@ -535,7 +996,22 @@ private final class NemotronMultiRowQMVKernel: Sendable {
             inputNames: ["residual", "w", "scales", "biases", "x", "K", "N"],
             outputNames: ["y"], source: addingSource,
             header: nemotronMultiRowQMVHeader, ensureRowContiguous: true)
+        let halfSource = nemotronSwapped(nemotronMultiRowQMVSource, nemotronMultiRowHalfSwaps)
+        let halfHeader = nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader
+        kernelHalf = MLXFast.metalKernel(
+            name: "nemotron_multirow_qmv_affine4_gs64_hf",
+            inputNames: ["w", "scales", "biases", "x", "K", "N"],
+            outputNames: ["y"], source: halfSource, header: halfHeader)
+        attentionOutputAddingHalf = MLXFast.metalKernel(
+            name: "nemotron_mtp_attention_output_add_affine4_gs64_hf",
+            inputNames: ["residual", "w", "scales", "biases", "x", "K", "N"],
+            outputNames: ["y"], source: nemotronSwapped(addingSource, nemotronMultiRowHalfSwaps),
+            header: halfHeader, ensureRowContiguous: true)
     }
+    let kernelHalf: MLXFast.MLXFastKernel
+    let attentionOutputAddingHalf: MLXFast.MLXFastKernel
+    static let attentionHalfDecodeForm = 2
+    static let r1HalfDecodeForm = 2
 }
 
 enum NemotronMultiRowQMV {
@@ -562,7 +1038,8 @@ enum NemotronMultiRowQMV {
     /// order and closing simd_sum, so only the row-to-SIMD-group map moves.
     static let headRPS4 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_RPS4"] != "0"
-    static func headRPS(n: Int) -> Int { headRPS4 && n == 131072 ? 4 : 2 }
+    static let headRPSValue = 4
+    static func headRPS(n: Int) -> Int { headRPS4 && n == 131072 ? headRPSValue : 2 }
 
     /// DARKBLOOM_BONSAI_R8B=0 keeps the MTP wo projection and residual add
     /// as two launches. Otherwise the fused route engages only after the
@@ -601,11 +1078,14 @@ enum NemotronMultiRowQMV {
         // lane split and simd_sum produce each output.
         let rps = resultsPerSimdgroup(rows: rows, k: 4096, n: 2688)
         let (k, n) = scalarPair(4096, 2688)
-        let y = NemotronMultiRowQMVKernel.shared.attentionOutputAdding(
+        let form = NemotronMultiRowQMVKernel.attentionHalfDecodeForm
+        let half = rows == 3 && form != 0
+        let y = (half ? NemotronMultiRowQMVKernel.shared.attentionOutputAddingHalf
+                      : NemotronMultiRowQMVKernel.shared.attentionOutputAdding)(
             [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
              x.reshaped(rows, 4096), k, n],
             template: [("T", x.dtype), ("R", rows), ("FAST", true),
-                       ("RELU2", false), ("RPS", rps)],
+                       ("RELU2", false), ("RPS", rps)] + nemotronHalfTemplate(half, form),
             grid: (32, 2688 / rps, 1), threadGroup: (32, 2, 1),
             outputShapes: [[1, rows, 2688]], outputDTypes: [x.dtype])[0]
         guard NemotronMoELeader.selfTest else { return y }
@@ -660,10 +1140,13 @@ enum NemotronMultiRowQMV {
                                  _ x: MLXArray, relu2: Bool, rps: Int) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = w.dim(0)
         let (kArray, nArray) = scalarPair(k, n)
-        return NemotronMultiRowQMVKernel.shared.kernel(
+        let form = NemotronMultiRowQMVKernel.r1HalfDecodeForm
+        let half = rows == 1 && form != 0
+        return (half ? NemotronMultiRowQMVKernel.shared.kernelHalf
+                     : NemotronMultiRowQMVKernel.shared.kernel)(
             [w, scales, biases, x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
-                       ("RELU2", relu2), ("RPS", rps)],
+                       ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
             grid: (32, n / rps, 1),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows, n]],
@@ -1105,6 +1588,38 @@ enum NemotronTargetQKV {
         outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronHeadPreparedQMVSource + "\n}",
         header: nemotronMultiRowQMVHeader)
 
+    static let r1HalfDecodeForm = 2
+    private static let kernelHalf = MLXFast.metalKernel(
+        name: "nemotron_target_qkv_affine4_gs64_hf",
+        inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
+        outputNames: ["qy", "ky", "vy"],
+        source: tilePrefix + nemotronSwapped(nemotronMultiRowQMVSource, nemotronMultiRowHalfSwaps) + "\n}",
+        header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader)
+    private static let preparedKernelHalf = MLXFast.metalKernel(
+        name: "nemotron_target_qkv_prepared_affine4_gs64_hf",
+        inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
+        outputNames: ["qy", "ky", "vy"],
+        source: tilePrefix + NemotronHeadPreparedActivation.preparedHalfSource + "\n}",
+        header: NemotronHeadPreparedActivation.preparedHalfHeader)
+
+    nonisolated(unsafe) private static var loadKernels: [String: MLXFast.MLXFastKernel] = [:]
+    private static let loadKernelsLock = NSLock()
+    private static func preparedLoadKernel(half: Bool, load: Int) -> MLXFast.MLXFastKernel {
+        let name = "nemotron_target_qkv_prepared_affine4_gs64" + (half ? "_hf" : "") + "_ld\(load)"
+        loadKernelsLock.lock(); defer { loadKernelsLock.unlock() }
+        if let kernel = loadKernels[name] { return kernel }
+        let body = nemotronPreparedVariantSource(
+            half ? NemotronHeadPreparedActivation.preparedHalfSource : nemotronHeadPreparedQMVSource,
+            load: load, nsg: false)
+        let kernel = MLXFast.metalKernel(
+            name: name,
+            inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
+            outputNames: ["qy", "ky", "vy"], source: tilePrefix + body + "\n}",
+            header: NemotronHeadPreparedActivation.variantHeader(half: half, load: load))
+        loadKernels[name] = kernel
+        return kernel
+    }
+
     /// Outputs per SIMD group for the fused Q/K/V launch: narrow at R = 3
     /// and 4 (M1 Max: -9 % and -12 %; R = 1 +7 %). Same kill switch as
     /// NemotronMultiRowQMV.
@@ -1132,10 +1647,20 @@ enum NemotronTargetQKV {
             ? (NemotronHeadPreparedActivation.compatible(packed, rows: rows, k: 2688)
                 ?? NemotronHeadPreparedActivation.pack(x.reshaped(rows, 2688)))
             : x
-        return (prepared ? preparedKernel : kernel)(
+        let preparedForm = NemotronHeadPreparedActivation.decodeForm(rows: rows, fast: false)
+        let r1Half = !prepared && rows == 1 && r1HalfDecodeForm != 0
+        let qkvLoad = prepared && rows == 3 ? NemotronHeadPreparedActivation.qkvLoadForm : 0
+        let chosen = prepared
+            ? (qkvLoad != 0 ? preparedLoadKernel(half: preparedForm != nil, load: qkvLoad)
+               : (preparedForm == nil ? preparedKernel : preparedKernelHalf))
+            : (r1Half ? kernelHalf : kernel)
+        let extra = prepared
+            ? nemotronHalfTemplate(preparedForm != nil, preparedForm ?? 0)
+            : nemotronHalfTemplate(r1Half, r1HalfDecodeForm)
+        return chosen(
             weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
-                       ("RPS", rps)],
+                       ("RPS", rps)] + extra,
             grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
             outputShapes: [[1, rows, 4096], [1, rows, 256], [1, rows, 256]],
             outputDTypes: [x.dtype, x.dtype, x.dtype])
@@ -1485,6 +2010,32 @@ enum NemotronHeadScreen {
         name: "nemotron_head_screen_final",
         inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
 
+    static let partialHalfDecodeForm = 0
+    static let selectHalfDecodeForm = 0
+    static let partialHalfSwaps: [(String, String, Int)] = [
+        ("const uint16_t q = ws[i];", "const float4 hq = nmr_half_decode4<HF>(ws, i);", 1),
+        ("float(q & 0x000f)", "hq.x", 1),
+        ("float(q & 0x00f0)", "hq.y", 1),
+        ("float(q & 0x0f00)", "hq.z", 1),
+        ("float(q & 0xf000)", "hq.w", 1),
+    ]
+    private static let partialHalfKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_affine4_gs64_hf",
+        inputNames: ["w", "scales", "biases", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: nemotronSwapped(partialSource, partialHalfSwaps),
+        header: nemotronHalfDecodeHeader)
+    private static let packedPartialHalfKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_packed_affine4_gs64_hf",
+        inputNames: ["w", "sb", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: nemotronSwapped(packedPartialSource, partialHalfSwaps),
+        header: nemotronHalfDecodeHeader)
+    private static let selectHalfKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_select_affine4_gs64_hf",
+        inputNames: ["scores", "w", "scales", "biases", "x"],
+        outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
+        source: nemotronSwapped(selectSource, nemotronMultiRowHalfSwaps),
+        header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader)
+
     struct Result {
         let id: MLXArray
         let scores: MLXArray
@@ -1508,20 +2059,24 @@ enum NemotronHeadScreen {
             ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
             ("NSG", simdgroups), ("LO", Self.rows),
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
+        let partialHalf = partialHalfDecodeForm != 0
+        let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (packed.map {
-            packedPartialKernel(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: template,
+            (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
+                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? partialKernel(
-            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: template,
+        } ?? (partialHalf ? partialHalfKernel : partialKernel)(
+            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: partialTemplate,
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
         let selectGroups = 8
-        let picked = selectKernel(
+        let selectHalf = selectHalfDecodeForm != 0
+        let picked = (selectHalf ? selectHalfKernel : selectKernel)(
             [scores, weight, scales, biases, hidden],
-            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)],
+            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
+                + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
             outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
             outputDTypes: [.int32, .float32, .float32, .int32])
