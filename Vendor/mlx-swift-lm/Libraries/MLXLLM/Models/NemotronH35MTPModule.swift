@@ -285,6 +285,13 @@ private final class NemotronH35MTPDraftFrontCache {
     }
 }
 
+/// Experts the assistant's one-token draft step routes to (stock 6). Test override:
+/// NEMOTRON_MTP_DRAFT_TOPK (1...6).
+let nemotronMTPDraftTopK: Int = {
+    let v = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_TOPK"] ?? "") ?? 4
+    return (1...6).contains(v) ? v : 4
+}()
+
 final class NemotronH35MTPExpertBlock: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHMoE
@@ -333,6 +340,14 @@ final class NemotronH35MTPExpertBlock: Module {
     fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
         let h = normalized ?? norm(x)
         let (indices, scores) = mixer.gate(h)
+        if nemotronMTPDraftTopK < 6, let sharedExperts = mixer.sharedExperts {
+            let order = argSort(-scores, axis: -1)[.ellipsis, ..<nemotronMTPDraftTopK]
+            let inds = takeAlong(indices, order, axis: -1)
+            let kept = takeAlong(scores, order, axis: -1)
+            var y = mixer.switchMLP(h, inds)
+            y = (y * kept[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            return finalNorm(x + (y + sharedExperts(h)))
+        }
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
                 h, indices, scores, mixer.switchMLP)
@@ -516,7 +531,9 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
-        let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
+        let hidden = cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
+            earlyEvalInterval: nemotronPrefillEvalInterval)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)

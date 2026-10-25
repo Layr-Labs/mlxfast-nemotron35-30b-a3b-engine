@@ -135,6 +135,7 @@ private let nemotronMultiRowQMVSource = """
   constexpr int block_size = values_per_thread * 32;
   constexpr int scale_step_per_thread = group_size / values_per_thread;
   typedef float U;
+  constexpr bool half_decode = !FAST && R == 3;
 
   const int in_vec_size = K;
   const int out_vec_size = N;
@@ -184,10 +185,10 @@ private let nemotronMultiRowQMVSource = """
       for (int r = 0; r < R; r++) accum[r] = 0;
       const device uint16_t* words = (const device uint16_t*)wl;
       for (int i = 0; i < values_per_thread / 4; i++) {
-        const U a = words[i] & 0x000f;
-        const U b1 = words[i] & 0x00f0;
-        const U c = words[i] & 0x0f00;
-        const U d = words[i] & 0xf000;
+        const U a = half_decode ? U(half(ushort(words[i] & 0x000f))) : U(words[i] & 0x000f);
+        const U b1 = half_decode ? U(half(ushort(words[i] & 0x00f0))) : U(words[i] & 0x00f0);
+        const U c = half_decode ? U(half(ushort(words[i] & 0x0f00))) : U(words[i] & 0x0f00);
+        const U d = half_decode ? U(half(ushort(words[i] & 0xf000))) : U(words[i] & 0xf000);
         for (int r = 0; r < R; r++) {
           accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
               + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
@@ -222,10 +223,10 @@ private let nemotronMultiRowQMVSource = """
         for (int r = 0; r < R; r++) accum[r] = 0;
         const device uint16_t* words = (const device uint16_t*)wl;
         for (int i = 0; i < remaining / 4; i++) {
-          const U a = words[i] & 0x000f;
-          const U b1 = words[i] & 0x00f0;
-          const U c = words[i] & 0x0f00;
-          const U d = words[i] & 0xf000;
+          const U a = half_decode ? U(half(ushort(words[i] & 0x000f))) : U(words[i] & 0x000f);
+          const U b1 = half_decode ? U(half(ushort(words[i] & 0x00f0))) : U(words[i] & 0x00f0);
+          const U c = half_decode ? U(half(ushort(words[i] & 0x0f00))) : U(words[i] & 0x0f00);
+          const U d = half_decode ? U(half(ushort(words[i] & 0xf000))) : U(words[i] & 0xf000);
           for (int r = 0; r < R; r++) {
             accum[r] += x_thread[r][4*i] * a + x_thread[r][4*i+1] * b1
                 + x_thread[r][4*i+2] * c + x_thread[r][4*i+3] * d;
@@ -280,7 +281,7 @@ private let nemotronHeadPreparedQMVSource = """
   // through an exact ushort -> half convert (<= 4 significant bits, <= 61440)
   // widened as an operand. Same float value, same FP32 arithmetic and order.
   // M4: 1.9-2.2% faster at K 2688/3712; neutral or slower with FAST, kept stock.
-  constexpr bool half_decode = !FAST && R == 3;
+  constexpr bool half_decode = R == 3;
 
   const int in_vec_size = K;
   const int out_vec_size = N;
@@ -1250,8 +1251,8 @@ enum NemotronHeadScreen {
           _Pragma("clang loop unroll(full)")
           for (int i = 0; i < VPL / 4; i++) {
             const uint16_t q = ws[i];
-            a += xv[4 * i] * float(q & 0x000f) + xv[4 * i + 1] * float(q & 0x00f0)
-                + xv[4 * i + 2] * float(q & 0x0f00) + xv[4 * i + 3] * float(q & 0xf000);
+            a += xv[4 * i] * float(half(ushort(q & 0x000f))) + xv[4 * i + 1] * float(half(ushort(q & 0x00f0)))
+                + xv[4 * i + 2] * float(half(ushort(q & 0x0f00))) + xv[4 * i + 3] * float(half(ushort(q & 0xf000)));
           }
           acc = sc * a + bi * xs;
         }
@@ -1344,10 +1345,10 @@ enum NemotronHeadScreen {
             U accum = 0;
             const device uint16_t* words = (const device uint16_t*)wl[row];
             for (int i = 0; i < values_per_thread / 4; i++) {
-              const U a = words[i] & 0x000f;
-              const U b1 = words[i] & 0x00f0;
-              const U c = words[i] & 0x0f00;
-              const U d = words[i] & 0xf000;
+              const U a = U(half(ushort(words[i] & 0x000f)));
+              const U b1 = U(half(ushort(words[i] & 0x00f0)));
+              const U c = U(half(ushort(words[i] & 0x0f00)));
+              const U d = U(half(ushort(words[i] & 0xf000)));
               accum += x_thread[4*i] * a + x_thread[4*i+1] * b1
                   + x_thread[4*i+2] * c + x_thread[4*i+3] * d;
             }
@@ -1370,10 +1371,10 @@ enum NemotronHeadScreen {
             U accum = 0;
             const device uint16_t* words = (const device uint16_t*)wl[row];
             for (int i = 0; i < remaining / 4; i++) {
-              const U a = words[i] & 0x000f;
-              const U b1 = words[i] & 0x00f0;
-              const U c = words[i] & 0x0f00;
-              const U d = words[i] & 0xf000;
+              const U a = U(half(ushort(words[i] & 0x000f)));
+              const U b1 = U(half(ushort(words[i] & 0x00f0)));
+              const U c = U(half(ushort(words[i] & 0x0f00)));
+              const U d = U(half(ushort(words[i] & 0xf000)));
               accum += x_thread[4*i] * a + x_thread[4*i+1] * b1
                   + x_thread[4*i+2] * c + x_thread[4*i+3] * d;
             }

@@ -53,6 +53,8 @@ struct PagedAttentionKernelKey: Hashable {
     var partitionTokens: Int
     /// Pass A only: fuse the decode KV write into the kernel.
     var hasWrite: Bool = false
+    /// Part head split is a template and must have a distinct pipeline identity.
+    var headsPerThreadgroup: Int = 0
 
     var kernelName: String {
         let d: String
@@ -69,7 +71,7 @@ struct PagedAttentionKernelKey: Hashable {
         case .write: p = "write"
         }
         return "cbv2_paged_\(p)_\(d)_d\(headDim)_s\(pageSize)_g\(gqa)"
-            + "_n\(simdgroups)_t\(partitionTokens)"
+            + "_h\(headsPerThreadgroup)_n\(simdgroups)_t\(partitionTokens)"
             + "_sink\(hasSinks ? 1 : 0)_cap\(hasSoftcap ? 1 : 0)"
             + (hasWrite ? "_w1" : "")
     }
@@ -646,7 +648,8 @@ public enum PagedAttentionKernel {
         pageSize: Int,
         writeFence: MLXArray,
         kernelSource: String,
-        stream: StreamOrDevice = .default
+        stream: StreamOrDevice = .default,
+        draftAttention: Bool = false
     ) throws(CBv2PagedKVWriteError) -> (out: MLXArray, nextWriteFence: MLXArray?) {
         var q = queries
         if q.ndim == 4 {
@@ -673,7 +676,7 @@ public enum PagedAttentionKernel {
         precondition(maxAttendLength >= 1)
 
         let gqa = queryHeads / kvHeads
-        guard let nsg = simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa) else {
+        guard var nsg = simdgroupsPerThreadgroup(headDim: headDim, gqa: gqa) else {
             preconditionFailure(
                 "paged decode dispatched for a statically ineligible shape: "
                     + (ineligibilityReason(headDim: headDim, gqa: gqa)
@@ -699,12 +702,16 @@ public enum PagedAttentionKernel {
         }
         partInputs.append(contentsOf: [kSlab, vSlab, tables, seqinfo, params, writeFence])
 
-        let hpt = headsPerThreadgroup(headDim: headDim, gqa: gqa)
+        let geometry = NemotronDraftAttentionGeometry.select(enabled: draftAttention,
+            dtype: dtype, queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim,
+            pageSize: pageSize, length: maxAttendLength, batch: b)
+        let hpt = geometry?.hpt ?? headsPerThreadgroup(headDim: headDim, gqa: gqa)
+        if geometry != nil { nsg = 4 }
         let splits = gqa / hpt
         // WS-6.4: partition length adapts to context and batch so a short
         // B == 1 decode still fills the GPU. Every value it can return is a
         // page multiple, which is the invariant the shader relies on.
-        let ptok = partitionTokensForDispatch(
+        let ptok = geometry?.ptok ?? partitionTokensForDispatch(
             maxAttendLength: maxAttendLength, batch: b, kvHeads: kvHeads,
             headSplits: splits, pageSize: pageSize)
         precondition(ptok % pageSize == 0, "PTOK must be a page multiple")
@@ -714,7 +721,7 @@ public enum PagedAttentionKernel {
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
-            partitionTokens: ptok, hasWrite: hasWrite)
+            partitionTokens: ptok, hasWrite: hasWrite, headsPerThreadgroup: hpt)
         let tg = 32 * nsg
         // MLX passes arrays smaller than 8 elements in Metal's constant address
         // space; the merge implementation expects a device pointer. Keep even
@@ -744,7 +751,7 @@ public enum PagedAttentionKernel {
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: headDim, pageSize: pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false,
-            partitionTokens: ptok)
+            partitionTokens: ptok, headsPerThreadgroup: hpt)
         let outputs = kernel(for: mergeKey, source: kernelSource)(
             [partOut[0], partOut[1], seqinfo, sinks ?? zeroSinks],
             template: [
