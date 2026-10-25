@@ -445,6 +445,90 @@ enum NemotronHResidualRMSNorm {
         outputNames: ["residual", "normalized"],
         source: sumSource(), ensureRowContiguous: true)
 
+    /// `sumKernel` reading the routed half as the six weighted slot products of
+    /// its row ([rows * 6 * 2688] FP32, slot-major): the zero-skip top-six
+    /// reduce (first slot, then `slot + total` in slot order, BF16 store) runs
+    /// here instead of in its own launch, as `sumProductsPreparedKernel` does
+    /// for the verify. Every later expression is unchanged.
+    private static func sumProductsSource() -> String {
+        let add = "T part = rhs[offset + i] + shared[offset + i];"
+        let s = sumSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        return s.replacingOccurrences(of: add, with: """
+            const size_t column = lid * n_reads + i;
+                            float total = rhs[size_t(gid * 6) * axis_size + column];
+                            for (int j = 1; j < 6; j++) {
+                                total = rhs[size_t(gid * 6 + j) * axis_size + column] + total;
+                            }
+                            T part = static_cast<T>(total) + shared[offset + i];
+            """)
+    }
+    private static let sumProductsKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_products_rms_bf16",
+        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: sumProductsSource(), ensureRowContiguous: true)
+
+    /// Set at load by `checkSumProductsJoin`; the draft tail asks the MoE for
+    /// its slot products only after this join matched there.
+    nonisolated(unsafe) static var sumProductsVerified = false
+
+    /// The one-row draft tail join over the routed slot products
+    /// (`NemotronZSkip`): products is [6 * 2688] FP32, slot-major.
+    static func applySumProducts(_ lhs: MLXArray, _ products: MLXArray, shared: MLXArray,
+                                 norm: RMSNorm) -> (MLXArray, MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              lhs.shape == [1, 1, 2688], lhs.dtype == .bfloat16,
+              products.shape == [6 * 2688], products.dtype == .float32,
+              shared.shape == lhs.shape, shared.dtype == .bfloat16,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let result = sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
+        let routed = NemotronZSkip.reduceProducts(products, rows: 1)
+        guard let expected = applySum(lhs, routed, shared: shared, norm: norm) else { return nil }
+        let ok = MLX.logicalAnd(
+            (result[0].view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+            (result[1].view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all())
+        return (which(ok, result[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, result[1], MLXArray(Float.nan).asType(.bfloat16)))
+    }
+
+    /// Load time: the one-row products join against the separate top-six
+    /// reduce plus `applySum`, bit for bit, on seeded rows and a real norm.
+    static func checkSumProductsJoin(_ model: Module) {
+        sumProductsVerified = false
+        guard Device.defaultDevice().deviceType == .gpu,
+              let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+                  type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+              }) else { return }
+        var ok = MLXArray(true)
+        for seed in 0 ..< 3 {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x6b01 + seed)), into: 3)
+            let lhs = MLXRandom.normal([1, 1, 2688], key: keys[0]).asType(.bfloat16)
+            var products = MLXRandom.normal([6 * 2688], scale: 0.05, key: keys[1])
+            if seed == 1 { products = which(abs(products) .< MLXArray(Float(0.03)), MLXArray(Float(0)), products) }
+            let shared = MLXRandom.normal([1, 1, 2688], scale: 0.1, key: keys[2]).asType(.bfloat16)
+            guard let fused = applySumProducts(lhs, products, shared: shared, norm: norm),
+                  let expected = applySum(
+                      lhs, NemotronZSkip.reduceProducts(products, rows: 1), shared: shared, norm: norm)
+            else { return }
+            ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                (fused.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                (fused.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()))
+        }
+        sumProductsVerified = ok.item(Bool.self)
+        if !sumProductsVerified {
+            FileHandle.standardError.write(
+                Data("nemotron draft zskip join off: the products join differs from reduce + join\n".utf8))
+        }
+    }
+
     static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
     {
@@ -4246,7 +4330,7 @@ private class NemotronHBackbone: Module {
                     && (next % nemotronVerifySubmitInterval == 0
                         || (next == 1 && nemotronVerifyFirstSubmit)))
             if submit && next < layers.count {
-                asyncEval(hidden)
+                asyncEval([hidden] + CBv2MTPSubmitMerge.take())
             }
         }
         precondition(
