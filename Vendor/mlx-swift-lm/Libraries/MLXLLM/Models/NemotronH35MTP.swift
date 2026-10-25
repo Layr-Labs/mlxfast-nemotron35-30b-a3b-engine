@@ -55,7 +55,7 @@ private final class NemotronMTPDraftHead {
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
     /// `upper`: also screen the upper vocabulary half (when the plan has it).
-    func greedy(_ hidden: MLXArray, upper: Bool = false) -> MLXArray {
+    func greedy(_ hidden: MLXArray, upper: Bool = false, contextIds: MLXArray? = nil) -> MLXArray {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
         else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
@@ -65,8 +65,9 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records,
-            counter: screen.counter)
-        if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
+            counter: screen.counter,
+            contextIds: contextIds)
+        if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) && contextIds == nil {
             checkAgainstStock(hidden, result, screen)
         }
         return result.id
@@ -496,6 +497,33 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// Committed tokens since the last one in the upper vocabulary half
         /// (prompt tail included); Int.max when none has been seen.
         var tokensSinceUpper = Int.max
+        /// Distinct upper-half ids of the request's context (prompt and
+        /// committed tokens), oldest first, at most
+        /// `NemotronHeadScreen.contextSlots`; the device copy is padded by
+        /// repeating the first id and rebuilt only when the set changes.
+        var contextUpper: [Int32] = []
+        var contextUpperArray: MLXArray?
+        func noteContextToken(_ token: Int) {
+            guard token >= NemotronHeadScreen.rows else { return }
+            let id = Int32(token)
+            if let i = contextUpper.firstIndex(of: id) {
+                contextUpper.remove(at: i)
+                contextUpper.append(id)
+                return
+            }
+            contextUpper.append(id)
+            if contextUpper.count > NemotronHeadScreen.contextSlots { contextUpper.removeFirst() }
+            contextUpperArray = nil
+        }
+        func contextIds() -> MLXArray? {
+            guard let first = contextUpper.first else { return nil }
+            if let array = contextUpperArray { return array }
+            var padded = contextUpper
+            while padded.count < NemotronHeadScreen.contextSlots { padded.append(first) }
+            let array = MLXArray(padded)
+            contextUpperArray = array
+            return array
+        }
         /// Whether a round's first draft (`firstDraft`) or a later one screens
         /// the upper vocabulary half.
         func screensUpper(firstDraft: Bool) -> Bool {
@@ -612,6 +640,19 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         deinit { release() }
     }
     private final class Prepared: CBv2MTPPreparedCapture {}
+    /// NEMOTRON_MTP_HEAD_CONTEXT_UPPER=0 restores the upper-half screen with
+    /// its per-position windows. Otherwise a draft screens the lower half and
+    /// scores the request's context upper-half ids exactly.
+    static let contextUpperEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_CONTEXT_UPPER"] != "0"
+
+    private func draftGreedy(_ hidden: MLXArray, _ s: State, firstDraft: Bool) -> MLXArray {
+        guard Self.contextUpperEnabled else {
+            return draftHead.greedy(hidden, upper: s.screensUpper(firstDraft: firstDraft))
+        }
+        return draftHead.greedy(hidden, contextIds: s.contextIds())
+    }
+
     private func state(_ value: any CBv2MTPRequestState) -> State {
         guard let s = value as? State, s.owner == ObjectIdentifier(self), !s.released else {
             preconditionFailure("Nemotron MTP foreign or released request state")
@@ -752,7 +793,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
+        let ids = draftGreedy(out, s, firstDraft: first)
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -915,7 +956,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
                     hidden: first.hidden,
                     embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
             }
-            ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: false))
+            ids = draftGreedy(out, s, firstDraft: false)
         }
         s.stagedInputCount += 1
         s.roots.append(contentsOf: [out, ids])
@@ -977,7 +1018,7 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
         let out = module.finishPagedAttentionRow(attended)
-        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
+        let ids = draftGreedy(out, s, firstDraft: true)
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
         // The second draft's cache-free part on this first draft, so after the
@@ -1009,7 +1050,7 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
                 inputs: inputs,
                 keys: concatenated([history.keys, ownKeys], axis: 2),
                 values: concatenated([history.values, ownValues], axis: 2), mask: mask)
-            let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
+            let ids2 = draftGreedy(out2, s, firstDraft: false)
             s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
             roots += [ids2, out2, ownKeys, ownValues]
         }
@@ -1034,7 +1075,18 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
             } else if s.tokensSinceUpper != Int.max {
                 s.tokensSinceUpper += 1
             }
+            s.noteContextToken(token)
         }
+    }
+}
+
+extension NemotronH35MTPAssistant: CBv2MTPPromptTokenObserving {
+    /// Every prompt token joins the request's context id set.
+    public func observePromptTokens(
+        _ tokens: [Int], requestState: any CBv2MTPRequestState
+    ) {
+        let s = state(requestState)
+        for token in tokens { s.noteContextToken(token) }
     }
 }
 
