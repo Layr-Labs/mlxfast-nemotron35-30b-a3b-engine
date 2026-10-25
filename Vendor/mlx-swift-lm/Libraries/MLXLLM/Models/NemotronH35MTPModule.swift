@@ -172,6 +172,47 @@ final class NemotronH35MTPAttentionBlock: Module {
         return [front[0], front[1], q, k, v]
     }
 
+    func frontRows(hidden: MLXArray, embedding: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        let joined = joinedNorms(hidden: hidden, embedding: embedding)
+        let fused = nemotronMTPLinearRows(joined, projection)
+        let x = norm(fused)
+        let batch = x.dim(0), length = x.dim(1)
+        let queries = nemotronMTPLinearRows(x, mixer.wq)
+            .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let keys = nemotronMTPLinearRows(x, mixer.wk)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let values = nemotronMTPLinearRows(x, mixer.wv)
+            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        return (fused, queries, keys, values)
+    }
+
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries.asType(keys.dtype), keys: keys, values: values,
+            scale: mixer.scale, mask: .array(mask))
+        let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
+        return fused + nemotronMTPLinearRows(merged, mixer.wo)
+    }
+
+    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
+        (inputs[3].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3),
+         inputs[4].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3))
+    }
+
+    func maskedDraftAttention(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let queries = inputs[2].reshaped(1, 1, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+            .asType(keys.dtype)
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: keys, values: values, scale: mixer.scale, mask: .array(mask))
+        return mixer.wo(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1))
+    }
+
     /// `pagedForwardParts` from `pagedDraftInputs` of the same inputs.
     func pagedForwardParts(
         inputs: [MLXArray], cache: any CBv2AttendingLayerCache
@@ -453,6 +494,27 @@ final class NemotronH35MTPModule: Module {
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
+    }
+    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).draftKeyValues(inputs: inputs)
+    }
+    func frontRows(hidden: MLXArray, embedding: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding)
+    }
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowOutput(
+            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+    }
+    func maskedSecondDraft(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedDraftAttention(
+            inputs: inputs, keys: keys, values: values, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
     }
     func pagedForward(inputs: [MLXArray], cache: any CBv2AttendingLayerCache) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
