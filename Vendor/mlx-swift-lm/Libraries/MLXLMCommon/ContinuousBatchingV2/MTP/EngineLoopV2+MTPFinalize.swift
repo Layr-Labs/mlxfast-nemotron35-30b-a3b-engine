@@ -280,6 +280,7 @@ extension EngineLoopV2 {
                     let fixed = mtp.config.fixedDraftTokens ?? 0
                     let depth = CBv2MTPFirstDraftPrestage.chained
                         && rec.request.maxTokens - rec.generatedTokenCount >= fixed ? fixed : 1
+                    CBv2MTPSubmitMerge.begin()
                     prestager.prestageDrafts(
                         token: kept[confirmed - 1], hidden: hidden, requestState: state,
                         depth: depth)
@@ -529,6 +530,41 @@ public enum CBv2MTPFirstDraftPrestage {
     /// CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT=0 restores host-selected tail submission.
     public static let deviceAccepted = speculateAfterVerify
         && ProcessInfo.processInfo.environment["CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT"] != "0"
+}
+
+/// Head-chain submissions grouped into fewer `asyncEval` calls (evaluation
+/// order only): finalize's prestaged drafts and the round-build draft steps
+/// ride the verify's first submission, so the host reaches that submission
+/// with no separate submit before it. Each `asyncEval` ends its command
+/// buffer with an event. The acceptance packet and the post-verify head
+/// graphs keep their own submissions. `NEMOTRON_MTP_MERGE_SUBMITS=0` submits
+/// each graph on its own.
+public enum CBv2MTPSubmitMerge {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MERGE_SUBMITS"] != "0"
+    nonisolated(unsafe) private static var held: [MLXArray]? = nil
+
+    /// Start holding submissions (engine thread only).
+    public static func begin() {
+        if enabled && held == nil { held = [] }
+    }
+
+    /// `asyncEval(arrays)`, or hold them for the next `take`/`flush`.
+    public static func submit(_ arrays: [MLXArray]) {
+        if held != nil { held!.append(contentsOf: arrays) } else { asyncEval(arrays) }
+    }
+
+    /// The held arrays (empty when none); holding ends.
+    public static func take() -> [MLXArray] {
+        defer { held = nil }
+        return held ?? []
+    }
+
+    /// Submit the held arrays on their own; holding ends.
+    public static func flush() {
+        let arrays = take()
+        if !arrays.isEmpty { asyncEval(arrays) }
+    }
 }
 
 extension EngineLoopV2 {
