@@ -1614,26 +1614,25 @@ private let nemotronZSkipStagedSource = """
   }
 """
 
-// Tile-major copy: for each expert and 128-output tile, row k's 32 uint16 words
-// (four outputs' nibbles each, output 4h + o in bits 4o, as in the K-major
-// halves) are contiguous, so a threadgroup's rows are 64-byte segments of one
-// [K, 32] block. Scales and biases are [expert, tile, group, 128].
+// Lossless tile/chunk/row-major copy: each lane owns four original uint32
+// code words (one per output) per eight-element input chunk. A uint4 load
+// directly supplies qdot's coefficients; no runtime nibble transpose is needed.
+// Scales and biases remain [expert, tile, group, 128].
 private let nemotronZSkipTiledLayoutSource = """
   const uint lid = thread_position_in_grid.x % 32;
   const uint t = thread_position_in_grid.x / 32;
-  const uint k = thread_position_in_grid.y;
+  const uint c = thread_position_in_grid.y;
   const uint e = thread_position_in_grid.z;
   const uint n = t * 128 + 4 * lid;
-  const uint shift = 4 * (k % 8);
-  uint v = 0;
-  for (uint o = 0; o < 4; o++) {
-    v |= ((w[((ulong)e * N + n + o) * (K / 8) + k / 8] >> shift) & 0xfu) << (4 * o);
-  }
-  wk[(((ulong)e * (N / 128) + t) * K + k) * 32 + lid] = uint16_t(v);
+  const ulong base = ((ulong)e * N + n) * (K / 8) + c;
+  const uint4 words = uint4(w[base], w[base + K / 8],
+                            w[base + 2 * (K / 8)], w[base + 3 * (K / 8)]);
+  ((device uint4*)wk)[(((ulong)e * (N / 128) + t) * (K / 8) + c) * 32 + lid] = words;
+
 """
 
-// The staged slot kernel on the tile-major copy: the same statements, with
-// only the code-word, scale and bias addresses moved to that layout.
+// The staged slot kernel on the lossless chunk/row-major copy. The arithmetic
+// and lane/chunk reduction order match the original tiled kernel.
 private let nemotronZSkipTiledSeqSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
@@ -1657,14 +1656,14 @@ private let nemotronZSkipTiledSeqSource = """
     const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
     uint m = 0;
     for (int i = 0; i < 8; i++) {
-      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      m |= uint(xb[i] & 0x7fff);
       xsh[8 * c + i] = xs[8 * c + i];
     }
-    cmask[c] = uchar(m);
+    cmask[c] = uchar(m != 0);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
-  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;
+  const device uint4* wq = (const device uint4*)wk + tb * K * 4 + lid;
   const device T* sq = sk + tb * groups * OT + 4 * lid;
   const device T* bq = bk + tb * groups * OT + 4 * lid;
   for (int ll = 0; ll < LPS; ll++) {
@@ -1690,16 +1689,8 @@ private let nemotronZSkipTiledSeqSource = """
         xt[i + 2] = xv[i + 2] / 256.0f;
         xt[i + 3] = xv[i + 3] / 4096.0f;
       }
-      uint u[4];
-      for (int i = 0; i < 4; i++) {
-        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
-        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
-        u[i] = lo | (hi << 16);
-      }
-      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
-      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
-      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
-      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      const uint4 words = wq[c * 32];
+      uint u[4] = {words.x, words.y, words.z, words.w};
       const int gi = c / 8;
       const uint2 sr = *((const device uint2*)(sq + gi * OT));
       const uint2 br = *((const device uint2*)(bq + gi * OT));
@@ -1817,10 +1808,10 @@ enum NemotronZSkip {
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
     private static let tiledLayout = MLXFast.metalKernel(
-        name: "nemotron_zskip_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
+        name: "nemotron_zskip_pretransposed_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipTiledLayoutSource)
     private static let tiledSlotKernel = MLXFast.metalKernel(
-        name: "nemotron_zskip_fc2_slots_tiled", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        name: "nemotron_zskip_fc2_pretransposed", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
         outputNames: ["prod"], source: nemotronZSkipTiledSeqSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
@@ -1829,11 +1820,11 @@ enum NemotronZSkip {
     /// re-checks every layer) if the tiled kernel misses a bit check.
     nonisolated(unsafe) private static var tiled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TILED"] != "0"
-    /// SIMD groups per slot-kernel threadgroup: 16 halves each thread's lane
-    /// partials (two instead of four) with the same lane-to-chunk map, so every
-    /// partial, its order and the closing reduction are unchanged.
-    /// NEMOTRON_MTP_ZSKIP_SGS=8 keeps the base's 256-thread threadgroups.
-    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 8 ? 8 : 16
+    /// Eight SIMD groups per original-word slot kernel: four lane partials per
+    /// thread, unchanged lane-to-chunk map and reduction order. The direct uint4
+    /// code loads remove the transpose's register pressure. SGS=16 retains the
+    /// preceding 512-thread geometry for comparison.
+    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 16 ? 16 : 8
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
     /// also falls back to the original slot kernel (and re-checks every layer)
     /// if the staged one misses a bit check.
@@ -1852,7 +1843,7 @@ enum NemotronZSkip {
             let tiles = bank.n / 128, groups = bank.k / 64
             let codes = tiledLayout(
                 [bank.weight], template: [("N", bank.n), ("K", bank.k)],
-                grid: (32 * tiles, bank.k, experts), threadGroup: (32, 8, 1),
+                grid: (32 * tiles, bank.k / 8, experts), threadGroup: (32, 8, 1),
                 outputShapes: [[experts, tiles, bank.k, 32]], outputDTypes: [.uint16])[0]
             func tileMajor(_ a: MLXArray) -> MLXArray {
                 a.reshaped(experts, tiles, 128, groups).transposed(0, 1, 3, 2).contiguous()
