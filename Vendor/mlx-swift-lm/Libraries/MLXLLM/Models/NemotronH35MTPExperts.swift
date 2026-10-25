@@ -902,7 +902,8 @@ enum NemotronMoELeader {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
             return kernel(
-                [bank.weight, bank.scales, bank.biases, packed, inds],
+                [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                 NemotronBankBinding.bind(bank.biases), packed, inds],
                 template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                            ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                            ("RELU2", relu2), ("RPS", rps)],
@@ -914,7 +915,8 @@ enum NemotronMoELeader {
         let kernel = (tail8 ? NemotronMoELeaderKernel.shared.tail8 : nil)
             ?? NemotronMoELeaderKernel.shared.kernel
         return kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds],
+            [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+             NemotronBankBinding.bind(bank.biases), x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
                        ("RELU2", relu2), ("RPS", rps)],
@@ -962,7 +964,8 @@ enum NemotronMoELeader {
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = leaderResultsPerSimdgroup(rows: 3)
-        let result = kernel([bank.weight, bank.scales, bank.biases, packed, inds],
+        let result = kernel([NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                             NemotronBankBinding.bind(bank.biases), packed, inds],
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", false),
                        ("RELU2", relu2), ("RPS", rps)],
@@ -988,7 +991,8 @@ enum NemotronMoELeader {
         let kernel = (tail8 ? NemotronMoELeaderWeightedKernel.shared.tail8 : nil)
             ?? NemotronMoELeaderWeightedKernel.shared.kernel
         return kernel(
-            [bank.weight, bank.scales, bank.biases, x, inds, scores],
+            [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+             NemotronBankBinding.bind(bank.biases), x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n)],
             grid: (32 * (bank.n / 4), 6, 1),
@@ -1274,7 +1278,8 @@ private final class NMLBalanceWeighted: Sendable {
              _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
         let plan = plan ?? NMLBalancePlan.shared.make(ids)
         let kernel = (NemotronMoELeader.fc2Tail8 ? tail8 : nil) ?? self.kernel
-        return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
+        return kernel([NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                       NemotronBankBinding.bind(bank.biases), x, ids, scores, plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
@@ -1656,6 +1661,52 @@ private let nemotronZSkipReduceSource = """
   y[row * N + n] = static_cast<T>(total);
 """
 
+/// MLX commits a command buffer once the distinct input buffers bound in it
+/// exceed its per-buffer budget (`max_mb_per_buffer`, 40-50 MB). An expert
+/// bank is one buffer of hundreds of MB, so every launch that binds a whole
+/// bank ends its command buffer although it reads only the routed experts.
+/// The expert kernels address a bank from its base pointer with their own
+/// constants (never through the bound array's shape or strides), so binding
+/// the bank's first expert, a view of the same MTLBuffer at the same base,
+/// reads the same memory; only MLX's byte count of the binding changes.
+/// NEMOTRON_MTP_BANK_VIEWS=0 binds the whole banks.
+enum NemotronBankBinding {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_BANK_VIEWS"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var views: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+
+    /// The cached `bank[0 ..< 1]` of a bank recorded by `warm`, else the bank.
+    /// Never evaluates (callers may be inside a compile trace).
+    static func bind(_ bank: MLXArray) -> MLXArray {
+        guard enabled else { return bank }
+        if let cached = lock.withLock({ views[ObjectIdentifier(bank)] }), cached.0 === bank {
+            return cached.1
+        }
+        return bank
+    }
+
+    /// Load time, outside any trace: record evaluated first-expert views of
+    /// every switch-linear bank of `model` and of `extra` banks.
+    static func warm(_ model: Module, extra: [MLXArray] = []) {
+        guard enabled else { return }
+        var banks = extra
+        for module in model.modules() {
+            guard let q = module as? QuantizedSwitchLinear else { continue }
+            for (key, value) in q.parameters().flattened()
+            where key == "weight" || key == "scales" || key == "biases" {
+                banks.append(value)
+            }
+        }
+        var made: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for bank in banks where bank.ndim >= 2 && bank.dim(0) > 1 {
+            let view = bank[0 ..< 1]
+            made[ObjectIdentifier(bank)] = (bank, view)
+        }
+        eval(made.values.map { $0.1 })
+        lock.withLock { views.merge(made) { _, new in new } }
+    }
+}
+
 enum NemotronZSkip {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP"] != "0"
     /// Local hosts without room for the whole copy: zero-skip only the first N MoE layers.
@@ -1669,6 +1720,10 @@ enum NemotronZSkip {
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+    /// The load-time copies' arrays (for `NemotronBankBinding.warm`).
+    static var copyArrays: [MLXArray] {
+        lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
 
     private static let layout = MLXFast.metalKernel(
         name: "nemotron_zskip_kmajor_codes", inputNames: ["w"], outputNames: ["wk"],
@@ -1748,7 +1803,8 @@ enum NemotronZSkip {
         let slots = rows * 6
         let threads = 32 * sgs
         return kernel(
-            [copy.codes, copy.scales, copy.biases, x, inds, scores],
+            [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
