@@ -71,10 +71,14 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        (assistant.module.layers[1] as? NemotronH35MTPExpertBlock)?
+            .prepareOwnedSparseDraftDown()
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
+        NemotronRoutedSharedLaunch.verify(target)
+        NemotronRoutedSharedFourRows.verify(target)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMultiRowQMV.warmNarrow()
@@ -107,7 +111,7 @@ extension NemotronH35MTPAssistant {
             warmPostVerifySpeculation()
             return
         }
-        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 2
+        let requested = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] ?? "") ?? 3
         let depth = max(1, min(requested, maximumDraftTokens ?? 7, 7))
         let promptLength = max(8, Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PROMPT"] ?? "") ?? 488)
         let prefillLength = Int(environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_PREFILL"] ?? "") ?? 1024
@@ -293,6 +297,21 @@ extension NemotronH35MTPAssistant {
                     requestState: draftState)
             }
             eval([seed, carry] + evaluationTargets(for: draftState))
+        }
+        // Official-worker private load smoke for the new three-entry prestage
+        // protocol. Consume the exact chained hidden objects, then discard its
+        // ordinary transaction. No request state or warm tokens escape.
+        if depth == 3, NemotronMTPFourRows.enabled {
+            prestageDrafts(token: Int(seed.item(Int32.self)), hidden: carry,
+                requestState: draftState, depth: 3)
+            var tokens = seed, hidden = carry
+            for _ in 0..<3 {
+                let next = draftStep(tokens: tokens, hidden: hidden, shortlist: nil,
+                    requestState: draftState)
+                tokens = next.tokens.reshaped(1, 1)
+                hidden = next.hidden
+            }
+            eval([tokens, hidden] + evaluationTargets(for: draftState))
         }
         // Depth one has no shallower round to consume the prestaged row.
         // Release that private transaction through the ordinary discard path.
