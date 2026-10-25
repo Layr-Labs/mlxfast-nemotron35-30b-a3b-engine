@@ -675,6 +675,11 @@ private let nemotronMambaInProjConvDtEpilogue = """
 """
 
 enum NemotronMambaInProjConvDt {
+    /// SIMD groups per threadgroup (two outputs each): 4 by default. Each
+    /// output keeps its SIMD group's lane split, order and epilogue; only the
+    /// output-to-threadgroup map moves. NEMOTRON_MTP_INPROJ_NSG=2 keeps two.
+    static let simdgroups =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_NSG"] == "2" ? 2 : 4
     /// NEMOTRON_MTP_INPROJ_CONV=0 keeps the separate conv/timestep launch.
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV"] != "0"
@@ -684,11 +689,13 @@ enum NemotronMambaInProjConvDt {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV_CHECK"] == "1"
 
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mamba_in_proj_conv_dt",
+        name: "nemotron_mamba_in_proj_conv_dt" + (simdgroups == 2 ? "" : "_nsg"),
         inputNames: ["w", "scales", "biases", "prepared", "K", "N",
                      "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
         outputNames: ["y", "conv", "padded", "dt"],
-        source: nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
+        source: nemotronPreparedVariantSource(
+            nemotronHeadPreparedQMVSource, load: 0, nsg: simdgroups != 2)
+            + nemotronMambaInProjConvDtEpilogue,
         header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
@@ -724,8 +731,9 @@ enum NemotronMambaInProjConvDt {
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", 2), ("CS", convStart), ("CC", convDim),
-                       ("DS", convStart + convDim), ("NH", heads)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                       ("DS", convStart + convDim), ("NH", heads)]
+                + (simdgroups == 2 ? [] : [("NSG", simdgroups)] as [(String, any KernelTemplateArg)]),
+            grid: (32, n / 2, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
@@ -792,7 +800,12 @@ enum NemotronHeadPreparedActivation {
     static let fastLoadForm = 0
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
-    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
+    /// NEMOTRON_MTP_QMV_NSG4=0 keeps two SIMD groups for out_proj / o_proj
+    /// [4096, 2688] and the shared down [3712, 2688].
+    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NSG4"] == "0"
+        ? [[2688, 131072]: (rps: 2, nsg: 8)]
+        : [[2688, 131072]: (rps: 2, nsg: 8), [4096, 2688]: (rps: 2, nsg: 4), [3712, 2688]: (rps: 2, nsg: 4)]
     static func loadForm(k: Int, n: Int) -> Int {
         loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
     }
