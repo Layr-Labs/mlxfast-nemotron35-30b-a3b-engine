@@ -514,6 +514,125 @@ enum NemotronHeadPreparedActivation {
     }
 }
 
+private let nemotronSharedUpPackHeader = nemotronMultiRowQMVHeader + """
+
+template <typename T, typename U, int values_per_thread>
+inline U nmr_load_vector_tg(const threadgroup T* x, thread U* x_thread) {
+  U sum = 0;
+  for (int i = 0; i < values_per_thread; i += 4) {
+    sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 16.0f;
+    x_thread[i + 2] = x[i + 2] / 256.0f;
+    x_thread[i + 3] = x[i + 3] / 4096.0f;
+  }
+  return sum;
+}
+"""
+
+private func nemotronSharedUpPackSource() -> String {
+    let groups = "constexpr int num_simdgroups = 2;"
+    let store = "yp[r * out_vec_size + row] = h;"
+    precondition(nemotronHeadPreparedQMVSource.components(separatedBy: groups).count == 2)
+    precondition(nemotronHeadPreparedQMVSource.components(separatedBy: store).count == 2)
+    let body = nemotronHeadPreparedQMVSource
+        .replacingOccurrences(of: groups, with: "constexpr int num_simdgroups = 4;")
+        .replacingOccurrences(
+            of: store,
+            with: store + "\n        chunk_h[r][simd_gid * results_per_simdgroup + row] = h;")
+    return "  threadgroup T chunk_h[R][8];\n" + body + """
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < uint(R)) {
+    const int r = int(simd_lid);
+    float values[8];
+    const float total = nmr_load_vector_tg<T, float, 8>(&chunk_h[r][0], values);
+    const int chunk = int(tid.y);
+    const int chunk_tiles = (out_vec_size / 8 + 31) / 32;
+    const int base = (r * chunk_tiles + chunk / 32) * (8 + 1) * 32 + chunk % 32;
+    for (int i = 0; i < 8; i++) packed[base + i * 32] = values[i];
+    packed[base + 8 * 32] = total;
+  }
+"""
+}
+
+enum NemotronSharedUpPacking {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PACK"] != "0"
+    nonisolated(unsafe) private static var verified = false
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_shared_up_relu2_pack_r3",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+        outputNames: ["y", "packed"], source: nemotronSharedUpPackSource(),
+        header: nemotronSharedUpPackHeader)
+
+    private static func dispatch(_ x: MLXArray, _ q: QuantizedLinear,
+                                 prepared: MLXArray?) -> (MLXArray, MLXArray)? {
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 2, x.dim(0) == 3, x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, q.weight.ndim == 2, q.weight.dtype == .uint32,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        let k = x.dim(1), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, q.weight.dim(1) * 8 == k,
+              n >= 2688, n % 8 == 0, n % 512 != 0, NemotronMultiRowQMV.headRPS(n: n) == 2
+        else { return nil }
+        let pv = k % 512 == 0 ? 16 : 8
+        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let outputs = kernel([q.weight, q.scales, biases, input, args.0, args.1],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+                       ("RELU2", true), ("RPS", 2)],
+            grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[3, n], [3, (n / 8 + 31) / 32, 9 * 32]],
+            outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    static func apply(_ x: MLXArray, up: Linear, down: Linear,
+                      prepared: MLXArray?) -> MLXArray? {
+        guard verified, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
+              let q = up as? QuantizedLinear,
+              let fused = dispatch(x.reshaped(3, x.dim(2)), q, prepared: prepared)
+        else { return nil }
+        var activated = fused.0
+        if NemotronMoELeader.selfTest {
+            activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
+                x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
+        }
+        return nemotronMTPLinearRows(
+            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+    }
+
+    static func verify(_ model: Module) {
+        verified = false
+        guard enabled,
+              let mlp = model.modules().lazy.compactMap({ ($0 as? NemotronHMoE)?.sharedExperts }).first,
+              let up = mlp.upProj as? QuantizedLinear
+        else { return }
+        var matches = true
+        for seed in 0 ..< 3 {
+            let x = MLXRandom.normal(
+                [3, up.weight.dim(1) * 8], dtype: .bfloat16,
+                key: MLXRandom.key(UInt64(0x5a17 + seed)))
+            guard let fused = dispatch(x, up, prepared: nil) else { return }
+            let activated = NemotronHeadPreparedActivation.apply(
+                x, up, relu2: true, rps: 2, prepared: nil)
+            let lhs = nemotronMTPLinearRows(
+                fused.0.reshaped(1, 3, up.weight.dim(0)), mlp.downProj, prepared: fused.1)
+            let rhs = nemotronMTPLinearRows(
+                activated.reshaped(1, 3, up.weight.dim(0)), mlp.downProj)
+            let sameUp = (fused.0.view(dtype: .uint16) .== activated.view(dtype: .uint16)).all()
+            let sameDown = (lhs.view(dtype: .uint16) .== rhs.view(dtype: .uint16)).all()
+            matches = matches && sameUp.item(Bool.self) && sameDown.item(Bool.self)
+        }
+        verified = matches
+    }
+}
+
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
