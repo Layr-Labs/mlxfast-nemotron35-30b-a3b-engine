@@ -278,13 +278,26 @@ private final class NemotronMTPDraftHead {
             + " qualified (synthetic agreement \(chosen.agree)/4)")
     }
 
-    /// Committed target tokens a request must have seen within this many
-    /// tokens for its drafts to screen the upper vocabulary half
-    /// (NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW; 0 screens it always).
-    static let upperWindow = Int(
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW"] ?? "") ?? 32
-    static func usesUpper(tokensSinceUpper: Int) -> Bool {
-        upperWindow == 0 || tokensSinceUpper < upperWindow
+    /// A request's drafts screen the upper vocabulary half while it committed
+    /// an upper-half id within this many committed tokens; separately per draft
+    /// position. Break-even per draft: one draft's upper screen costs ~0.4% of a
+    /// round with packed records (~0.01 tokens' worth at ~2.45 tokens per round;
+    /// both drafts' together measured ~0.8%). An upper-half hit is worth
+    /// ~h (1 + a2) ~ 1.08 accepted tokens for the first draft and ~h a1 ~ 0.48
+    /// for the second (h ~0.6, a1 ~0.8, a2 ~0.8), so the first pays above an
+    /// upper-id rate of ~0.9% (one per ~110 tokens) and the second above ~2.0%
+    /// (one per ~49). NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_FIRST / _LATER set
+    /// them; NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW sets both; 0 screens always.
+    private static func window(_ key: String, _ fallback: Int) -> Int {
+        let environment = ProcessInfo.processInfo.environment
+        return Int(environment[key] ?? "")
+            ?? Int(environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW"] ?? "") ?? fallback
+    }
+    static let upperWindowFirst = window("NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_FIRST", 110)
+    static let upperWindowLater = window("NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_LATER", 49)
+    static func usesUpper(tokensSinceUpper: Int, firstDraft: Bool) -> Bool {
+        let window = firstDraft ? upperWindowFirst : upperWindowLater
+        return window == 0 || tokensSinceUpper < window
     }
 
     /// Multi-row twin for the post-verify head rows: the same prefix view
@@ -387,14 +400,23 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// Committed tokens since the last one in the upper vocabulary half
         /// (prompt tail included); Int.max when none has been seen.
         var tokensSinceUpper = Int.max
-        var draftsScreenUpper: Bool {
-            NemotronMTPDraftHead.usesUpper(tokensSinceUpper: tokensSinceUpper)
+        /// Whether a round's first draft (`firstDraft`) or a later one screens
+        /// the upper vocabulary half.
+        func screensUpper(firstDraft: Bool) -> Bool {
+            NemotronMTPDraftHead.usesUpper(tokensSinceUpper: tokensSinceUpper, firstDraft: firstDraft)
         }
         /// The cache-free inputs of the second draft on `deviceFirstDraft`
         /// (`pagedDraftInputs`), queued with it, and the same inputs carried
         /// with `nextFirstDraft` once finalize adopts that first draft.
         var deviceSecondInputs: (inputs: [MLXArray], from: MLXArray)?
         var nextSecondInputs: (inputs: [MLXArray], from: MLXArray)?
+        /// The whole second draft on `deviceFirstDraft` (masked attention over
+        /// the head cache's rows as the device-picked count keeps them), with
+        /// its own K/V row; carried with `nextFirstDraft` once adopted.
+        var deviceSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                                from: MLXArray)?
+        var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
+                              from: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -480,6 +502,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 layerKinds: [kind], promptLength: 0, maxLength: storageLength)
             row = state[0] as! PagedSequenceKV
             cache = backend.makeLayerCaches()[0]
+            cache.nemotronDraftAttention = true
             cache.setRows([row])
         }
 
@@ -542,7 +565,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         if s.prestagedResult != nil || s.prestagedSecond != nil {
             discardRound(requestState: requestState)
         }
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
         precondition(s.stagedInputCount == 0)
         let n = observation.tokens.dim(1)
         precondition(observation.tokens.shape == [1, n] && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
@@ -582,7 +605,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             }
             discardRound(requestState: requestState)
         }
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
         precondition(s.paged != nil, "Nemotron MTP state requires admitted sequence bound")
         precondition(s.stagedInputCount < draftLimit && tokens.shape == [1, 1] && hidden.shape == [1, 1, target.configuration.hiddenSize])
         let first = s.stagedInputCount == 0
@@ -631,7 +654,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
+        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -654,6 +677,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Adopt only when the host's accepted prefix is the device-selected row.
         let deviceFirstDraft = s.hostAcceptedDrafts == n ? s.deviceFirstDraft : nil
         let deviceSecondInputs = deviceFirstDraft == nil ? nil : s.deviceSecondInputs
+        let deviceSecondDraft = deviceFirstDraft == nil ? nil : s.deviceSecondDraft
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
             // target hidden r) after the trusted seed row. Exact-greedy
@@ -678,11 +702,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Build the ordinary one-token tail lazily. The existing prestage
         // submits it only when the engine has a continuing carry.
         s.nextSecondInputs = speculation == nil ? nil : deviceSecondInputs
+        s.nextSecondDraft = speculation == nil ? nil : deviceSecondDraft
         s.nextFirstDraft = speculation.map { spec in
             if let deviceFirstDraft { return deviceFirstDraft }
             let out = module.finishPagedAttentionRow(
                 spec.attention[0..., n ..< (n + 1), 0...])
-            let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
+            let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
             return (ids: ids, out: out,
                     keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
                     values: spec.values[0..., 0..., n ..< (n + 1), 0...])
@@ -704,11 +729,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
         s.deviceFirstDraft = nil; s.hostAcceptedDrafts = nil; s.deviceSecondInputs = nil
+        s.deviceSecondDraft = nil
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
         clearRound(s)
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
         s.paged?.release(); s.paged = nil
         s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil
         s.committedInputCount = 0; s.released = true
@@ -727,7 +753,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     ) {
         let s = state(requestState)
         let next = s.nextFirstDraft
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
         guard s.canPrestageFirstDraft, s.started, s.stagedInputCount == 0,
               s.prestagedResult == nil, s.paged != nil,
               hidden.shape == [1, 1, target.configuration.hiddenSize]
@@ -764,22 +790,32 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
     ) {
         let secondInputs = state(requestState).nextSecondInputs
+        let secondDraft = state(requestState).nextSecondDraft
         prestageFirstDraft(token: token, hidden: hidden, requestState: requestState)
         let s = state(requestState)
         guard depth >= 2, draftLimit >= 2, let first = s.prestagedResult,
               s.prestagedSecond == nil, s.stagedInputCount == 1
         else { return }
-        // On the adopted device-picked first draft, its cache-free part is
-        // already queued (`speculateNextFirstDraft`): same inputs, same ops.
-        let out: MLXArray
-        if let secondInputs, secondInputs.from === first.hidden {
-            out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
+        let out: MLXArray, ids: MLXArray
+        if let secondDraft, secondDraft.from === first.hidden {
+            // The whole second draft already ran behind the verify for this
+            // row (`speculateNextFirstDraft`); only its K/V row is appended, at
+            // the position the round-build step would write it.
+            s.roots += s.cache.appendTrusted(keys: secondDraft.keys, values: secondDraft.values)
+            out = secondDraft.out
+            ids = secondDraft.ids
         } else {
-            out = module.pagedForward(
-                hidden: first.hidden,
-                embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+            // On the adopted device-picked first draft, its cache-free part is
+            // already queued (`speculateNextFirstDraft`): same inputs, same ops.
+            if let secondInputs, secondInputs.from === first.hidden {
+                out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
+            } else {
+                out = module.pagedForward(
+                    hidden: first.hidden,
+                    embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+            }
+            ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: false))
         }
-        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         s.stagedInputCount += 1
         s.roots.append(contentsOf: [out, ids])
         asyncEval([ids, out] + s.arrays)
@@ -838,7 +874,7 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         else { return }
         let row = acceptedDrafts.asType(.int32)
         let out = module.finishPagedAttentionRow(take(spec.attention, row, axis: 1))
-        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
+        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
         // The second draft's cache-free part on this first draft, so after the
@@ -850,7 +886,31 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         let inputs = module.pagedDraftInputs(
             hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        asyncEval([ids, out, keys, values] + inputs)
+        var roots = [ids, out, keys, values] + inputs
+        // The rest of the second draft too: its attention reads the head cache,
+        // which still holds every post-verify row (they sit last). Attend over
+        // the trusted prefix, post-verify rows 0...n for the device-picked n,
+        // and the draft's own row; mask out the rows past n.
+        if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged {
+            let history = paged.row.snapshot()
+            let length = history.keys.dim(2)
+            let firstSpeculated = length - spec.attention.dim(1)
+            let own = module.draftKeyValues(inputs: inputs)
+            let ownKeys = own.keys.asType(history.keys.dtype)
+            let ownValues = own.values.asType(history.values.dtype)
+            let position = MLXArray(Int32(0) ..< Int32(length + 1))
+            let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
+            let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
+            let out2 = module.maskedSecondDraft(
+                inputs: inputs,
+                keys: concatenated([history.keys, ownKeys], axis: 2),
+                values: concatenated([history.values, ownValues], axis: 2), mask: mask)
+            let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
+            s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
+            roots += [ids2, out2, ownKeys, ownValues]
+        }
+        asyncEval(roots)
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {
@@ -877,6 +937,13 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 
 /// NEMOTRON_MTP_DEVICE_SECOND_FRONT=0 builds the whole second draft after
 /// the readback again.
+/// NEMOTRON_MTP_DEVICE_SECOND_DRAFT=0 keeps the second draft's attention and
+/// tail after the readback.
+enum NemotronH35MTPDeviceSecondDraft {
+    static let enabled = NemotronH35MTPDeviceSecondFront.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
+}
+
 enum NemotronH35MTPDeviceSecondFront {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_FRONT"] != "0"
