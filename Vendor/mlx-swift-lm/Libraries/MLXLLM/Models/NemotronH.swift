@@ -955,7 +955,7 @@ private enum NemotronPackedConvKernel {
 private enum NemotronPackedConvDtKernel {
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_packed_conv_silu_dt",
-        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi"],
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A_log"],
         outputNames: ["out", "padded", "dt"],
         source: """
             int64_t channel = int64_t(thread_position_in_grid.x);
@@ -979,7 +979,12 @@ private enum NemotronPackedConvDtKernel {
                 float lo = dtLo;
                 float hi = dtHi;
                 float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
-                dt[position * H + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+                float dtValue = metal::isnan(m) ? m : (m < hi ? m : hi);
+                dt[position * (2 * H) + head] = dtValue;
+                // One identical FP32 decay per head/timestep, shared by all
+                // 64 head channels and 32 recurrence lanes. No state is read.
+                auto A = -fast::exp(static_cast<float>(A_log[head * A_log_strides[0]]));
+                dt[position * (2 * H) + H + head] = fast::exp(A * dtValue);
                 return;
             }
             padded[(position + 3) * C + channel] =
@@ -1123,16 +1128,16 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             conv1d.padding == 0, let bias = conv1d.bias,
             bias.dtype == .bfloat16, bias.shape == [convDim],
             dt.shape == [1, input.dim(1), numHeads], dt.dtype == .bfloat16,
-            dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
+            aLog.shape == [numHeads], dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
             Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
         else { return nil }
         let length = input.dim(1)
         let arrays = NemotronPackedConvDtKernel.kernel(
             [oldState, input, conv1d.weight, bias, dt, dtBias,
-             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), aLog],
             template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads)],
             grid: (convDim + numHeads, length, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads]],
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, 2 * numHeads]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         return (arrays[0], arrays[1], arrays[2])
     }
