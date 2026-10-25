@@ -825,7 +825,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     }
 }
 
-extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
+extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPacketPrestaging {
     /// Queue the next round's first draft for the device-picked row right
     /// behind `speculateAfterVerify`: the same one-token expert/head tail and
     /// K/V row the host path takes from `speculation` at finalize, gathered
@@ -852,6 +852,30 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
         s.deviceSecondInputs = (inputs: inputs, from: out)
         asyncEval([ids, out, keys, values] + inputs)
+    }
+
+    public func speculateNextFirstDraft(
+        packet: MLXArray, draftOffset: Int, targetOffset: Int, k: Int,
+        requestState: any CBv2MTPRequestState
+    ) -> Bool {
+        let s = state(requestState)
+        guard let spec = s.speculation, spec.attention.dim(1) == s.stagedInputCount + 1,
+              let (out, row) = module.finishPagedAttentionAcceptedRow(
+                packet: packet, draftOffset: draftOffset, targetOffset: targetOffset, k: k,
+                rows: spec.attention)
+        else { return false }
+        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
+        let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
+        s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
+            asyncEval([ids, out, keys, values])
+            return true
+        }
+        let inputs = module.pagedDraftInputs(
+            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
+        s.deviceSecondInputs = (inputs: inputs, from: out)
+        asyncEval([ids, out, keys, values] + inputs)
+        return true
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {

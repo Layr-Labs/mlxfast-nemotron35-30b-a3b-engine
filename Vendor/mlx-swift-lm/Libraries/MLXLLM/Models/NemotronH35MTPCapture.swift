@@ -317,6 +317,19 @@ extension NemotronH35Model {
                     state: state, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, steps: width - 1, writeOutput: false)
                 roots += [window.output, window.finalState, replay.finalState]
+                if NemotronHMamba2Mixer.packedDecay {
+                    // The [dt | decay] instantiations the conv/dt launch feeds.
+                    let packed = concatenated([dt, dt], axis: -1)
+                    let pw = nemotronMTPSSMCompact(
+                        convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: packed,
+                        state: state, heads: heads, headDim: dim, groups: groups,
+                        stateDim: stateDim, steps: width, writeOutput: true)
+                    let pr = nemotronMTPSSMCompact(
+                        convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: packed,
+                        state: state, heads: heads, headDim: dim, groups: groups,
+                        stateDim: stateDim, steps: width - 1, writeOutput: false)
+                    roots += [pw.output, pw.finalState, pr.finalState]
+                }
             } else if NemotronMTPExecution.windowSSM {
                 let values = split(convolution,
                     indices: [mixer.intermediateSize, mixer.intermediateSize + groups * stateDim],
