@@ -1546,7 +1546,8 @@ private let nemotronZSkipTiledLayoutSource = """
   for (uint o = 0; o < 4; o++) {
     v |= ((w[((ulong)e * N + n + o) * (K / 8) + k / 8] >> shift) & 0xfu) << (4 * o);
   }
-  wk[(((ulong)e * (N / 128) + t) * K + k) * 32 + lid] = uint16_t(v);
+  wk[(((ulong)e * (N / 128) + t) * (K / 8) + k / 8) * 256
+     + lid * 8 + (k % 4) * 2 + (k % 8) / 4] = uint16_t(v);
 """
 
 // The staged slot kernel on the tile-major copy: the same statements, with
@@ -1574,14 +1575,14 @@ private let nemotronZSkipTiledSeqSource = """
     const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
     uint m = 0;
     for (int i = 0; i < 8; i++) {
-      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      m |= uint(xb[i] & 0x7fff);
       xsh[8 * c + i] = xs[8 * c + i];
     }
-    cmask[c] = uchar(m);
+    cmask[c] = uchar(m != 0);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
-  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;
+  const device uint4* wq = (const device uint4*)wk + tb * K * 4 + lid;
   const device T* sq = sk + tb * groups * OT + 4 * lid;
   const device T* bq = bk + tb * groups * OT + 4 * lid;
   for (int ll = 0; ll < LPS; ll++) {
@@ -1607,12 +1608,8 @@ private let nemotronZSkipTiledSeqSource = """
         xt[i + 2] = xv[i + 2] / 256.0f;
         xt[i + 3] = xv[i + 3] / 4096.0f;
       }
-      uint u[4];
-      for (int i = 0; i < 4; i++) {
-        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
-        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
-        u[i] = lo | (hi << 16);
-      }
+      const uint4 words = wq[c * 32];
+      uint u[4] = {words.x, words.y, words.z, words.w};
       nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
       nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
       nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
@@ -1684,10 +1681,10 @@ enum NemotronZSkip {
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
     private static let tiledLayout = MLXFast.metalKernel(
-        name: "nemotron_zskip_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
+        name: "nemotron_zskip_chunkpacked_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipTiledLayoutSource)
     private static let tiledSlotKernel = MLXFast.metalKernel(
-        name: "nemotron_zskip_fc2_slots_tiled", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        name: "nemotron_zskip_fc2_chunkpacked", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
         outputNames: ["prod"], source: nemotronZSkipTiledSeqSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
