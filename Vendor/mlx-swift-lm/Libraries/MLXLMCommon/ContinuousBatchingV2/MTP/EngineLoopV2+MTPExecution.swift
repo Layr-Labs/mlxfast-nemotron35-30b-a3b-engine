@@ -154,7 +154,8 @@ extension EngineLoopV2 {
         }
 
         func observeCommittedTarget(
-            row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray, hostTokens: [Int] = []
+            row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray, hostTokens: [Int] = [],
+            promptTokens: [Int] = []
         ) throws {
             guard mtp.tracksPersistentHistory, mtpBasicEligible(row.rec),
                 let state = try mtp.takeOrMakeAssistantState(
@@ -162,6 +163,10 @@ extension EngineLoopV2 {
                     maximumSequenceLength: row.rec.request.promptTokens.count
                         + max(row.rec.request.maxTokens, 1))
             else { return }
+            if !promptTokens.isEmpty {
+                (mtp.drafter as? any CBv2MTPPromptTokenObserving)?
+                    .observePromptTokens(promptTokens, requestState: state)
+            }
             if !hostTokens.isEmpty {
                 (mtp.drafter as? any CBv2MTPCommittedTokenObserving)?
                     .observeCommittedTokens(hostTokens, requestState: state)
@@ -389,7 +394,7 @@ extension EngineLoopV2 {
             if let observedHidden {
                 try observeCommittedTarget(
                     row: row, tokens: inputs, hidden: observedHidden,
-                    hostTokens: Array(slice.suffix(64)))
+                    hostTokens: Array(slice.suffix(64)), promptTokens: Array(slice))
                 // The last prompt row's hidden predicted the sampled token,
                 // so it is that token's carry: the first round can verify
                 // [sampled, drafts] without a one-token seed step first.

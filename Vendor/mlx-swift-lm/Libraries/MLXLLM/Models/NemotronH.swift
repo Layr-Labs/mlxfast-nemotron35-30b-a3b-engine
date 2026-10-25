@@ -220,29 +220,6 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumPreparedSource(), ensureRowContiguous: true)
-
-    /// The MoE join reading the routed half as the six weighted slot products
-    /// of its row ([18 * 2688] FP32, slot-major): the zero-skip top-six reduce
-    /// (first slot, then `slot + total` in slot order, BF16 store) runs here
-    /// instead of in its own launch. Every later expression is unchanged.
-    private static func sumProductsPreparedSource() -> String {
-        let add = "T part = rhs[offset + i] + shared[offset + i];"
-        let s = sumPreparedSource()
-        precondition(s.components(separatedBy: add).count == 2)
-        return s.replacingOccurrences(of: add, with: """
-            const size_t column = lid * n_reads + i;
-                            float total = rhs[size_t(gid * 6) * axis_size + column];
-                            for (int j = 1; j < 6; j++) {
-                                total = rhs[size_t(gid * 6 + j) * axis_size + column] + total;
-                            }
-                            T part = static_cast<T>(total) + shared[offset + i];
-            """)
-    }
-    private static let sumProductsPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_products_rms_prepared_bf16",
-        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
-        outputNames: ["residual", "normalized", "prepared"],
-        source: sumProductsPreparedSource(), ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
         name: "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
@@ -284,9 +261,6 @@ enum NemotronHResidualRMSNorm {
     static func applyPreparedRows(
         _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray)? {
-        if rhs.shape == [18 * 2688] {
-            return applyProductsRows(lhs, rhs, shared: shared, norm: norm)
-        }
         guard plumbingRows(lhs, norm: norm),
               rhs.shape == lhs.shape, rhs.dtype == .bfloat16,
               shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
@@ -313,72 +287,6 @@ enum NemotronHResidualRMSNorm {
         let ok = MLX.logicalAnd(
             (outputs[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
             (outputs[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
-        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
-                which(ok, outputs[1], MLXArray(Float.nan).asType(.bfloat16)),
-                which(ok, outputs[2], MLXArray(Float.nan)))
-    }
-
-    /// Set at load by `checkProductsJoin`; the verify asks the MoE for its
-    /// slot products only after the products join matched there.
-    nonisolated(unsafe) static var productsJoinVerified = false
-
-    /// Load time: the products join against the separate top-six reduce plus
-    /// the two-operand join, bit for bit, on seeded rows and a real norm.
-    static func checkProductsJoin(_ model: Module) {
-        productsJoinVerified = false
-        guard plumbingAvailable, let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
-            type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
-        }) else { return }
-        var ok = MLXArray(true)
-        for seed in 0 ..< 3 {
-            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x6a01 + seed)), into: 3)
-            let lhs = MLXRandom.normal([1, 3, 2688], key: keys[0]).asType(.bfloat16)
-            var products = MLXRandom.normal([18 * 2688], scale: 0.05, key: keys[1])
-            if seed == 1 { products = which(abs(products) .< MLXArray(Float(0.03)), MLXArray(Float(0)), products) }
-            let shared = MLXRandom.normal([1, 3, 2688], scale: 0.1, key: keys[2]).asType(.bfloat16)
-            let fused = applyProductsRows(lhs, products, shared: shared, norm: norm)
-            guard let expected = applyPreparedRows(
-                lhs, NemotronZSkip.reduceProducts(products, rows: 3), shared: shared, norm: norm)
-            else { return }
-            ok = MLX.logicalAnd(ok, MLX.logicalAnd(
-                (fused.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
-                (fused.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()))
-        }
-        productsJoinVerified = ok.item(Bool.self)
-        if !productsJoinVerified {
-            FileHandle.standardError.write(
-                Data("nemotron zskip join off: the products join differs from reduce + join\n".utf8))
-        }
-    }
-
-    /// The MoE join over the routed slot products (`NemotronZSkip`): rhs is
-    /// [18 * 2688] FP32, slot-major (row r owns slots 6r ..< 6r + 6).
-    private static func applyProductsRows(
-        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray?, norm: RMSNorm
-    ) -> (MLXArray, MLXArray, MLXArray) {
-        guard plumbingRows(lhs, norm: norm), products.dtype == .float32, let shared,
-              shared.shape == lhs.shape, shared.dtype == .bfloat16 else {
-            // Not reachable on the plumbing route that requested products.
-            let routed = NemotronZSkip.reduceProducts(products, rows: 3)
-            let summed = lhs + (shared.map { routed + $0 } ?? routed)
-            let normalized = norm(summed)
-            return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(3, 2688)))
-        }
-        let (axis, eps) = scalars(norm.eps)
-        let outputs = sumProductsPreparedKernel([lhs, products, shared, norm.weight, axis, eps],
-            template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
-            outputDTypes: [.bfloat16, .bfloat16, .float32])
-        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
-        // Reference: the separate top-six reduce, then the two-operand join.
-        let routed = NemotronZSkip.reduceProducts(products, rows: 3)
-        let expected = applyPreparedRows(lhs, routed, shared: shared, norm: norm)!
-        // The prepared output's padding slots are never written; compare the
-        // residual and the normalized rows it is formed from, as the base does.
-        let ok = MLX.logicalAnd(
-            (outputs[0].view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
-            (outputs[1].view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all())
         return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
                 which(ok, outputs[1], MLXArray(Float.nan).asType(.bfloat16)),
                 which(ok, outputs[2], MLXArray(Float.nan)))
@@ -683,23 +591,12 @@ enum NemotronHPrefillX5 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_X5"] != "0"
     /// The run gather clones the NAX kernel; without NAX stock runs another one.
     static let runGather = enabled && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
-    /// The state update `product + exp(cumsum)[-1] * previous` is one kernel.
-    /// `NEMOTRON_PREFILL_SSM_STATE_UPDATE=0` restores the stock pair.
     static let ssmStateUpdate = enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SSM_STATE_UPDATE"] != "0"
-    /// `dtx * decay` for the state product is written in the GEMM's layout
-    /// by one kernel. `NEMOTRON_PREFILL_SSM_DTX_DECAY=0` restores the stock pair.
     static let ssmDtxDecay = enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SSM_DTX_DECAY"] != "0"
-    /// The SSM window-output kernel also applies `+ x * D` and writes the
-    /// concatenated output. `NEMOTRON_PREFILL_SSM_EPILOGUE=0` restores the
-    /// separate concatenate, multiply and add.
     static let ssmEpilogue = enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SSM_EPILOGUE"] != "0"
-    /// The four kernels above and the prefill router select run only inside the
-    /// engine's request prefill (the seed of the scored decode); the stepper's
-    /// prefill keeps the base graph. `NEMOTRON_PREFILL_SEED_ONLY=0` uses them on
-    /// every multi-token prefill.
     static let seedOnly = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SEED_ONLY"] != "0"
     nonisolated(unsafe) static var requestPrefill = false
     static var active: Bool { !seedOnly || requestPrefill }
@@ -720,11 +617,6 @@ private final class NemotronHScanKernels: Sendable {
     let dtxDecayT: MLXFast.MLXFastKernel
     let windowOutFinal: MLXFast.MLXFastKernel
     private init() {
-        // (dtx * decay) written as the contiguous [B, H, DH, n] array that
-        // `.swappedAxes(1, 2).swappedAxes(2, 3).reshaped(...)` copies it into:
-        // the same single fp32 product per element, one pass instead of the
-        // product and the reshape copy. A 32 x 32 (token, row) tile per
-        // threadgroup keeps both the read and the transposed write coalesced.
         dtxDecayT = MLXFast.metalKernel(
             name: "nemotron_ssm_dtx_decay_t",
             inputNames: ["dtx", "last", "n"], outputNames: ["out"],
@@ -759,9 +651,6 @@ private final class NemotronHScanKernels: Sendable {
                     }
                 }
             """, ensureRowContiguous: false)
-        // nextState = product + ec[..., -1, :, None, None] * previous: the
-        // stock broadcast multiply and add (each one fp32 rounding, in that
-        // order) in one pass over the [B, H, DH, DS] state.
         stateUpdate = MLXFast.metalKernel(
             name: "nemotron_ssm_state_update",
             inputNames: ["prod", "prev", "ec", "n"], outputNames: ["out"],
@@ -864,15 +753,6 @@ private final class NemotronHScanKernels: Sendable {
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                 }
             """, ensureRowContiguous: false)
-        // windowOut with the prefill epilogue `concatenated(outputs) + x * D`
-        // folded in: each token's OT(u) is followed by OT(x * D) and OT(sum),
-        // the two stock bf16 element-wise ops (each a float op rounded once;
-        // a bf16 product is exact in float and float add then rounding is a
-        // correctly rounded bf16 add, so this is bitwise the stock pair).
-        // Token t of the window reads X row xs + t and writes output row
-        // s0 + t. Rows t < s0 come from the earlier windows' epilogued outputs P
-        // (grid.y blocks past this window's), copied into the full [B, LT, H,
-        // DH] output in place of the concatenation.
         windowOutFinal = MLXFast.metalKernel(
             name: "nemotron_ssm_window_out_final",
             inputNames: ["state", "C", "y", "ec", "n", "X", "Dw", "P", "s0", "xs"], outputNames: ["out"],
@@ -1087,8 +967,6 @@ func nemotronSSMAttn(
     let dtx = dt.reshaped(b, l, h, 1) * x
 
     let step = 256
-    // The fused epilogue needs every window on the windowOut path below,
-    // whose dtype conditions hold for an fp32 state and fp32 dtA.
     let fuseEpilogue = NemotronHPrefillX5.ssmEpilogue && NemotronHPrefillX5.active && d == 128 && dh % 32 == 0
         && h % g == 0 && (state?.dtype ?? .float32) == .float32 && dtA.dtype == .float32
         && D.dtype == x.dtype && [DType.bfloat16, .float16, .float32].contains(x.dtype)
@@ -2021,13 +1899,6 @@ enum NemotronHRouterSelection {
             """,
         header: sigmoidHeader, ensureRowContiguous: true)
 
-    /// Prefill rows (L > 8) take the same one-launch selection instead of the
-    /// stock sigmoid / bias / argPartition / takeAlong / sum / divide / scale
-    /// chain: each row is the same 128 scores, the same descending pick with
-    /// the lowest id on ties (the stock arg-sort of a 128-wide row), the same
-    /// sequential six-term sum and the same divide and scale, so indices and
-    /// weights are bitwise the stock chain's at any row count.
-    /// NEMOTRON_PREFILL_ROUTER_SELECT=0 keeps the stock chain for L > 8.
     static let prefillEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_ROUTER_SELECT"] != "0"
 

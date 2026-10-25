@@ -147,8 +147,7 @@ extension NemotronHMoE {
         }
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed,
-            products: parts && NemotronHResidualRMSNorm.plumbingAvailable) {
+            x, indices, scores, switchMLP, prepared: packed) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
@@ -997,12 +996,43 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
+    static func draftRowWeightedReduce(
+        _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
+        _ mlp: NemotronHSwitchMLP, topK: Int
+    ) -> MLXArray? {
+        guard enabled, (1 ..< 6).contains(topK), type(of: mlp) == NemotronHSwitchMLP.self,
+              type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+              type(of: mlp.fc2) == QuantizedSwitchLinear.self,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              indices.dtype == .uint32, indices.shape == [1, 1, 6],
+              scores.dtype == .float32, scores.shape == indices.shape,
+              let up = bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+              let down = bank(mlp.fc2, k: 1856, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336],
+              down.weight.shape == [128, 2688, 232]
+        else { return nil }
+        let flat = indices.reshaped(6)
+        let act = apply(x.reshaped(1, 2688), flat, rows: 1, topK: topK, bank: up,
+            perSlot: false, relu2: true, tail8: leaderTail8)
+        let weighted = (leaderTail8 ? NemotronMoELeaderWeightedKernel.shared.tail8 : nil)
+            ?? NemotronMoELeaderWeightedKernel.shared.kernel
+        return weighted(
+            [down.weight, down.scales, down.biases, act, flat, scores.reshaped(6)],
+            template: [("T", x.dtype), ("R", 1), ("TOPK", topK),
+                       ("K", down.k), ("N", down.n)],
+            grid: (32 * (down.n / 4), topK, 1),
+            threadGroup: (32, topK, 1),
+            outputShapes: [[1, 1, down.n]],
+            outputDTypes: [x.dtype])[0]
+    }
+
     /// The router produces six distinct indices per token. Keep its original
     /// slot order and the accepted cross-row leader pairs. Row-contiguous
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, products: Bool = false
+        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -1042,18 +1072,6 @@ enum NemotronMoELeader {
             balancePlan = nil
         }
         let weights = scores.reshaped(rows * 6)
-        // `products`: the unreduced slot products for the captured verify's
-        // join kernel, which sums them itself (same expressions and order).
-        if products, rows == 3,
-           let prod = NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2) {
-            guard selfTest else { return prod }
-            let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
-            let expected = (original * scores[.ellipsis, .newAxis])
-                .sum(axis: -2).asType(original.dtype)
-            let ok = (NemotronZSkip.reduceProducts(prod, rows: 3).view(dtype: .uint16)
-                .== expected.view(dtype: .uint16)).all()
-            return which(ok, prod, MLXArray(Float.nan))
-        }
         var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
             ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: balancePlan,
                 tail8: leaderTail8)
@@ -1434,103 +1452,6 @@ private let nemotronZSkipSource = """
   }
 """
 
-// Staged twin of the slot kernel: the slot's activations and every chunk's
-// zero mask go to threadgroup memory once per threadgroup (the same mask test),
-// and a lane's four scales (and four biases), four consecutive BF16 values,
-// load as one 8-byte word each and widen by the exact BF16 -> FP32 shift. The
-// chunk sum, the pre-scaled x_thread values (nml_load_vector's expressions),
-// code reads, nibble swaps, qdot, partial order and reduction are unchanged.
-private let nemotronZSkipStagedSource = """
-  constexpr int OT = 128;
-  constexpr int LPS = 32 / SGS;
-  constexpr int chunks = K / 8;
-  constexpr int tail = chunks - 224;
-  constexpr int halves = N / 4;
-  constexpr int groups = K / 64;
-  constexpr int PS = OT + 1;
-  typedef float U;
-  threadgroup float part[32 * PS];
-  threadgroup T xsh[K];
-  threadgroup uchar cmask[chunks];
-
-  const int slot = int(threadgroup_position_in_grid.y);
-  const int n0 = int(threadgroup_position_in_grid.x) * OT;
-  const int lid = int(thread_index_in_simdgroup);
-  const int sg = int(simdgroup_index_in_threadgroup);
-  const uint expert = inds[slot];
-  const device T* xs = x + slot * K;
-  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
-    const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
-    uint m = 0;
-    for (int i = 0; i < 8; i++) {
-      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
-      xsh[8 * c + i] = xs[8 * c + i];
-    }
-    cmask[c] = uchar(m);
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  const device uint16_t* wq = (const device uint16_t*)wk + (ulong)expert * K * halves + n0 / 4 + lid;
-  const ulong sbase = (ulong)expert * groups * N + n0 + 4 * lid;
-  const device T* sq = sk + sbase;
-  const device T* bq = bk + sbase;
-  for (int ll = 0; ll < LPS; ll++) {
-    const int l = sg + SGS * ll;
-    thread U p[4];
-    for (int o = 0; o < 4; o++) {
-      p[o] = 0;
-    }
-    const int count = l < tail ? 8 : 7;
-    for (int j = 0; j < count; j++) {
-      const int c = j < 7 ? l + 32 * j : 224 + l;
-      const uint m = cmask[c];
-      if (m == 0) {
-        continue;
-      }
-      thread U xt[8];
-      U sum = 0;
-      const threadgroup T* xv = xsh + 8 * c;
-      for (int i = 0; i < 8; i += 4) {
-        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
-        xt[i] = xv[i];
-        xt[i + 1] = xv[i + 1] / 16.0f;
-        xt[i + 2] = xv[i + 2] / 256.0f;
-        xt[i + 3] = xv[i + 3] / 4096.0f;
-      }
-      uint u[4];
-      for (int i = 0; i < 4; i++) {
-        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * halves]) : 0u;
-        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * halves]) : 0u;
-        u[i] = lo | (hi << 16);
-      }
-      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
-      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
-      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
-      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
-      const int gi = c / 8;
-      const uint2 sr = *((const device uint2*)(sq + gi * N));
-      const uint2 br = *((const device uint2*)(bq + gi * N));
-      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
-      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
-      for (int o = 0; o < 4; o++) {
-        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
-        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
-      }
-    }
-    for (int o = 0; o < 4; o++) {
-      part[l * PS + 4 * lid + o] = p[o];
-    }
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int q = 0; q < OT / SGS; q++) {
-    const int n = sg * (OT / SGS) + q;
-    const U r = simd_sum(part[lid * PS + n]);
-    if (lid == 0) {
-      const T h = nml_store<T, false>(r);
-      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;
-    }
-  }
-"""
-
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1562,22 +1483,11 @@ enum NemotronZSkip {
     private static let layout = MLXFast.metalKernel(
         name: "nemotron_zskip_kmajor_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipLayoutSource)
-    private static let recordSlotKernel = MLXFast.metalKernel(
+    private static let kernel = MLXFast.metalKernel(
         name: "nemotron_zskip_fc2_slots", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
         outputNames: ["prod"], source: nemotronZSkipSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
-    private static let stagedSlotKernel = MLXFast.metalKernel(
-        name: "nemotron_zskip_fc2_slots_staged", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
-        outputNames: ["prod"], source: nemotronZSkipStagedSource,
-        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
-        ensureRowContiguous: true)
-    /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
-    /// also falls back to the original slot kernel (and re-checks every layer)
-    /// if the staged one misses a bit check.
-    nonisolated(unsafe) private static var staged =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
-    private static var kernel: MLXFast.MLXFastKernel { staged ? stagedSlotKernel : recordSlotKernel }
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
         source: nemotronZSkipReduceSource)
@@ -1592,52 +1502,17 @@ enum NemotronZSkip {
                     biases: bank.biases.swappedAxes(1, 2).contiguous())
     }
 
-    /// x: [rows * 6, 1856] relu2 rows per slot; inds, scores: [rows * 6].
-    /// Returns [1, rows, 2688]. Every slot is its own threadgroup column, so
-    /// the slot kernel is the same for any row count.
-    static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy,
-                    rows: Int = 3) -> MLXArray {
-        reduceProducts(products(x, inds, scores, copy: copy, rows: rows), rows: rows)
-    }
-
-    /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
-    private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
-        let slots = rows * 6
-        return kernel(
+    /// x: [18, 1856] relu2 rows per slot; inds, scores: [18]. Returns [1, 3, 2688].
+    static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy) -> MLXArray {
+        let prod = kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8)],
-            grid: (256 * (2688 / 128), slots, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
-    }
-
-    /// The record's top-six reduce of `products` output: [1, rows, 2688] BF16.
-    static func reduceProducts(_ prod: MLXArray, rows: Int) -> MLXArray {
-        reduce(
-            [prod], template: [("T", DType.bfloat16), ("TOPK", 6), ("N", 2688)],
-            grid: (2688, rows, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, rows, 2688]], outputDTypes: [.bfloat16])[0]
-    }
-
-    /// NEMOTRON_MTP_ZSKIP_JOIN=0 keeps the top-six reduce as its own launch in
-    /// the captured verify; otherwise the MoE layer's join kernel sums the six
-    /// slot products itself (`NemotronHResidualRMSNorm.applyPreparedRows`).
-    static let joinReduce = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] != "0"
-
-    /// True when `owner` (a target layer's routed FC2) has a verified copy.
-    static func covers(_ owner: SwitchLinear) -> Bool {
-        lock.withLock { copies[ObjectIdentifier(owner)] != nil }
-    }
-
-    /// The R = 3 weighted slot products of a target layer ([18 * 2688] FP32,
-    /// slot-major), or nil when `owner` has no verified copy.
-    static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 owner: SwitchLinear) -> MLXArray? {
-        guard joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
-              x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
-              let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+            grid: (256 * (2688 / 128), 18, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[18 * 2688]], outputDTypes: [.float32])[0]
+        return reduce(
+            [prod], template: [("T", x.dtype), ("TOPK", 6), ("N", 2688)],
+            grid: (2688, 3, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 3, 2688]], outputDTypes: [x.dtype])[0]
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
@@ -1656,36 +1531,6 @@ enum NemotronZSkip {
     /// a one-hot slot, tail chunks only, and dense; experts shared across rows).
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
-        var result = build(model)
-        if case .kernelMiss = result, staged {
-            // The staged twin missed a check: the original slot kernel, every layer again.
-            staged = false
-            FileHandle.standardError.write(
-                Data("nemotron zskip: staged slot kernel differs; original slot kernel\n".utf8))
-            result = build(model)
-        }
-        switch result {
-        case .built(let built):
-            lock.withLock { copies = built }
-            FileHandle.standardError.write(Data("nemotron zskip on: \(built.count) MoE layers\n".utf8))
-        case .nonFinite(let layer):
-            lock.withLock { copies = [:] }
-            FileHandle.standardError.write(
-                Data("nemotron zskip off: layer \(layer) has non-finite scales or biases\n".utf8))
-        case .kernelMiss(let layer):
-            lock.withLock { copies = [:] }
-            FileHandle.standardError.write(
-                Data("nemotron zskip off: layer \(layer) differs from the record kernel\n".utf8))
-        }
-    }
-
-    private enum BuildResult {
-        case built([ObjectIdentifier: Copy])
-        case nonFinite(Int)
-        case kernelMiss(Int)
-    }
-
-    private static func build(_ model: Module) -> BuildResult {
         var built: [ObjectIdentifier: Copy] = [:]
         for module in model.modules() {
             guard built.count < layerLimit, let moe = module as? NemotronHMoE,
@@ -1695,11 +1540,16 @@ enum NemotronZSkip {
                   down.biases.shape == down.scales.shape else { continue }
             let copy = makeCopy(down)
             eval(copy.codes, copy.scales, copy.biases)
-            guard finite(down) else { return .nonFinite(built.count) }
-            guard matches(down, copy, seed: built.count) else { return .kernelMiss(built.count) }
+            guard finite(down), matches(down, copy, seed: built.count) else {
+                lock.withLock { copies = [:] }
+                FileHandle.standardError.write(
+                    Data("nemotron zskip off: layer \(built.count) differs from the record kernel\n".utf8))
+                return
+            }
             built[ObjectIdentifier(moe.switchMLP.fc2)] = copy
         }
-        return .built(built)
+        lock.withLock { copies = built }
+        FileHandle.standardError.write(Data("nemotron zskip on: \(built.count) MoE layers\n".utf8))
     }
 
     private static func finite(_ bank: NemotronMoELeader.Bank) -> Bool {
