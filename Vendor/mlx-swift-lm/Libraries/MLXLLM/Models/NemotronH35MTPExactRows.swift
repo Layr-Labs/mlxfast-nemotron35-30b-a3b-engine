@@ -2200,11 +2200,20 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    /// Router rows per threadgroup: one (128 threadgroups) instead of the
+    /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
+    /// order do not depend on which rows share a threadgroup, so the gates,
+    /// indices and weights are the same; `qualify` checks them bit for bit.
+    /// NEMOTRON_MTP_ROUTER_ROWS_PER_TG=4 keeps four rows per threadgroup.
+    static let rowsPerThreadgroup =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_ROWS_PER_TG"] == "4" ? 4 : 1
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_mtp_router_rows_select",
         inputNames: ["w", "x", "K", "N", "bias", "counter"],
         outputNames: ["y", "indices", "weights"],
-        source: nemotronMTPRouterRowsSource + nemotronMTPRouterRowsSelectEpilogue,
+        source: nemotronSwapped(nemotronMTPRouterRowsSource, [
+            ("  constexpr int TM = 4;\n", "  constexpr int TM = \(rowsPerThreadgroup);\n", 1),
+        ]) + nemotronMTPRouterRowsSelectEpilogue,
         header: NemotronHRouterSelection.sigmoidHeader,
         ensureRowContiguous: true, mutableInputs: ["counter"])
 
@@ -2226,7 +2235,7 @@ enum NemotronMTPRouterRowsSelect {
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
         let out = kernel([weight, x, kArray, nArray, bias, counter],
             template: [("T", x.dtype), ("R", rows)],
-            grid: (32 * 32, 8, 1), threadGroup: (32, 8, 1),
+            grid: (32 * (128 / rowsPerThreadgroup), 8, 1), threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128], [1, rows, 6], [1, rows, 6]],
             outputDTypes: [x.dtype, .uint32, .float32])
         return (out[1], out[2])
@@ -2878,6 +2887,95 @@ enum NemotronHeadScreen {
         inputNames: ["rec", "x", "groups", "groups2"],
         outputNames: ["scores"], source: recordPartialSource)
 
+    /// One lane per row: each SIMD group scores 32 consecutive rows, one per
+    /// lane, from the row-interleaved records (`interleaveRecords`: for every
+    /// 32-row block, word w of the 32 rows is one contiguous 128-byte line), so
+    /// every lane is busy (the half-group mapping leaves 8 of 32 lanes idle on
+    /// 12-group rows and 16 on 8-group rows) and no row needs a cross-lane
+    /// reduction. The selected groups' pre-scaled activations and sums are
+    /// staged once per threadgroup. A row's score is the same affine sum of the
+    /// same products, accumulated per 64-value group instead of per 32-value
+    /// half-group, so it can differ from the half-group kernel in the last
+    /// bits; the screen only ranks rows, every kept row is rescored exactly,
+    /// and the plan adopts this kernel only when its picks equal the record
+    /// kernel's (`NemotronMTPDraftHead.prepareScreen`).
+    private static let rowPartialSource = """
+      constexpr int RB = 32;
+      constexpr int XS = 68;
+      constexpr int MAXS = S > S2 ? S : S2;
+      threadgroup float xp[MAXS * XS];
+      const int lane = int(thread_index_in_simdgroup);
+      const int sgi = int(simdgroup_index_in_threadgroup);
+      const int tid = int(thread_index_in_threadgroup);
+      const int tgRow0 = int(threadgroup_position_in_grid.x) * NSG * RB;
+      const bool upper = tgRow0 >= LO;
+      const int SS = upper ? S2 : S;
+      for (int t = tid; t < SS * 64; t += NSG * 32) {
+        const int gi = t >> 6;
+        const int v = t & 63;
+        const int g = int(upper ? groups2[gi] : groups[gi]);
+        const float xv = float(x[g * 64 + v]);
+        const int q = v & 3;
+        xp[gi * XS + v] = q == 0 ? xv : (q == 1 ? xv / 16.0f : (q == 2 ? xv / 256.0f : xv / 4096.0f));
+      }
+      for (int gi = sgi; gi < SS; gi += NSG) {
+        const int g = int(upper ? groups2[gi] : groups[gi]);
+        const float s = simd_sum(float(x[g * 64 + lane]) + float(x[g * 64 + 32 + lane]));
+        if (lane == 0) {
+          xp[gi * XS + 64] = s;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const int row0 = tgRow0 + sgi * RB;
+      const device uint32_t* rp = rec + (upper
+          ? size_t(LO) * (9 * S) + size_t(row0 - LO) * (9 * S2) : size_t(row0) * (9 * S)) + lane;
+      float acc = 0.0f;
+      for (int gi = 0; gi < SS; gi++) {
+        const threadgroup float4* xg = (const threadgroup float4*)(xp + gi * XS);
+        float a = 0.0f;
+        for (int wd = 0; wd < 8; wd++) {
+          const uint word = rp[(gi * 8 + wd) * RB];
+          const float4 x0 = xg[2 * wd];
+          const float4 x1 = xg[2 * wd + 1];
+          a += x0.x * float(word & 0x000fu) + x0.y * float(word & 0x00f0u)
+              + x0.z * float(word & 0x0f00u) + x0.w * float(word & 0xf000u);
+          const uint hi = word >> 16;
+          a += x1.x * float(hi & 0x000fu) + x1.y * float(hi & 0x00f0u)
+              + x1.z * float(hi & 0x0f00u) + x1.w * float(hi & 0xf000u);
+        }
+        const uint sw = rp[(8 * SS + (gi >> 1)) * RB];
+        const uint bw = rp[(8 * SS + ((SS + gi) >> 1)) * RB];
+        const float sc = as_type<float>((gi & 1) != 0 ? (sw & 0xffff0000u) : (sw << 16));
+        const float bi = as_type<float>(((SS + gi) & 1) != 0 ? (bw & 0xffff0000u) : (bw << 16));
+        acc += sc * a + bi * xp[gi * XS + 64];
+      }
+      scores[row0 + lane] = acc;
+    """
+    private static let rowPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_rows_affine4_gs64",
+        inputNames: ["rec", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: rowPartialSource)
+    /// SIMD groups (32 rows each) per threadgroup of the one-lane-per-row partial.
+    static let rowPartialSimdgroups = 8
+    /// NEMOTRON_MTP_HEAD_SCREEN_ROWS=0 keeps the half-group record partial.
+    static let rowPartialEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_ROWS"] != "0"
+
+    /// The row-interleaved copy of `packRecords`' output: for every block of 32
+    /// rows, word w of the 32 rows is contiguous (`[block][w][32]`). The lower
+    /// rows keep 9 * groupCount words per row, the upper ones 9 * upperGroupCount,
+    /// so every block starts where it does in the flat records.
+    static func interleaveRecords(_ records: MLXArray, groupCount: Int, upperGroupCount: Int?) -> MLXArray {
+        func blocks(_ flat: MLXArray, words: Int) -> MLXArray {
+            flat.reshaped(-1, 32, words).transposed(0, 2, 1).reshaped(-1)
+        }
+        let lowerWords = rows * 9 * groupCount
+        let lower = blocks(records[0 ..< lowerWords], words: 9 * groupCount)
+        guard let upperGroupCount else { return lower.contiguous() }
+        let upper = blocks(records[lowerWords...], words: 9 * upperGroupCount)
+        return concatenated([lower, upper], axis: 0).contiguous()
+    }
+
     /// [rows, 2 * groupCount] bf16: each row's selected scales then biases
     /// (rows from `rows` up: the upper group set, zero-padded). Copies of the
     /// head's own bytes, built once at load for the draft screen only.
@@ -3060,7 +3158,8 @@ enum NemotronHeadScreen {
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil,
         counter: MLXArray? = nil,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2,
+        interleaved: MLXArray? = nil
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
@@ -3069,7 +3168,16 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records.map {
+        let rowScores: MLXArray? = interleaved.map {
+            rowPartialKernel(
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: [("T", hidden.dtype), ("S", groupCount), ("LO", Self.rows),
+                           ("S2", upperGroups == nil ? groupCount : upperGroupCount),
+                           ("NSG", rowPartialSimdgroups)],
+                grid: (rows, 1, 1), threadGroup: (32 * rowPartialSimdgroups, 1, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        }
+        let scores = rowScores ?? (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),

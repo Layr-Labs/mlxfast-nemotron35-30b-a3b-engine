@@ -44,6 +44,10 @@ private final class NemotronMTPDraftHead {
         /// Full packed records (`NemotronHeadScreen.packRecords`), adopted the
         /// same way; when set, `packed` is not built.
         var records: MLXArray? = nil
+        /// Row-interleaved records (`NemotronHeadScreen.interleaveRecords`)
+        /// for the one-lane-per-row partial, adopted only when its picks equal
+        /// the record partial's.
+        var interleaved: MLXArray? = nil
         /// Ticket counter of the fused select + final launch
         /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
         /// two-launch path bitwise.
@@ -65,7 +69,7 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records,
-            counter: screen.counter)
+            counter: screen.counter, interleaved: screen.interleaved)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -290,6 +294,50 @@ private final class NemotronMTPDraftHead {
                 return packed
             }
         }
+        // One lane per row on row-interleaved records: adopted only if, on the
+        // synthetic inputs and for each half the plan screens, its pick equals
+        // the record partial's (its scores may differ from the half-group sums
+        // in the last bits; every kept row is still rescored exactly).
+        var rowsNote = "off"
+        if NemotronHeadScreen.rowPartialEnabled, let records = plan.records {
+            do {
+                let adopted = try withError { () -> MLXArray? in
+                    let interleaved = NemotronHeadScreen.interleaveRecords(
+                        records, groupCount: groupCount,
+                        upperGroupCount: plan.upperGroups == nil ? nil : plan.upperGroupCount)
+                    eval(interleaved)
+                    var state: UInt64 = 0x3C6E_F372_FE94_F82B
+                    for _ in 0..<8 {
+                        let t = (0..<k).map { _ -> Float in
+                            state = state &* 6364136223846793005 &+ 1442695040888963407
+                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                        }
+                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                        for half in plan.upperGroups == nil ? [false] : [false, true] {
+                            func screened(_ rowsCopy: MLXArray?) -> MLXArray {
+                                NemotronHeadScreen.run(
+                                    x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                    groups: plan.groups, groupCount: groupCount, chunk: chunk,
+                                    keep: keep, upperGroups: half ? plan.upperGroups : nil,
+                                    upperGroupCount: half ? plan.upperGroupCount : 0,
+                                    packed: plan.packed, records: plan.records,
+                                    interleaved: rowsCopy).id
+                            }
+                            if !(screened(nil) .== screened(interleaved)).all().item(Bool.self) { return nil }
+                        }
+                    }
+                    return interleaved
+                }
+                if let adopted {
+                    plan.interleaved = adopted
+                    rowsNote = "on (picks equal)"
+                } else {
+                    rowsNote = "off (picks differ)"
+                }
+            } catch {
+                rowsNote = "off (\(error))"
+            }
+        }
         // Fused select + final: adopted only if, on synthetic inputs and for
         // each half the plan screens, its id and candidates equal the
         // two-launch path's bitwise, one launch at a time and again with all
@@ -325,7 +373,8 @@ private final class NemotronMTPDraftHead {
                                     groups: plan.groups, groupCount: groupCount, chunk: chunk,
                                     keep: keep, upperGroups: half ? plan.upperGroups : nil,
                                     upperGroupCount: half ? plan.upperGroupCount : 0,
-                                    packed: plan.packed, records: plan.records, counter: counter)
+                                    packed: plan.packed, records: plan.records, counter: counter,
+                                    interleaved: plan.interleaved)
                             }
                             let reference = screened(nil)
                             if !same(reference, screened(counter)) { return nil }
@@ -357,11 +406,12 @@ private final class NemotronMTPDraftHead {
             eval(NemotronHeadScreen.run(
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
-                packed: plan.packed, records: plan.records, counter: plan.counter).id)
+                packed: plan.packed, records: plan.records, counter: plan.counter,
+                interleaved: plan.interleaved).id)
         }
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
-            + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
+            + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), row partial \(rowsNote), fused final \(fusedNote),"
             + " qualified (synthetic agreement \(chosen.agree)/4)")
     }
 
