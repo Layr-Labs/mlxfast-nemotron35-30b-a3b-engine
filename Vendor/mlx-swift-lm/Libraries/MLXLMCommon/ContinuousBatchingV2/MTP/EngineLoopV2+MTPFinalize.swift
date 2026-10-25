@@ -78,6 +78,7 @@ extension EngineLoopV2 {
         // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
         // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
         // fallback in `EngineLoopV2+MTPExecution`).
+        CBv2MTPReadbackSpin.awaitAvailable(verify.acceptancePacket)
         let host = verify.acceptancePacket.asArray(Int32.self)
         CBv2CoreInstrumentation.recordHostSync()
         let policyTopTwoHost: [Float]?
@@ -230,6 +231,8 @@ extension EngineLoopV2 {
             if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
+                (stateful as? any CBv2MTPCommittedTokenObserving)?.observeCommittedTokens(
+                    kept, requestState: state)
                 (stateful as? any CBv2MTPDeviceAcceptedPrestaging)?.noteHostAcceptedDrafts(
                     accepted, requestState: state)
                 stateful.finalizeRound(
@@ -467,6 +470,14 @@ extension CBv2MTPFirstDraftPrestaging {
     }
 }
 
+/// Optional request-stateful drafter capability: the target tokens a request
+/// commits, on the host, in order (the prompt's chunks at prefill, then each
+/// round's confirmed tokens at finalize). Drafters may use them only to choose
+/// how they draft; the target still verifies every proposal.
+public protocol CBv2MTPCommittedTokenObserving: AnyObject {
+    func observeCommittedTokens(_ tokens: [Int], requestState: any CBv2MTPRequestState)
+}
+
 /// Optional: queue the next round's first draft right behind the verify, for
 /// the row the device picks from the acceptance packet, so the head does not
 /// wait for the host's finalize. The host still decides: finalize reports its
@@ -478,6 +489,31 @@ public protocol CBv2MTPDeviceAcceptedPrestaging: CBv2MTPFirstDraftPrestaging {
     func speculateNextFirstDraft(acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState)
     /// Before `finalizeRound`: the host walk's accept count.
     func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState)
+}
+
+/// The acceptance readback polls the packet's completion event instead of
+/// sleeping in the event wait, so the engine thread resumes as soon as the
+/// verify signals rather than after a thread wake-up. Bounded: after the cap it
+/// falls back to the blocking read. Only when the waiting changes, never what
+/// is read. CBV2_MTP_SPIN_READBACK=0 keeps the blocking wait.
+enum CBv2MTPReadbackSpin {
+    static let enabled =
+        ProcessInfo.processInfo.environment["CBV2_MTP_SPIN_READBACK"] != "0"
+    static let capSeconds = 0.05
+
+    static func awaitAvailable(_ packet: MLXArray) {
+        guard enabled else { return }
+        let start = CFAbsoluteTimeGetCurrent()
+        while true {
+            // An inspection error ends the poll; the blocking read reports it.
+            do {
+                if try packet.evaluatedBufferInfo() != nil { return }
+            } catch {
+                return
+            }
+            if CFAbsoluteTimeGetCurrent() - start > capSeconds { return }
+        }
+    }
 }
 
 public enum CBv2MTPFirstDraftPrestage {

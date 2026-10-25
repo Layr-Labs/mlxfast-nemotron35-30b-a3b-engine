@@ -154,7 +154,7 @@ extension EngineLoopV2 {
         }
 
         func observeCommittedTarget(
-            row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
+            row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray, hostTokens: [Int] = []
         ) throws {
             guard mtp.tracksPersistentHistory, mtpBasicEligible(row.rec),
                 let state = try mtp.takeOrMakeAssistantState(
@@ -162,6 +162,10 @@ extension EngineLoopV2 {
                     maximumSequenceLength: row.rec.request.promptTokens.count
                         + max(row.rec.request.maxTokens, 1))
             else { return }
+            if !hostTokens.isEmpty {
+                (mtp.drafter as? any CBv2MTPCommittedTokenObserving)?
+                    .observeCommittedTokens(hostTokens, requestState: state)
+            }
             if let carry = row.historyCarry {
                 mtp.observeCommittedTarget(
                     id: row.rec.id,
@@ -307,12 +311,17 @@ extension EngineLoopV2 {
                 tokens: row.count, packed: false, vision: visionChunk,
                 stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
                 launchNanos: launchNanos)
-            // Configure the request's assistant backing before building any
-            // target prefill layers. Paged allocation fences its stream; doing
-            // it in observeCommittedTarget below would drain the target's
-            // early submissions partway through construction of this graph.
+            // With a default-stream zero-fill (NEMOTRON_PAGED_HOST_ZERO=0),
+            // configure the request's assistant backing before building any
+            // target prefill layers: that paged allocation fences the GPU
+            // stream, and doing it in observeCommittedTarget below would drain
+            // the target's early submissions partway through this graph. The
+            // default host zero-fill runs on the CPU stream and fences only
+            // that, so observeCommittedTarget allocates it after the target
+            // prefill's early chunks are queued, under GPU work.
             // Keep ownership in the driver until the observation detaches it.
-            if !visionChunk, mtp.tracksPersistentHistory, mtpBasicEligible(rec),
+            if !pagedSegmentHostZeroFill, !visionChunk, mtp.tracksPersistentHistory,
+                mtpBasicEligible(rec),
                 let state = try mtp.takeOrMakeAssistantState(
                     for: rec.id,
                     maximumSequenceLength: rec.request.promptTokens.count
@@ -378,7 +387,9 @@ extension EngineLoopV2 {
                     requirement: requirement)
             }
             if let observedHidden {
-                try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
+                try observeCommittedTarget(
+                    row: row, tokens: inputs, hidden: observedHidden,
+                    hostTokens: Array(slice.suffix(64)))
                 // The last prompt row's hidden predicted the sampled token,
                 // so it is that token's carry: the first round can verify
                 // [sampled, drafts] without a one-token seed step first.

@@ -196,9 +196,91 @@ inline U nml_load_vector_safe(const device T* x, thread U* x_thread, int N) {
   return sum;
 }
 
+// R = 3 verify (HALF): the same masked coefficients, decoded off the
+// int->float pipe. n0 and n1 of a word pair come from one 32-bit AND/OR into
+// half2 magic numbers 1024 + v, minus 1024; n2 and n3 through ushort -> half.
+// Every value has <= 4 significant bits and is <= 61440, so each float operand,
+// the FP32 terms, their order and the affine close match the record's helpers.
 template <typename U, int values_per_thread>
+inline U nml_qdot_half(
+    const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum) {
+  U accum = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  const device uint* ws2 = (const device uint*)w;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const uint w2 = ws2[i / 2];
+    const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+    const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+    const U a = U(h0[i % 2]);
+    const U b1 = U(h1[i % 2]);
+    const U c = U(half(ushort(ws[i] & 0x0f00)));
+    const U d = U(half(ushort(ws[i] & 0xf000)));
+    accum +=
+        (x_thread[4 * i] * a +
+         x_thread[4 * i + 1] * b1 +
+         x_thread[4 * i + 2] * c +
+         x_thread[4 * i + 3] * d);
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename U, int values_per_thread>
+inline U nml_qdot_safe_half(
+    const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum,
+    int N) {
+  U accum = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  const device uint* ws2 = (const device uint*)w;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    if (i < N / 4) {
+      const uint w2 = ws2[i / 2];
+      const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+      const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+      const U a = U(h0[i % 2]);
+      const U b1 = U(h1[i % 2]);
+      const U c = U(half(ushort(ws[i] & 0x0f00)));
+      const U d = U(half(ushort(ws[i] & 0xf000)));
+      accum +=
+          (x_thread[4 * i] * a +
+           x_thread[4 * i + 1] * b1 +
+           x_thread[4 * i + 2] * c +
+           x_thread[4 * i + 3] * d);
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename U, int values_per_thread>
+inline void nml_qdot_pair_half(
+    const device uint8_t* w, const thread U* x0, const thread U* x1,
+    U scale, U bias, U sum0, U sum1, int N, thread U& value0, thread U& value1) {
+  U accum0 = 0;
+  U accum1 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  const device uint* ws2 = (const device uint*)w;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    if (i < N / 4) {
+      const uint w2 = ws2[i / 2];
+      const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+      const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+      const U a = U(h0[i % 2]);
+      const U b1 = U(h1[i % 2]);
+      const U c = U(half(ushort(ws[i] & 0x0f00)));
+      const U d = U(half(ushort(ws[i] & 0xf000)));
+      accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b1 + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+      accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b1 + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+    }
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+}
+
+template <typename U, int values_per_thread, bool HALF = false>
 inline U nml_qdot(
     const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum) {
+  if (HALF) {
+    return nml_qdot_half<U, values_per_thread>(w, x_thread, scale, bias, sum);
+  }
   U accum = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < (values_per_thread / 4); i++) {
@@ -211,10 +293,13 @@ inline U nml_qdot(
   return scale * accum + sum * bias;
 }
 
-template <typename U, int values_per_thread>
+template <typename U, int values_per_thread, bool HALF = false>
 inline U nml_qdot_safe(
     const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum,
     int N) {
+  if (HALF) {
+    return nml_qdot_safe_half<U, values_per_thread>(w, x_thread, scale, bias, sum, N);
+  }
   U accum = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < (N / 4); i++) {
@@ -230,10 +315,15 @@ inline U nml_qdot_safe(
 // A leader and its partner share one expert's weights. Each packed word and
 // its four masked coefficients are decoded once and fed to two independent
 // accumulators, each with the stock per-token term order and affine close.
-template <typename U, int values_per_thread>
+template <typename U, int values_per_thread, bool HALF = false>
 inline void nml_qdot_pair(
     const device uint8_t* w, const thread U* x0, const thread U* x1,
     U scale, U bias, U sum0, U sum1, int N, thread U& value0, thread U& value1) {
+  if (HALF) {
+    nml_qdot_pair_half<U, values_per_thread>(
+        w, x0, x1, scale, bias, sum0, sum1, N, value0, value1);
+    return;
+  }
   U accum0 = 0;
   U accum1 = 0;
   const device uint16_t* ws = (const device uint16_t*)w;
@@ -364,7 +454,7 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result[r] += nml_qdot<U, values_per_thread>(wl, x_thread, s, b, sum);
+        result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
       }
       ws += block_size / 2;
       sc += block_size / 64;
@@ -381,7 +471,7 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result[r] += nml_qdot_safe<U, values_per_thread>(
+        result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
             wl, x_thread, s, b, sum, remaining);
       }
     }
@@ -410,7 +500,7 @@ private let nemotronMoELeaderSource = """
         U s = sl[0];
         U b = bl[0];
         U value0, value1;
-        nml_qdot_pair<U, values_per_thread>(
+        nml_qdot_pair<U, values_per_thread, R == 3>(
             wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
         result0[r] += value0;
         result1[r] += value1;
@@ -433,7 +523,7 @@ private let nemotronMoELeaderSource = """
         U s = sl[0];
         U b = bl[0];
         U value0, value1;
-        nml_qdot_pair<U, values_per_thread>(
+        nml_qdot_pair<U, values_per_thread, R == 3>(
             wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
         result0[r] += value0;
         result1[r] += value1;
@@ -551,7 +641,7 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result[r] += nml_qdot<U, values_per_thread>(wl, x_thread, s, b, sum);
+          result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
         }
         ws += block_size / 2;
         sc += block_size / 64;
@@ -568,7 +658,7 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result[r] += nml_qdot_safe<U, values_per_thread>(
+          result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
               wl, x_thread, s, b, sum, remaining);
         }
       }
@@ -596,7 +686,7 @@ private let nemotronMoELeaderWeightedSource = """
           U s = sl[0];
           U b = bl[0];
           U value0, value1;
-          nml_qdot_pair<U, values_per_thread>(
+          nml_qdot_pair<U, values_per_thread, R == 3>(
               wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
           result0[r] += value0;
           result1[r] += value1;
@@ -619,7 +709,7 @@ private let nemotronMoELeaderWeightedSource = """
           U s = sl[0];
           U b = bl[0];
           U value0, value1;
-          nml_qdot_pair<U, values_per_thread>(
+          nml_qdot_pair<U, values_per_thread, R == 3>(
               wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
           result0[r] += value0;
           result1[r] += value1;
