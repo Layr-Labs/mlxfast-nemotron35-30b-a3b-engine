@@ -471,6 +471,55 @@ func nemotronSBDictSource(_ source: String) -> String? {
     return s
 }
 
+/// Native prepared QMV lanes in one 64-value group address the same pair.
+/// Exchange the original FP32 payload bits, without a new table or format.
+enum NemotronPreparedPairBroadcast {
+    nonisolated(unsafe) static var enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREPARED_PAIR_BROADCAST"] != "0"
+}
+
+func nemotronPreparedBroadcastSBDictSource(_ source: String) -> String? {
+    guard source.contains("constexpr int group_size = 64;"),
+          source.contains("constexpr int scale_step_per_thread = group_size / values_per_thread;"),
+          source.contains("const uint simd_lid = thread_index_in_simdgroup;"),
+          var s = nemotronSBDictSource(source) else { return nil }
+    // `K` is the launch's scalar input, so incomplete groups keep the
+    // original per-lane reads. Native eligible callers have K % 64 == 0.
+    func read(_ index: String, tag: String) -> String {
+        """
+        uint2 nml_pair_\(tag) = uint2(0);
+        const uint nml_src_\(tag) = simd_lid - simd_lid % scale_step_per_thread;
+        if (K % group_size != 0 || simd_lid == nml_src_\(tag)) {
+          const float2 nml_value_\(tag) = sbt[\(index)];
+          nml_pair_\(tag) = as_type<uint2>(nml_value_\(tag));
+        }
+        if (K % group_size == 0) {
+          nml_pair_\(tag).x = simd_shuffle(nml_pair_\(tag).x, ushort(nml_src_\(tag)));
+          nml_pair_\(tag).y = simd_shuffle(nml_pair_\(tag).y, ushort(nml_src_\(tag)));
+        }
+        """
+    }
+    let direct = "const float2 sbp = sbt[sl[0]];"
+    var replacements = s.components(separatedBy: direct).count - 1
+    s = s.replacingOccurrences(of: direct,
+        with: read("sl[0]", tag: "direct") + "\n        const float2 sbp = as_type<float2>(nml_pair_direct);")
+    for (name, next) in [("v", false), ("n", true)] {
+        let index = (next ? "block_size / group_size + " : "") + "row * in_vec_size_g"
+        let from = "s\(name)[row] = sbt[sc[\(index)]].x;\n"
+            + "      b\(name)[row] = sbt[bs[\(index)]].y;"
+        replacements += s.components(separatedBy: from).count - 1
+        s = s.replacingOccurrences(of: from,
+            with: read("sc[\(index)]", tag: name)
+                + "\n      s\(name)[row] = as_type<float>(nml_pair_\(name).x);"
+                + "\n      b\(name)[row] = as_type<float>(nml_pair_\(name).y);")
+    }
+    guard replacements > 0, !s.contains(direct),
+          !s.contains("sv[row] = sbt["), !s.contains("bv[row] = sbt["),
+          !s.contains("sn[row] = sbt["), !s.contains("bn[row] = sbt[") else { return nil }
+    return s
+}
+
+
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
@@ -1873,6 +1922,190 @@ private let nemotronZSkipTiledFastSource = """
   }
 """
 
+// Two consecutive occurrences of the same current-call expert share code
+// words and coefficients. Each slot keeps every original lane partial and
+// its own rounding/score boundary. Follower return precedes all barriers.
+private let nemotronZSkipCrossSlotSource = """
+  constexpr int OT = 128;
+  constexpr int LPS = 32 / SGS;
+  constexpr int chunks = K / 8;
+  constexpr int tail = chunks - 224;
+  constexpr int groups = K / 64;
+  constexpr int PS = OT + 1;
+  typedef float U;
+  threadgroup float part[32 * PS];
+  threadgroup T xsh[2 * K];
+  threadgroup uchar cmask[2 * chunks];
+
+  const int slot = int(threadgroup_position_in_grid.y);
+  const int n0 = int(threadgroup_position_in_grid.x) * OT;
+  const int lid = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const uint expert = inds[slot];
+  int before = 0;
+  for (int s = 0; s < slot; s++) {
+    before += inds[s] == expert ? 1 : 0;
+  }
+  if ((before & 1) != 0) {
+    return;
+  }
+  int partner = -1;
+  for (int s = slot + 1; s < SLOTS; s++) {
+    if (inds[s] == expert) {
+      partner = s;
+      break;
+    }
+  }
+  const int countSlots = partner < 0 ? 1 : 2;
+  const int members[2] = {slot, partner};
+  const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
+  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;
+  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;
+  const device float2* sbt = (const device float2*)bk;
+  for (int v = 0; v < countSlots; v++) {
+    const device T* xs = x + members[v] * K;
+    for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+      const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+      uint m = 0;
+      for (int i = 0; i < 8; i++) {
+        m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+        xsh[v * K + 8 * c + i] = xs[8 * c + i];
+      }
+      cmask[v * chunks + c] = uchar(m);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  thread U p[2][LPS][4];
+  _Pragma("clang loop unroll(full)")
+  for (int v = 0; v < 2; v++) {
+    _Pragma("clang loop unroll(full)")
+    for (int ll = 0; ll < LPS; ll++) {
+      for (int o = 0; o < 4; o++) {
+        p[v][ll][o] = 0;
+      }
+    }
+  }
+  _Pragma("clang loop unroll(full)")
+  for (int ll = 0; ll < LPS; ll++) {
+    const int l = sg + SGS * ll;
+    const int count = l < tail ? 8 : 7;
+    for (int j = 0; j < count; j++) {
+      const int c = j < 7 ? l + 32 * j : 224 + l;
+      const uint mask0 = cmask[c];
+      const uint mask1 = countSlots == 2 ? cmask[chunks + c] : 0u;
+      const uint unionMask = mask0 | mask1;
+      if (unionMask == 0) {
+        continue;
+      }
+      uint words[4];
+      for (int i = 0; i < 4; i++) {
+        const uint lo = (unionMask & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+        const uint hi = (unionMask & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+        words[i] = lo | (hi << 16);
+      }
+      const int gi = c / 8;
+      const uint2 ir = *((const device uint2*)(sq + gi * OT));
+      const float2 e0 = sbt[ir.x & 0xffffu];
+      const float2 e1 = sbt[ir.x >> 16];
+      const float2 e2 = sbt[ir.y & 0xffffu];
+      const float2 e3 = sbt[ir.y >> 16];
+      const uint sv[4] = {as_type<uint>(e0.x), as_type<uint>(e1.x), as_type<uint>(e2.x), as_type<uint>(e3.x)};
+      const uint bv[4] = {as_type<uint>(e0.y), as_type<uint>(e1.y), as_type<uint>(e2.y), as_type<uint>(e3.y)};
+      _Pragma("clang loop unroll(full)")
+      for (int v = 0; v < 2; v++) {
+        if (v >= countSlots) {
+          continue;
+        }
+        const uint m = v == 0 ? mask0 : mask1;
+        if (m == 0) {
+          continue;
+        }
+        const threadgroup T* xv = xsh + v * K + 8 * c;
+        if (popcount(m) == 1) {
+          const int j1 = ctz(m);
+          const T xvj = xv[j1];
+          const int jq = j1 & 3;
+          const U xtj = jq == 0 ? U(xvj) : (jq == 1 ? xvj / 16.0f : (jq == 2 ? xvj / 256.0f : xvj / 4096.0f));
+          const U sum1 = U(xvj);
+          const uint w = (words[j1 & 3] >> ((j1 & 4) * 4)) & 0xffffu;
+          for (int o = 0; o < 4; o++) {
+            const uint code = ((w >> (4 * o)) & 0xfu) << (4 * jq);
+            U accum = 0;
+            accum += xtj * U(int(code));
+            p[v][ll][o] += as_type<float>(sv[o]) * accum + sum1 * as_type<float>(bv[o]);
+          }
+          continue;
+        }
+        if (popcount(m) == 2) {
+          const int j1 = ctz(m);
+          const int j2 = ctz(m & (m - 1));
+          const uint w1 = (words[j1 & 3] >> ((j1 & 4) * 4)) & 0xffffu;
+          const uint w2 = (words[j2 & 3] >> ((j2 & 4) * 4)) & 0xffffu;
+          const T xv1 = xv[j1];
+          const T xv2 = xv[j2];
+          const int q1 = j1 & 3;
+          const int q2 = j2 & 3;
+          const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
+          const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+          const U sum2 = U(xv1) + U(xv2);
+          for (int o = 0; o < 4; o++) {
+            const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
+            const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+            const U accum = xt1 * c1 + xt2 * c2;
+            p[v][ll][o] += as_type<float>(sv[o]) * accum + sum2 * as_type<float>(bv[o]);
+          }
+          continue;
+        }
+        thread U xt[8];
+        U sum = 0;
+        for (int i = 0; i < 8; i += 4) {
+          sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+          xt[i] = xv[i];
+          xt[i + 1] = xv[i + 1] / 16.0f;
+          xt[i + 2] = xv[i + 2] / 256.0f;
+          xt[i + 3] = xv[i + 3] / 4096.0f;
+        }
+        uint u[4];
+        for (int i = 0; i < 4; i++) {
+          const uint lo = (m & (1u << i)) != 0 ? words[i] & 0xffffu : 0u;
+          const uint hi = (m & (16u << i)) != 0 ? words[i] & 0xffff0000u : 0u;
+          u[i] = lo | hi;
+        }
+        nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+        nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+        nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+        nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+        for (int o = 0; o < 4; o++) {
+          const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+          p[v][ll][o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+        }
+      }
+    }
+  }
+  for (int v = 0; v < countSlots; v++) {
+    _Pragma("clang loop unroll(full)")
+    for (int ll = 0; ll < LPS; ll++) {
+      const int l = sg + SGS * ll;
+      for (int o = 0; o < 4; o++) {
+        part[l * PS + 4 * lid + o] = p[v][ll][o];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int q = 0; q < OT / SGS; q++) {
+      const int n = sg * (OT / SGS) + q;
+      const U r = simd_sum(part[lid * PS + n]);
+      if (lid == 0) {
+        const T h = nml_store<T, false>(r);
+        prod[members[v] * N + n0 + n] = float(h) * scores[members[v]] + 0.0f;
+      }
+    }
+    if (v + 1 < countSlots) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+"""
+
+
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
 // tile-major uint16 pair index (one per group and output) and `bk` the bank's
@@ -2030,7 +2263,16 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    /// The slot kernel that reads a dictionary copy (the fast or plain tiled form).
+    private static let crossSlotPairKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_cross_slot_pairs_sbd",
+        inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"],
+        source: nemotronZSkipCrossSlotSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    /// Current-call expert pairs only; no route or result is cached.
+    nonisolated(unsafe) private static var crossSlotPair =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_CROSS_SLOT_PAIR"] != "0"
+    /// The original8415 dictionary kernel, retained as the raw-product reference.
     private static var dictKernel: MLXFast.MLXFastKernel? {
         fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
     }
@@ -2102,15 +2344,41 @@ enum NemotronZSkip {
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, useCrossSlotPair: Bool = true) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
+        let inputs = [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+                      NemotronBankBinding.bind(copy.biases), x, inds, scores]
+        if rows == 3, copy.dict, tiled, fast, crossSlotPair, useCrossSlotPair {
+            return crossSlotPairKernel(inputs,
+                template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs),
+                           ("SLOTS", slots)],
+                grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+        }
         return (copy.dict ? dictKernel! : kernel)(
-            [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
-             NemotronBankBinding.bind(copy.biases), x, inds, scores],
+            inputs,
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+    }
+
+    /// Worker load only: compare all new slot-product bits with the untouched
+    /// dictionary twin. A refusal disables only cross-slot scheduling before
+    /// trying any of the record's independent dictionary/fast/layout fallbacks.
+    private static func crossSlotProductsMatch(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                                              copy: Copy, rows: Int) -> Bool {
+        guard copy.dict, rows == 3, fast, crossSlotPair else { return true }
+        do {
+            return try withError {
+                let staged = products(x, inds, scores, copy: copy, rows: rows)
+                let original = products(x, inds, scores, copy: copy, rows: rows,
+                                        useCrossSlotPair: false)
+                return (staged.view(dtype: .uint32) .== original.view(dtype: .uint32)).all().item(Bool.self)
+            }
+        } catch {
+            return false
+        }
     }
 
     /// The record's top-six reduce of `products` output: [1, rows, 2688] BF16.
@@ -2256,6 +2524,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, sbDict, fast, crossSlotPair {
+            crossSlotPair = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: cross-slot products differ; original slot schedule\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
             sbDict = false
@@ -2289,7 +2563,7 @@ enum NemotronZSkip {
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
             FileHandle.standardError.write(
-                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, cross-slot pairs \(crossSlotPair && fast)\n".utf8))
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
@@ -2347,9 +2621,18 @@ enum NemotronZSkip {
                            which(slot .== MLXArray(Int32(8)), oneHot, which(keep, h, zero)))
         let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
         let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[2])
+        if copy.dict, fast, crossSlotPair {
+            let allSame = MLXArray([UInt32](repeating: offset % 128, count: 18))
+            let distinct = MLXArray((0 ..< 18).map { (UInt32($0) + offset) % 128 })
+            let boundary = which(column .< MLXArray(Int32(8)), h, tail).asType(.bfloat16)
+            for extra in [allSame, distinct] {
+                guard crossSlotProductsMatch(boundary, extra, scores, copy: copy, rows: 3) else { return false }
+            }
+        }
         var same = MLXArray(true)
         for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
             let act = (a * a).asType(.bfloat16)
+            guard crossSlotProductsMatch(act, inds, scores, copy: copy, rows: 3) else { return false }
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
@@ -2737,7 +3020,14 @@ enum NemotronSBDict {
             }
         }
         lock.withLock { dicts = built }
-        let (same, fc1, shapes) = checkKernels(model)
+        var check = checkKernelsSafely(model)
+        if !check.0, NemotronPreparedPairBroadcast.enabled {
+            NemotronPreparedPairBroadcast.enabled = false
+            FileHandle.standardError.write(Data(
+                "nemotron prepared pair broadcast refused; original dictionary readers\n".utf8))
+            check = checkKernelsSafely(model)
+        }
+        let (same, fc1, shapes) = check
         guard same else {
             lock.withLock { dicts = [:] }
             FileHandle.standardError.write(
@@ -2746,6 +3036,14 @@ enum NemotronSBDict {
         }
         FileHandle.standardError.write(Data(
             "nemotron sb dict on: \(built.count) tensors, \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
+    }
+
+    private static func checkKernelsSafely(_ model: Module) -> (Bool, Int, [[Int]]) {
+        do {
+            return try withError { checkKernels(model) }
+        } catch {
+            return (false, 0, [])
+        }
     }
 
     private static func checkKernels(_ model: Module) -> (Bool, Int, [[Int]]) {
@@ -2758,7 +3056,7 @@ enum NemotronSBDict {
         var shapes: [[Int]] = []
         var inProj = false, sharedUp = false
         for module in model.modules() {
-            if !inProj, let mixer = module as? NemotronHMamba2Mixer,
+            if (NemotronPreparedPairBroadcast.enabled || !inProj), let mixer = module as? NemotronHMamba2Mixer,
                let q = mixer.inProj as? QuantizedLinear, dict(q) != nil,
                NemotronMambaInProjConvDt.dictAvailable, let convBias = mixer.conv1d.bias {
                 let xk = (MLXRandom.normal([3, 2688], key: keys[1]) * 0.5).asType(.bfloat16)
@@ -2779,7 +3077,7 @@ enum NemotronSBDict {
                     inProj = true
                 }
             }
-            if !sharedUp, let q = module as? QuantizedLinear, dict(q) != nil,
+            if (NemotronPreparedPairBroadcast.enabled || !sharedUp), let q = module as? QuantizedLinear, dict(q) != nil,
                q.weight.shape == [3712, 336] {
                 let xk = (MLXRandom.normal([3, 2688], key: keys[1]) * 0.5).asType(.bfloat16)
                 if let ok = NemotronSharedUpPacking.dictMatches(xk, q) {
@@ -2802,8 +3100,8 @@ enum NemotronSBDict {
             } else if let q = module as? QuantizedLinear, dict(q) != nil {
                 let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
                 guard NemotronHeadPreparedActivation.dictLaunchAvailable(k: k, n: n),
-                      !shapes.contains([k, n]) else { continue }
-                shapes.append([k, n])
+                      NemotronPreparedPairBroadcast.enabled || !shapes.contains([k, n]) else { continue }
+                if !shapes.contains([k, n]) { shapes.append([k, n]) }
                 let xk = (MLXRandom.normal([3, k], key: keys[1]) * 0.5).asType(.bfloat16)
                 let rps = n == 131072 ? NemotronMultiRowQMV.headRPS(n: n) : 2
                 for relu2 in [false, true] {
