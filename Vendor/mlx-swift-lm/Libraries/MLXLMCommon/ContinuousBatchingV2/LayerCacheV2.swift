@@ -181,6 +181,38 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return outputs
     }
 
+    /// CBV2_KV_IN_PLACE_APPEND: where a producer kernel may write the next
+    /// `count` tokens' K/V of the single bound row directly, for the same
+    /// configuration `updateAndAttendSerialQueryRows` serves. nil (and
+    /// nothing changed) otherwise.
+    public func mtpInPlaceKVTarget(count: Int, dtype: DType, headDim: Int)
+        -> (keys: MLXArray, values: MLXArray, offset: Int, capacity: Int)?
+    {
+        guard kind.sharesKVWithLayer == nil, mtpSerializesRectangularAttention,
+              rows.count == 1, count > 1,
+              attentionSoftcap == nil, attentionMetadata == nil, attentionPacket == nil,
+              boundSpanContexts?.contains(where: { $0 != nil }) != true,
+              let row = rows[0] as? CBv2FullSequenceKV
+        else { return nil }
+        return row.inPlaceAppendTarget(count: count, dtype: dtype, headDim: headDim)
+    }
+
+    /// `updateAndAttendSerialQueryRows` after the producer kernel wrote the
+    /// new K/V into the target from `mtpInPlaceKVTarget` (`written` is any
+    /// output of that kernel). Same per-query SDPA calls and offset advance.
+    public func updateAndAttendSerialQueryRowsWritten(
+        queries: MLXArray, written: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> [MLXArray] {
+        guard let row = rows[0] as? CBv2FullSequenceKV else {
+            preconditionFailure("CBv2LayerCache: in-place KV append on a non-contiguous row")
+        }
+        let outputs = CBv2AttentionV1.attendSerialQueryRowsWritten(
+            row: row, kind: kind, queries: queries, written: written,
+            scale: scale, sinks: sinks, softcap: attentionSoftcap)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        return outputs
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk

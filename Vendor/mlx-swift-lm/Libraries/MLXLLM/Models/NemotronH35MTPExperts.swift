@@ -397,6 +397,35 @@ private func nmlPreparedSource(_ source: String, pointers: [(String, String)]) -
     return "  constexpr int PSTRIDE = 9 * 32;\n  constexpr int PTILES = (K / 8 + 31) / 32;\n" + s
 }
 
+/// Tail block in its constant 8-value form (NEMOTRON_MTP_FC1_TAIL8 /
+/// NEMOTRON_MTP_FC2_TAIL8). With 8 values per lane and K % 8 == 0, a lane's
+/// tail `remaining` is 0 or 8, and the tail body runs only when it is 8. At
+/// N = 8 every `_safe` load equals the full load and every qdot with N = 8
+/// equals the main-loop call: same loads, same terms, same order and rounding.
+private func nmlTail8Source(_ source: String) -> String? {
+    let typedef = "  typedef float U;\n"
+    guard source.components(separatedBy: typedef).count == 2 else { return nil }
+    var s = source.replacingOccurrences(of: typedef, with:
+        "  static_assert(K % values_per_thread == 0, \"tail lanes hold 8 values\");\n" + typedef)
+    for x in ["x0, x_thread", "x0, x0_thread", "x1, x1_thread", "x2, x2_thread"] {
+        s = s.replacingOccurrences(
+            of: "nml_load_vector_safe<T, U, values_per_thread>(\(x), remaining)",
+            with: "nml_load_vector<T, U, values_per_thread>(\(x))")
+    }
+    for (from, to) in [
+        ("sum, remaining)", "sum, values_per_thread)"),
+        ("sum1, remaining, ", "sum1, values_per_thread, "),
+        ("sum2,\n            remaining, ", "sum2,\n            values_per_thread, "),
+    ] {
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    // `remaining` survives only in its declaration and the tail guards.
+    let rest = s.replacingOccurrences(of: "const int remaining = clamp(", with: "")
+        .replacingOccurrences(of: "(remaining > 0)", with: "")
+    guard !rest.contains("remaining"), !s.contains("nml_load_vector_safe") else { return nil }
+    return s
+}
+
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
@@ -543,6 +572,9 @@ private let nemotronMoELeaderSource = """
 private final class NemotronMoELeaderKernel: Sendable {
     static let shared = NemotronMoELeaderKernel()
     let kernel: MLXFast.MLXFastKernel
+    /// Production-only copy with the constant 8-value tail (nmlTail8Source);
+    /// `kernel` stays the reference the self-tests compare against.
+    let tail8: MLXFast.MLXFastKernel?
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_qmv_affine4_gs64",
@@ -550,6 +582,14 @@ private final class NemotronMoELeaderKernel: Sendable {
             outputNames: ["y"],
             source: nemotronMoELeaderSource,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        tail8 = nmlTail8Source(nemotronMoELeaderSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
     }
 }
 
@@ -557,6 +597,9 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     static let shared = NemotronMoELeaderPreparedKernels()
     let gateUp: MLXFast.MLXFastKernel?
     let gateUpAndPlan: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlan: MLXFast.MLXFastKernel?
+    /// The same triple FC1 with its tail block in the constant 8-value form.
+    let tripleGateUpAndPlanTail8: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -577,6 +620,33 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
                 header: header)
+        }
+        // Select only the source's R3 FC1 traversal; weighted FC2 retains
+        // the complete winner's paired body and original 36-word plan.
+        let tripleSource = nemotronMoETripleGateUpSource.replacingOccurrences(
+            of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+        let triplePointers = [
+            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ]
+        tripleGateUpAndPlan = nmlPreparedSource(tripleSource, pointers: triplePointers).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpAndPlanTail8 = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
+                header: header + nemotronMoETripleDecodeHeader)
         }
     }
 }
@@ -746,6 +816,8 @@ private let nemotronMoELeaderWeightedSource = """
 private final class NemotronMoELeaderWeightedKernel: Sendable {
     static let shared = NemotronMoELeaderWeightedKernel()
     let kernel: MLXFast.MLXFastKernel
+    /// Production-only copy with the constant 8-value tail (nmlTail8Source).
+    let tail8: MLXFast.MLXFastKernel?
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_weighted_qmv_affine4_gs64",
@@ -754,6 +826,15 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
             source: nemotronMoELeaderWeightedSource,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
             ensureRowContiguous: true)
+        tail8 = nmlTail8Source(nemotronMoELeaderWeightedSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_weighted_qmv_tail8_affine4_gs64",
+                inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+                ensureRowContiguous: true)
+        }
     }
 }
 
@@ -807,9 +888,10 @@ enum NemotronMoELeader {
 
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
+    /// tail8: production calls only (the self-test references keep false).
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil) -> MLXArray {
+                      prepared: MLXArray? = nil, tail8: Bool = false) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
@@ -825,7 +907,9 @@ enum NemotronMoELeader {
                 outputShapes: [[rows * topK, bank.n]],
                 outputDTypes: [x.dtype])[0]
         }
-        return NemotronMoELeaderKernel.shared.kernel(
+        let kernel = (tail8 ? NemotronMoELeaderKernel.shared.tail8 : nil)
+            ?? NemotronMoELeaderKernel.shared.kernel
+        return kernel(
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
@@ -839,6 +923,21 @@ enum NemotronMoELeader {
     static let preparedGateUp = true
     static let fuseBalancePlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
+    /// 7968e3f5 (c486095a grouping): NEMOTRON_MTP_TRIPLE_FC1_ONLY=0 keeps the
+    /// pair-only prepared R3 FC1; on, one leader also serves an expert's third
+    /// row with one shared coefficient decode.
+    static let tripleGateUp =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_TRIPLE_FC1_ONLY"] != "0"
+    /// Tail block of the R3 triple FC1 / balanced FC2 in its constant 8-value
+    /// form (nmlTail8Source); =0 keeps the runtime-`remaining` tail.
+    static let fc1Tail8 =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_TAIL8"] != "0"
+    static let fc2Tail8 =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_TAIL8"] != "0"
+    /// The same constant tail for the R != 3 (draft tail) leader and weighted
+    /// kernels, through production-only kernel copies.
+    static let leaderTail8 =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEADER_TAIL8"] != "0"
 
     /// The ordinary prepared R3/top-six FC1 arithmetic plus the original
     /// integer FC2 plan, emitted by just the first leader/output tile.
@@ -851,7 +950,10 @@ enum NemotronMoELeader {
               x.shape == [3, 2688], x.dtype == .bfloat16,
               inds.shape == [18], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
-              let kernel = NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+              let kernel = (tripleGateUp
+                  ? (fc1Tail8 ? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlanTail8 : nil)
+                      ?? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlan : nil)
+                  ?? NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
         else { return nil }
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
@@ -876,9 +978,12 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank, plan: MLXArray? = nil) -> MLXArray {
+                              rows: Int, bank: Bank, plan: MLXArray? = nil,
+                              tail8: Bool = false) -> MLXArray {
         if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
-        return NemotronMoELeaderWeightedKernel.shared.kernel(
+        let kernel = (tail8 ? NemotronMoELeaderWeightedKernel.shared.tail8 : nil)
+            ?? NemotronMoELeaderWeightedKernel.shared.kernel
+        return kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n)],
@@ -922,18 +1027,18 @@ enum NemotronMoELeader {
                 balancePlan = fused.plan
             } else {
                 act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                    relu2: true, prepared: prepared)
+                    relu2: true, prepared: prepared, tail8: leaderTail8)
                 balancePlan = nil
             }
         } else {
             let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                prepared: prepared)
+                prepared: prepared, tail8: leaderTail8)
             let a = maximum(h, MLXArray(0))
             act = a * a
             balancePlan = nil
         }
         var y = applyWeighted(act, flat, scores.reshaped(rows * 6),
-            rows: rows, bank: down, plan: balancePlan)
+            rows: rows, bank: down, plan: balancePlan, tail8: leaderTail8)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -1005,6 +1110,10 @@ enum NemotronMoELeader {
                     ?? apply(x, inds, rows: rows, topK: topK, bank: up, perSlot: false,
                              relu2: fuseRelu2)
                 if let fused { outputs.append(fused.plan) }
+                if fused == nil, leaderTail8 {
+                    outputs.append(apply(x, inds, rows: rows, topK: topK, bank: up,
+                        perSlot: false, relu2: fuseRelu2, tail8: true))
+                }
                 if rows > 1 {
                     outputs.append(apply(h, inds, rows: rows, topK: topK, bank: down, perSlot: true))
                 }
@@ -1012,7 +1121,7 @@ enum NemotronMoELeader {
                     down.weight.shape == [128, 2688, 232] {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down,
-                        plan: fused?.plan))
+                        plan: fused?.plan, tail8: leaderTail8))
                 }
             }
         }
@@ -1135,9 +1244,18 @@ private final class NMLBalanceWeighted: Sendable {
         outputNames: ["y"], source: nmlBalanceWeightedSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
+    /// The same body with its tail block in the constant 8-value form.
+    let tail8 = nmlTail8Source(nmlBalanceWeightedSource).map {
+        MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced_tail8",
+            inputNames: ["w","scales","biases","x","inds","scores","plan"],
+            outputNames: ["y"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+            ensureRowContiguous: true)
+    }
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
              _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
         let plan = plan ?? NMLBalancePlan.shared.make(ids)
+        let kernel = (NemotronMoELeader.fc2Tail8 ? tail8 : nil) ?? self.kernel
         return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
@@ -1168,3 +1286,269 @@ private func nmlFC1WithBalancePlanSource(_ preparedFC1: String) -> String {
       }
     """
 }
+
+
+// Selected only for native R3 prepared FC1. Public c486 grouping adapted to
+// the winner's paired decode and a new triple decoder; paired FC2 stays intact.
+private let nemotronMoETripleGateUpSource = """
+  constexpr int results_per_simdgroup = RPS;
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int scale_step_per_thread = 64 / values_per_thread;
+  constexpr int in_vec_size_w = K / 2;
+  constexpr int in_vec_size_g = K / 64;
+  typedef float U;
+
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+
+  const int slot = tid.z;
+  const int row = slot / TOPK;
+  const uint expert = inds[slot];
+  int before = 0;
+  for (int r = 0; r < row; r++) {
+    for (int j = 0; j < TOPK; j++) {
+      before += inds[r * TOPK + j] == expert ? 1 : 0;
+    }
+  }
+  if ((R == 3 ? before : (before & 1)) != 0) {
+    return;
+  }
+  int partner = -1;
+  int third = -1;
+  for (int r = R - 1; r > row; r--) {
+    for (int j = 0; j < TOPK; j++) {
+      if (inds[r * TOPK + j] == expert) {
+        if (R == 3) { third = partner; }
+        partner = r * TOPK + j;
+      }
+    }
+  }
+
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+  const device uint8_t* ws = (const device uint8_t*)w +
+      (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
+      simd_lid * 4;
+  const device T* sc = scales + (ulong)expert * (N * in_vec_size_g) +
+      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* bs = biases + (ulong)expert * (N * in_vec_size_g) +
+      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+  const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;
+  device T* y0 = y + slot * N + out_row;
+
+  if (partner < 0) {
+    thread U x_thread[values_per_thread];
+    thread U result[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum = nml_load_vector<T, U, values_per_thread>(x0, x_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum = nml_load_vector_safe<T, U, values_per_thread>(x0, x_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
+            wl, x_thread, s, b, sum, remaining);
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result[r] = simd_sum(result[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result[r]);
+      }
+    }
+  } else if (third >= 0) {
+    const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
+        simd_lid * values_per_thread;
+    const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +
+        simd_lid * values_per_thread;
+    device T* y1 = y + partner * N + out_row;
+    device T* y2 = y + third * N + out_row;
+    thread U x0_thread[values_per_thread];
+    thread U x1_thread[values_per_thread];
+    thread U x2_thread[values_per_thread];
+    thread U result0[results_per_simdgroup] = {0};
+    thread U result1[results_per_simdgroup] = {0};
+    thread U result2[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1, value2;
+        nml_qdot_triple<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+            values_per_thread, value0, value1, value2);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+      x1 += block_size;
+      x2 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+      U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1, value2;
+        nml_qdot_triple<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+            remaining, value0, value1, value2);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result0[r] = simd_sum(result0[r]);
+      result1[r] = simd_sum(result1[r]);
+      result2[r] = simd_sum(result2[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result0[r]);
+        y1[r] = nml_store<T, RELU2>(result1[r]);
+        y2[r] = nml_store<T, RELU2>(result2[r]);
+      }
+    }
+  } else {
+    const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
+        simd_lid * values_per_thread;
+    device T* y1 = y + partner * N + out_row;
+    thread U x0_thread[values_per_thread];
+    thread U x1_thread[values_per_thread];
+    thread U result0[results_per_simdgroup] = {0};
+    thread U result1[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1;
+        nml_qdot_pair<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
+        result0[r] += value0;
+        result1[r] += value1;
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+      x1 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+      U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1;
+        nml_qdot_pair<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
+        result0[r] += value0;
+        result1[r] += value1;
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result0[r] = simd_sum(result0[r]);
+      result1[r] = simd_sum(result1[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result0[r]);
+        y1[r] = nml_store<T, RELU2>(result1[r]);
+      }
+    }
+  }
+"""
+
+
+// Extend the new winner's shared coefficient decode to three independent
+// FC1 rows; the singleton and pair branches retain its original helpers.
+private let nemotronMoETripleDecodeHeader = """
+template <typename U, int values_per_thread, bool HALF = false>
+inline void nml_qdot_triple(
+    const device uint8_t* w, const thread U* x0, const thread U* x1, const thread U* x2,
+    U scale, U bias, U sum0, U sum1, U sum2, int N,
+    thread U& value0, thread U& value1, thread U& value2) {
+  U accum0 = 0;
+  U accum1 = 0;
+  U accum2 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  if (HALF) {
+    // nml_qdot_pair_half's decode and per-row term order, three rows.
+    const device uint* ws2 = (const device uint*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      if (i < N / 4) {
+        const uint w2 = ws2[i / 2];
+        const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+        const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+        const U a = U(h0[i % 2]);
+        const U b1 = U(h1[i % 2]);
+        const U c = U(half(ushort(ws[i] & 0x0f00)));
+        const U d = U(half(ushort(ws[i] & 0xf000)));
+        accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b1 + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+        accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b1 + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+        accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b1 + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+      }
+    }
+  } else {
+    for (int i = 0; i < (N / 4); i++) {
+      const uint16_t q = ws[i];
+      const U a = q & 0x000f;
+      const U b = q & 0x00f0;
+      const U c = q & 0x0f00;
+      const U d = q & 0xf000;
+      accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+      accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+      accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+    }
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+  value2 = scale * accum2 + sum2 * bias;
+}
+"""

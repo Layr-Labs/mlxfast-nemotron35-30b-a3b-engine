@@ -664,20 +664,42 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
-        if let shortlist = target.shortlist {
-            packetParts.append(shortlist.massScaled.reshaped([-1]))
+        func concatenatedPacket() -> MLXArray {
+            var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+            if let shortlist = target.shortlist {
+                packetParts.append(shortlist.massScaled.reshaped([-1]))
+            }
+            if CBv2MTPPolicyPacket.enabled, let values = target.policyTopTwo?.values {
+                packetParts.append(values.view(dtype: .int32).reshaped([-1]))
+            }
+            return concatenated(packetParts, axis: 0)
         }
-        if CBv2MTPPolicyPacket.enabled, let values = target.policyTopTwo?.values {
-            packetParts.append(values.view(dtype: .int32).reshaped([-1]))
+        // The top-2 finalize already wrote this exact layout (drafts, top-1
+        // ids, top-2 value bits): no concatenate copies, and the retained
+        // draft ids are a view of it instead of a stack.
+        let acceptancePacket: MLXArray
+        var retainedDraftIDs = draftIDs
+        if let folded = target.packet, target.shortlist == nil, CBv2MTPPolicyPacket.enabled,
+            target.policyTopTwo != nil, folded.size == batch * k + batch * (k + 1) * 3
+        {
+            if CBv2MTPTopTwoPacket.selfTest {
+                let reference = concatenatedPacket()
+                eval(folded, reference)
+                precondition(
+                    folded.asArray(Int32.self) == reference.asArray(Int32.self),
+                    "CBv2 MTP: top-2 finalize packet differs from the concatenated packet")
+            }
+            acceptancePacket = folded
+            retainedDraftIDs = folded[0 ..< (batch * k)].reshaped([batch, k])
+        } else {
+            acceptancePacket = concatenatedPacket()
         }
-        let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
-            draftIDs: draftIDs,
+            draftIDs: retainedDraftIDs,
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,

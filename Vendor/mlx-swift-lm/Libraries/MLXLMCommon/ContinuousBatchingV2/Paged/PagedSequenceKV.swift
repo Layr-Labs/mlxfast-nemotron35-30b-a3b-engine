@@ -443,6 +443,9 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
 
         absoluteOffset += n
         writtenHighWater = max(writtenHighWater, absoluteOffset)
+        if CBv2CriticalPathCuts.selfTest, CBv2CriticalPathCuts.stridedSegmentWrite, windowSize == nil {
+            selfTestReadBack(start: absoluteOffset - n, keys: keys, values: values)
+        }
     }
 
     /// Reserve the destination for ONE decode token and advance the
@@ -584,6 +587,24 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         }
         return pool.gather(
             group: groupKey, pages: pages, firstSlot: start % s, count: count)
+    }
+
+    /// NEMOTRON_KERNEL_SELFTEST=1 with CBV2_PAGED_STRIDED_WRITE: read the
+    /// tokens just written back from the pages and require them bit for bit
+    /// equal to the `[H, n, D]` source (one host sync per write; self-test
+    /// only). Stops the process on any difference.
+    private func selfTestReadBack(start: Int, keys: MLXArray, values: MLXArray) {
+        let back = gatherRange(start: start, count: keys.dim(1))
+        func bits(_ a: MLXArray) -> MLXArray {
+            a.view(dtype: a.itemSize == 2 ? .uint16 : (a.itemSize == 4 ? .uint32 : .uint8))
+        }
+        let same = all(bits(back.keys.reshaped(keys.shape)) .== bits(keys))
+            .&& all(bits(back.values.reshaped(values.shape)) .== bits(values))
+        guard same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "CBv2 strided segment write self-test: read-back differs at \(start)\n".utf8))
+            preconditionFailure("CBv2 strided segment write self-test failed")
+        }
     }
 
     /// Modular table length the decode kernel divides by to resolve a

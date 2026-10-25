@@ -578,6 +578,12 @@ extension NemotronH35Model: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
         cbv2TopTwoRows(logits)
     }
+
+    public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
+        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
+    {
+        cbv2TopTwoRowsPacket(logits, window: window)
+    }
 }
 
 extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
