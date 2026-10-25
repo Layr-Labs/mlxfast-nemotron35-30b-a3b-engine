@@ -50,6 +50,10 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
+/// Layers between early asyncEval calls on the MTP prefill path only. The seed
+/// window is the first request after the engine drains MLX's buffer cache, so a
+/// shorter chunk hands its transient live set back to that cache sooner.
+/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
@@ -3691,6 +3695,14 @@ private class NemotronHBackbone: Module {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
+                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
+                    // milliseconds while the host builds the next in well under
+                    // one, so without a wait the host encodes, and allocates,
+                    // every layer's intermediates before the first chunk
+                    // completes. Waiting on the previous chunk returns its
+                    // temporaries to MLX's buffer cache for the next chunk; this
+                    // chunk is already queued, so the GPU never waits on the
+                    // host. Evaluation order only; values are unchanged.
                     if recyclePrefillChunks {
                         if let previous = submittedPrefillChunk { eval(previous) }
                         submittedPrefillChunk = hidden
