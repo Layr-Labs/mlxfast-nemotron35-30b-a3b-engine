@@ -1,6 +1,23 @@
 import Foundation
 import MLX
 
+/// Stage cuts in the draft head's per-round chain. Each one removes a
+/// dependent dispatch and leaves every draft value bitwise unchanged; the
+/// target never reaches these paths.
+/// NEMOTRON_MTP_DRAFT_CHAIN_CLEANUP=0 disables both.
+public enum NemotronMTPDraftChainCleanup {
+    static let environment = ProcessInfo.processInfo.environment
+    static let enabled = environment["NEMOTRON_MTP_DRAFT_CHAIN_CLEANUP"] != "0"
+    /// NEMOTRON_MTP_DRAFT_RETAINED_SEED_ROW=0: the prestaged first draft
+    /// rewrites its seed K/V row again.
+    public static let retainedSeedRow = enabled
+        && environment["NEMOTRON_MTP_DRAFT_RETAINED_SEED_ROW"] != "0"
+    /// NEMOTRON_MTP_DRAFT_HOST_OFFSETS=0: the draft cache advances its
+    /// device position offsets per attention call again.
+    static let hostPositionOffsets = enabled
+        && environment["NEMOTRON_MTP_DRAFT_HOST_OFFSETS"] != "0"
+}
+
 /// Only changes launch geometry for the embedded assistant. All other caches
 /// and shapes retain the original selectors. NSG stays four so HPT alone
 /// cannot change the per-head SIMD or partition reduction tree.

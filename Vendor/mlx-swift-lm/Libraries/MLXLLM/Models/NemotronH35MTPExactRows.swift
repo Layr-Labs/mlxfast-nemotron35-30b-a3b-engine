@@ -748,8 +748,8 @@ enum NemotronHeadPreparedActivation {
     /// prefetch) and the row -> SIMD-group geometry per [K, N]. Crown values
     /// (0, empty tables) keep the crown / m1 kernel objects, template lists,
     /// grid and threadgroup.
-    static let loadForm = 0
-    static let fastLoadForm = 0
+    static let loadForm = 2
+    static let fastLoadForm = 2
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
     static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
@@ -919,6 +919,125 @@ enum NemotronHeadPreparedActivation {
     }
 }
 
+private let nemotronSharedUpPackHeader = nemotronMultiRowQMVHeader + """
+
+template <typename T, typename U, int values_per_thread>
+inline U nmr_load_vector_tg(const threadgroup T* x, thread U* x_thread) {
+  U sum = 0;
+  for (int i = 0; i < values_per_thread; i += 4) {
+    sum += U(x[i]) + U(x[i + 1]) + U(x[i + 2]) + U(x[i + 3]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 16.0f;
+    x_thread[i + 2] = x[i + 2] / 256.0f;
+    x_thread[i + 3] = x[i + 3] / 4096.0f;
+  }
+  return sum;
+}
+"""
+
+private func nemotronSharedUpPackSource() -> String {
+    let groups = "constexpr int num_simdgroups = 2;"
+    let store = "yp[r * out_vec_size + row] = h;"
+    precondition(nemotronHeadPreparedQMVSource.components(separatedBy: groups).count == 2)
+    precondition(nemotronHeadPreparedQMVSource.components(separatedBy: store).count == 2)
+    let body = nemotronHeadPreparedQMVSource
+        .replacingOccurrences(of: groups, with: "constexpr int num_simdgroups = 4;")
+        .replacingOccurrences(
+            of: store,
+            with: store + "\n        chunk_h[r][simd_gid * results_per_simdgroup + row] = h;")
+    return "  threadgroup T chunk_h[R][8];\n" + body + """
+
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < uint(R)) {
+    const int r = int(simd_lid);
+    float values[8];
+    const float total = nmr_load_vector_tg<T, float, 8>(&chunk_h[r][0], values);
+    const int chunk = int(tid.y);
+    const int chunk_tiles = (out_vec_size / 8 + 31) / 32;
+    const int base = (r * chunk_tiles + chunk / 32) * (8 + 1) * 32 + chunk % 32;
+    for (int i = 0; i < 8; i++) packed[base + i * 32] = values[i];
+    packed[base + 8 * 32] = total;
+  }
+"""
+}
+
+enum NemotronSharedUpPacking {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PACK"] != "0"
+    nonisolated(unsafe) private static var verified = false
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_shared_up_relu2_pack_r3",
+        inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+        outputNames: ["y", "packed"], source: nemotronSharedUpPackSource(),
+        header: nemotronSharedUpPackHeader)
+
+    private static func dispatch(_ x: MLXArray, _ q: QuantizedLinear,
+                                 prepared: MLXArray?) -> (MLXArray, MLXArray)? {
+        guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 2, x.dim(0) == 3, x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, q.weight.ndim == 2, q.weight.dtype == .uint32,
+              q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+        else { return nil }
+        let k = x.dim(1), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, q.weight.dim(1) * 8 == k,
+              n >= 2688, n % 8 == 0, n % 512 != 0, NemotronMultiRowQMV.headRPS(n: n) == 2
+        else { return nil }
+        let pv = k % 512 == 0 ? 16 : 8
+        let input = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let outputs = kernel([q.weight, q.scales, biases, input, args.0, args.1],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+                       ("RELU2", true), ("RPS", 2)],
+            grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
+            outputShapes: [[3, n], [3, (n / 8 + 31) / 32, 9 * 32]],
+            outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    static func apply(_ x: MLXArray, up: Linear, down: Linear,
+                      prepared: MLXArray?) -> MLXArray? {
+        guard verified, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
+              let q = up as? QuantizedLinear,
+              let fused = dispatch(x.reshaped(3, x.dim(2)), q, prepared: prepared)
+        else { return nil }
+        var activated = fused.0
+        if NemotronMoELeader.selfTest {
+            activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
+                x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
+        }
+        return nemotronMTPLinearRows(
+            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+    }
+
+    static func verify(_ model: Module) {
+        verified = false
+        guard enabled,
+              let mlp = model.modules().lazy.compactMap({ ($0 as? NemotronHMoE)?.sharedExperts }).first,
+              let up = mlp.upProj as? QuantizedLinear
+        else { return }
+        var matches = true
+        for seed in 0 ..< 3 {
+            let x = MLXRandom.normal(
+                [3, up.weight.dim(1) * 8], dtype: .bfloat16,
+                key: MLXRandom.key(UInt64(0x5a17 + seed)))
+            guard let fused = dispatch(x, up, prepared: nil) else { return }
+            let activated = NemotronHeadPreparedActivation.apply(
+                x, up, relu2: true, rps: 2, prepared: nil)
+            let lhs = nemotronMTPLinearRows(
+                fused.0.reshaped(1, 3, up.weight.dim(0)), mlp.downProj, prepared: fused.1)
+            let rhs = nemotronMTPLinearRows(
+                activated.reshaped(1, 3, up.weight.dim(0)), mlp.downProj)
+            let sameUp = (fused.0.view(dtype: .uint16) .== activated.view(dtype: .uint16)).all()
+            let sameDown = (lhs.view(dtype: .uint16) .== rhs.view(dtype: .uint16)).all()
+            matches = matches && sameUp.item(Bool.self) && sameDown.item(Bool.self)
+        }
+        verified = matches
+    }
+}
+
 private final class NemotronMultiRowQMVKernel: Sendable {
     static let shared = NemotronMultiRowQMVKernel()
     let kernel: MLXFast.MLXFastKernel
@@ -981,6 +1100,9 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
     static let narrowEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
+    /// NEMOTRON_MTP_R1_TWIN=0 keeps the stock call for the draft step's
+    /// one-row eh_proj, attention wo and shared-expert down (`nemotronR1Linear`).
+    static let r1Route = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R1_TWIN"] != "0"
     /// NEMOTRON_MTP_HEAD_RPS4=0 keeps two outputs per SIMD group on the
     /// 131,072-row target head. Four halves the threadgroups that each
     /// re-read the prepared rows; every output keeps its lane split, block
@@ -1147,10 +1269,31 @@ enum NemotronMultiRowQMV {
                     outputs.append(dispatch(w, s, s, x, relu2: relu2, rps: 2))
                 }
             }
+            // The one-row route (`nemotronR1Linear`, shared-expert up) at RPS 4.
+            let x1 = MLXArray.zeros([1, k], dtype: .bfloat16)
+            for relu2 in [false, true] {
+                outputs.append(dispatch(w, s, s, x1, relu2: relu2, rps: 4))
+            }
         }
         outputs += NemotronTargetQKV.warmNarrow()
         eval(outputs)
     }
+}
+
+/// One-row twin route for M = 1 quantized projections (the draft step): the
+/// multi-row qmv at R = 1 repeats the stock qmv / qmv_fast per-row body at the
+/// stock four rows per SIMD group, so each output is bitwise the stock one.
+/// It takes the twin's R = 1 decode form (`r1HalfDecodeForm`).
+func nemotronR1Linear(_ x: MLXArray, _ linear: Linear) -> MLXArray {
+    guard NemotronMultiRowQMV.r1Route, x.size == x.dim(-1), x.dtype == .bfloat16,
+          type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear,
+          q.bias == nil, let y = NemotronMultiRowQMV.apply(x.reshaped(1, x.dim(-1)), q)
+    else { return linear(x) }
+    var shape = x.shape
+    shape[shape.count - 1] = q.weight.dim(0)
+    let out = y.reshaped(shape)
+    guard NemotronMoELeader.selfTest else { return out }
+    return nemotronBitwiseOrNaN(out, linear(x))
 }
 
 /// Self-test select: `y` where it is bitwise equal to `expected`, else NaN
@@ -1281,6 +1424,391 @@ enum NemotronMTPAttentionDirect {
             }
         }
         if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
+// MTP verify SDPA over the R serialized query rows in one launch. The verify
+// attends query row r alone over keys [0, history + r + 1) with one one-pass
+// sdpa_vector launch of 32 threadgroups per row; this is one grid of 32 x R
+// threadgroups with z = row. A prologue sets row r's query and output pointers
+// and key length; below it the text is sdpa_vector's (kernels/sdpa_vector.h)
+// with its function constants folded to the stock call's values (no mask, no
+// sinks, not causal), so each (head, row) threadgroup runs the stock program
+// on the same inputs: 1024 threads, lane-to-element map, key order per
+// simdgroup, simd_sum, fast::exp and the cross-simdgroup reduction. K/V and
+// the queries are read in place through their strides (cache views, no copy).
+// MLX JIT-compiles custom kernels with MathMode::Safe; the metallib is built
+// with -fno-fast-math. Used only after the load-time bit check in `qualify`.
+private let nemotronMTPVerifySDPASource = """
+  // Verify row r = tid.z of the tpg.z serialized query rows: query row r,
+  // keys [0, N) with N = keys_shape[2] - (tpg.z - 1 - r), output row r.
+  // Below this prologue the text is sdpa_vector's, with its function
+  // constants folded to the stock verify call's values (no mask, no sinks,
+  // not causal) and its scalar arguments taken from the inputs.
+  constexpr bool query_transposed = false;
+  constexpr bool do_causal = false;
+  constexpr bool bool_mask = false;
+  constexpr bool float_mask = false;
+  constexpr bool has_sinks = false;
+  const device bool* bmask = nullptr;
+  const device T* fmask = nullptr;
+  constexpr int mask_kv_seq_stride = 0;
+  constexpr int mask_q_seq_stride = 0;
+  constexpr int mask_head_stride = 0;
+  const device T* sinks = nullptr;
+  constexpr int num_q_heads = 1;
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint3 tpg = threadgroups_per_grid;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const int gqa_factor = int(tpg.x) / keys_shape[1];
+  const int N = keys_shape[2] - int(tpg.z - tid.z) + 1;
+  const size_t k_head_stride = keys_strides[1];
+  const size_t k_seq_stride = keys_strides[2];
+  const size_t v_head_stride = values_strides[1];
+  const size_t v_seq_stride = values_strides[2];
+  queries += tid.z * queries_strides[2];
+  out += tid.z * tpg.x * V;
+  constexpr int BN = 32;
+  constexpr int BD = 32;
+  constexpr int qk_per_thread = D / BD;
+  constexpr int v_per_thread = V / BD;
+  int inner_k_stride = BN * int(k_seq_stride);
+  int inner_v_stride = BN * int(v_seq_stride);
+
+  typedef float U;
+
+  thread U q[qk_per_thread];
+  thread U k[qk_per_thread];
+  thread U o[v_per_thread];
+
+  threadgroup U outputs[BN * BD];
+  threadgroup U max_scores[BN];
+  threadgroup U sum_exp_scores[BN];
+
+  // Adjust positions
+  const int q_batch_head_idx = tid.x;
+  const int q_seq_idx = tid.y;
+  const int kv_head_idx = q_batch_head_idx / gqa_factor;
+  const int o_offset = q_batch_head_idx * tpg.y + q_seq_idx;
+  const int q_offset =
+      query_transposed ? tpg.x * q_seq_idx + q_batch_head_idx : o_offset;
+  queries += q_offset * D + simd_lid * qk_per_thread;
+  keys += kv_head_idx * k_head_stride + simd_gid * k_seq_stride +
+      simd_lid * qk_per_thread;
+  values += kv_head_idx * v_head_stride + simd_gid * v_seq_stride +
+      simd_lid * v_per_thread;
+  if (bool_mask) {
+    bmask += q_batch_head_idx * mask_head_stride +
+        simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  }
+  if (float_mask) {
+    fmask += q_batch_head_idx * mask_head_stride +
+        simd_gid * mask_kv_seq_stride + q_seq_idx * mask_q_seq_stride;
+  }
+
+  out += o_offset * V + simd_gid * v_per_thread;
+
+  // Read the query and 0 the output accumulator
+  for (int i = 0; i < qk_per_thread; i++) {
+    q[i] = static_cast<U>(scale) * queries[i];
+  }
+  for (int i = 0; i < v_per_thread; i++) {
+    o[i] = 0;
+  }
+
+  U max_score = Limits<U>::finite_min;
+  U sum_exp_score = 0;
+  if (has_sinks && simd_gid == 0) {
+    max_score = static_cast<U>(sinks[q_batch_head_idx % num_q_heads]);
+    sum_exp_score = 1;
+  }
+
+  // For each key
+  for (int i = simd_gid; i < N; i += BN) {
+    bool use_key = true;
+    if (do_causal) {
+      use_key = i <= (N - int(tpg.y) + int(q_seq_idx));
+    } else if (bool_mask) {
+      use_key = bmask[0];
+    } else if (float_mask) {
+      use_key = (fmask[0] >= Limits<T>::finite_min);
+    }
+    if (use_key) {
+      // Read the key
+      for (int j = 0; j < qk_per_thread; j++) {
+        k[j] = keys[j];
+      }
+
+      // Compute the i-th score
+      U score = 0;
+      for (int j = 0; j < qk_per_thread; j++) {
+        score += q[j] * k[j];
+      }
+      score = simd_sum(score);
+      if (float_mask) {
+        score += static_cast<U>(fmask[0]);
+      }
+
+      // Update the accumulators
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+
+      // Update the output accumulator
+      for (int j = 0; j < v_per_thread; j++) {
+        o[j] = o[j] * factor + exp_score * values[j];
+      }
+    }
+
+    // Move the pointers to the next kv
+    keys += inner_k_stride;
+    values += inner_v_stride;
+    if (bool_mask) {
+      bmask += BN * mask_kv_seq_stride;
+    }
+    if (float_mask) {
+      fmask += BN * mask_kv_seq_stride;
+    }
+  }
+
+  // Each thread has a partial part of the output so we need to combine them.
+
+  // First let's communicate the max and sum_exp
+  if (simd_lid == 0) {
+    max_scores[simd_gid] = max_score;
+    sum_exp_scores[simd_gid] = sum_exp_score;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  max_score = max_scores[simd_lid];
+  U new_max = simd_max(max_score);
+  U factor = fast::exp(max_score - new_max);
+  sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+  // Now we need to aggregate all the outputs
+  for (int i = 0; i < v_per_thread; i++) {
+    outputs[simd_lid * BD + simd_gid] = o[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // And write the output
+  if (simd_lid == 0) {
+    for (int i = 0; i < v_per_thread; i++) {
+      out[i] = static_cast<T>(o[i]);
+    }
+  }
+"""
+
+// The lab's unroll4 key loop (patches/sdpa-unroll4.patch) for the unmasked
+// call: K and V of keys i, i+32, i+64, i+96 load first, then the four scores
+// and online-softmax updates run in key order with the stock statements; the
+// remainder runs the stock loop. Only load issue moves.
+private let nemotronMTPVerifySDPAUnroll4Loop = """
+  int i = simd_gid;
+  if (!do_causal && !bool_mask && !float_mask) {
+    // Four keys per step: issue their K and V loads first, then apply the
+    // per-key updates in the original key order.
+    for (; i + 3 * BN < N; i += 4 * BN) {
+      U kk[4][qk_per_thread];
+      U vv[4][v_per_thread];
+      for (int u = 0; u < 4; u++) {
+        for (int j = 0; j < qk_per_thread; j++) {
+          kk[u][j] = keys[u * inner_k_stride + j];
+        }
+        for (int j = 0; j < v_per_thread; j++) {
+          vv[u][j] = values[u * inner_v_stride + j];
+        }
+      }
+      U key_scores[4];
+      for (int u = 0; u < 4; u++) {
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; j++) {
+          score += q[j] * kk[u][j];
+        }
+        key_scores[u] = simd_sum(score);
+      }
+      for (int u = 0; u < 4; u++) {
+        U new_max = max(max_score, key_scores[u]);
+        U factor = fast::exp(max_score - new_max);
+        U exp_score = fast::exp(key_scores[u] - new_max);
+
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        for (int j = 0; j < v_per_thread; j++) {
+          o[j] = o[j] * factor + exp_score * vv[u][j];
+        }
+      }
+      keys += 4 * inner_k_stride;
+      values += 4 * inner_v_stride;
+    }
+  }
+  for (; i < N; i += BN) {
+"""
+
+enum NemotronMTPVerifySDPA {
+    /// NEMOTRON_MTP_VERIFY_SDPA_MERGED=0 keeps the per-row stock launches;
+    /// NEMOTRON_MTP_VERIFY_SDPA_UNROLL4=0 keeps the stock key loop in the
+    /// merged launch.
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_MERGED"] != "0"
+    static let unroll4 =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_UNROLL4"] != "0"
+    nonisolated(unsafe) private static var verified = false
+
+    private static func source() -> String {
+        guard unroll4 else { return nemotronMTPVerifySDPASource }
+        let loop = "  for (int i = simd_gid; i < N; i += BN) {"
+        precondition(nemotronMTPVerifySDPASource.components(separatedBy: loop).count == 2,
+                     "verify sdpa source: key loop")
+        return nemotronMTPVerifySDPASource.replacingOccurrences(
+            of: loop, with: nemotronMTPVerifySDPAUnroll4Loop)
+    }
+    private static let kernel = MLXFast.metalKernel(
+        name: unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows",
+        inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out"],
+        source: source(), ensureRowContiguous: false)
+
+    nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
+    private static let lock = NSLock()
+    private static func scaleArray(_ scale: Float) -> MLXArray {
+        lock.lock(); defer { lock.unlock() }
+        if let array = scales[scale.bitPattern] { return array }
+        let array = MLXArray(scale)
+        scales[scale.bitPattern] = array
+        return array
+    }
+
+    /// queries [1, 32, R, 128], R = 2...4; keys/values the updated cache
+    /// views [1, 2, history + R, 128]. Returns [R, 32, 128], or nil where the
+    /// stock per-query calls would not all be one-pass sdpa_vector: MLX
+    /// switches to the two-pass kernel from 1024 keys ('d'/'s' GPUs) or 4096
+    /// (GQA elsewhere), so every row stays below 1024 keys.
+    private static func merged(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+    ) -> MLXArray? {
+        let rows = queries.ndim == 4 ? queries.dim(2) : 0
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              queries.ndim == 4, queries.dim(0) == 1, queries.dim(1) == 32,
+              (2...4).contains(rows), queries.dim(3) == 128,
+              keys.ndim == 4, keys.dim(0) == 1, keys.dim(1) == 2, keys.dim(3) == 128,
+              values.shape == keys.shape, (rows ..< 1024).contains(keys.dim(2)),
+              queries.dtype == .bfloat16, keys.dtype == .bfloat16, values.dtype == .bfloat16
+        else { return nil }
+        return kernel(
+            [queries, keys, values, scaleArray(scale)],
+            template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
+            grid: (32 * 1024, 1, rows), threadGroup: (1024, 1, 1),
+            outputShapes: [[rows, 32, 128]], outputDTypes: [DType.bfloat16])[0]
+    }
+
+    /// The per-query calls `CBv2AttentionV1.queryBlockOutputs` makes for the
+    /// serialized verify of a full-attention layer (block size 1, no sinks):
+    /// row r attends keys [0, history + r + 1) with no mask.
+    static func stock(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+    ) -> [MLXArray] {
+        let rows = queries.dim(2), history = keys.dim(2) - rows
+        return (0..<rows).map { r in
+            MLXFast.scaledDotProductAttention(
+                queries: queries[0..., 0..., r ..< (r + 1), 0...],
+                keys: keys[0..., 0..., 0 ..< (history + r + 1), 0...],
+                values: values[0..., 0..., 0 ..< (history + r + 1), 0...],
+                scale: scale, mask: .none)
+        }
+    }
+
+    /// Row r as [1, 32, 1, 128]: a slice view (an Int subscript would gather).
+    private static func split(_ out: MLXArray) -> [MLXArray] {
+        (0..<out.dim(0)).map { out[$0 ..< ($0 + 1)].reshaped(1, 32, 1, 128) }
+    }
+
+    /// `attendRows` for the serialized verify: the R outputs [1, 32, 1, 128]
+    /// as views of the one launch's output, bitwise the stock calls'; nil
+    /// until `qualify` passed or outside the shapes `merged` serves.
+    static func rows(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+    ) -> [MLXArray]? {
+        guard verified, let out = merged(queries, keys, values, scale) else { return nil }
+        let outputs = split(out)
+        guard NemotronMoELeader.selfTest else { return outputs }
+        return zip(outputs, stock(queries, keys, values, scale)).map { nemotronBitwiseOrNaN($0, $1) }
+    }
+
+    /// Load-time bit check on seeded random inputs against the stock
+    /// per-query launches, at the target's attention scale: R = 2...4, key
+    /// lengths across the 32-key and unroll boundaries up to 1023, cache
+    /// capacity past the keys (head stride != N * 128), query/key scales
+    /// 1 to 16. Engages only if every output is bitwise equal; an MLX error
+    /// (a kernel that fails to build, or a threadgroup limit below 1024)
+    /// keeps the stock launches. Also JITs the pipeline outside any request.
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp verify sdpa merged: \(message)\n".utf8))
+        }
+        guard enabled, NemotronMTPAttentionDirect.enabled else { return report("off (setting)") }
+        var scaleBits = Set<UInt32>()
+        for module in target.modules() {
+            guard let attention = module as? NemotronHAttention, attention.numHeads == 32,
+                  attention.numKeyValueHeads == 2, attention.headDim == 128 else { continue }
+            scaleBits.insert(attention.scale.bitPattern)
+        }
+        guard !scaleBits.isEmpty else { return report("off (no 32 x 2 x 128 attention layer)") }
+        let cases: [(rows: Int, histories: [Int])] = [
+            (3, [0, 1, 29, 30, 31, 92, 93, 94, 125, 126, 127, 254, 488, 552, 616, 1020]),
+            (2, [94, 95, 616, 1021]), (4, [92, 93, 616, 1019]),
+        ]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for bits in scaleBits.sorted() {
+                    let scale = Float(bitPattern: bits)
+                    for (rows, histories) in cases {
+                        for (i, history) in histories.enumerated() {
+                            let seed = UInt64(0x5d9a_0000 + rows * 256 + i)
+                            let (qScale, kvScale) = inputScales[i % inputScales.count]
+                            let capacity = history + rows + 37
+                            let q = MLXRandom.normal(
+                                [1, rows, 4096], dtype: .bfloat16, scale: qScale,
+                                key: MLXRandom.key(seed))
+                            let k = MLXRandom.normal(
+                                [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                                key: MLXRandom.key(seed &+ 0x100))
+                            let v = MLXRandom.normal(
+                                [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                                key: MLXRandom.key(seed &+ 0x200))
+                            // The views the verify passes: the transposed Q
+                            // projection and the cache's [..<offset] slices.
+                            let queries = q.reshaped(1, rows, 32, 128).transposed(0, 2, 1, 3)
+                            let keys = k[.ellipsis, ..<(history + rows), 0...]
+                            let values = v[.ellipsis, ..<(history + rows), 0...]
+                            guard let out = merged(queries, keys, values, scale) else { return false }
+                            var same = MLXArray(true)
+                            for (row, expected) in zip(split(out), stock(queries, keys, values, scale)) {
+                                same = same .&& (row.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+                            }
+                            if !same.item(Bool.self) { return false }
+                            checked += 1
+                        }
+                    }
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified
+            ? "on (\(checked) cases bitwise equal, key loop \(unroll4 ? "unroll4" : "stock"))"
+            : "off (outputs differ from the stock launches after \(checked) cases)")
     }
 }
 
@@ -1680,6 +2208,15 @@ enum NemotronHeadScreen {
             && packedPartialSource.components(separatedBy: "sb[size_t(row) * (2 * S)").count == 3
             && !packedPartialSource.contains("scales[") && !packedPartialSource.contains("biases[")
     }
+    /// NEMOTRON_MTP_HEAD_SCREEN_PACK_FULL=0 keeps the weight words in place
+    /// (packed scales/biases only); NEMOTRON_MTP_HEAD_SCREEN_PACKED=0 turns
+    /// off both.
+    static var packedRecords: Bool {
+        packedScalesBiases
+            && ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_PACK_FULL"] != "0"
+            && recordPartialSource.contains("(rp + (lane >> 1) * 8 + part * 4)")
+            && !recordPartialSource.contains("(w + ") && !recordPartialSource.contains("sb[size_t(row)")
+    }
     static let width = 2688
     static let wordsPerRow = 336
     static let groupsPerRow = 42
@@ -1896,6 +2433,119 @@ enum NemotronHeadScreen {
       }
     """
 
+    private static let contextSource = """
+      constexpr int RPSG = 4;
+      constexpr int in_vec_size = 2688;
+      constexpr int in_vec_size_w = 1344;
+      constexpr int in_vec_size_g = 42;
+      constexpr int values_per_thread = 8;
+      constexpr int block_size = 256;
+      constexpr int scale_step_per_thread = 8;
+      typedef float U;
+      const int lane = int(thread_index_in_simdgroup);
+      const int sgid = int(simdgroup_index_in_threadgroup);
+      threadgroup int cand[C];
+      threadgroup float cval[C];
+      // The candidates are the request's context ids (padded by repetition).
+      if (sgid == 0) {
+        for (int c = lane; c < C; c += 32) cand[c] = ids[c];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      const device uint8_t* wbytes = (const device uint8_t*)w;
+      for (int slot0 = sgid * RPSG; slot0 < C; slot0 += NSG * RPSG) {
+        const device uint8_t* wl[RPSG];
+        const device T* sl[RPSG];
+        const device T* bl[RPSG];
+        for (int row = 0; row < RPSG; row++) {
+          const size_t id = size_t(cand[slot0 + row]);
+          wl[row] = wbytes + id * in_vec_size_w + lane * 4;
+          sl[row] = scales + id * in_vec_size_g + lane / scale_step_per_thread;
+          bl[row] = biases + id * in_vec_size_g + lane / scale_step_per_thread;
+        }
+        const device T* xp = x + lane * values_per_thread;
+        thread U x_thread[values_per_thread];
+        thread U result[RPSG];
+        for (int row = 0; row < RPSG; row++) result[row] = 0;
+        U sum;
+        int k = 0;
+        constexpr int k_end = in_vec_size - block_size;
+        for (; k < k_end; k += block_size) {
+          sum = nmr_load_vector<T, U, values_per_thread>(xp, x_thread);
+          for (int row = 0; row < RPSG; row++) {
+            U s = sl[row][0];
+            U b = bl[row][0];
+            U accum = 0;
+            const device uint16_t* words = (const device uint16_t*)wl[row];
+            for (int i = 0; i < values_per_thread / 4; i++) {
+              const U a = words[i] & 0x000f;
+              const U b1 = words[i] & 0x00f0;
+              const U c = words[i] & 0x0f00;
+              const U d = words[i] & 0xf000;
+              accum += x_thread[4*i] * a + x_thread[4*i+1] * b1
+                  + x_thread[4*i+2] * c + x_thread[4*i+3] * d;
+            }
+            result[row] += s * accum + b * sum;
+            wl[row] += block_size / 2;
+            sl[row] += block_size / 64;
+            bl[row] += block_size / 64;
+          }
+          xp += block_size;
+        }
+        const int remaining = clamp(
+            static_cast<int>(in_vec_size - k - lane * values_per_thread),
+            0,
+            values_per_thread);
+        if (remaining > 0) {
+          sum = nmr_load_vector_safe<T, U, values_per_thread>(xp, x_thread, remaining);
+          for (int row = 0; row < RPSG; row++) {
+            U s = sl[row][0];
+            U b = bl[row][0];
+            U accum = 0;
+            const device uint16_t* words = (const device uint16_t*)wl[row];
+            for (int i = 0; i < remaining / 4; i++) {
+              const U a = words[i] & 0x000f;
+              const U b1 = words[i] & 0x00f0;
+              const U c = words[i] & 0x0f00;
+              const U d = words[i] & 0xf000;
+              accum += x_thread[4*i] * a + x_thread[4*i+1] * b1
+                  + x_thread[4*i+2] * c + x_thread[4*i+3] * d;
+            }
+            result[row] += s * accum + b * sum;
+          }
+        }
+        for (int row = 0; row < RPSG; row++) {
+          U v = simd_sum(result[row]);
+          if (lane == 0) {
+            T h = static_cast<T>(v);
+            cval[slot0 + row] = float(h);
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+
+      if (sgid == 0) {
+        float mv = -INFINITY;
+        int mi = 0x7fffffff;
+        for (int s2 = lane; s2 < C; s2 += 32) {
+          const float v = cval[s2];
+          const int id = cand[s2];
+          if (mi == 0x7fffffff || v > mv || (v == mv && id < mi)) { mv = v; mi = id; }
+        }
+        for (ushort off = 16; off > 0; off >>= 1) {
+          const float ov = simd_shuffle_xor(mv, off);
+          const int oi = simd_shuffle_xor(mi, off);
+          if (oi != 0x7fffffff && (mi == 0x7fffffff || ov > mv || (ov == mv && oi < mi))) {
+            mv = ov; mi = oi;
+          }
+        }
+        if (lane == 0) {
+          best_val[0] = mv;
+          best_id[0] = mi;
+        }
+      }
+    """
+
     private static let finalSource = """
       const int lane = int(thread_index_in_simdgroup);
       float mv = -INFINITY;
@@ -1913,6 +2563,30 @@ enum NemotronHeadScreen {
         }
       }
       if (lane == 0) {
+        out[0] = mi;
+      }
+    """
+
+    private static let finalContextSource = """
+      const int lane = int(thread_index_in_simdgroup);
+      float mv = -INFINITY;
+      int mi = 0x7fffffff;
+      for (int c = lane; c < NCH; c += 32) {
+        const float v = best_val[c];
+        const int id = best_id[c];
+        if (mi == 0x7fffffff || v > mv || (v == mv && id < mi)) { mv = v; mi = id; }
+      }
+      for (ushort off = 16; off > 0; off >>= 1) {
+        const float ov = simd_shuffle_xor(mv, off);
+        const int oi = simd_shuffle_xor(mi, off);
+        if (oi != 0x7fffffff && (mi == 0x7fffffff || ov > mv || (ov == mv && oi < mi))) {
+          mv = ov; mi = oi;
+        }
+      }
+      if (lane == 0) {
+        const float cv = ctx_val[0];
+        const int ci = ctx_id[0];
+        if (mi == 0x7fffffff || cv > mv || (cv == mv && ci < mi)) { mv = cv; mi = ci; }
         out[0] = mi;
       }
     """
@@ -1937,6 +2611,27 @@ enum NemotronHeadScreen {
         name: "nemotron_head_screen_partial_packed_affine4_gs64",
         inputNames: ["w", "sb", "x", "groups", "groups2"],
         outputNames: ["scores"], source: packedPartialSource)
+    /// The same body reading each row's whole screen record from one flat
+    /// array: the selected groups' 8 words each, then that row's packed
+    /// scales/biases (9 * S words per row below LO, 9 * S2 from LO up). With
+    /// RPS 8 and 16 / 8 groups a simdgroup's rows are one contiguous run of
+    /// whole 128-byte lines (4,608 / 2,304 bytes) instead of 8 row-strided
+    /// gathers; the same words and values in the same order, so scores are
+    /// bitwise equal (checked at load).
+    private static let recordPartialSource = packedPartialSource
+        .replacingOccurrences(
+            of: "const device uint16_t* ws = (const device uint16_t*)(w + size_t(row) * KW + woff);",
+            with: """
+                const device uint32_t* rp = rec + (upper
+                          ? size_t(LO) * (9 * S) + size_t(row - LO) * (9 * S2) : size_t(row) * (9 * S));
+                      const device uint16_t* ws = (const device uint16_t*)(rp + (lane >> 1) * 8 + part * 4);
+                      const device T* sb = (const device T*)(rp + 8 * (upper ? S2 : S));
+                """)
+        .replacingOccurrences(of: "sb[size_t(row) * (2 * S) + ", with: "sb[")
+    private static let recordPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_record_affine4_gs64",
+        inputNames: ["rec", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: recordPartialSource)
 
     /// [rows, 2 * groupCount] bf16: each row's selected scales then biases
     /// (rows from `rows` up: the upper group set, zero-padded). Copies of the
@@ -1958,11 +2653,45 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
+
+    /// Flat uint32 screen records: per row the selected groups' words
+    /// (`groups` order), then its selected scales and biases as above, 9 words
+    /// per selected group (rows from `rows` up: the upper group set). Copies
+    /// of the head's own bytes, built once at load for the draft screen only;
+    /// the rescore keeps reading the head.
+    static func packRecords(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
+        upperGroups: [Int]?
+    ) -> MLXArray {
+        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
+            let words = MLXArray(selected.flatMap { g in (0..<8).map { Int32(8 * g + $0) } })
+            let index = MLXArray(selected.map { Int32($0) })
+            let sb = concatenated(
+                [take(scales[range], index, axis: 1), take(biases[range], index, axis: 1)], axis: 1)
+            return concatenated(
+                [take(weight[range], words, axis: 1), sb.view(dtype: .uint32)], axis: 1
+            ).reshaped(-1)
+        }
+        let lower = pack(0..<rows, groups)
+        guard let upperGroups else { return lower }
+        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
+    }
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
         outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
         source: selectSource, header: nemotronMultiRowQMVHeader)
+    private static let contextKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_context_affine4_gs64",
+        inputNames: ["w", "scales", "biases", "x", "ids"],
+        outputNames: ["best_val", "best_id"], source: contextSource,
+        header: nemotronMultiRowQMVHeader)
+    private static let finalContextKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_final_context",
+        inputNames: ["best_val", "best_id", "ctx_val", "ctx_id"], outputNames: ["out"],
+        source: finalContextSource)
+    /// Request context ids scored exactly per draft (`run(contextIds:)`).
+    static let contextSlots = 32
     private static let finalKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_final",
         inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
@@ -1990,12 +2719,92 @@ enum NemotronHeadScreen {
         inputNames: ["w", "sb", "x", "groups", "groups2"],
         outputNames: ["scores"], source: nemotronSwapped(packedPartialSource, partialHalfSwaps),
         header: nemotronHalfDecodeHeader)
+    /// The full-record twin, on the same decode swaps.
+    private static let recordPartialHalfKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_record_affine4_gs64_hf",
+        inputNames: ["rec", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: nemotronSwapped(recordPartialSource, partialHalfSwaps),
+        header: nemotronHalfDecodeHeader)
     private static let selectHalfKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64_hf",
         inputNames: ["scores", "w", "scales", "biases", "x"],
         outputNames: ["cand_ids", "cand_vals", "best_val", "best_id"],
         source: nemotronSwapped(selectSource, nemotronMultiRowHalfSwaps),
         header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader)
+    /// NEMOTRON_MTP_SCREEN_FUSED_FINAL=0 keeps the separate final kernel.
+    static var fusedFinal: Bool {
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_FUSED_FINAL"] != "0"
+            && !fusedSelectSource.contains("best_val[") && !fusedSelectSource.contains("best_id[")
+            && fusedSelectSource.components(separatedBy: "atomic_load_explicit(").count == 3
+    }
+    // Select + final in one launch: each chunk's threadgroup publishes its
+    // (best_val, best_id) with device atomics (same bits), fences at device
+    // scope and takes a ticket from `counter`; the threadgroup that draws
+    // NCH - 1 runs finalSource over all NCH pairs (atomic loads: same values,
+    // lane order and comparator, so the same id) and resets the counter.
+    // One launch and one dependent barrier fewer per screen.
+    private static let fusedFinalHead = """
+
+      if (sgid == 0) {
+        uint ticket = 0;
+        if (lane == 0) {
+          atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+          ticket = atomic_fetch_add_explicit((device atomic_uint*)counter, 1u, memory_order_relaxed);
+        }
+        if (simd_broadcast(ticket, 0) == uint(NCH - 1)) {
+          atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+          {
+
+    """
+    private static let fusedFinalTail = """
+
+          }
+          if (lane == 0) {
+            atomic_store_explicit((device atomic_uint*)counter, 0u, memory_order_relaxed);
+          }
+        }
+      }
+    """
+    private static let fusedSelectSource = selectSource
+        .replacingOccurrences(
+            of: "best_val[chunk] = mv;",
+            with: "atomic_store_explicit((device atomic_uint*)(best_val + chunk), as_type<uint>(mv), memory_order_relaxed);")
+        .replacingOccurrences(
+            of: "best_id[chunk] = mi;",
+            with: "atomic_store_explicit((device atomic_int*)(best_id + chunk), mi, memory_order_relaxed);")
+        + fusedFinalHead
+        + finalSource
+            .replacingOccurrences(
+                of: "const float v = best_val[c];",
+                with: "const float v = as_type<float>(atomic_load_explicit((device atomic_uint*)(best_val + c), memory_order_relaxed));")
+            .replacingOccurrences(
+                of: "const int id = best_id[c];",
+                with: "const int id = atomic_load_explicit((device atomic_int*)(best_id + c), memory_order_relaxed);")
+        + fusedFinalTail
+    private static let fusedSelectKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_select_final_affine4_gs64",
+        inputNames: ["scores", "w", "scales", "biases", "x", "counter"],
+        outputNames: ["cand_ids", "cand_vals", "best_val", "best_id", "out"],
+        source: fusedSelectSource, header: nemotronMultiRowQMVHeader,
+        mutableInputs: ["counter"])
+    /// The fused select on the select rescore's decode swaps.
+    private static let fusedSelectHalfKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_select_final_affine4_gs64_hf",
+        inputNames: ["scores", "w", "scales", "biases", "x", "counter"],
+        outputNames: ["cand_ids", "cand_vals", "best_val", "best_id", "out"],
+        source: nemotronSwapped(fusedSelectSource, nemotronMultiRowHalfSwaps),
+        header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader,
+        mutableInputs: ["counter"])
+
+    /// The fused select's ticket counter: one zeroed uint32, allocated once
+    /// per screen plan, which every fused dispatch returns to 0. MLX treats
+    /// a mutable input as that dispatch's output, so it puts a barrier
+    /// between any two fused dispatches and their tickets never interleave.
+    static func makeCounter() -> MLXArray {
+        let counter = MLXArray.zeros([1], dtype: .uint32)
+        eval(counter)
+        return counter
+    }
 
     struct Result {
         let id: MLXArray
@@ -2008,12 +2817,17 @@ enum NemotronHeadScreen {
     /// `upperGroups` (count `upperGroupCount`) also screens rows 65536..<131072
     /// with that smaller group set; candidate ids stay global head rows, and
     /// every chunk keeps the same per-chunk selection and exact rescore.
+    /// `records` (`packRecords`) wins over `packed` (`packScalesBiases`); each
+    /// must be built from the same groups and upper groups.
+    /// `counter` (`makeCounter`): one fused select + final launch.
     static func run(
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        packed: MLXArray? = nil, records: MLXArray? = nil,
+        counter: MLXArray? = nil,
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2,
+        contextIds: MLXArray? = nil
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
@@ -2022,7 +2836,12 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (packed.map {
+        let scores = (records.map {
+            (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
+                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])
+        } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
                 [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
@@ -2034,6 +2853,28 @@ enum NemotronHeadScreen {
         let chunks = rows / chunk
         let selectGroups = 8
         let selectHalf = selectHalfDecodeForm != 0
+        if let counter {
+            let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
+                [scores, weight, scales, biases, hidden, counter],
+                template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
+                           ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
+                grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
+                outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks], [1]],
+                outputDTypes: [.int32, .float32, .float32, .int32, .int32])
+            guard let contextIds else {
+                return Result(id: picked[4], scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+            }
+            let context = contextKernel(
+                [weight, scales, biases, hidden, contextIds],
+                template: [("T", hidden.dtype), ("C", contextSlots), ("NSG", selectGroups)],
+                grid: (32, selectGroups, 1), threadGroup: (32, selectGroups, 1),
+                outputShapes: [[1], [1]], outputDTypes: [.float32, .int32])
+            let id = finalContextKernel(
+                [picked[2], picked[3], context[0], context[1]], template: [("NCH", chunks)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32])[0]
+            return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+        }
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
             [scores, weight, scales, biases, hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
@@ -2041,10 +2882,26 @@ enum NemotronHeadScreen {
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
             outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
             outputDTypes: [.int32, .float32, .float32, .int32])
-        let id = finalKernel(
-            [picked[2], picked[3]], template: [("NCH", chunks)],
-            grid: (32, 1, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.int32])[0]
+        let id: MLXArray
+        if let contextIds {
+            // The request's context ids (`contextSlots`, padded by repetition)
+            // rescored with the same per-row arithmetic, then one more
+            // candidate for the final argmax with the same tie-break.
+            let context = contextKernel(
+                [weight, scales, biases, hidden, contextIds],
+                template: [("T", hidden.dtype), ("C", contextSlots), ("NSG", selectGroups)],
+                grid: (32, selectGroups, 1), threadGroup: (32, selectGroups, 1),
+                outputShapes: [[1], [1]], outputDTypes: [.float32, .int32])
+            id = finalContextKernel(
+                [picked[2], picked[3], context[0], context[1]], template: [("NCH", chunks)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32])[0]
+        } else {
+            id = finalKernel(
+                [picked[2], picked[3]], template: [("NCH", chunks)],
+                grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32])[0]
+        }
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
     }
 }

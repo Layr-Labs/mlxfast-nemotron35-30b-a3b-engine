@@ -478,6 +478,12 @@ public protocol CBv2MTPCommittedTokenObserving: AnyObject {
     func observeCommittedTokens(_ tokens: [Int], requestState: any CBv2MTPRequestState)
 }
 
+/// Optional: every prompt token a request's prefill commits (the committed-token
+/// observer above sees only the tail of the prompt).
+public protocol CBv2MTPPromptTokenObserving: AnyObject {
+    func observePromptTokens(_ tokens: [Int], requestState: any CBv2MTPRequestState)
+}
+
 /// Optional: queue the next round's first draft right behind the verify, for
 /// the row the device picks from the acceptance packet, so the head does not
 /// wait for the host's finalize. The host still decides: finalize reports its
