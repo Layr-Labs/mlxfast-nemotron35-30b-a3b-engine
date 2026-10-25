@@ -1696,11 +1696,12 @@ enum NemotronZSkip {
     /// re-checks every layer) if the tiled kernel misses a bit check.
     nonisolated(unsafe) private static var tiled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TILED"] != "0"
-    /// SIMD groups per slot-kernel threadgroup: 16 halves each thread's lane
-    /// partials (two instead of four) with the same lane-to-chunk map, so every
+    /// SIMD groups per slot-kernel threadgroup: 32 gives each thread one lane
+    /// partial (instead of four) with the same lane-to-chunk map, so every
     /// partial, its order and the closing reduction are unchanged.
-    /// NEMOTRON_MTP_ZSKIP_SGS=8 keeps the base's 256-thread threadgroups.
-    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 8 ? 8 : 16
+    /// NEMOTRON_MTP_ZSKIP_SGS=8 or 16 selects 256- or 512-thread threadgroups.
+    static let sgs = [8, 16].contains(Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") ?? 0)
+        ? Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"]!)! : 32
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
     /// also falls back to the original slot kernel (and re-checks every layer)
     /// if the staged one misses a bit check.
