@@ -50,11 +50,10 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
-/// Layers per submitted chunk in a multi-token (prompt prefill) CBv2 forward,
-/// where each chunk also waits for the previous one so its temporaries return
-/// to MLX's buffer cache before the next chunk allocates. Every prompt prefill
-/// (engine request prefill and teacher-forced stepper alike) runs this one
-/// path. `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
+/// Layers between early asyncEval calls on the MTP prefill path only. The seed
+/// window is the first request after the engine drains MLX's buffer cache, so a
+/// shorter chunk hands its transient live set back to that cache sooner.
+/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
@@ -326,6 +325,48 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
         source: sumSource(), ensureRowContiguous: true)
+
+    /// The assistant already has six FP32 score products per output from its
+    /// private sparse FC2. Fold them in original slot order in this join,
+    /// retaining the routed BF16 cast, both BF16 Adds and the exact RMS tree.
+    static let draftExpertFold =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FC2_FOLD_RMS"] != "0"
+    private static func draftExpertFoldSource() -> String {
+        let add = "T sum = lhs[offset + i] + rhs[offset + i];"
+        precondition(source.components(separatedBy: add).count == 2)
+        return source.replacingOccurrences(of: add, with: """
+                float total = products[offset + i];
+                for (uint slot = 1; slot < 6; slot++) {
+                    total = products[slot * axis_size + offset + i] + total;
+                }
+                T routed = static_cast<T>(total);
+                T part = routed + shared[offset + i];
+                T sum = lhs[offset + i] + part;
+                """)
+    }
+    private static let draftExpertFoldKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_owned_fc2_fold_residual_rms_bf16",
+        inputNames: ["lhs", "products", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: draftExpertFoldSource(), ensureRowContiguous: true)
+
+    static func applyDraftExpertFold(
+        _ lhs: MLXArray, products: MLXArray, shared: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
+        guard draftExpertFold,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              lhs.shape == [1, 1, 2688], shared.shape == lhs.shape,
+              lhs.dtype == .bfloat16, shared.dtype == .bfloat16,
+              products.shape == [6, 2688], products.dtype == .float32,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16 else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let outputs = draftExpertFoldKernel([lhs, products, shared, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        return (outputs[0], outputs[1])
+    }
 
     static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
@@ -1044,6 +1085,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
     @ModuleInfo(key: "norm") var norm: NemotronHRMSNormGated
     let mtpCompactGraphCache = NemotronH35MTPCompactGraphCache()
+    // Load-only official-worker admission; fixed before captured graph tracing.
+    var mtpInProjConvDtQualified = false
 
     init(_ args: NemotronHConfiguration) {
         self.numHeads = args.mambaNumHeads
@@ -3640,7 +3683,9 @@ private class NemotronHBackbone: Module {
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3651,8 +3696,6 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
-        let prefillChunks = inputs.dim(1) > 1 && !captureMTP
-        let earlyEvalInterval = prefillChunks ? nemotronPrefillEvalInterval : nemotronEarlyEvalInterval
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3692,20 +3735,22 @@ private class NemotronHBackbone: Module {
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
-                if prefillChunks {
+                if inputs.dim(1) > 1 && !captureMTP {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
-                    // Every prompt prefill. A chunk runs for milliseconds while
-                    // the host builds the next in well under one, so without a
-                    // wait the host encodes, and allocates, every layer's
-                    // intermediates before the first chunk completes. Waiting on
-                    // the previous chunk returns its temporaries to MLX's buffer
-                    // cache for the next chunk; this chunk is already queued, so
-                    // the GPU never waits on the host. Evaluation order only;
-                    // values are unchanged.
-                    if let previous = submittedPrefillChunk { eval(previous) }
-                    submittedPrefillChunk = hidden
+                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
+                    // milliseconds while the host builds the next in well under
+                    // one, so without a wait the host encodes, and allocates,
+                    // every layer's intermediates before the first chunk
+                    // completes. Waiting on the previous chunk returns its
+                    // temporaries to MLX's buffer cache for the next chunk; this
+                    // chunk is already queued, so the GPU never waits on the
+                    // host. Evaluation order only; values are unchanged.
+                    if recyclePrefillChunks {
+                        if let previous = submittedPrefillChunk { eval(previous) }
+                        submittedPrefillChunk = hidden
+                    }
                 } else {
                     asyncEval(hidden)
                 }
@@ -3955,7 +4000,9 @@ public class NemotronHModel:
         _ inputs: MLXArray,
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -3964,7 +4011,8 @@ public class NemotronHModel:
             return attending
         }
         return backbone.cbv2Forward(
-            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP)
+            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
+            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.
