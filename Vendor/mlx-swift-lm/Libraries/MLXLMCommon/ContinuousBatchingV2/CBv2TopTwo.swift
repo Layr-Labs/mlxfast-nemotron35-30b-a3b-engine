@@ -1,5 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 
+import Foundation
 import MLX
 
 // MARK: - Hierarchical top-2
@@ -209,4 +210,119 @@ package func cbv2TopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXAr
         outputDTypes: [.int32, .float32]
     )
     return (outputs[0], outputs[1])
+}
+
+// MARK: - Top-2 finalize that also writes the MTP acceptance packet
+
+/// CBV2_MTP_TOP2_PACKET=0 keeps the acceptance packet as a separate
+/// concatenate (one copy launch per part) after the top-2 finalize.
+public enum CBv2MTPTopTwoPacket {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_PACKET"] != "0"
+    /// NEMOTRON_KERNEL_SELFTEST=1: compare with the concatenated packet on
+    /// the host when it is built (the process stops on a difference).
+    public static let selfTest =
+        ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
+}
+
+/// The finalize body above, unchanged, plus the MTP acceptance packet the
+/// engine otherwise concatenates: `[B * k]` drafts (window columns 1...k,
+/// row-major), the `[B * (1 + k)]` top-1 ids, then the `[B * (1 + k) * 2]`
+/// top-2 values as their int32 bit patterns. `window` is the `[B, 1 + k]`
+/// int32 verify input; logits row r is its position r. Integer stores only:
+/// each element is window[r], or a value this launch already writes.
+private let cbv2TopTwoFinalizePacketKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_finalize_packet",
+    inputNames: ["partial_ids", "partial_values", "window"],
+    outputNames: ["top_ids", "top_values", "packet"],
+    source: """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        uint base = (row * 32 + lane) * 2;
+        darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
+        darkbloom_qwen35_mtp_top2_insert(
+            local, partial_values[base], uint(partial_ids[base]));
+        darkbloom_qwen35_mtp_top2_insert(
+            local, partial_values[base + 1], uint(partial_ids[base + 1]));
+
+        threadgroup darkbloom_qwen35_mtp_top2_state scratch[32];
+        scratch[lane] = local;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = 16; stride > 0; stride >>= 1) {
+            if (lane < stride) {
+                darkbloom_qwen35_mtp_top2_state merged = scratch[lane];
+                darkbloom_qwen35_mtp_top2_state other = scratch[lane + stride];
+                darkbloom_qwen35_mtp_top2_insert(
+                    merged, other.first_value, other.first_id);
+                darkbloom_qwen35_mtp_top2_insert(
+                    merged, other.second_value, other.second_id);
+                scratch[lane] = merged;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (lane == 0) {
+            uint output_base = row * 2;
+            top_ids[output_base] = int(scratch[0].first_id);
+            top_ids[output_base + 1] = int(scratch[0].second_id);
+            top_values[output_base] = scratch[0].first_value;
+            top_values[output_base + 1] = scratch[0].second_value;
+
+            uint batch = uint(window_shape[0]);
+            uint width = uint(window_shape[1]);
+            uint drafts = batch * (width - 1);
+            uint rows = batch * width;
+            packet[drafts + row] = int(scratch[0].first_id);
+            packet[drafts + rows + output_base] = as_type<int>(scratch[0].first_value);
+            packet[drafts + rows + output_base + 1] = as_type<int>(scratch[0].second_value);
+            uint column = row % width;
+            if (column > 0) {
+                packet[(row / width) * (width - 1) + (column - 1)] = window[row];
+            }
+        }
+    """,
+    header: cbv2TopTwoHeader,
+    ensureRowContiguous: true
+)
+
+/// `cbv2TopTwoRows` plus the MTP acceptance packet from the same finalize
+/// launch, for logits `[1, B * (1 + k), vocab]` whose rows are the positions
+/// of the int32 verify window `[B, 1 + k]`. `ids` and `values` are those of
+/// `cbv2TopTwoRows` (same partial kernel and merge code). nil when the
+/// shapes do not qualify or `CBV2_MTP_TOP2_PACKET=0`.
+package func cbv2TopTwoRowsPacket(
+    _ logits: MLXArray, window: MLXArray
+) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+    guard CBv2MTPTopTwoPacket.enabled,
+        logits.ndim == 3, logits.dim(0) == 1, logits.dim(2) >= 2,
+        window.ndim == 2, window.dtype == .int32, window.dim(1) >= 2,
+        window.dim(0) * window.dim(1) == logits.dim(1)
+    else { return nil }
+    let rows = logits.dim(1)
+    let drafts = window.dim(0) * (window.dim(1) - 1)
+    let partials = cbv2TopTwoPartialKernel(
+        [logits],
+        grid: (rows * 32 * 256, 1, 1),
+        threadGroup: (256, 1, 1),
+        outputShapes: [[rows, 32, 2], [rows, 32, 2]],
+        outputDTypes: [.int32, .float32]
+    )
+    let outputs = cbv2TopTwoFinalizePacketKernel(
+        [partials[0], partials[1], window],
+        grid: (rows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[rows, 2], [rows, 2], [drafts + rows * 3]],
+        outputDTypes: [.int32, .float32, .int32]
+    )
+    return (outputs[0], outputs[1], outputs[2])
+}
+
+/// Load-time JIT of the packet finalize (its pipeline depends only on the
+/// int32/float32/int32 input types, not on the window shape).
+package func cbv2TopTwoRowsPacketWarm(logitsDType: DType) {
+    let logits = MLXArray.zeros([1, 3, 64], dtype: logitsDType)
+    let window = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
+    guard let warmed = cbv2TopTwoRowsPacket(logits, window: window) else { return }
+    eval(warmed.ids, warmed.values, warmed.packet)
 }

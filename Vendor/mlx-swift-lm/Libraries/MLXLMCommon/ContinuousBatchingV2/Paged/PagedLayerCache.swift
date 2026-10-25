@@ -222,8 +222,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var roots: [MLXArray] = []
         roots.reserveCapacity(pagedRows.count * 2)
         for (index, row) in pagedRows.enumerated() {
-            let k = keys[index]
-            let v = values[index]
+            // CBV2_PAGED_STRIDED_WRITE: a slice view (no launch) instead of
+            // an Int subscript (an MLX `take`, one gather launch per array);
+            // the strided segment write reads the same elements.
+            let k = CBv2CriticalPathCuts.stridedSegmentWrite
+                ? keys[index ..< (index + 1)].squeezed(axis: 0) : keys[index]
+            let v = CBv2CriticalPathCuts.stridedSegmentWrite
+                ? values[index ..< (index + 1)].squeezed(axis: 0) : values[index]
             row.write(keys: k, values: v)
             roots.append(k)
             roots.append(v)

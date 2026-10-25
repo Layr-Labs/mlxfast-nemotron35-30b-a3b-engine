@@ -142,9 +142,9 @@ enum PagedSegmentAttention {
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok,
             headsPerThreadgroup: hpt)
-        let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
         return mergeKernel(key: mergeKey, source: source)(
-            [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
+            [partials, meta, seqinfo, sinks ?? PagedSegmentZeroSinks.array(count: max(8, qh)),
+             group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
@@ -187,5 +187,27 @@ enum PagedMTPBatchedColumns {
             source: source, dispatchCache: dispatchCache, draftAttention: draftAttention)
         let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
+    }
+}
+
+/// CBV2_PAGED_CACHED_ZERO_SINKS: the merge's placeholder sinks input (never
+/// read when HAS_SINKS is false) as one evaluated, read-only float32 zeros
+/// array per length, instead of a fresh `zeros` (one fill launch) per
+/// decode. Input-independent and never written; same values either way.
+enum PagedSegmentZeroSinks {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var arrays: [Int: MLXArray] = [:]
+
+    static func array(count: Int) -> MLXArray {
+        guard CBv2CriticalPathCuts.cachedZeroSinks else {
+            return MLXArray.zeros([count], dtype: .float32)
+        }
+        return lock.withLock {
+            if let cached = arrays[count] { return cached }
+            // Host-backed constant: no device fill, nothing lazy to evaluate.
+            let made = MLXArray([Float](repeating: 0, count: count))
+            arrays[count] = made
+            return made
+        }
     }
 }

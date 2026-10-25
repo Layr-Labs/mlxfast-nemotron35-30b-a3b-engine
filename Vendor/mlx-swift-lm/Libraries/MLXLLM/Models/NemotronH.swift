@@ -215,6 +215,34 @@ enum NemotronHResidualRMSNorm {
         return s.replacingOccurrences(of: add, with: "T sum = lhs[offset + i];")
             .replacingOccurrences(of: store, with: "")
     }
+
+    /// Fuse the zero-skip top-six reduction into the shared/residual/RMS join.
+    private static func productsSumPreparedSource() -> String {
+        let add = "T part = rhs[offset + i] + shared[offset + i];"
+        let offset = "const size_t offset = size_t(gid) * axis_size + lid * n_reads;"
+        let s = sumPreparedSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        precondition(s.components(separatedBy: offset).count == 2)
+        return s.replacingOccurrences(of: offset, with: offset
+                + "\n            const size_t pbase = size_t(gid) * 6 * axis_size + lid * n_reads;")
+            .replacingOccurrences(of: add, with: """
+                float total = prod[pbase + i];
+                                for (int j = 1; j < 6; j++) {
+                                    total = prod[pbase + size_t(j) * axis_size + i] + total;
+                                }
+                                T part = static_cast<T>(total) + shared[offset + i];
+                """)
+    }
+
+    private static let productsSumPreparedKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_top6_sum_rms_prepared_bf16",
+        inputNames: ["lhs", "prod", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: productsSumPreparedSource(), ensureRowContiguous: true)
+
+    static let productsJoinEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] != "0"
+
     private static let sumPreparedKernel = MLXFast.metalKernel(
         name: "nemotron_h_residual_sum_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
@@ -261,14 +289,21 @@ enum NemotronHResidualRMSNorm {
     static func applyPreparedRows(
         _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray)? {
+        let products = rhs.dtype == .float32 && rhs.shape == [18 * 2688]
         guard plumbingRows(lhs, norm: norm),
-              rhs.shape == lhs.shape, rhs.dtype == .bfloat16,
-              shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
+              products || (rhs.shape == lhs.shape && rhs.dtype == .bfloat16),
+              shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16),
+              !products || shared != nil
         else { return nil }
         let (axis, eps) = scalars(norm.eps)
         let shapes = [lhs.shape, lhs.shape, [3, 11, 9 * 32]]
         let outputs: [MLXArray]
-        if let shared {
+        if products, let shared {
+            outputs = productsSumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
+        } else if let shared {
             outputs = sumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
                 grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
@@ -1496,6 +1531,41 @@ class NemotronHAttention: Module, NemotronHMixer {
         let length = x.dim(1)
         precondition(precomputed.map { $0.0.dim(0) == batch && $0.0.dim(1) == length } ?? true,
                      "NemotronH attention projections do not match their input rows")
+        // CBV2_KV_IN_PLACE_APPEND: on the captured [1, 3] verify window the
+        // fused Q/K/V launch also stores the K/V rows straight into this
+        // layer's contiguous cache (the slice-update copies of K and V go
+        // away); the serialized SDPA calls then read the cache behind that
+        // launch. Same stored bytes, same attention.
+        if precomputed == nil, captureMTP, targetQKV, batch == 1, length == 3,
+           NemotronMTPAttentionDirect.enabled,
+           numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+           let layerCache = cache as? CBv2LayerCache,
+           let target = layerCache.mtpInPlaceKVTarget(
+               count: length, dtype: x.dtype, headDim: headDim),
+           let qkv = NemotronTargetQKV.applyWritingKV(
+               x, query: wq, key: wk, value: wv, prepared: prepared,
+               kCache: target.keys, vCache: target.values,
+               offset: target.offset, capacity: target.capacity)
+        {
+            var queries = qkv.0.reshaped(batch, length, numHeads, headDim).transposed(0, 2, 1, 3)
+            if NemotronMoELeader.selfTest {
+                // The cache rows just written must be bitwise the K/V rows
+                // the stock slice update would store; poison on a difference.
+                let span = target.offset ..< (target.offset + length)
+                let stored = [target.keys, target.values].map {
+                    depends(input: $0[0..., 0..., span, 0...], dependencies: [qkv.0])
+                }
+                let expected = [qkv.1, qkv.2].map {
+                    $0.reshaped(batch, length, numKeyValueHeads, headDim).transposed(0, 2, 1, 3)
+                }
+                let same = all(stored[0].view(dtype: .uint16) .== expected[0].view(dtype: .uint16))
+                    .&& all(stored[1].view(dtype: .uint16) .== expected[1].view(dtype: .uint16))
+                queries = which(same, queries, MLXArray(Float.nan).asType(queries.dtype))
+            }
+            let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
+                queries: queries, written: qkv.0, scale: scale, sinks: nil)
+            return NemotronMTPAttentionDirect.project(rows, wo)
+        }
         let (q, k, v) = precomputed ?? cbv2Projections(
             x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
         let queries = q.reshaped(
@@ -3599,6 +3669,9 @@ private class NemotronHBlock: Module {
             return (triple.0, triple.1, triple.2)
         }
         // Original arithmetic: stock shared Add, residual Add, stock RMSNorm.
+        if output.dtype == .float32 && output.shape == [18 * 2688] {
+            output = NemotronZSkip.reduceProducts(output, dtype: .bfloat16)
+        }
         if let shared { output = output + shared }
         let residual = x + output
         return (residual, nemotronMTPNormRows(residual) { nextNorm($0) }, nil)

@@ -764,6 +764,30 @@ enum CBv2AttentionV1 {
             spanContext: nil, keepMask: nil)
     }
 
+    /// `updateAndAttendSerialQueryRows` when a producer kernel already wrote
+    /// the L new tokens' K/V into `row`'s storage in place (the target from
+    /// `CBv2FullSequenceKV.inPlaceAppendTarget`; `written` is an output of
+    /// that kernel). The append is committed behind that write; the per-query
+    /// SDPA calls are unchanged.
+    static func attendSerialQueryRowsWritten(
+        row: CBv2FullSequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, written: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?
+    ) -> [MLXArray] {
+        precondition(
+            queries.dim(0) == 1 && queries.dim(2) > 1,
+            "CBv2AttentionV1: serial query rows serve one row with L > 1")
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = row.commitInPlaceAppend(count: L, written: written)
+        return queryBlockOutputs(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: 1,
+            spanContext: nil, keepMask: nil)
+    }
+
     /// One query at a time — the pinned MTP serial-verification path.
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
