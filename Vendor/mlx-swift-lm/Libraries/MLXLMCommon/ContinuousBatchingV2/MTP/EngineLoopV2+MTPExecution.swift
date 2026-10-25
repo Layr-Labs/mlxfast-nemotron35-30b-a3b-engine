@@ -579,6 +579,7 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
+        var draftConfidences: [MLXArray?] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
@@ -600,6 +601,9 @@ extension EngineLoopV2 {
                         hidden: currentHidden[index],
                         shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
                         requestState: requestState)
+                    if batch == 1 {
+                        draftConfidences.append(CBv2MTPLastRowGate.confidence(of: result.tokens))
+                    }
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
@@ -643,6 +647,19 @@ extension EngineLoopV2 {
             }
         }
         let draftIDs = stacked(draftSteps, axis: 1)
+        // Depth-two single-row round: gate the verify's last row on the two
+        // drafts' confidences (`CBv2MTPLastRowGate`).
+        var lastRowGate: MLXArray? = nil
+        var packetDrafts = draftIDs.reshaped([-1])
+        if CBv2MTPLastRowGate.enabled, batch == 1, k == 2, draftConfidences.count == 2,
+           let first = draftConfidences[0], let second = draftConfidences[1] {
+            let gated = CBv2MTPLastRowGate.gate(
+                firstConfidence: first, secondConfidence: second,
+                secondDraft: draftSteps[1].reshaped([-1]))
+            lastRowGate = gated.gate
+            packetDrafts = concatenated(
+                [draftSteps[0].reshaped([-1]).asType(.int32), gated.packetSecondDraft], axis: 0)
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
@@ -656,15 +673,16 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
-        let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+        let target = try CBv2MTPLastRowGate.withGate(lastRowGate) {
+            try mtpBuildTargetVerification(columns: targetColumns, rows: verifyRows, driver: mtp)
+        }
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+        var packetParts = [packetDrafts, target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }

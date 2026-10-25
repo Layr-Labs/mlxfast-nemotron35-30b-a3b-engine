@@ -20,21 +20,23 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = usesPrepared + 2 * parts; every slot is its own compiled graph.
-    private var entries: [Entry?] = [nil, nil, nil, nil]
+    /// Slot = usesPrepared + 2 * parts + 4 * gated; every slot is its own
+    /// compiled graph. A gated graph takes the last-row gate as an input.
+    private var entries: [Entry?] = Array(repeating: nil, count: 8)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
     var callCount: Int { lock.withLock { calls } }
 
-    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, owner: NemotronHMoE) -> MLXArray {
-        let result = outputs(x, prepared: prepared, parts: false, owner: owner)
+    func callAsFunction(_ x: MLXArray, prepared: MLXArray? = nil, owner: NemotronHMoE,
+                        rowGate: MLXArray? = nil) -> MLXArray {
+        let result = outputs(x, prepared: prepared, parts: false, owner: owner, rowGate: rowGate)
         return result.isEmpty ? MLXArray(0) : result[0]
     }
 
     /// parts: [routed, shared] before their Add (owner must have shared experts).
     func outputs(_ x: MLXArray, prepared: MLXArray?, parts: Bool,
-                 owner: NemotronHMoE) -> [MLXArray] {
+                 owner: NemotronHMoE, rowGate: MLXArray? = nil) -> [MLXArray] {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
         // child identity cheaply, and collect array handles only on a miss.
@@ -44,7 +46,8 @@ final class NemotronH35MTPGraphCache {
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
-        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
+        let gated = rowGate != nil
+        let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0) + (gated ? 4 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -53,7 +56,8 @@ final class NemotronH35MTPGraphCache {
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 return owner.mtpForwardRowsUncompiledOutputs(arrays[0],
-                    prepared: usesPrepared ? arrays[1] : nil, parts: parts)
+                    prepared: usesPrepared ? arrays[1] : nil, parts: parts,
+                    rowGate: gated ? arrays[arrays.count - 1] : nil)
             }
             let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
             retired = entries[slot]
@@ -63,7 +67,8 @@ final class NemotronH35MTPGraphCache {
         }
         // Destroy retired compiler entries outside this helper's lock; compiler
         // evaluation owns a separate global/per-function lock ordering.
-        return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
+        let inputs = [x] + (prepared.map { [$0] } ?? []) + (rowGate.map { [$0] } ?? [])
+        return withExtendedLifetime(retired) { current.function(inputs) }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
@@ -92,9 +97,19 @@ extension NemotronHMoE {
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
         if NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
             x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) {
-            return mtpCompiledRowsCache(x, prepared: prepared, owner: self)
+            return mtpCompiledRowsCache(x, prepared: prepared, owner: self, rowGate: Self.rowGate(x))
         }
-        return mtpForwardRowsUncompiled(x, prepared: prepared)
+        return mtpForwardRowsUncompiledOutputs(
+            x, prepared: prepared, parts: false, rowGate: Self.rowGate(x))[0]
+    }
+
+    /// The verify's last-row gate (`CBv2MTPLastRowGate`) for a three-row input.
+    static func rowGate(_ x: MLXArray) -> MLXArray? {
+        guard NemotronMoELeader.enabled, NemotronMoELeader.tripleLeader,
+              NemotronMoELeader.fuseRelu2, NemotronMoELeader.fuseBalancePlan,
+              !NemotronMoELeader.selfTest,
+              x.ndim == 3, x.dim(1) == 3 else { return nil }
+        return CBv2MTPLastRowGate.current
     }
 
     /// Captured-verify join only: (routed, shared) before `routed + shared`,
@@ -103,9 +118,11 @@ extension NemotronHMoE {
     func mtpForwardRowsParts(_ x: MLXArray, prepared: MLXArray? = nil) -> (MLXArray, MLXArray)? {
         guard sharedExperts != nil, NemotronMTPExecution.batchedM1,
               x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) else { return nil }
+        let rowGate = Self.rowGate(x)
         let outputs = NemotronMTPExecution.compiledMoE
-            ? mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true, owner: self)
-            : mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: true)
+            ? mtpCompiledRowsCache.outputs(
+                x, prepared: prepared, parts: true, owner: self, rowGate: rowGate)
+            : mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: true, rowGate: rowGate)
         return outputs.count == 2 ? (outputs[0], outputs[1]) : nil
     }
 
@@ -116,7 +133,7 @@ extension NemotronHMoE {
     /// [routed + shared], or [routed, shared] when `parts` (shared experts
     /// present, batched M=1 route).
     func mtpForwardRowsUncompiledOutputs(
-        _ x: MLXArray, prepared: MLXArray?, parts: Bool
+        _ x: MLXArray, prepared: MLXArray?, parts: Bool, rowGate: MLXArray? = nil
     ) -> [MLXArray] {
         guard NemotronMTPExecution.batchedM1 else { return [nemotronMTPMapRows(x) { self($0) }] }
         let packed: MLXArray?
@@ -144,7 +161,7 @@ extension NemotronHMoE {
         }
         var y: MLXArray
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed) {
+            x, indices, scores, switchMLP, prepared: packed, gate: rowGate) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
@@ -339,6 +356,51 @@ inline void nml_qdot_pair(
   value0 = scale * accum0 + sum0 * bias;
   value1 = scale * accum1 + sum1 * bias;
 }
+
+// Width-3 verify only: an expert routed by all three rows is walked once by
+// its first occurrence. One decode per word feeds three accumulators, each
+// with exactly the pair form's per-token terms, order and affine close.
+template <typename U, int values_per_thread, bool HALF = false>
+inline void nml_qdot_triple(
+    const device uint8_t* w, const thread U* x0, const thread U* x1,
+    const thread U* x2, U scale, U bias, U sum0, U sum1, U sum2, int N,
+    thread U& value0, thread U& value1, thread U& value2) {
+  U accum0 = 0;
+  U accum1 = 0;
+  U accum2 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  if (HALF) {
+    const device uint* ws2 = (const device uint*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+      if (i < N / 4) {
+        const uint w2 = ws2[i / 2];
+        const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+        const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+        const U a = U(h0[i % 2]);
+        const U b1 = U(h1[i % 2]);
+        const U c = U(half(ushort(ws[i] & 0x0f00)));
+        const U d = U(half(ushort(ws[i] & 0xf000)));
+        accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b1 + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+        accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b1 + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+        accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b1 + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+      }
+    }
+  } else {
+    for (int i = 0; i < (N / 4); i++) {
+      const uint16_t q = ws[i];
+      const U a = q & 0x000f;
+      const U b = q & 0x00f0;
+      const U c = q & 0x0f00;
+      const U d = q & 0xf000;
+      accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+      accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+      accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+    }
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+  value2 = scale * accum2 + sum2 * bias;
+}
 """
 
 // RELU2 epilogue = stock relu2 on the stored bf16 value, op for op as MLX's
@@ -389,6 +451,7 @@ private func nmlPreparedSource(_ source: String, pointers: [(String, String)]) -
         ("nml_load_vector<T, U, values_per_thread>(", "nml_prepared_vector<U, values_per_thread>("),
         ("x0 += block_size;", "x0 += PSTRIDE;"),
         ("x1 += block_size;", "x1 += PSTRIDE;"),
+        ("x2 += block_size;", "x2 += PSTRIDE;"),
     ] {
         s = s.replacingOccurrences(of: from, with: to)
     }
@@ -419,16 +482,22 @@ private let nemotronMoELeaderSource = """
       before += inds[r * TOPK + j] == expert ? 1 : 0;
     }
   }
-  if ((before & 1) != 0) {
+  constexpr bool triple = TRIPLE && R == 3;
+  if (triple ? before != 0 : (before & 1) != 0) {
     return;
   }
   int partner = -1;
+  int partner2 = -1;
   for (int r = R - 1; r > row; r--) {
     for (int j = 0; j < TOPK; j++) {
       if (inds[r * TOPK + j] == expert) {
+        partner2 = partner;
         partner = r * TOPK + j;
       }
     }
+  }
+  if (!triple) {
+    partner2 = -1;
   }
 
   const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
@@ -481,7 +550,7 @@ private let nemotronMoELeaderSource = """
         y0[r] = nml_store<T, RELU2>(result[r]);
       }
     }
-  } else {
+  } else if (partner2 < 0) {
     const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
         simd_lid * values_per_thread;
     device T* y1 = y + partner * N + out_row;
@@ -537,15 +606,98 @@ private let nemotronMoELeaderSource = """
         y1[r] = nml_store<T, RELU2>(result1[r]);
       }
     }
+  } else {
+    const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
+        simd_lid * values_per_thread;
+    const device T* x2 = x + (XSLOT ? partner2 : partner2 / TOPK) * K +
+        simd_lid * values_per_thread;
+    device T* y1 = y + partner * N + out_row;
+    device T* y2 = y + partner2 * N + out_row;
+    thread U x0_thread[values_per_thread];
+    thread U x1_thread[values_per_thread];
+    thread U x2_thread[values_per_thread];
+    thread U result0[results_per_simdgroup] = {0};
+    thread U result1[results_per_simdgroup] = {0};
+    thread U result2[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1, value2;
+        nml_qdot_triple<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+            values_per_thread, value0, value1, value2);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+      x1 += block_size;
+      x2 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+      U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1, value2;
+        nml_qdot_triple<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+            remaining, value0, value1, value2);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result0[r] = simd_sum(result0[r]);
+      result1[r] = simd_sum(result1[r]);
+      result2[r] = simd_sum(result2[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result0[r]);
+        y1[r] = nml_store<T, RELU2>(result1[r]);
+        y2[r] = nml_store<T, RELU2>(result2[r]);
+      }
+    }
   }
 """
+
+// Selected confidence omission on the full current triple source. No
+// coefficient, accumulation, affine-close or reduction expression changes.
+private let nemotronMoELeaderLastRowSource = nemotronMoELeaderSource
+    .replacingOccurrences(of: "  const int row = slot / TOPK;", with: """
+      const int row = slot / TOPK;
+      const bool MASK2 = gate[0] != 0;
+      if (MASK2 && row == R - 1) { return; }
+    """)
+    .replacingOccurrences(of: "  for (int r = R - 1; r > row; r--) {", with: """
+      for (int r = R - 1; r > row; r--) {
+        if (MASK2 && r == R - 1) { continue; }
+    """)
 
 private final class NemotronMoELeaderKernel: Sendable {
     static let shared = NemotronMoELeaderKernel()
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_moe_leader_qmv_affine4_gs64",
+            name: "nemotron_moe_leader_qmv_affine4_gs64_t3",
             inputNames: ["w", "scales", "biases", "x", "inds"],
             outputNames: ["y"],
             source: nemotronMoELeaderSource,
@@ -557,6 +709,7 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     static let shared = NemotronMoELeaderPreparedKernels()
     let gateUp: MLXFast.MLXFastKernel?
     let gateUpAndPlan: MLXFast.MLXFastKernel?
+    let gateUpAndLastRowPlan: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -564,18 +717,36 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
             ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
              "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x2 = x + (XSLOT ? partner2 : partner2 / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x2 = prepared + (partner2 / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ])
+        let lastRowSource = nmlPreparedSource(nemotronMoELeaderLastRowSource, pointers: [
+            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x2 = x + (XSLOT ? partner2 : partner2 / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x2 = prepared + (partner2 / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
         ])
         gateUp = preparedSource.map {
             MLXFast.metalKernel(
-                name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
+                name: "nemotron_moe_leader_qmv_affine4_gs64_prepared_t3",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0, header: header)
         }
         gateUpAndPlan = preparedSource.map {
             MLXFast.metalKernel(
-                name: "nemotron_moe_leader_prepared_fc1_with_balance_plan",
+                name: "nemotron_moe_leader_prepared_fc1_with_balance_plan_t3",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
+                header: header)
+        }
+        gateUpAndLastRowPlan = lastRowSource.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_prepared_fc1_lastrow_plan_t3",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "gate"],
+                outputNames: ["y", "plan"],
+                source: nmlFC1WithBalancePlanSource($0, planSource: nmlLastRowPlanSource),
                 header: header)
         }
     }
@@ -619,6 +790,7 @@ private let nemotronMoELeaderWeightedSource = """
         }
       }
     }
+    const int partner2 = -1;
 
     const device uint8_t* ws = (const device uint8_t*)w +
         (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
@@ -669,7 +841,7 @@ private let nemotronMoELeaderWeightedSource = """
           products[slot * results_per_simdgroup + r] = float(h) * scores[slot] + 0.0f;
         }
       }
-    } else {
+    } else if (partner2 < 0) {
       const device T* x1 = x + partner * K + simd_lid * values_per_thread;
       thread U x0_thread[values_per_thread];
       thread U x1_thread[values_per_thread];
@@ -725,10 +897,79 @@ private let nemotronMoELeaderWeightedSource = """
           products[partner * results_per_simdgroup + r] = float(h1) * scores[partner] + 0.0f;
         }
       }
+    } else {
+      const device T* x1 = x + partner * K + simd_lid * values_per_thread;
+      const device T* x2 = x + partner2 * K + simd_lid * values_per_thread;
+      thread U x0_thread[values_per_thread];
+      thread U x1_thread[values_per_thread];
+      thread U x2_thread[values_per_thread];
+      thread U result0[results_per_simdgroup] = {0};
+      thread U result1[results_per_simdgroup] = {0};
+      thread U result2[results_per_simdgroup] = {0};
+      int k = 0;
+      for (; k < K - block_size; k += block_size) {
+        U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+        U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+        U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+        for (int r = 0; r < results_per_simdgroup; r++) {
+          auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+          const device T* sl = sc + r * in_vec_size_g;
+          const device T* bl = bs + r * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          U value0, value1, value2;
+          nml_qdot_triple<U, values_per_thread, R == 3>(
+              wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+              values_per_thread, value0, value1, value2);
+          result0[r] += value0;
+          result1[r] += value1;
+          result2[r] += value2;
+        }
+        ws += block_size / 2;
+        sc += block_size / 64;
+        bs += block_size / 64;
+        x0 += block_size;
+        x1 += block_size;
+        x2 += block_size;
+      }
+      const int remaining = clamp(
+          static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+      if (remaining > 0) {
+        U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+        U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+        U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+        for (int r = 0; r < results_per_simdgroup; r++) {
+          auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+          const device T* sl = sc + r * in_vec_size_g;
+          const device T* bl = bs + r * in_vec_size_g;
+          U s = sl[0];
+          U b = bl[0];
+          U value0, value1, value2;
+          nml_qdot_triple<U, values_per_thread, R == 3>(
+              wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+              remaining, value0, value1, value2);
+          result0[r] += value0;
+          result1[r] += value1;
+          result2[r] += value2;
+        }
+      }
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        result0[r] = simd_sum(result0[r]);
+        result1[r] = simd_sum(result1[r]);
+        result2[r] = simd_sum(result2[r]);
+        if (simd_lid == 0) {
+          const T h0 = nml_store<T, false>(result0[r]);
+          const T h1 = nml_store<T, false>(result1[r]);
+          const T h2 = nml_store<T, false>(result2[r]);
+          products[slot * results_per_simdgroup + r] = float(h0) * scores[slot] + 0.0f;
+          products[partner * results_per_simdgroup + r] = float(h1) * scores[partner] + 0.0f;
+          products[partner2 * results_per_simdgroup + r] = float(h2) * scores[partner2] + 0.0f;
+        }
+      }
     }
   }
 
-  // Every original slot is written by its leader or by its one partner.
+  // Every original slot is written by its leader or by one of its partners.
   // All SIMD groups reach this barrier, including groups with no leader.
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (simd_gid < R && simd_lid == 0) {
@@ -748,7 +989,7 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_moe_leader_weighted_qmv_affine4_gs64",
+            name: "nemotron_moe_leader_weighted_qmv_affine4_gs64_t3",
             inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
             outputNames: ["y"],
             source: nemotronMoELeaderWeightedSource,
@@ -773,6 +1014,8 @@ enum NemotronMoELeader {
     static func leaderResultsPerSimdgroup(rows: Int) -> Int {
         narrowLeader && rows == 3 ? 2 : 4
     }
+    static let tripleLeader =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_TRIPLE"] != "0"
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -819,7 +1062,7 @@ enum NemotronMoELeader {
                 [bank.weight, bank.scales, bank.biases, packed, inds],
                 template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                            ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                           ("RELU2", relu2), ("RPS", rps)],
+                           ("RELU2", relu2), ("RPS", rps), ("TRIPLE", tripleLeader)],
                 grid: (32, bank.n / rps, rows * topK),
                 threadGroup: (32, 2, 1),
                 outputShapes: [[rows * topK, bank.n]],
@@ -829,7 +1072,7 @@ enum NemotronMoELeader {
             [bank.weight, bank.scales, bank.biases, x, inds],
             template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                       ("RELU2", relu2), ("RPS", rps)],
+                       ("RELU2", relu2), ("RPS", rps), ("TRIPLE", tripleLeader)],
             grid: (32, bank.n / rps, rows * topK),
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
@@ -845,23 +1088,27 @@ enum NemotronMoELeader {
     /// Both outputs are fresh current-call arrays; no planner state persists.
     static func applyWithBalancePlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?
+        prepared: MLXArray?, gate: MLXArray? = nil
     ) -> (activation: MLXArray, plan: MLXArray)? {
+        let rowGate = tripleLeader && !selfTest ? gate : nil
         guard fuseBalancePlan, preparedGateUp,
               x.shape == [3, 2688], x.dtype == .bfloat16,
               inds.shape == [18], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
-              let kernel = NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+              let kernel = rowGate == nil
+                ? NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+                : NemotronMoELeaderPreparedKernels.shared.gateUpAndLastRowPlan
         else { return nil }
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = leaderResultsPerSimdgroup(rows: 3)
-        let result = kernel([bank.weight, bank.scales, bank.biases, packed, inds],
+        let result = kernel([bank.weight, bank.scales, bank.biases, packed, inds]
+                + (rowGate.map { [$0] } ?? []),
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", false),
-                       ("RELU2", relu2), ("RPS", rps)],
+                       ("RELU2", relu2), ("RPS", rps), ("TRIPLE", tripleLeader)],
             grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
-            outputShapes: [[18, bank.n], [36]], outputDTypes: [x.dtype, .int32])
+            outputShapes: [[18, bank.n], [54]], outputDTypes: [x.dtype, .int32])
         guard selfTest else { return (result[0], result[1]) }
         let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
             perSlot: false, relu2: relu2, prepared: packed)
@@ -876,8 +1123,11 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank, plan: MLXArray? = nil) -> MLXArray {
-        if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
+                              rows: Int, bank: Bank, plan: MLXArray? = nil,
+                              gate: MLXArray? = nil) -> MLXArray {
+        if rows == 3 {
+            return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan, gate: gate)
+        }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
             template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
@@ -893,7 +1143,7 @@ enum NemotronMoELeader {
     /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
-        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil
+        _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, gate: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -917,7 +1167,7 @@ enum NemotronMoELeader {
         let balancePlan: MLXArray?
         if fuseRelu2 {
             if rows == 3, let fused = applyWithBalancePlan(
-                xr, flat, bank: up, relu2: true, prepared: prepared) {
+                xr, flat, bank: up, relu2: true, prepared: prepared, gate: gate) {
                 act = fused.activation
                 balancePlan = fused.plan
             } else {
@@ -933,7 +1183,8 @@ enum NemotronMoELeader {
             balancePlan = nil
         }
         var y = applyWeighted(act, flat, scores.reshaped(rows * 6),
-            rows: rows, bank: down, plan: balancePlan)
+            rows: rows, bank: down, plan: balancePlan,
+            gate: balancePlan == nil || selfTest || !tripleLeader ? nil : gate)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -1013,6 +1264,17 @@ enum NemotronMoELeader {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down,
                         plan: fused?.plan))
+                    if rows == 3, tripleLeader, fuseRelu2, !selfTest,
+                       CBv2MTPLastRowGate.enabled {
+                        for skip in [Int32(0), Int32(1)] {
+                            let gate = MLXArray([skip])
+                            if let gated = applyWithBalancePlan(
+                                x, inds, bank: up, relu2: true, prepared: nil, gate: gate) {
+                                outputs.append(applyWeighted(gated.activation, inds, scores,
+                                    rows: rows, bank: down, plan: gated.plan, gate: gate))
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1024,9 +1286,10 @@ private let nmlBalancePlanSource = """
   const uint lane = thread_position_in_grid.x;
   threadgroup uint ids[18];
   threadgroup int lead[18];
+  threadgroup int lead2[18];
   threadgroup int leaders[18];
   threadgroup int costs[18];
-  threadgroup int tplan[36];
+  threadgroup int tplan[54];
   if (lane < 18) { ids[lane] = inds[lane]; }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane < 18) {
@@ -1038,26 +1301,31 @@ private let nmlBalancePlanSource = """
       for (int j = 0; j < 6; j++) { before += ids[r*6+j] == expert ? 1 : 0; }
     }
     int partner = -1;
+    int partner2 = -1;
     for (int r = 2; r > row; r--) {
       for (int j = 0; j < 6; j++) {
-        if (ids[r*6+j] == expert) { partner = r*6+j; }
+        if (ids[r*6+j] == expert) { partner2 = partner; partner = r*6+j; }
       }
     }
+    if (!TRIPLE) { partner2 = -1; }
     // -2 marks a slot whose earlier occurrence leads it.
-    lead[slot] = (before & 1) != 0 ? -2 : partner;
+    lead[slot] = (TRIPLE ? before != 0 : (before & 1) != 0) ? -2 : partner;
+    lead2[slot] = partner2;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (lane == 0) {
     int counts[6] = {0}, loads[6] = {0}, original[6] = {0};
     int number = 0;
-    for (int i = 0; i < 36; i++) { tplan[i] = -1; }
+    for (int i = 0; i < 54; i++) { tplan[i] = -1; }
     for (int slot = 0; slot < 18; slot++) {
       const int partner = lead[slot];
       if (partner == -2) { continue; }
       leaders[number] = slot;
-      costs[number] = partner < 0 ? SOLO_COST : PAIR_COST;
+      costs[number] = partner < 0 ? SOLO_COST
+          : (lead2[slot] < 0 ? PAIR_COST : 2 * PAIR_COST - SOLO_COST);
       original[slot % 6] += costs[number];
       tplan[18+slot] = partner;
+      tplan[36+slot] = lead2[slot];
       number++;
     }
     // Stable largest-cost-first order; integer load, then group id break ties.
@@ -1085,8 +1353,21 @@ private let nmlBalancePlanSource = """
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (uint i = lane; i < 36; i += 32) { plan[i] = tplan[i]; }
+  for (uint i = lane; i < 54; i += 32) { plan[i] = tplan[i]; }
 """
+private let nmlLastRowPlanSource = nmlBalancePlanSource
+    .replacingOccurrences(of: "  const uint lane = thread_position_in_grid.x;", with: """
+      const uint lane = thread_position_in_grid.x;
+      const bool MASK2 = gate[0] != 0;
+    """)
+    .replacingOccurrences(of: "    for (int r = 2; r > row; r--) {", with: """
+        for (int r = 2; r > row; r--) {
+          if (MASK2 && r == 2) { continue; }
+    """)
+    .replacingOccurrences(
+        of: "lead[slot] = (TRIPLE ? before != 0 : (before & 1) != 0) ? -2 : partner;",
+        with: "lead[slot] = (MASK2 && row == 2) || (TRIPLE ? before != 0 : (before & 1) != 0) ? -2 : partner;")
+
 private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacingOccurrences(
     of: """
   for (int slot = simd_gid; slot < R * TOPK; slot += TOPK) {
@@ -1109,6 +1390,7 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
         }
       }
     }
+    const int partner2 = -1;
 
 """, with: """
   for (int job = 0; job < 3; job++) {
@@ -1116,29 +1398,54 @@ private let nmlBalanceWeightedSource = nemotronMoELeaderWeightedSource.replacing
     if (slot < 0) { continue; }
     const uint expert = inds[slot];
     const int partner = plan[18 + slot];
+    const int partner2 = plan[36 + slot];
 
 """)
+// All six SIMD groups still reach the original barrier. Omitted outputs
+// are zeroed BEFORE reading their intentionally unwritten products.
+private let nmlLastRowWeightedSource = "  const bool MASK2 = gate[0] != 0;\n" + nmlBalanceWeightedSource
+    .replacingOccurrences(
+        of: "      const int base = simd_gid * TOPK * results_per_simdgroup + r;",
+        with: """
+          if (MASK2 && simd_gid == R - 1) {
+            y[simd_gid * N + out_row + r] = static_cast<T>(0.0f);
+            continue;
+          }
+          const int base = simd_gid * TOPK * results_per_simdgroup + r;
+        """)
+
 private final class NMLBalancePlan: Sendable {
     static let shared = NMLBalancePlan()
-    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan",
+    let kernel = MLXFast.metalKernel(name: "nml_fc2_current_call_plan_t3",
         inputNames: ["inds"], outputNames: ["plan"], source: nmlBalancePlanSource)
     func make(_ ids: MLXArray, pairCost: Int = 1500) -> MLXArray {
-        kernel([ids], template: [("PAIR_COST",pairCost), ("SOLO_COST",1000)],
+        kernel([ids], template: [("PAIR_COST",pairCost), ("SOLO_COST",1000),
+                                 ("TRIPLE", NemotronMoELeader.tripleLeader)],
             grid: (32,1,1), threadGroup: (32,1,1),
-            outputShapes: [[36]], outputDTypes: [.int32])[0]
+            outputShapes: [[54]], outputDTypes: [.int32])[0]
     }
 }
 private final class NMLBalanceWeighted: Sendable {
     static let shared = NMLBalanceWeighted()
-    let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced",
+    let kernel = MLXFast.metalKernel(name: "nml_fc2_original_jobs_balanced_t3",
         inputNames: ["w","scales","biases","x","inds","scores","plan"],
         outputNames: ["y"], source: nmlBalanceWeightedSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
         ensureRowContiguous: true)
+    let lastRowKernel = MLXFast.metalKernel(name: "nml_fc2_lastrow_original_jobs_balanced_t3",
+        inputNames: ["w","scales","biases","x","inds","scores","plan","gate"],
+        outputNames: ["y"], source: nmlLastRowWeightedSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+        ensureRowContiguous: true)
     func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
-             _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil) -> MLXArray {
+             _ bank: NemotronMoELeader.Bank, plan: MLXArray? = nil,
+             gate: MLXArray? = nil) -> MLXArray {
+        let rowGate = plan != nil && NemotronMoELeader.tripleLeader
+            && !NemotronMoELeader.selfTest ? gate : nil
         let plan = plan ?? NMLBalancePlan.shared.make(ids)
-        return kernel([bank.weight,bank.scales,bank.biases,x,ids,scores,plan],
+        let selected = rowGate == nil ? kernel : lastRowKernel
+        return selected([bank.weight,bank.scales,bank.biases,x,ids,scores,plan]
+                + (rowGate.map { [$0] } ?? []),
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
@@ -1150,14 +1457,16 @@ private final class NMLBalanceWeighted: Sendable {
 /// in exactly one complete 64-thread TG: row-zero/slot-zero is always a leader,
 /// so its original follower return cannot skip the plan. FC2 already depends
 /// on FC1; reading the plan adds no dependency on a different producer.
-private func nmlFC1WithBalancePlanSource(_ preparedFC1: String) -> String {
+private func nmlFC1WithBalancePlanSource(
+    _ preparedFC1: String, planSource: String = nmlBalancePlanSource
+) -> String {
     let lane = "const uint lane = thread_position_in_grid.x;"
-    let store = "for (uint i = lane; i < 36; i += 32)"
-    precondition(nmlBalancePlanSource.components(separatedBy: lane).count == 2)
-    precondition(nmlBalancePlanSource.components(separatedBy: store).count == 2)
-    let plan = nmlBalancePlanSource
+    let store = "for (uint i = lane; i < 54; i += 32)"
+    precondition(planSource.components(separatedBy: lane).count == 2)
+    precondition(planSource.components(separatedBy: store).count == 2)
+    let plan = planSource
         .replacingOccurrences(of: lane, with: "const uint lane = simd_lid + 32 * simd_gid;")
-        .replacingOccurrences(of: store, with: "for (uint i = lane; i < 36; i += 64)")
+        .replacingOccurrences(of: store, with: "for (uint i = lane; i < 54; i += 64)")
     return preparedFC1 + """
 
       // tid is a TG coordinate, so both SIMD groups take this branch together.

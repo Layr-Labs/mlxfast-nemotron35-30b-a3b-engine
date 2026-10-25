@@ -84,6 +84,8 @@ extension NemotronH35MTPAssistant {
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
+        try NemotronDraftAttentionGeometry.warm()
+        CBv2MTPLastRowGate.warm()
         assistant.warmUpExactShapes()
         return assistant
     }
@@ -123,6 +125,7 @@ extension NemotronH35MTPAssistant {
             FileHandle.standardError.write(Data("nemotron mtp warm-up skipped: \(error)\n".utf8))
         }
         warmPostVerifySpeculation(skippingWidth: postVerifyWarmupWidth)
+        CBv2MTPLastRowGate.pruneReleasedDrafts()
         Memory.clearCache()
     }
 
@@ -217,6 +220,7 @@ extension NemotronH35MTPAssistant {
         // branch), then every shallower width.
         var rounds = [(depth, min(2, depth + 1)), (depth, depth + 1), (depth, 1)]
         for k in (1..<depth).reversed() { rounds += [(k, k + 1), (k, 1)] }
+        var warmedLastRowGraph = false
         for (k, confirmed) in rounds {
             var tokens = seed, hidden = carry
             var drafts: [MLXArray] = []
@@ -239,8 +243,16 @@ extension NemotronH35MTPAssistant {
             }
             let window = concatenated([seed] + drafts, axis: 1)
             let evaluation = try recurrent.bind()
-            let verify = target.cbv2ForwardWithHiddenCaptured(
-                window, caches: caches, recurrentState: [evaluation], positionIds: nil)
+            // Trace the gated graph slot once on private warm-up state. A zero
+            // gate keeps this round's original complete target arithmetic;
+            // gate zero/one share the same explicit device-input graph.
+            let warmGate: MLXArray? = CBv2MTPLastRowGate.enabled && k == 2 && !warmedLastRowGraph
+                ? MLXArray([Int32(0)]) : nil
+            let verify = CBv2MTPLastRowGate.withGate(warmGate) {
+                target.cbv2ForwardWithHiddenCaptured(
+                    window, caches: caches, recurrentState: [evaluation], positionIds: nil)
+            }
+            if warmGate != nil { warmedLastRowGraph = true }
             for cache in layerCaches {
                 cache.mtpSerializesRectangularAttention = false
                 cache.mtpBatchesRectangularAttention = false
