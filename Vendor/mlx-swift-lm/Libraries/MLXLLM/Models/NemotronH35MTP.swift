@@ -296,6 +296,35 @@ private final class NemotronMTPDraftHead {
     }
 }
 
+/// Select only the assistant's initial prompt-history pairs. The target keeps
+/// its complete history and verifies every proposal. This policy is fixed when
+/// the assistant is loaded; checkpoints continue to store the full pending
+/// history, so fresh prefill, restore and rollback select the same pairs.
+enum NemotronMTPPromptPriming {
+    static let sinkTokens = 8
+
+    /// Unset uses a recent 256-token tail. Zero, negative, malformed and
+    /// out-of-range values retain the original full-history priming.
+    static func tailTokens(_ value: String?) -> Int? {
+        guard let value else { return 256 }
+        guard let count = Int(value), count > 0 else { return nil }
+        return count
+    }
+
+    /// Ranges address aligned (next token, previous target hidden) pairs.
+    /// Subtract before comparing with the sink to avoid overflowing a large
+    /// configured tail. Adjacent/overlapping ranges retain the full history.
+    static func ranges(count: Int, tailTokens: Int?) -> [Range<Int>] {
+        guard count > 0 else { return [] }
+        guard let tailTokens, tailTokens > 0, tailTokens < count else {
+            return [0..<count]
+        }
+        let suffixStart = count - tailTokens
+        guard suffixStart > sinkTokens else { return [0..<count] }
+        return [0..<sinkTokens, suffixStart..<count]
+    }
+}
+
 /// Request-local embedded assistant with native paged attention. Each draft
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
@@ -306,6 +335,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     private let draftHead: NemotronMTPDraftHead
     private let kvOnlyHistory: Bool
     private let primePromptHistory: Bool
+    private let primeTailTokens: Int?
     private let draftLimit: Int
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
@@ -346,6 +376,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         self.kvOnlyHistory = ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_KV_ONLY_HISTORY"] != "0"
         self.primePromptHistory = primePromptHistory
         let environment = ProcessInfo.processInfo.environment
+        self.primeTailTokens = NemotronMTPPromptPriming.tailTokens(
+            environment["NEMOTRON_MTP_PRIME_TAIL"])
         let requested = maximumDraftTokens
             ?? Int(environment["DARKBLOOM_NEMOTRON35_MTP_MAX_DRAFT_TOKENS"] ?? "") ?? 7
         self.draftLimit = (1...7).contains(requested) ? requested : 7
@@ -599,8 +631,17 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // matters for quantized projections whose selected graph may depend
         // on row count. It also bounds temporary fused/K/V tensors.
         if primePromptHistory && !s.started && !s.pendingTokens.isEmpty {
-            let ids = concatenated(s.pendingTokens, axis: 1)
-            let rows = concatenated(s.pendingHidden, axis: 1)
+            let allIds = concatenated(s.pendingTokens, axis: 1)
+            let allRows = concatenated(s.pendingHidden, axis: 1)
+            let ranges = NemotronMTPPromptPriming.ranges(
+                count: allIds.dim(1), tailTokens: primeTailTokens)
+            // Compact the selected sink and suffix together before applying
+            // the same fixed-width chunking. Complete pending/saved history
+            // remains intact until the ordinary round cleanup below.
+            let ids = ranges.count > 1
+                ? concatenated(ranges.map { allIds[0..., $0] }, axis: 1) : allIds
+            let rows = ranges.count > 1
+                ? concatenated(ranges.map { allRows[0..., $0, 0...] }, axis: 1) : allRows
             for start in stride(from: 0, to: ids.dim(1), by: 512) {
                 let end = min(start + 512, ids.dim(1))
                 let primed = module.appendTrustedKV(
