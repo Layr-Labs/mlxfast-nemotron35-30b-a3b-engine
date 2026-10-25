@@ -2218,6 +2218,18 @@ enum NemotronZSkip {
     static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ZSKIP"] != "0"
     nonisolated(unsafe) private static var draftCopies: [ObjectIdentifier: Copy] = [:]
 
+    /// Immutable, qualified draft-only FC2 backing is not a registered module
+    /// parameter. Only copies owned by this head participate in its lease.
+    static func draftResidencyArrays(_ head: Module) -> [MLXArray] {
+        let owners = head.modules().compactMap { ($0 as? NemotronHMoE)?.switchMLP.fc2 }
+        return lock.withLock {
+            owners.flatMap { owner -> [MLXArray] in
+                guard let copy = draftCopies[ObjectIdentifier(owner)] else { return [] }
+                return [copy.codes, copy.scales, copy.biases]
+            }
+        }
+    }
+
     /// The draft head's R = 1 weighted slot products ([6 * 2688] FP32), or nil
     /// when `owner` has no verified draft copy.
     static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
