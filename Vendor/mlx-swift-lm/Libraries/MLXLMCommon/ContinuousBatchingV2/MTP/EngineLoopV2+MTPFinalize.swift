@@ -491,6 +491,16 @@ public protocol CBv2MTPDeviceAcceptedPrestaging: CBv2MTPFirstDraftPrestaging {
     func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState)
 }
 
+/// Optional: the same queued first draft, given the acceptance packet itself
+/// (row r's drafts at `draftOffset`, its targets at `targetOffset`, `k` each),
+/// so the drafter can join the accept walk into its own first launch. Returns
+/// false, having queued nothing, to fall back to `speculateNextFirstDraft`.
+public protocol CBv2MTPDeviceAcceptedPacketPrestaging: CBv2MTPDeviceAcceptedPrestaging {
+    func speculateNextFirstDraft(
+        packet: MLXArray, draftOffset: Int, targetOffset: Int, k: Int,
+        requestState: any CBv2MTPRequestState) -> Bool
+}
+
 /// The acceptance readback polls the packet's completion event instead of
 /// sleeping in the event wait, so the engine thread resumes as soon as the
 /// verify signals rather than after a thread wake-up. Bounded: after the cap it
@@ -555,6 +565,12 @@ extension EngineLoopV2 {
             if CBv2MTPFirstDraftPrestage.deviceAccepted, verify.k > 0,
                 let deviceAccepted = speculator as? any CBv2MTPDeviceAcceptedPrestaging
             {
+                if let packetDrafter = deviceAccepted as? any CBv2MTPDeviceAcceptedPacketPrestaging,
+                   packetDrafter.speculateNextFirstDraft(
+                       packet: verify.acceptancePacket, draftOffset: index * verify.k,
+                       targetOffset: draftCount + index * width, k: verify.k, requestState: state) {
+                    continue
+                }
                 deviceAccepted.speculateNextFirstDraft(
                     acceptedDrafts: Self.mtpDeviceAcceptedDrafts(verify, row: index),
                     requestState: state)

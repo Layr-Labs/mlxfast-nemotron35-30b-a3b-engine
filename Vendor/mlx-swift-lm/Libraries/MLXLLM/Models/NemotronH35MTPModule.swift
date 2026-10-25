@@ -20,11 +20,7 @@ enum NemotronMTPFrontNorms {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FRONT"] != "0"
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED"] != "0"
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_bf16",
-        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
-        outputNames: ["out"],
-        source: """
+    private static let source = """
             constexpr uint n_reads = 4;
             const uint gid = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -66,7 +62,95 @@ enum NemotronMTPFrontNorms {
                 out[target + i] = weight[lid * n_reads + i]
                     * static_cast<T>(thread_x[i] * local_inv_mean[0]);
             }
-            """, ensureRowContiguous: true)
+            """
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_front_norms_concat_bf16",
+        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
+        outputNames: ["out"],
+        source: source, ensureRowContiguous: true)
+
+    /// The same launch also emitting eh_proj's prepared K=5376 activation
+    /// (the lane-coalesced FP32 buffer `nemotron_head_prepare_activation`
+    /// builds, PV 8: per 8-value chunk the nmr_load_vector values and sum,
+    /// from the BF16-rounded outputs). A chunk never straddles the two
+    /// halves, so each threadgroup prepares its own 336 chunks.
+    private static func preparedSource() -> String {
+        let scratch = "threadgroup float local_sums[32];"
+        // The literal's indentation is stripped to the closing delimiter's.
+        let store = "    out[target + i] = weight[lid * n_reads + i]\n"
+            + "        * static_cast<T>(thread_x[i] * local_inv_mean[0]);\n}"
+        precondition(source.components(separatedBy: scratch).count == 2)
+        precondition(source.components(separatedBy: store).count == 2)
+        return source.replacingOccurrences(of: scratch, with: scratch + "\nthreadgroup T rounded[2688];")
+            .replacingOccurrences(of: store, with: """
+                T value = weight[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                out[target + i] = value;
+                rounded[lid * n_reads + i] = value;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < 336) {
+                const int chunk = (second ? 336 : 0) + int(lid);
+                float values[8];
+                float total = 0;
+                for (int i = 0; i < 8; i += 4) {
+                    total += float(rounded[lid * 8 + i]) + float(rounded[lid * 8 + i + 1])
+                        + float(rounded[lid * 8 + i + 2]) + float(rounded[lid * 8 + i + 3]);
+                    values[i] = rounded[lid * 8 + i];
+                    values[i + 1] = rounded[lid * 8 + i + 1] / 16.0f;
+                    values[i + 2] = rounded[lid * 8 + i + 2] / 256.0f;
+                    values[i + 3] = rounded[lid * 8 + i + 3] / 4096.0f;
+                }
+                if (NG) total += 1.0f;
+                const int base = (int(row) * 21 + chunk / 32) * 9 * 32 + chunk % 32;
+                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
+                prepared[base + 8 * 32] = total;
+            }
+""")
+    }
+    private static let preparedKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_front_norms_concat_prepared_bf16",
+        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
+        outputNames: ["out", "prepared"],
+        source: preparedSource(), ensureRowContiguous: true)
+
+    /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
+    static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
+        -> (MLXArray, MLXArray)?
+    {
+        guard NemotronMTPDraftJoins.enabled, embedding.ndim == 3, embedding.dim(1) == 3,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              let reference = eligible(embedding: embedding, hidden: hidden, enorm: enorm, hnorm: hnorm)
+        else { return nil }
+        let rows = embedding.dim(1)
+        let (a, e, h) = scalars(enorm.eps, hnorm.eps)
+        let outputs = preparedKernel([embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
+            template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
+            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
+        let expected = reference()
+        let packed = NemotronHeadPreparedActivation.pack(expected.reshaped(rows, 5376))
+        let ok = MLX.logicalAnd(
+            (outputs[0].view(dtype: .uint16) .== expected.view(dtype: .uint16)).all(),
+            (outputs[1].view(dtype: .uint32) .== packed.view(dtype: .uint32)).all())
+        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[1], MLXArray(Float.nan)))
+    }
+
+    private static func eligible(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
+        -> (() -> MLXArray)?
+    {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              embedding.ndim == 3, embedding.dim(0) == 1, (1...512).contains(embedding.dim(1)),
+              embedding.dim(2) == 2688, hidden.shape == embedding.shape,
+              embedding.dtype == .bfloat16, hidden.dtype == .bfloat16,
+              type(of: enorm) == RMSNorm.self, type(of: hnorm) == RMSNorm.self,
+              enorm.weight.shape == [2688], hnorm.weight.shape == [2688],
+              enorm.weight.dtype == .bfloat16, hnorm.weight.dtype == .bfloat16
+        else { return nil }
+        return { concatenated([enorm(embedding), hnorm(hidden)], axis: -1) }
+    }
 
     nonisolated(unsafe) private static var axis: MLXArray?
     nonisolated(unsafe) private static var epsilons: [UInt32: MLXArray] = [:]
@@ -216,11 +300,22 @@ final class NemotronH35MTPAttentionBlock: Module {
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
-        let joined = joinedNorms(hidden: hidden, embedding: embedding)
-        let fused = nemotronMTPLinearRows(joined, projection)
-        let x = norm(fused)
+        // Draft-only joins at R = 3: the front norms also emit eh_proj's
+        // prepared input, and the attention norm wq's (NEMOTRON_MTP_DRAFT_JOINS).
+        let front = NemotronMTPFrontNorms.applyPrepared(
+            embedding: embedding, hidden: hidden, enorm: embeddingNorm, hnorm: hiddenNorm)
+        let joined = front?.0 ?? joinedNorms(hidden: hidden, embedding: embedding)
+        let fused = nemotronMTPLinearRows(joined, projection, prepared: front?.1)
+        var (x, xPrepared): (MLXArray, MLXArray?) = (norm(fused), nil)
+        if NemotronMTPDraftJoins.enabled,
+           let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: norm) {
+            (x, xPrepared) = pair
+            if NemotronMTPDraftJoins.negativeNorm {
+                xPrepared = NemotronHeadPreparedActivation.pack(fused.reshaped(3, 2688))
+            }
+        }
         let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq)
+        let queries = nemotronMTPLinearRows(x, mixer.wq, prepared: xPrepared)
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
         let keys = nemotronMTPLinearRows(x, mixer.wk)
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
@@ -315,6 +410,17 @@ final class NemotronH35MTPExpertBlock: Module {
             return exactOneTokenTail(joined.0, normalized: joined.1)
         }
         return self(residual + attention)
+    }
+
+    /// The one-token tail of `x` given `normalized` == norm(x) bit for bit
+    /// (the device-picked first draft's joined accept/take/norm launch).
+    func callAsFunction(row x: MLXArray, normalized: MLXArray) -> MLXArray? {
+        guard exactTailAvailable(x), normalized.shape == x.shape, normalized.dtype == x.dtype
+        else { return nil }
+        if NemotronMTPExecution.compiledMoE {
+            return oneTokenTailCache([x, normalized], mode: 2, owner: self)
+        }
+        return exactOneTokenTail(x, normalized: normalized)
     }
 
     fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
@@ -477,6 +583,21 @@ final class NemotronH35MTPModule: Module {
             hidden: hidden, embedding: embedding, cache: cache)
     }
 
+    /// `finishPagedAttentionRow(take(rows, accepted, axis: 1))` with the
+    /// accept walk, the take and the expert-entry norm in one launch.
+    /// Returns (output, accepted) or nil to keep the separate launches.
+    func finishPagedAttentionAcceptedRow(
+        packet: MLXArray, draftOffset: Int, targetOffset: Int, k: Int, rows: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        let block = layers[1] as! NemotronH35MTPExpertBlock
+        guard let (x, h, accepted) = NemotronMTPDraftJoins.acceptedRow(
+                packet: packet, draftOffset: draftOffset, targetOffset: targetOffset, k: k,
+                rows: rows, norm: block.norm),
+              let out = block(row: x, normalized: h)
+        else { return nil }
+        return (out, accepted)
+    }
+
     func finishPagedAttentionRow(_ attention: MLXArray) -> MLXArray {
         precondition(attention.ndim == 3 && attention.dim(0) == 1 && attention.dim(1) == 1)
         return (layers[1] as! NemotronH35MTPExpertBlock)(attention)
@@ -524,5 +645,139 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
         case .lastPositionLogits: return (logits(last), hidden)
         }
+    }
+}
+
+/// Draft-only tiny joins on the drafter chain. NEMOTRON_MTP_DRAFT_JOINS=0
+/// keeps the separate launches; =nega / =negb / =negc are negative controls
+/// (each perturbs only its own piece's draft values, so acceptance must
+/// change while tokens stay the target's).
+enum NemotronMTPDraftJoins {
+    private static let setting = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_JOINS"]
+    static let enabled = setting != "0"
+    static let negativeAccept = setting == "nega"
+    static let negativeFront = setting == "negb"
+    static let negativeNorm = setting == "negc"
+
+    // (a) The device accept walk (leading draft matches in the acceptance
+    // packet, the cumprod-of-equality sum), the take of that post-verify
+    // attention row and the expert-entry RMSNorm, in one 672-thread launch.
+    // The norm is the residual-RMS text (stock rms_single_row arithmetic)
+    // with its input read from the selected row.
+    private static let acceptRowNorm = MLXFast.metalKernel(
+        name: "nemotron_mtp_accept_row_rms_bf16",
+        inputNames: ["packet", "rows", "weight", "axis_size", "eps", "offs"],
+        outputNames: ["residual", "normalized", "acceptedOut"],
+        source: """
+            int accepted = 0;
+            for (int j = 0; j < offs[2]; j++) {
+                if (packet[offs[1] + j] != packet[offs[0] + j]) break;
+                accepted++;
+            }
+            constexpr uint n_reads = 4;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            if (lid == 0) acceptedOut[0] = accepted;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            float acc = 0;
+            float thread_x[n_reads];
+            const size_t offset = lid * n_reads;
+            const device T* x = rows + size_t(accepted) * axis_size;
+            for (uint i = 0; i < n_reads; i++) {
+                T sum = x[offset + i];
+                residual[offset + i] = sum;
+                thread_x[i] = sum;
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = 0; i < n_reads; i++) {
+                T value = weight[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                normalized[offset + i] = NG ? -value : value;
+            }
+            """, ensureRowContiguous: true)
+
+    nonisolated(unsafe) private static var axis: MLXArray?
+    nonisolated(unsafe) private static var epsilons: [UInt32: MLXArray] = [:]
+    private static let lock = NSLock()
+    private static func scalars(_ eps: Float) -> (MLXArray, MLXArray) {
+        lock.lock(); defer { lock.unlock() }
+        let a = axis ?? MLXArray(UInt32(2688))
+        axis = a
+        if let cached = epsilons[eps.bitPattern] { return (a, cached) }
+        let created = MLXArray(eps)
+        epsilons[eps.bitPattern] = created
+        return (a, created)
+    }
+
+    /// JIT the accept/take/norm pipeline at load for both packet signatures
+    /// MLX generates (an input under 8 elements binds as a `constant`
+    /// pointer, a longer one as `device`): the IDs-only warm-up packet is
+    /// short, the production packet with its policy values is long.
+    static func warm(norm: RMSNorm) {
+        guard enabled else { return }
+        let rows = MLXArray.zeros([1, 3, 2688], dtype: .bfloat16)
+        var outputs: [MLXArray] = []
+        for length in [5, 16] {
+            let packet = MLXArray(Array(repeating: Int32(0), count: length))
+            if let out = acceptedRow(packet: packet, draftOffset: 0, targetOffset: 2, k: 2,
+                                     rows: rows, norm: norm) {
+                outputs += [out.0, out.1, out.2]
+            }
+        }
+        if !outputs.isEmpty { eval(outputs) }
+    }
+
+    /// (x, norm(x), accepted [1] int32) for x = rows[accepted], accepted the
+    /// leading matches of packet[targetOffset ..< +k] vs packet[draftOffset ..< +k].
+    static func acceptedRow(
+        packet: MLXArray, draftOffset: Int, targetOffset: Int, k: Int,
+        rows: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              packet.ndim == 1, packet.dtype == .int32, k > 0,
+              draftOffset >= 0, draftOffset <= packet.dim(0), k <= packet.dim(0) - draftOffset,
+              targetOffset >= 0, targetOffset <= packet.dim(0), k <= packet.dim(0) - targetOffset,
+              rows.ndim == 3, rows.dim(0) == 1, rows.dim(1) > k, rows.dim(2) == 2688,
+              rows.dtype == .bfloat16, type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let (a, e) = scalars(norm.eps)
+        let offs = MLXArray([Int32(draftOffset), Int32(targetOffset), Int32(k)])
+        let out = acceptRowNorm([packet, rows, norm.weight, a, e, offs],
+            template: [("T", DType.bfloat16), ("NG", negativeAccept)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, 1, 2688], [1, 1, 2688], [1]],
+            outputDTypes: [.bfloat16, .bfloat16, .int32])
+        guard NemotronMoELeader.selfTest else { return (out[0], out[1], out[2]) }
+        let drafts = packet[draftOffset ..< (draftOffset + k)]
+        let targets = packet[targetOffset ..< (targetOffset + k)]
+        let accepted = cumprod((targets .== drafts).asType(.int32), axis: 0)
+            .sum(axis: 0, keepDims: true).asType(.int32)
+        let x = take(rows, accepted, axis: 1)
+        let ok = MLX.logicalAnd(MLX.logicalAnd(
+            (out[2] .== accepted).all(),
+            (out[0].view(dtype: .uint16) .== x.view(dtype: .uint16)).all()),
+            (out[1].view(dtype: .uint16) .== norm(x).view(dtype: .uint16)).all())
+        let poison = MLXArray(Float.nan).asType(.bfloat16)
+        return (which(ok, out[0], poison), which(ok, out[1], poison),
+                which(ok, out[2], MLXArray(Int32(-1))))
     }
 }

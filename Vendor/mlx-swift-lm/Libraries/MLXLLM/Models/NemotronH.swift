@@ -950,7 +950,7 @@ private enum NemotronPackedConvKernel {
 private enum NemotronPackedConvDtKernel {
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_packed_conv_silu_dt",
-        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi"],
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A_log"],
         outputNames: ["out", "padded", "dt"],
         source: """
             int64_t channel = int64_t(thread_position_in_grid.x);
@@ -974,7 +974,18 @@ private enum NemotronPackedConvDtKernel {
                 float lo = dtLo;
                 float hi = dtHi;
                 float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
-                dt[position * H + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+                float dtValue = metal::isnan(m) ? m : (m < hi ? m : hi);
+                if constexpr (!PK) {
+                    dt[position * H + head] = dtValue;
+                    return;
+                }
+                dt[position * (2 * H) + head] = dtValue;
+                // One identical FP32 decay per head/timestep, shared by all
+                // 64 head channels and 32 recurrence lanes. No state is read.
+                // (newjordan 6d67c741.) NG: negative control only.
+                auto A = -fast::exp(static_cast<float>(A_log[head * A_log_strides[0]]));
+                dt[position * (2 * H) + H + head] = NG ? 0.5f * fast::exp(A * dtValue)
+                                                       : fast::exp(A * dtValue);
                 return;
             }
             padded[(position + 3) * C + channel] =
@@ -1118,21 +1129,32 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             conv1d.padding == 0, let bias = conv1d.bias,
             bias.dtype == .bfloat16, bias.shape == [convDim],
             dt.shape == [1, input.dim(1), numHeads], dt.dtype == .bfloat16,
-            dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
+            aLog.shape == [numHeads], dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
             Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
         else { return nil }
         let length = input.dim(1)
         let arrays = NemotronPackedConvDtKernel.kernel(
             [oldState, input, conv1d.weight, bias, dt, dtBias,
-             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
-            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads)],
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), aLog],
+            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads),
+                       ("PK", Self.packedDecay), ("NG", Self.packedDecayNegative)],
             grid: (convDim + numHeads, length, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads]],
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim],
+                           [1, length, (Self.packedDecay ? 2 : 1) * numHeads]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         return (arrays[0], arrays[1], arrays[2])
     }
     static let convDtEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_CONV_DT"] != "0"
+    /// The conv/dt launch also writes the per-head decay exp(-exp(A_log) * dt)
+    /// beside dt ([dt | decay], width 2H), so the compact scan reads it instead
+    /// of recomputing it in every lane (newjordan 6d67c741). Same FP32
+    /// expressions. NEMOTRON_MTP_MAMBA_DECAY=0 keeps dt only; =neg halves the
+    /// decay (negative control: tokens must change).
+    static let packedDecay =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MAMBA_DECAY"] != "0"
+    static let packedDecayNegative =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MAMBA_DECAY"] == "neg"
 
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
         var convInput = input
@@ -4447,3 +4469,5 @@ public struct NemotronHConfiguration: Codable, Sendable {
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
 private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
+
+// Re-measurement 1 of submission 990c152a (same code).
