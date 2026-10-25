@@ -953,11 +953,7 @@ private enum NemotronPackedConvKernel {
 /// `nemotronCompiledPrefillDt`. One launch instead of two; the conv threads
 /// run the packed-conv text unchanged.
 private enum NemotronPackedConvDtKernel {
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_packed_conv_silu_dt",
-        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi"],
-        outputNames: ["out", "padded", "dt"],
-        source: """
+    static let source = """
             int64_t channel = int64_t(thread_position_in_grid.x);
             int64_t position = int64_t(thread_position_in_grid.y);
             if (channel >= C) {
@@ -1004,7 +1000,26 @@ private enum NemotronPackedConvDtKernel {
             auto y = 1 / (1 + metal::exp(metal::abs(x)));
             T sigmoid = x < 0 ? y : 1 - y;
             out[position * C + channel] = x * sigmoid;
-            """, ensureRowContiguous: false)
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_dt",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi"],
+        outputNames: ["out", "padded", "dt"],
+        source: source, ensureRowContiguous: false)
+}
+
+private enum NemotronPackedConvDtDecayKernel {
+    private static let store = "dt[position * H + head] = metal::isnan(m) ? m : (m < hi ? m : hi);"
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_packed_conv_silu_dt_decay",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A_log"],
+        outputNames: ["out", "padded", "dt", "decay"],
+        source: NemotronPackedConvDtKernel.source.replacingOccurrences(of: store, with: """
+            float dtValue = metal::isnan(m) ? m : (m < hi ? m : hi);
+            dt[position * H + head] = dtValue;
+            auto A = -fast::exp(static_cast<float>(A_log[head * A_log_strides[0]]));
+            decay[position * H + head] = fast::exp(A * dtValue);
+            """), ensureRowContiguous: false)
 }
 
 private enum NemotronRequestConvHistory {
@@ -1135,6 +1150,39 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         return (arrays[0], arrays[1], arrays[2])
+    }
+    // Qualified only during official-worker model warm-up, before graph traces.
+    var mtpConvDtDecayQualified = false
+    var mtpConvDtDecayQualificationComplete = false
+    static let convDtDecayEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_CONV_DT_DECAY"] != "0"
+
+    func packedConvDtDecay(_ oldState: MLXArray, _ input: MLXArray, _ dt: MLXArray,
+        qualifying: Bool = false)
+        -> (convolution: MLXArray, padded: MLXArray, dt: MLXArray, decay: MLXArray)? {
+        guard Self.convDtDecayEnabled, (qualifying || mtpConvDtDecayQualified),
+            aLog.shape == [numHeads], [DType.float32, .bfloat16].contains(aLog.dtype),
+            Self.convDtEnabled, convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, (2...4).contains(input.dim(1)),
+            input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
+            conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
+            conv1d.padding == 0, let bias = conv1d.bias,
+            bias.dtype == .bfloat16, bias.shape == [convDim],
+            dt.shape == [1, input.dim(1), numHeads], dt.dtype == .bfloat16,
+            dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return nil }
+        let length = input.dim(1)
+        let arrays = NemotronPackedConvDtDecayKernel.kernel(
+            [oldState, input, conv1d.weight, bias, dt, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), aLog],
+            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads)],
+            grid: (convDim + numHeads, length, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, length, convDim], [1, length + 3, convDim], [1, length, numHeads],
+                           [1, length, numHeads]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32, .float32])
+        return (arrays[0], arrays[1], arrays[2], arrays[3])
     }
     static let convDtEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_CONV_DT"] != "0"

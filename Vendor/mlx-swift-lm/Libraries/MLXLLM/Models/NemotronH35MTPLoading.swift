@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -85,6 +86,7 @@ extension NemotronH35MTPAssistant {
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
         assistant.warmUpExactShapes()
+        nemotronWireResidentWeights()
         return assistant
     }
 }
@@ -298,4 +300,19 @@ extension NemotronH35MTPAssistant {
         discardRound(requestState: draftState)
         Stream.gpu.synchronize()
     }
+}
+
+func nemotronWireResidentWeights() {
+    guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_WIRED_WEIGHTS"] != "0",
+          Device.defaultDevice().deviceType == .gpu,
+          let recommended = GPU.maxRecommendedWorkingSetBytes()
+    else { return }
+    Stream.gpu.synchronize()
+    let limit = min(recommended, Memory.activeMemory + (8 << 30))
+    guard limit > 0 else { return }
+    var previous: size_t = 0
+    guard mlx_set_wired_limit(&previous, size_t(limit)) == 0, previous > size_t(limit)
+    else { return }
+    let restore = previous
+    _ = mlx_set_wired_limit(&previous, restore)
 }

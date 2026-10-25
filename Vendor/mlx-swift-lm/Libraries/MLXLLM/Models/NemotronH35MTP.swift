@@ -715,7 +715,29 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
 }
 
-extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
+extension NemotronH35MTPAssistant: CBv2MTPPrefillDraftPrestaging {
+    /// Initial prompt priming and the first draft use draftStep unchanged.
+    /// Only their submission moves into the existing post-prefill fence.
+    public func prestagePrefillDrafts(
+        token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
+    ) {
+        let s = state(requestState)
+        guard !s.started, s.stagedInputCount == 0, s.prestagedResult == nil,
+              s.prestagedSecond == nil, s.paged != nil,
+              hidden.shape == [1, 1, target.configuration.hiddenSize]
+        else { return }
+        let result = draftStep(
+            tokens: MLXArray([Int32(token)]).reshaped([1, 1]), hidden: hidden,
+            shortlist: nil, requestState: requestState)
+        s.prestagedHidden = hidden
+        s.prestagedResult = result
+        asyncEval([result.tokens, result.hidden] + s.arrays)
+        // prestageFirstDraft leaves this result intact because the initial
+        // round has not started. The ordinary second-draft body then chains
+        // on it; draftStep consumes both by the existing identity checks.
+        prestageDrafts(token: token, hidden: hidden, requestState: requestState, depth: depth)
+    }
+
     /// Called from finalize once the next round's carry is final, while the
     /// GPU is idle after the acceptance readback. Builds and submits exactly
     /// the first draft the next round would build (same ops, same inputs:

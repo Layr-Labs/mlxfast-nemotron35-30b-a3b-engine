@@ -159,17 +159,14 @@ final class NemotronH35MTPAttentionBlock: Module {
         hidden: MLXArray, embedding: MLXArray,
         cache: any CBv2AttendingLayerCache
     ) -> (residual: MLXArray, attention: MLXArray) {
-        let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
-        return (front[0], mixer.cbv2Forward(
-            front[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV))
+        pagedForwardParts(
+            inputs: pagedDraftInputs(hidden: hidden, embedding: embedding), cache: cache)
     }
 
     /// The part of `pagedForwardParts` that reads no cache: the fused
     /// residual, its norm and that norm's Q/K/V, as [residual, norm, q, k, v].
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
-        let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
-        let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
-        return [front[0], front[1], q, k, v]
+        draftFrontCache.inputs(hidden: hidden, embedding: embedding, owner: self)
     }
 
     /// `pagedForwardParts` from `pagedDraftInputs` of the same inputs.
@@ -184,6 +181,13 @@ final class NemotronH35MTPAttentionBlock: Module {
     fileprivate func uncompiledDraftFront(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         let fused = fuse(hidden: hidden, embedding: embedding)
         return [fused, norm(fused)]
+    }
+
+    /// The existing cache-free operations, now also available as one compiled graph.
+    fileprivate func uncompiledDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
+        let front = uncompiledDraftFront(hidden: hidden, embedding: embedding)
+        let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
+        return [front[0], front[1], q, k, v]
     }
 
     /// Trusted target rows only need the head's K/V projections. Their
@@ -237,8 +241,8 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 }
 
-/// Only the one-token draft's stateless norm/concat/projection/norm prefix.
-/// The original attention projections and all cache operations stay outside.
+/// Stateless one-token front, with a separate slot including its Q/K/V.
+/// All attention, request KV, cache offsets and transactions stay outside.
 private final class NemotronH35MTPDraftFrontCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
@@ -246,12 +250,41 @@ private final class NemotronH35MTPDraftFrontCache {
     }
     private static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_DRAFT_FRONT"] != "0"
+    private static let includesQKV =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_DRAFT_QKV"] != "0"
     private let lock = NSLock()
-    private var entry: Entry?
+    private var entries: [Entry?] = [nil, nil]
+
+    func inputs(hidden: MLXArray, embedding: MLXArray,
+                owner: NemotronH35MTPAttentionBlock) -> [MLXArray] {
+        if Self.includesQKV {
+            return outputs(hidden: hidden, embedding: embedding, owner: owner, projections: true)
+        }
+        // Original split boundary, including its original two-output cache.
+        let front = callAsFunction(hidden: hidden, embedding: embedding, owner: owner)
+        let (q, k, v) = owner.mixer.cbv2Projections(
+            front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
+        return [front[0], front[1], q, k, v]
+    }
 
     func callAsFunction(
         hidden: MLXArray, embedding: MLXArray, owner: NemotronH35MTPAttentionBlock
     ) -> [MLXArray] {
+        outputs(hidden: hidden, embedding: embedding, owner: owner, projections: false)
+    }
+
+    private func outputs(
+        hidden: MLXArray, embedding: MLXArray, owner: NemotronH35MTPAttentionBlock,
+        projections: Bool
+    ) -> [MLXArray] {
+        func direct() -> [MLXArray] {
+            projections
+                ? owner.uncompiledDraftInputs(hidden: hidden, embedding: embedding)
+                : owner.uncompiledDraftFront(hidden: hidden, embedding: embedding)
+        }
+        func nativeLinear(_ layer: Linear) -> Bool {
+            type(of: layer) == Linear.self || type(of: layer) == QuantizedLinear.self
+        }
         guard Self.enabled,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               hidden.shape == [1, 1, 2688], hidden.dtype == .bfloat16,
@@ -261,27 +294,38 @@ private final class NemotronH35MTPDraftFrontCache {
               type(of: owner.norm) == RMSNorm.self,
               (type(of: owner.projection) == Linear.self
                 || type(of: owner.projection) == QuantizedLinear.self)
-        else { return owner.uncompiledDraftFront(hidden: hidden, embedding: embedding) }
-        let modules: [Module] = [owner, owner.embeddingNorm, owner.hiddenNorm,
+        else { return direct() }
+        if projections {
+            guard type(of: owner.mixer) == NemotronHAttention.self,
+                  nativeLinear(owner.mixer.wq), nativeLinear(owner.mixer.wk),
+                  nativeLinear(owner.mixer.wv) else { return direct() }
+        }
+        var modules: [Module] = [owner, owner.embeddingNorm, owner.hiddenNorm,
                                  owner.projection, owner.norm]
+        if projections {
+            modules += [owner.mixer, owner.mixer.wq, owner.mixer.wk, owner.mixer.wv]
+        }
         let identity = modules.map(ObjectIdentifier.init)
+        let slot = projections ? 1 : 0
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
-            if let entry, entry.identity == identity { return entry }
-            let state = modules.dropFirst().flatMap { $0.innerState() }
+            if let entry = entries[slot], entry.identity == identity { return entry }
+            let state = projections ? owner.innerState()
+                : modules.dropFirst().flatMap { $0.innerState() }
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MTP draft-front owner") }
-                return owner.uncompiledDraftFront(hidden: arrays[0], embedding: arrays[1])
+                return projections
+                    ? owner.uncompiledDraftInputs(hidden: arrays[0], embedding: arrays[1])
+                    : owner.uncompiledDraftFront(hidden: arrays[0], embedding: arrays[1])
             }
             let replacement = Entry(identity: identity, function: function)
-            retired = entry
-            entry = replacement
+            retired = entries[slot]
+            entries[slot] = replacement
             return replacement
         }
         let result = withExtendedLifetime(retired) { current.function([hidden, embedding]) }
-        return result.count == 2 ? result
-            : owner.uncompiledDraftFront(hidden: hidden, embedding: embedding)
+        return result.count == (projections ? 5 : 2) ? result : direct()
     }
 }
 
