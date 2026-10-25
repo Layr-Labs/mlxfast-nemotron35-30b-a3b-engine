@@ -330,8 +330,50 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let cut: Int
     let queue = DispatchQueue(label: "nemotron.decode.memory")
 
-    init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier]) {
+    /// The target's own parameter buffers, one set per backbone group (embeddings, layers in order, then the
+    /// rest), requested on their own serial queue when a request's lease begins and ended with the lease.
+    static let targetEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_TARGET_RESIDENCY"] != "0"
+    let targetSets: [any MTLResidencySet]
+    let targetQueue = DispatchQueue(label: "nemotron.target.memory")
+
+    /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
+    static func targetGroups(_ model: Module) -> [[MLXArray]] {
+        var groups: [Int: [MLXArray]] = [:]
+        for (key, a) in model.parameters().flattened() {
+            let parts = key.split(separator: ".")
+            var g = Int.max
+            if parts.contains("embeddings") { g = -1 }
+            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
+            groups[g, default: []].append(a)
+        }
+        return groups.keys.sorted().map { groups[$0]! }
+    }
+
+    /// One committed set per group; none at all when a set cannot be made or a buffer cannot be found.
+    private static func makeTargetSets(_ device: any MTLDevice, _ target: [[MLXArray]]) -> [any MTLResidencySet] {
+        var sets: [any MTLResidencySet] = []
+        var seen = Set<ObjectIdentifier>()
+        for group in target {
+            let descriptor = MTLResidencySetDescriptor()
+            descriptor.initialCapacity = group.count
+            guard let set = try? device.makeResidencySet(descriptor: descriptor) else { return [] }
+            for a in group {
+                guard let ctx = a.ctx.ctx, let ptr = nemotronDecodeBacking(ctx),
+                      let buffer = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue() as? any MTLBuffer
+                else { return [] }
+                if seen.insert(ObjectIdentifier(buffer)).inserted { set.addAllocation(buffer) }
+            }
+            set.commit()
+            sets.append(set)
+        }
+        return sets
+    }
+
+    init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier], target: [[MLXArray]]) {
         guard Self.enabled, let device = MTLCreateSystemDefaultDevice() else { return nil }
+        let targetSets = Self.targetEnabled ? Self.makeTargetSets(device, target) : []
+        FileHandle.standardError.write(Data("nemotron target residency: \(targetSets.count) sets\n".utf8))
+        self.targetSets = targetSets
         let cut = min(Self.seedLayers, layers.count)
         guard owners.count == layers.count else { return nil }
         let groups = [head + layers.prefix(cut).flatMap { $0 }] + Array(layers.dropFirst(cut))
@@ -381,6 +423,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             finished = true
             let owner = owner
+            owner.targetQueue.sync {
+                for set in owner.targetSets { set.endResidency() }
+            }
             owner.queue.sync {
                 owner.seedSet.endResidency()
                 if decoded { for set in owner.decodeSets { set.endResidency() } }
@@ -396,6 +441,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         }
     }
     func begin() -> Lease {
+        for set in targetSets {
+            targetQueue.async { set.requestResidency() }
+        }
         NemotronZSkip.beginCopyReadiness(owners)
         request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
         return Lease(self)

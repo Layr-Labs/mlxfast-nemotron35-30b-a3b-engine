@@ -406,7 +406,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         if #available(macOS 15.0, *) {
             decodeResidency = NemotronDecodeResidency(
                 head: module.parameters().flattened().map { $0.1 },
-                layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target))
+                layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
+                target: NemotronDecodeResidency.targetGroups(target))
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
