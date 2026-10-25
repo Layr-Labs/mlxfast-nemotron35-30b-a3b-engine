@@ -71,7 +71,9 @@ enum PagedSegmentAttention {
         queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
         sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
-        dispatchCache: PagedSegmentDispatchCache? = nil
+        dispatchCache: PagedSegmentDispatchCache? = nil,
+        draftAttention: Bool = false,
+        geometryOverride: NemotronDraftAttentionGeometry.Plan? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -85,12 +87,16 @@ enum PagedSegmentAttention {
         let b = q.dim(0), qh = q.dim(1), d = q.dim(2), kvh = group.key.kvHeads
         precondition(d == group.key.headDim && qh % kvh == 0)
         let gqa = qh / kvh
-        let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)!
-        let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
-        let splits = gqa / hpt
         let (seqinfo, maxLength) = PagedAttentionKernel.seqinfo(rows.map(\.info))
+        let geometry = geometryOverride ?? NemotronDraftAttentionGeometry.select(
+            enabled: draftAttention, dtype: dtype, queryHeads: qh, kvHeads: kvh,
+            headDim: d, pageSize: group.pageSize, length: maxLength, batch: b)
+        let nsg = geometry == nil
+            ? PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)! : 4
+        let hpt = geometry?.hpt ?? PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
+        let splits = gqa / hpt
         let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
-            PagedAttentionKernel.partitionTokensForDispatch(
+            geometry?.ptok ?? PagedAttentionKernel.partitionTokensForDispatch(
                 maxAttendLength: maxLength, batch: b, kvHeads: kvh,
                 headSplits: splits, pageSize: group.pageSize), pageSize: group.pageSize)
         let prepared = dispatchCache?.prepare(
@@ -110,7 +116,7 @@ enum PagedSegmentAttention {
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
-            partitionTokens: ptok, hasWrite: newKeys != nil)
+            partitionTokens: ptok, hasWrite: newKeys != nil, headsPerThreadgroup: hpt)
         for (bucket, metadata) in zip(plan.buckets, prepared.metadata) {
             let segments = bucket.segmentIDs.map { group.segments[$0]! }
             let bindingCount = bucket.bindingClass
@@ -134,7 +140,8 @@ enum PagedSegmentAttention {
         }
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
-            simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
+            simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok,
+            headsPerThreadgroup: hpt)
         let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
         return mergeKernel(key: mergeKey, source: source)(
             [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
@@ -161,7 +168,8 @@ enum PagedMTPBatchedColumns {
     static func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
                        row: PagedSequenceKV, group: PagedKVGroup,
                        sinks: MLXArray?, params: MLXArray, softcap: Bool,
-                       source: String, dispatchCache: PagedSegmentDispatchCache) -> MLXArray {
+                       source: String, dispatchCache: PagedSegmentDispatchCache,
+                       draftAttention: Bool = false) -> MLXArray {
         precondition(eligible(queries: queries, row: row, group: group))
         let count = queries.dim(2), heads = queries.dim(1), width = queries.dim(3)
         // One ordinary chunk write, followed by independent causal query rows.
@@ -176,7 +184,7 @@ enum PagedMTPBatchedColumns {
         let batch = queries.transposed(0, 2, 1, 3).reshaped(count, heads, width)
         let result = PagedSegmentAttention.decode(queries: batch, newKeys: nil, newValues: nil,
             group: group, rows: descriptors, sinks: sinks, params: params, softcap: softcap,
-            source: source, dispatchCache: dispatchCache)
+            source: source, dispatchCache: dispatchCache, draftAttention: draftAttention)
         let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
     }

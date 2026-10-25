@@ -480,6 +480,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 layerKinds: [kind], promptLength: 0, maxLength: storageLength)
             row = state[0] as! PagedSequenceKV
             cache = backend.makeLayerCaches()[0]
+            cache.nemotronDraftAttention = true
             cache.setRows([row])
         }
 
