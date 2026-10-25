@@ -158,11 +158,20 @@ enum PagedMTPBatchedColumns {
     static let enabled = ProcessInfo.processInfo.environment[
         "DARKBLOOM_NEMOTRON35_MTP_BATCHED_ATTENTION"] != "0"
 
-    static func eligible(queries: MLXArray, row: PagedSequenceKV, group: PagedKVGroup) -> Bool {
+    /// The drafter's own cache (`draftAttention`) also takes the batched rows
+    /// under a partition target: its outputs only shape draft proposals, so the
+    /// one-token summation order the target's caches keep is not needed there.
+    /// NEMOTRON_MTP_DRAFT_BATCHED_COLUMNS=0 keeps the drafter's rows serialized.
+    static let draftBatched =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BATCHED_COLUMNS"] != "0"
+
+    static func eligible(queries: MLXArray, row: PagedSequenceKV, group: PagedKVGroup,
+                         draftAttention: Bool = false) -> Bool {
         queries.dim(0) == 1 && (2...8).contains(queries.dim(2))
             && row.windowSize == nil && group.segmentLayout != nil
             && row.absoluteOffset >= row.frozenHighWater
-            && PagedAttentionKernel.partitionTargetThreadgroups == 0
+            && (PagedAttentionKernel.partitionTargetThreadgroups == 0
+                || (draftAttention && draftBatched))
     }
 
     static func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
@@ -170,7 +179,8 @@ enum PagedMTPBatchedColumns {
                        sinks: MLXArray?, params: MLXArray, softcap: Bool,
                        source: String, dispatchCache: PagedSegmentDispatchCache,
                        draftAttention: Bool = false) -> MLXArray {
-        precondition(eligible(queries: queries, row: row, group: group))
+        precondition(eligible(queries: queries, row: row, group: group,
+                              draftAttention: draftAttention))
         let count = queries.dim(2), heads = queries.dim(1), width = queries.dim(3)
         // One ordinary chunk write, followed by independent causal query rows.
         row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
