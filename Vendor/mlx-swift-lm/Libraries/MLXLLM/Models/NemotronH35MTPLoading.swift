@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -92,6 +93,7 @@ extension NemotronH35MTPAssistant {
         // Keep last: it ends with Memory.clearCache().
         try NemotronDraftAttentionGeometry.warm()
         assistant.warmUpExactShapes()
+        NemotronWiredWeights.apply()
         return assistant
     }
 }
@@ -304,5 +306,29 @@ extension NemotronH35MTPAssistant {
         // Release that private transaction through the ordinary discard path.
         discardRound(requestState: draftState)
         Stream.gpu.synchronize()
+    }
+}
+
+/// Keeps the loaded weights GPU-resident. Once loading is done, MLX's wired
+/// limit is raised to the bytes live at that point (target and head weights
+/// and load-time constants, capped at the device's recommended working set),
+/// so the allocator's standing residency sets hold exactly those allocations.
+/// Per-request arrays do not fit under the limit and stay out of the sets.
+/// NEMOTRON_WIRED_WEIGHTS=0 keeps MLX's default (nothing wired).
+enum NemotronWiredWeights {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_WIRED_WEIGHTS"] != "0"
+
+    static func apply() {
+        guard enabled, Device.defaultDevice().deviceType == .gpu else { return }
+        Stream.gpu.synchronize()
+        Memory.clearCache()
+        let live = Memory.activeMemory
+        let cap = Int(GPU.deviceInfo().maxRecommendedWorkingSetSize)
+        guard live > 0, cap > 0 else { return }
+        var previous: size_t = 0
+        let limit = min(live + (64 << 20), cap)
+        _ = mlx_set_wired_limit(&previous, size_t(limit))
+        FileHandle.standardError.write(
+            Data("nemotron wired weights: limit \(limit >> 20) MiB (live \(live >> 20) MiB)\n".utf8))
     }
 }
