@@ -1531,6 +1531,228 @@ private let nemotronZSkipStagedSource = """
   }
 """
 
+// Tile-major copy: for each expert and 128-output tile, row k's 32 uint16 words
+// (four outputs' nibbles each, output 4h + o in bits 4o, as in the K-major
+// halves) are contiguous, so a threadgroup's rows are 64-byte segments of one
+// [K, 32] block. Scales and biases are [expert, tile, group, 128].
+private let nemotronZSkipTiledLayoutSource = """
+  const uint lid = thread_position_in_grid.x % 32;
+  const uint t = thread_position_in_grid.x / 32;
+  const uint k = thread_position_in_grid.y;
+  const uint e = thread_position_in_grid.z;
+  const uint n = t * 128 + 4 * lid;
+  const uint shift = 4 * (k % 8);
+  uint v = 0;
+  for (uint o = 0; o < 4; o++) {
+    v |= ((w[((ulong)e * N + n + o) * (K / 8) + k / 8] >> shift) & 0xfu) << (4 * o);
+  }
+  wk[(((ulong)e * (N / 128) + t) * K + k) * 32 + lid] = uint16_t(v);
+"""
+
+// The staged slot kernel on the tile-major copy: the same statements, with
+// only the code-word, scale and bias addresses moved to that layout.
+private let nemotronZSkipTiledSeqSource = """
+  constexpr int OT = 128;
+  constexpr int LPS = 32 / SGS;
+  constexpr int chunks = K / 8;
+  constexpr int tail = chunks - 224;
+  constexpr int halves = N / 4;
+  constexpr int groups = K / 64;
+  constexpr int PS = OT + 1;
+  typedef float U;
+  threadgroup float part[32 * PS];
+  threadgroup T xsh[K];
+  threadgroup uchar cmask[chunks];
+
+  const int slot = int(threadgroup_position_in_grid.y);
+  const int n0 = int(threadgroup_position_in_grid.x) * OT;
+  const int lid = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const uint expert = inds[slot];
+  const device T* xs = x + slot * K;
+  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+    const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+    uint m = 0;
+    for (int i = 0; i < 8; i++) {
+      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      xsh[8 * c + i] = xs[8 * c + i];
+    }
+    cmask[c] = uchar(m);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
+  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;
+  const device T* sq = sk + tb * groups * OT + 4 * lid;
+  const device T* bq = bk + tb * groups * OT + 4 * lid;
+  for (int ll = 0; ll < LPS; ll++) {
+    const int l = sg + SGS * ll;
+    thread U p[4];
+    for (int o = 0; o < 4; o++) {
+      p[o] = 0;
+    }
+    const int count = l < tail ? 8 : 7;
+    for (int j = 0; j < count; j++) {
+      const int c = j < 7 ? l + 32 * j : 224 + l;
+      const uint m = cmask[c];
+      if (m == 0) {
+        continue;
+      }
+      thread U xt[8];
+      U sum = 0;
+      const threadgroup T* xv = xsh + 8 * c;
+      for (int i = 0; i < 8; i += 4) {
+        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+        xt[i] = xv[i];
+        xt[i + 1] = xv[i + 1] / 16.0f;
+        xt[i + 2] = xv[i + 2] / 256.0f;
+        xt[i + 3] = xv[i + 3] / 4096.0f;
+      }
+      uint u[4];
+      for (int i = 0; i < 4; i++) {
+        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+        u[i] = lo | (hi << 16);
+      }
+      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      const int gi = c / 8;
+      const uint2 sr = *((const device uint2*)(sq + gi * OT));
+      const uint2 br = *((const device uint2*)(bq + gi * OT));
+      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+      for (int o = 0; o < 4; o++) {
+        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+      }
+    }
+    for (int o = 0; o < 4; o++) {
+      part[l * PS + 4 * lid + o] = p[o];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int q = 0; q < OT / SGS; q++) {
+    const int n = sg * (OT / SGS) + q;
+    const U r = simd_sum(part[lid * PS + n]);
+    if (lid == 0) {
+      const T h = nml_store<T, false>(r);
+      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;
+    }
+  }
+"""
+
+// One-chunk integer load lookahead; floating expressions stay in the consumer.
+private let nemotronZSkipLookaheadHeader = """
+struct NMZWeightsAhead {
+  uint u[4];
+  uint2 scales;
+  uint2 biases;
+  uint mask;
+};
+
+template <typename T>
+inline NMZWeightsAhead nmz_read_ahead(
+    int c, uint mask, const device uint16_t* wq,
+    const device T* sq, const device T* bq) {
+  NMZWeightsAhead loaded;
+  loaded.mask = mask;
+  loaded.scales = uint2(0);
+  loaded.biases = uint2(0);
+  for (int i = 0; i < 4; i++) { loaded.u[i] = 0; }
+  if (mask == 0) { return loaded; }
+  for (int i = 0; i < 4; i++) {
+    const uint lo = (mask & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+    const uint hi = (mask & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+    loaded.u[i] = lo | (hi << 16);
+  }
+  nmz_swap(loaded.u[0], loaded.u[1], 4, 0x0f0f0f0fu);
+  nmz_swap(loaded.u[2], loaded.u[3], 4, 0x0f0f0f0fu);
+  nmz_swap(loaded.u[0], loaded.u[2], 8, 0x00ff00ffu);
+  nmz_swap(loaded.u[1], loaded.u[3], 8, 0x00ff00ffu);
+  const int gi = c / 8;
+  loaded.scales = *((const device uint2*)(sq + gi * 128));
+  loaded.biases = *((const device uint2*)(bq + gi * 128));
+  return loaded;
+}
+"""
+
+private let nemotronZSkipLookaheadSource: String = {
+    let original = """
+    for (int j = 0; j < count; j++) {
+      const int c = j < 7 ? l + 32 * j : 224 + l;
+      const uint m = cmask[c];
+      if (m == 0) {
+        continue;
+      }
+      thread U xt[8];
+      U sum = 0;
+      const threadgroup T* xv = xsh + 8 * c;
+      for (int i = 0; i < 8; i += 4) {
+        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+        xt[i] = xv[i];
+        xt[i + 1] = xv[i + 1] / 16.0f;
+        xt[i + 2] = xv[i + 2] / 256.0f;
+        xt[i + 3] = xv[i + 3] / 4096.0f;
+      }
+      uint u[4];
+      for (int i = 0; i < 4; i++) {
+        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+        u[i] = lo | (hi << 16);
+      }
+      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      const int gi = c / 8;
+      const uint2 sr = *((const device uint2*)(sq + gi * OT));
+      const uint2 br = *((const device uint2*)(bq + gi * OT));
+      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+      for (int o = 0; o < 4; o++) {
+        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+      }
+    }
+"""
+    let pipelined = """
+    NMZWeightsAhead current = nmz_read_ahead<T>(l, uint(cmask[l]), wq, sq, bq);
+    for (int j = 0; j < count; j++) {
+      const int c = j < 7 ? l + 32 * j : 224 + l;
+      NMZWeightsAhead next = current;
+      if (j + 1 < count) {
+        const int nj = j + 1;
+        const int nc = nj < 7 ? l + 32 * nj : 224 + l;
+        next = nmz_read_ahead<T>(nc, uint(cmask[nc]), wq, sq, bq);
+      }
+      if (current.mask != 0) {
+        thread U xt[8];
+        U sum = 0;
+        const threadgroup T* xv = xsh + 8 * c;
+        for (int i = 0; i < 8; i += 4) {
+          sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+          xt[i] = xv[i];
+          xt[i + 1] = xv[i + 1] / 16.0f;
+          xt[i + 2] = xv[i + 2] / 256.0f;
+          xt[i + 3] = xv[i + 3] / 4096.0f;
+        }
+        const uint2 sr = current.scales;
+        const uint2 br = current.biases;
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const uint16_t ws[2] = {uint16_t(current.u[o] & 0xffffu), uint16_t(current.u[o] >> 16)};
+          p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+        }
+      }
+      current = next;
+    }
+"""
+    precondition(nemotronZSkipTiledSeqSource.components(separatedBy: original).count == 2)
+    return nemotronZSkipTiledSeqSource.replacingOccurrences(of: original, with: pipelined)
+}()
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1572,18 +1794,54 @@ enum NemotronZSkip {
         outputNames: ["prod"], source: nemotronZSkipStagedSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
+    private static let tiledLayout = MLXFast.metalKernel(
+        name: "nemotron_zskip_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
+        source: nemotronZSkipTiledLayoutSource)
+    private static let tiledSlotKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_slots_tiled", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipTiledSeqSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    /// The tile-major copy and its slot kernel unless NEMOTRON_MTP_ZSKIP_TILED=0.
+    /// `prepare` falls back to the K-major copy and the staged kernel (and
+    /// re-checks every layer) if the tiled kernel misses a bit check.
+    nonisolated(unsafe) private static var tiled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TILED"] != "0"
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
     /// also falls back to the original slot kernel (and re-checks every layer)
     /// if the staged one misses a bit check.
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
-    private static var kernel: MLXFast.MLXFastKernel { staged ? stagedSlotKernel : recordSlotKernel }
+    nonisolated(unsafe) private static var lookahead =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_LOOKAHEAD"] != "0"
+    private static let lookaheadSlotKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_slots_tiled_load_ahead",
+        inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipLookaheadSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore
+            + nemotronZSkipHeader + nemotronZSkipLookaheadHeader,
+        ensureRowContiguous: true)
+    private static var kernel: MLXFast.MLXFastKernel {
+        tiled ? (lookahead ? lookaheadSlotKernel : tiledSlotKernel)
+            : (staged ? stagedSlotKernel : recordSlotKernel)
+    }
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
         source: nemotronZSkipReduceSource)
 
     static func makeCopy(_ bank: NemotronMoELeader.Bank) -> Copy {
         let experts = bank.weight.dim(0)
+        if tiled {
+            let tiles = bank.n / 128, groups = bank.k / 64
+            let codes = tiledLayout(
+                [bank.weight], template: [("N", bank.n), ("K", bank.k)],
+                grid: (32 * tiles, bank.k, experts), threadGroup: (32, 8, 1),
+                outputShapes: [[experts, tiles, bank.k, 32]], outputDTypes: [.uint16])[0]
+            func tileMajor(_ a: MLXArray) -> MLXArray {
+                a.reshaped(experts, tiles, 128, groups).transposed(0, 1, 3, 2).contiguous()
+            }
+            return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
+        }
         let codes = layout(
             [bank.weight], template: [("N", bank.n), ("K", bank.k)],
             grid: (bank.n / 8, bank.k, experts), threadGroup: (32, 8, 1),
@@ -1602,9 +1860,10 @@ enum NemotronZSkip {
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, reference: Bool = false) -> MLXArray {
         let slots = rows * 6
-        return kernel(
+        let selected = reference && tiled ? tiledSlotKernel : kernel
+        return selected(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8)],
             grid: (256 * (2688 / 128), slots, 1), threadGroup: (256, 1, 1),
@@ -1657,6 +1916,19 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, lookahead {
+            lookahead = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: load-ahead check missed; original tiled kernel\n".utf8))
+            result = build(model)
+        }
+        if case .kernelMiss = result, tiled {
+            // The tiled kernel missed a check: the K-major copy, every layer again.
+            tiled = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: tiled slot kernel differs; K-major copy\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, staged {
             // The staged twin missed a check: the original slot kernel, every layer again.
             staged = false
@@ -1731,6 +2003,12 @@ enum NemotronZSkip {
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+            if tiled && lookahead {
+                let baseline = products(act, inds, scores, copy: copy, rows: 3, reference: true)
+                let candidate = products(act, inds, scores, copy: copy, rows: 3)
+                same = logicalAnd(same,
+                    (candidate.view(dtype: .uint32) .== baseline.view(dtype: .uint32)).all())
+            }
         }
         return same.item(Bool.self)
     }
