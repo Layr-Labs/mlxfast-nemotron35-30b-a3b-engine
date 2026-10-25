@@ -60,6 +60,7 @@ private final class NemotronMTPDraftHead {
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
+        CBv2MTPLastRowGate.note(ids: result.id, confidence: result.confidence)
         return result.id
     }
 

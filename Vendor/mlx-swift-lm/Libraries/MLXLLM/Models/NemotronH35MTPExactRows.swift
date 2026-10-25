@@ -1433,6 +1433,16 @@ enum NemotronHeadScreen {
       if (lane == 0) {
         out[0] = mi;
       }
+      // The pick's softmax share among the exactly rescored candidates (every
+      // lane holds the maximum after the butterfly).
+      float sum = 0.0f;
+      for (int c = lane; c < NC; c += 32) {
+        sum += metal::exp(cand_vals[c] - mv);
+      }
+      sum = simd_sum(sum);
+      if (lane == 0) {
+        conf[0] = 1.0f / sum;
+      }
     """
 
     private static let partialKernel = MLXFast.metalKernel(
@@ -1483,13 +1493,16 @@ enum NemotronHeadScreen {
         source: selectSource, header: nemotronMultiRowQMVHeader)
     private static let finalKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_final",
-        inputNames: ["best_val", "best_id"], outputNames: ["out"], source: finalSource)
+        inputNames: ["best_val", "best_id", "cand_vals"], outputNames: ["out", "conf"],
+        source: finalSource)
 
     struct Result {
         let id: MLXArray
         let scores: MLXArray
         let candidateIds: MLXArray
         let candidateValues: MLXArray
+        /// float32 [1]: the pick's softmax share among the candidates.
+        let confidence: MLXArray
     }
 
     /// hidden [1, 1, 2688] bf16; the head arrays are the full shared head.
@@ -1525,10 +1538,11 @@ enum NemotronHeadScreen {
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
             outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
             outputDTypes: [.int32, .float32, .float32, .int32])
-        let id = finalKernel(
-            [picked[2], picked[3]], template: [("NCH", chunks)],
+        let final = finalKernel(
+            [picked[2], picked[3], picked[1]], template: [("NCH", chunks), ("NC", chunks * keep)],
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.int32])[0]
-        return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+            outputShapes: [[1], [1]], outputDTypes: [.int32, .float32])
+        return Result(id: final[0], scores: scores, candidateIds: picked[0],
+                      candidateValues: picked[1], confidence: final[1])
     }
 }

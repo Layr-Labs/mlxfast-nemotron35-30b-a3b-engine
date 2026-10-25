@@ -663,3 +663,60 @@ public struct CBv2MTPRoundAuditRecord: Sendable, Equatable {
         self.finishReason = finishReason
     }
 }
+
+/// Last-row verify gate for depth-two rounds. Each draft records the head's
+/// confidence in its pick (the softmax share of the pick among the screen's
+/// exactly rescored candidates, a device scalar). When the product for the
+/// round's two drafts is below the threshold, the verify skips the routed
+/// experts of its last row and the acceptance packet carries an impossible id
+/// in place of the second draft, so that draft is rejected and the round
+/// commits at most the first draft plus the target's next token. The rows the
+/// round can commit are computed exactly as before; only the last row's work
+/// is skipped. `NEMOTRON_MTP_LAST_ROW_GATE=0` disables it.
+public enum CBv2MTPLastRowGate {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_LAST_ROW_GATE"] != "0"
+    public static let threshold: Float =
+        Float(ProcessInfo.processInfo.environment["NEMOTRON_MTP_LAST_ROW_GATE_THRESHOLD"] ?? "")
+        ?? 0.3
+
+    private struct Entry {
+        weak var ids: MLXArray?
+        let confidence: MLXArray
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [ObjectIdentifier: Entry] = [:]
+    /// The gate of the verify graph being built (int32 [1]), else nil.
+    nonisolated(unsafe) public static var current: MLXArray?
+
+    /// Record the confidence of the draft whose ids array is `ids`.
+    public static func note(ids: MLXArray, confidence: MLXArray) {
+        guard enabled else { return }
+        lock.withLock {
+            if entries.count > 64 { entries = entries.filter { $0.value.ids != nil } }
+            entries[ObjectIdentifier(ids)] = Entry(ids: ids, confidence: confidence)
+        }
+    }
+
+    /// The recorded confidence of exactly this ids array, if any.
+    public static func confidence(of ids: MLXArray) -> MLXArray? {
+        lock.withLock {
+            guard let entry = entries[ObjectIdentifier(ids)], entry.ids === ids else { return nil }
+            return entry.confidence
+        }
+    }
+
+    private static let function: @Sendable ([MLXArray]) -> [MLXArray] = compile { arrays in
+        let skip = (arrays[0] * arrays[1]) .< MLXArray(threshold)
+        return [skip.asType(.int32), which(skip, MLXArray(Int32(-1)), arrays[2])]
+    }
+
+    /// One row, depth two: the gate (int32 [1], 1 = skip the last row) and
+    /// the second draft as the acceptance packet carries it (-1 when gated).
+    public static func gate(
+        firstConfidence: MLXArray, secondConfidence: MLXArray, secondDraft: MLXArray
+    ) -> (gate: MLXArray, packetSecondDraft: MLXArray) {
+        let out = function([firstConfidence, secondConfidence, secondDraft.asType(.int32)])
+        return (out[0], out[1])
+    }
+}
