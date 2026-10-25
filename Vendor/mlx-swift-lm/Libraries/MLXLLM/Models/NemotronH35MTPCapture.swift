@@ -10,8 +10,22 @@ import MLXNN
 /// conv/SSM inputs and explicit replay-tape outputs. No evaluation object,
 /// transaction, prefix-replay closure or request identity enters this graph.
 final class NemotronH35MTPCompactGraphCache {
+    /// Native child identity is fixed-width metadata. Keep it inline so a
+    /// cache hit does not allocate a module array and an identifier array for
+    /// every Mamba layer in every verification window.
+    private struct Identity: Equatable {
+        let owner: ObjectIdentifier
+        let inProj: ObjectIdentifier
+        let conv1d: ObjectIdentifier
+        let norm: ObjectIdentifier
+        let outProj: ObjectIdentifier
+    }
     private struct Entry {
-        let identity: [ObjectIdentifier]
+        let identity: Identity
+        // Retain the identified children until this compiled graph retires,
+        // preventing address reuse from making a replacement look identical.
+        // The owner is deliberately excluded: it already owns this cache.
+        let retainedChildren: [Module]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private static let enabled =
@@ -48,7 +62,9 @@ final class NemotronH35MTPCompactGraphCache {
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[3] : nil)
             }
-            let replacement = Entry(identity: identity, function: function)
+            let replacement = Entry(identity: identity,
+                retainedChildren: [owner.inProj, owner.conv1d, owner.norm, owner.outProj],
+                function: function)
             retired = entries[slot]
             entries[slot] = replacement
             return replacement
@@ -67,7 +83,7 @@ final class NemotronH35MTPCompactGraphCache {
         return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
+    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> Identity? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -77,8 +93,9 @@ final class NemotronH35MTPCompactGraphCache {
               type(of: owner.conv1d) == Conv1d.self,
               type(of: owner.norm) == NemotronHRMSNormGated.self,
               linear(owner.inProj), linear(owner.outProj) else { return nil }
-        let modules: [Module] = [owner, owner.inProj, owner.conv1d, owner.norm, owner.outProj]
-        return modules.map(ObjectIdentifier.init)
+        return Identity(owner: ObjectIdentifier(owner), inProj: ObjectIdentifier(owner.inProj),
+            conv1d: ObjectIdentifier(owner.conv1d), norm: ObjectIdentifier(owner.norm),
+            outProj: ObjectIdentifier(owner.outProj))
     }
 }
 

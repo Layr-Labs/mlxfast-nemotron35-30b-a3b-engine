@@ -14,8 +14,29 @@ extension NemotronHMLP {
 /// Stateless graph cache only. Request KV, recurrent state, offsets and
 /// transactions must never be captured by this helper.
 final class NemotronH35MTPGraphCache {
+    /// Store the supported native module tree inline. It is checked on every
+    /// call, preserving child-replacement invalidation without allocating
+    /// temporary module and identifier arrays on each cache hit.
+    private struct NativeIdentity: Equatable {
+        let owner: ObjectIdentifier
+        let gate: ObjectIdentifier
+        let switchMLP: ObjectIdentifier
+        let fc1: ObjectIdentifier
+        let fc2: ObjectIdentifier
+        let shared: ObjectIdentifier?
+        let upProj: ObjectIdentifier?
+        let downProj: ObjectIdentifier?
+    }
+    private enum Identity: Equatable {
+        case native(NativeIdentity)
+        case reflective([ObjectIdentifier])
+    }
     private struct Entry {
-        let identity: [ObjectIdentifier]
+        let identity: Identity
+        // Allocated on a native miss only. Keep known native children alive
+        // until graph retirement to prevent address reuse by a replacement.
+        // Unknown subclasses retain their original ownership behavior.
+        let retainedChildren: [Module]
         let usesPrepared: Bool
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
@@ -41,8 +62,9 @@ final class NemotronH35MTPGraphCache {
         // Unknown subclasses retain the fully reflective fallback.
         let nativeIdentity = Self.nativeIdentity(owner)
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
-        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
-            + (parameters ?? []).map(ObjectIdentifier.init))
+        let identity = nativeIdentity.map(Identity.native)
+            ?? .reflective(owner.modules().map(ObjectIdentifier.init)
+                + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
         let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
         var retired: Entry?
@@ -55,7 +77,21 @@ final class NemotronH35MTPGraphCache {
                 return owner.mtpForwardRowsUncompiledOutputs(arrays[0],
                     prepared: usesPrepared ? arrays[1] : nil, parts: parts)
             }
-            let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
+            let retainedChildren: [Module]
+            if nativeIdentity != nil {
+                var children: [Module] = [owner.gate, owner.switchMLP,
+                    owner.switchMLP.fc1, owner.switchMLP.fc2]
+                if let shared = owner.sharedExperts {
+                    children += [shared, shared.upProj, shared.downProj]
+                }
+                retainedChildren = children
+            } else {
+                // Unknown children may refer back to their owner. Do not
+                // extend their lifetime beyond the original reflective path.
+                retainedChildren = []
+            }
+            let replacement = Entry(identity: identity, retainedChildren: retainedChildren,
+                usesPrepared: usesPrepared, function: function)
             retired = entries[slot]
             entries[slot] = replacement
             generations += 1
@@ -66,7 +102,7 @@ final class NemotronH35MTPGraphCache {
         return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
+    private static func nativeIdentity(_ owner: NemotronHMoE) -> NativeIdentity? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -77,14 +113,17 @@ final class NemotronH35MTPGraphCache {
               type(of: owner.gate) == NemotronHMoEGate.self,
               type(of: owner.switchMLP) == NemotronHSwitchMLP.self,
               switched(owner.switchMLP.fc1), switched(owner.switchMLP.fc2) else { return nil }
-        var modules: [Module] = [owner, owner.gate, owner.switchMLP,
-                                 owner.switchMLP.fc1, owner.switchMLP.fc2]
         if let shared = owner.sharedExperts {
             guard type(of: shared) == NemotronHMLP.self,
                   linear(shared.upProj), linear(shared.downProj) else { return nil }
-            modules += [shared, shared.upProj, shared.downProj]
         }
-        return modules.map(ObjectIdentifier.init)
+        let shared = owner.sharedExperts
+        return NativeIdentity(owner: ObjectIdentifier(owner), gate: ObjectIdentifier(owner.gate),
+            switchMLP: ObjectIdentifier(owner.switchMLP),
+            fc1: ObjectIdentifier(owner.switchMLP.fc1), fc2: ObjectIdentifier(owner.switchMLP.fc2),
+            shared: shared.map(ObjectIdentifier.init),
+            upProj: shared.map { ObjectIdentifier($0.upProj) },
+            downProj: shared.map { ObjectIdentifier($0.downProj) })
     }
 }
 
