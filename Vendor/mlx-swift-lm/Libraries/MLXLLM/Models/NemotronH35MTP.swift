@@ -349,6 +349,10 @@ private final class NemotronMTPDraftHead {
             }
         }
         screen = plan
+        // The screen's launches bind first-row views of the head and record
+        // arrays they address from the base pointer (`NemotronBankBinding`).
+        NemotronBankBinding.warmDense(nil, extra: [plan.weight, plan.scales, plan.biases]
+            + [plan.records, plan.packed].compactMap { $0 })
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
         // well, so neither builds inside a timed window.
@@ -871,7 +875,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
                 + [next.ids, next.out]
             s.stagedInputCount = 1
             s.trustedOffset = s.cacheOffset
-            asyncEval(s.roots)
+            CBv2MTPSubmitMerge.submit(s.roots)
             s.prestagedHidden = hidden
             s.prestagedResult = (tokens: next.ids, hidden: next.out)
             return
@@ -879,7 +883,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let result = draftStep(
             tokens: MLXArray([Int32(token)]).reshaped([1, 1]), hidden: hidden,
             shortlist: nil, requestState: requestState)
-        asyncEval([result.tokens, result.hidden] + s.arrays)
+        CBv2MTPSubmitMerge.submit([result.tokens, result.hidden] + s.arrays)
         s.prestagedHidden = hidden
         s.prestagedResult = result
     }
@@ -919,7 +923,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         }
         s.stagedInputCount += 1
         s.roots.append(contentsOf: [out, ids])
-        asyncEval([ids, out] + s.arrays)
+        CBv2MTPSubmitMerge.submit([ids, out] + s.arrays)
         s.prestagedSecond = (tokens: ids, hidden: out, parent: first.hidden)
     }
 
@@ -949,7 +953,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         s.speculationWriteGeneration = s.paged!.row.writeGeneration
         let roots = [rows.fused, rows.queries] + written + s.cache.innerState()
         s.roots += roots
-        asyncEval(roots)
+        CBv2MTPSubmitMerge.submit(roots)
     }
 }
 
@@ -990,7 +994,7 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
         guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
-            asyncEval([ids, out, keys, values])
+            CBv2MTPSubmitMerge.submit([ids, out, keys, values])
             return
         }
         let inputs = module.pagedDraftInputs(
@@ -1030,7 +1034,7 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
             roots += [ids2, out2, ownKeys, ownValues]
         }
-        asyncEval(roots)
+        CBv2MTPSubmitMerge.submit(roots)
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {

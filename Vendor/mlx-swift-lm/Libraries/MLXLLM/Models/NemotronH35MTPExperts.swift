@@ -1125,14 +1125,16 @@ enum NemotronMoELeader {
         }
         let weights = scores.reshaped(rows * 6)
         // `products`: the unreduced slot products for the captured verify's
-        // join kernel, which sums them itself (same expressions and order).
-        if products, rows == 3,
-           let prod = NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2) {
+        // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
+        // itself (same expressions and order).
+        if products, let prod = rows == 3
+            ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
+            : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
                 .sum(axis: -2).asType(original.dtype)
-            let ok = (NemotronZSkip.reduceProducts(prod, rows: 3).view(dtype: .uint16)
+            let ok = (NemotronZSkip.reduceProducts(prod, rows: rows).view(dtype: .uint16)
                 .== expected.view(dtype: .uint16)).all()
             return which(ok, prod, MLXArray(Float.nan))
         }
@@ -1725,6 +1727,152 @@ private let nemotronZSkipTiledSeqSource = """
   }
 """
 
+// The tiled slot kernel with exact fast paths for chunks with one or two
+// non-zero activations (the relu2 rows are ~84% exact zeros). A chunk's mask
+// is uniform across the SIMD group (all 32 lanes meet the same chunk), so the
+// branches do not diverge. Every term x_thread[i] * code is exact in FP32 (a
+// BF16 value scaled by a power of two times a nibble shifted by a multiple of
+// four: at most 12 significant bits), so the record qdot's zero terms add +0
+// and its sum is the in-order sum of the non-zero terms: x1 * c1 (+ x2 * c2).
+// The chunk sum likewise reduces to x1 (+ x2), and the closing
+// scale * accum + sum * bias keeps the record's form. Chunks with three or
+// more non-zero values take the tiled kernel's statements unchanged.
+private let nemotronZSkipTiledFastSource = """
+  constexpr int OT = 128;
+  constexpr int LPS = 32 / SGS;
+  constexpr int chunks = K / 8;
+  constexpr int tail = chunks - 224;
+  constexpr int halves = N / 4;
+  constexpr int groups = K / 64;
+  constexpr int PS = OT + 1;
+  typedef float U;
+  threadgroup float part[32 * PS];
+  threadgroup T xsh[K];
+  threadgroup uchar cmask[chunks];
+
+  const int slot = int(threadgroup_position_in_grid.y);
+  const int n0 = int(threadgroup_position_in_grid.x) * OT;
+  const int lid = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const uint expert = inds[slot];
+  const device T* xs = x + slot * K;
+  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+    const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+    uint m = 0;
+    for (int i = 0; i < 8; i++) {
+      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      xsh[8 * c + i] = xs[8 * c + i];
+    }
+    cmask[c] = uchar(m);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
+  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;
+  const device T* sq = sk + tb * groups * OT + 4 * lid;
+  const device T* bq = bk + tb * groups * OT + 4 * lid;
+  for (int ll = 0; ll < LPS; ll++) {
+    const int l = sg + SGS * ll;
+    thread U p[4];
+    for (int o = 0; o < 4; o++) {
+      p[o] = 0;
+    }
+    const int count = l < tail ? 8 : 7;
+    for (int j = 0; j < count; j++) {
+      const int c = j < 7 ? l + 32 * j : 224 + l;
+      const uint m = cmask[c];
+      if (m == 0) {
+        continue;
+      }
+      if (popcount(m) == 1) {
+        const int j1 = ctz(m);
+        const T xvj = xsh[8 * c + j1];
+        const int jq = j1 & 3;
+        const U xtj = jq == 0 ? U(xvj) : (jq == 1 ? xvj / 16.0f : (jq == 2 ? xvj / 256.0f : xvj / 4096.0f));
+        const U sum1 = U(xvj);
+        const uint w = uint(wq[(8 * c + j1) * 32]);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const uint code = ((w >> (4 * o)) & 0xfu) << (4 * jq);
+          U accum = 0;
+          accum += xtj * U(int(code));
+          p[o] += as_type<float>(sv[o]) * accum + sum1 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
+      if (popcount(m) == 2) {
+        const int j1 = ctz(m);
+        const int j2 = ctz(m & (m - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const int q1 = j1 & 3;
+        const int q2 = j2 & 3;
+        const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
+        const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+        const U sum2 = U(xv1) + U(xv2);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+          const U accum = xt1 * c1 + xt2 * c2;
+          p[o] += as_type<float>(sv[o]) * accum + sum2 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
+      thread U xt[8];
+      U sum = 0;
+      const threadgroup T* xv = xsh + 8 * c;
+      for (int i = 0; i < 8; i += 4) {
+        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+        xt[i] = xv[i];
+        xt[i + 1] = xv[i + 1] / 16.0f;
+        xt[i + 2] = xv[i + 2] / 256.0f;
+        xt[i + 3] = xv[i + 3] / 4096.0f;
+      }
+      uint u[4];
+      for (int i = 0; i < 4; i++) {
+        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+        u[i] = lo | (hi << 16);
+      }
+      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      const int gi = c / 8;
+      const uint2 sr = *((const device uint2*)(sq + gi * OT));
+      const uint2 br = *((const device uint2*)(bq + gi * OT));
+      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+      for (int o = 0; o < 4; o++) {
+        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+      }
+    }
+    for (int o = 0; o < 4; o++) {
+      part[l * PS + 4 * lid + o] = p[o];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int q = 0; q < OT / SGS; q++) {
+    const int n = sg * (OT / SGS) + q;
+    const U r = simd_sum(part[lid * PS + n]);
+    if (lid == 0) {
+      const T h = nml_store<T, false>(r);
+      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;
+    }
+  }
+"""
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1783,6 +1931,76 @@ enum NemotronBankBinding {
         eval(made.values.map { $0.1 })
         lock.withLock { views.merge(made) { _, new in new } }
     }
+
+    /// NEMOTRON_MTP_DENSE_VIEWS=0 keeps binding the whole dense projections.
+    static let denseEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DENSE_VIEWS"] != "0"
+
+    /// Load-time only: both operands must retain the original device pointer
+    /// ABI. This checks identity without dereferencing beyond the short view.
+    /// No pointer value is copied to the host, only the equality Boolean.
+    private static let denseAliasCheck = MLXFast.metalKernel(
+        name: "nemotron_dense_native_alias_check",
+        inputNames: ["original", "prefix"], outputNames: ["same"],
+        source: "same[0] = original == prefix ? uint(1) : uint(0);",
+        ensureRowContiguous: false)
+
+    private static func denseRowMajor(_ array: MLXArray) -> Bool {
+        var stride = 1
+        for (length, actual) in zip(array.shape, array.strides).reversed() {
+            if length > 1 && actual != stride { return false }
+            stride *= length
+        }
+        return true
+    }
+
+    /// Load time, outside any trace: record evaluated first-row views of the
+    /// weight, scales and biases of every dense 4-bit projection
+    /// (`QuantizedLinear`) of `model` and of `extra` arrays. Only the decode
+    /// launches that address these arrays from their base pointer with their
+    /// own constants bind the views (`bind`); every other caller still binds
+    /// the whole array.
+    static func warmDense(_ model: Module?, extra: [MLXArray] = []) {
+        guard enabled, denseEnabled else { return }
+        var arrays = extra
+        for module in model?.modules() ?? [] {
+            guard type(of: module) == QuantizedLinear.self,
+                  let q = module as? QuantizedLinear else { continue }
+            arrays.append(q.weight)
+            arrays.append(q.scales)
+            if let biases = q.biases { arrays.append(biases) }
+        }
+        var made: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        var seen = Set<ObjectIdentifier>()
+        for array in arrays where array.ndim >= 1 && array.dim(0) > 1
+            && array.size >= 8 && denseRowMajor(array) {
+            guard seen.insert(ObjectIdentifier(array)).inserted else { continue }
+            // At least eight elements, so MLX keeps binding it in the device
+            // address space (smaller custom-kernel inputs become constant).
+            let perRow = max(1, array.size / array.dim(0))
+            let rows = min(array.dim(0), (8 + perRow - 1) / perRow)
+            made[ObjectIdentifier(array)] = (array, array[0 ..< rows])
+        }
+        // These are immutable loaded weights/records, outside graph tracing.
+        // A copied or unsupported view must never be used as a full-bank base.
+        var qualified: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for (key, pair) in made {
+            guard pair.1.size >= 8, denseRowMajor(pair.1) else { continue }
+            do {
+                let same = try withError { () -> Bool in
+                    eval(pair.0, pair.1)
+                    return denseAliasCheck([pair.0, pair.1],
+                        grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.uint32])[0].item(UInt32.self) == 1
+                }
+                if same { qualified[key] = pair }
+            } catch {
+                // Existing first-expert entries and full-array fallback stay.
+                continue
+            }
+        }
+        lock.withLock { views.merge(qualified) { _, new in new } }
+    }
 }
 
 enum NemotronZSkip {
@@ -1824,6 +2042,16 @@ enum NemotronZSkip {
         outputNames: ["prod"], source: nemotronZSkipTiledSeqSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
+    private static let tiledFastSlotKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_slots_tiled_fast", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    /// The tiled slot kernel's one- and two-value fast paths unless
+    /// NEMOTRON_MTP_ZSKIP_FAST=0. `prepare` falls back to the tiled kernel (and
+    /// re-checks every layer) if the fast twin misses a bit check.
+    nonisolated(unsafe) private static var fast =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_FAST"] != "0"
     /// The tile-major copy and its slot kernel unless NEMOTRON_MTP_ZSKIP_TILED=0.
     /// `prepare` falls back to the K-major copy and the staged kernel (and
     /// re-checks every layer) if the tiled kernel misses a bit check.
@@ -1840,7 +2068,7 @@ enum NemotronZSkip {
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
     private static var kernel: MLXFast.MLXFastKernel {
-        tiled ? tiledSlotKernel : (staged ? stagedSlotKernel : recordSlotKernel)
+        tiled ? (fast ? tiledFastSlotKernel : tiledSlotKernel) : (staged ? stagedSlotKernel : recordSlotKernel)
     }
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
@@ -1926,6 +2154,107 @@ enum NemotronZSkip {
         return run(x, inds, scores, copy: copy)
     }
 
+    // MARK: Draft head (one row per draft step)
+    //
+    // The draft head's routed MoE runs on one row: each draft step's one-token
+    // expert tail. The record runs its fc2 through the R = 1 weighted leader
+    // kernel, whose per-slot arithmetic is the slot kernel's (same lane chunks,
+    // coefficient values, qdot, simd_sum, store and weighted product); the
+    // tail's join then sums the six products in the reduce's slot order. The
+    // draft copy lives apart from the target's, with its own check and switch.
+    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ZSKIP"] != "0"
+    nonisolated(unsafe) private static var draftCopies: [ObjectIdentifier: Copy] = [:]
+
+    static var draftCopyArrays: [MLXArray] {
+        lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+
+    /// The draft head's R = 1 weighted slot products ([6 * 2688] FP32), or nil
+    /// when `owner` has no verified draft copy.
+    static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                              owner: SwitchLinear) -> MLXArray? {
+        guard x.shape == [6, 1856], x.dtype == .bfloat16,
+              inds.shape == [6], scores.shape == [6], scores.dtype == .float32,
+              let copy = lock.withLock({ draftCopies[ObjectIdentifier(owner)] }) else { return nil }
+        return products(x, inds, scores, copy: copy, rows: 1)
+    }
+
+    /// Load time, after `prepare` (same copy layout and slot kernel) and before
+    /// any draft graph is traced: copy the draft head's routed fc2 bank and keep
+    /// it only if its scales and biases are finite, the slot kernel plus the
+    /// reduce equals the production R = 1 kernel bit for bit on seeded one-row
+    /// inputs, and the one-row products join equals reduce + join. Any miss
+    /// leaves the draft head on the record kernel; the target is untouched.
+    static func prepareDraft(_ head: Module) {
+        guard draftEnabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
+        var built: [ObjectIdentifier: Copy] = [:]
+        for module in head.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  moe.numExpertsPerTok == 6, type(of: moe.switchMLP.fc2) == QuantizedSwitchLinear.self,
+                  let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                  down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
+                  down.biases.shape == down.scales.shape else { continue }
+            let copy = makeCopy(down)
+            eval(copy.codes, copy.scales, copy.biases)
+            guard finite(down), matchesOneRow(down, copy, seed: built.count) else {
+                FileHandle.standardError.write(
+                    Data("nemotron draft zskip off: the draft head differs from the record kernel\n".utf8))
+                return
+            }
+            built[ObjectIdentifier(moe.switchMLP.fc2)] = copy
+        }
+        guard !built.isEmpty else {
+            FileHandle.standardError.write(Data("nemotron draft zskip off: no 4-bit routed fc2 bank\n".utf8))
+            return
+        }
+        guard NemotronHResidualRMSNorm.checkDraftProductsJoin(head) else {
+            FileHandle.standardError.write(
+                Data("nemotron draft zskip off: the products join differs from reduce + join\n".utf8))
+            return
+        }
+        lock.withLock { draftCopies = built }
+        FileHandle.standardError.write(Data("nemotron draft zskip on: \(built.count) MoE layers\n".utf8))
+    }
+
+    /// Seeded one-row cases against the production R = 1 kernel: sparse rows
+    /// with an all-zero slot, a one-hot slot and -0 in place of some zeros,
+    /// tail chunks only, and dense.
+    private static func matchesOneRow(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
+        let offset = UInt32(seed) * 7
+        var routes: [UInt32] = [3, 17, 42, 77, 100, 121]
+        for i in routes.indices {
+            routes[i] = (routes[i] + offset) % 128
+        }
+        let inds = MLXArray(routes)
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x25d0 + seed)), into: 4)
+        let h = abs(MLXRandom.normal([6, 1856], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [6, 1856], key: keys[1]) .< MLXArray(Float(0.09))
+        let slot = MLXArray((0 ..< 6).map(Int32.init)).reshaped(6, 1)
+        let column = MLXArray((0 ..< 1856).map(Int32.init)).reshaped(1, 1856)
+        let zero = MLXArray(Float(0))
+        let oneHot = which(column .== MLXArray(Int32(1800)), MLXArray(Float(1.5)), zero)
+        let sparse = which(slot .== MLXArray(Int32(2)), zero,
+                           which(slot .== MLXArray(Int32(3)), oneHot, which(keep, h, zero)))
+        let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
+        let scores = MLXRandom.uniform(Float(0) ..< 1, [6], key: keys[2])
+        let negative = MLXRandom.uniform(Float(0) ..< 1, [6, 1856], key: keys[3]) .< MLXArray(Float(0.05))
+        let negativeZero = MLXArray(Float(-0.0)).asType(.bfloat16)
+        var cases: [MLXArray] = []
+        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
+            cases.append((a * a).asType(.bfloat16))
+        }
+        cases.append(which(logicalAnd(cases[0] .== MLXArray(Float(0)).asType(.bfloat16), negative),
+                           negativeZero, cases[0]))
+        var same = MLXArray(true)
+        for act in cases {
+            let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 1, bank: bank,
+                                                           tail8: NemotronMoELeader.leaderTail8)
+            let got = run(act, inds, scores, copy: copy, rows: 1)
+            same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+        }
+        return same.item(Bool.self)
+    }
+
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
     /// then keep the copies only if every layer's scales and biases are finite
     /// (the skipped-chunk argument needs it) and its kernel equals the record
@@ -1934,6 +2263,13 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, fast {
+            // The fast twin missed a check: the tiled kernel, every layer again.
+            fast = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: fast slot kernel differs; tiled slot kernel\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled {
             // The tiled kernel missed a check: the K-major copy, every layer again.
             tiled = false
