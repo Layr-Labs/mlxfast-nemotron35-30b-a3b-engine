@@ -1042,6 +1042,18 @@ enum NemotronMoELeader {
             balancePlan = nil
         }
         let weights = scores.reshaped(rows * 6)
+        // `products` at R = 1 (the draft tail): the head copy's slot products
+        // for the tail's sum join, which sums them itself.
+        if products, rows == 1,
+           let prod = NemotronZSkip.headWeightedProducts(act, flat, weights, owner: mlp.fc2) {
+            guard selfTest else { return prod }
+            let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
+            let expected = (original * scores[.ellipsis, .newAxis])
+                .sum(axis: -2).asType(original.dtype)
+            let ok = (NemotronZSkip.reduceProducts(prod, rows: 1).view(dtype: .uint16)
+                .== expected.view(dtype: .uint16)).all()
+            return which(ok, prod, MLXArray(Float.nan))
+        }
         // `products`: the unreduced slot products for the captured verify's
         // join kernel, which sums them itself (same expressions and order).
         if products, rows == 3,
@@ -1827,6 +1839,96 @@ enum NemotronZSkip {
             FileHandle.standardError.write(
                 Data("nemotron zskip off: layer \(layer) differs from the record kernel\n".utf8))
         }
+    }
+
+    // MARK: MTP head (draft tail, R = 1)
+
+    /// NEMOTRON_MTP_HEAD_ZSKIP=0 keeps the MTP head's dense R = 1 weighted fc2.
+    /// Otherwise the head's routed fc2 (an `mtp.*` weight: the participant
+    /// contract allows the head, and only the head, to be re-laid-out in
+    /// memory at load) gets the same K-major copy, the draft tail's fc2 runs
+    /// the slot kernel (6 slots x 21 column tiles), and the draft tail's sum
+    /// join folds the six-product sum (no added launch).
+    static let headEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_ZSKIP"] != "0"
+    nonisolated(unsafe) private static var headCopies: [ObjectIdentifier: Copy] = [:]
+
+    /// True when the draft tail can take the products route for `owner`.
+    static func headCovers(_ owner: SwitchLinear) -> Bool {
+        headEnabled && NemotronHResidualRMSNorm.headProductsJoinVerified
+            && lock.withLock { headCopies[ObjectIdentifier(owner)] != nil }
+    }
+
+    /// The R = 1 weighted slot products of the head's routed fc2
+    /// ([6 * 2688] FP32, slot-major), or nil when `owner` has no verified copy.
+    static func headWeightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                                     owner: SwitchLinear) -> MLXArray? {
+        guard headEnabled, NemotronHResidualRMSNorm.headProductsJoinVerified,
+              x.shape == [6, 1856], x.dtype == .bfloat16,
+              inds.shape == [6], scores.shape == [6], scores.dtype == .float32,
+              let copy = lock.withLock({ headCopies[ObjectIdentifier(owner)] }) else { return nil }
+        return products(x, inds, scores, copy: copy, rows: 1)
+    }
+
+    /// Load time, after `prepare(target)`: copy the head's routed fc2 bank and
+    /// keep it only if its scales and biases are finite and the slot kernel +
+    /// top-six reduce equals the head's dense R = 1 weighted fc2 bit for bit
+    /// on seeded relu2-like rows; then qualify the products sum join.
+    static func prepareHead(_ head: Module) {
+        lock.withLock { headCopies = [:] }
+        guard headEnabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu
+        else { return }
+        var built: [ObjectIdentifier: Copy] = [:]
+        for module in head.modules() {
+            guard let moe = module as? NemotronHMoE, moe.numExpertsPerTok == 6,
+                  type(of: moe.switchMLP.fc2) == QuantizedSwitchLinear.self,
+                  let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                  down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
+                  down.biases.shape == down.scales.shape else { continue }
+            let copy = makeCopy(down)
+            eval(copy.codes, copy.scales, copy.biases)
+            guard finite(down), matchesHead(down, copy, seed: built.count) else {
+                FileHandle.standardError.write(Data("nemotron head zskip off: bank check failed\n".utf8))
+                return
+            }
+            built[ObjectIdentifier(moe.switchMLP.fc2)] = copy
+        }
+        guard !built.isEmpty,
+              let norm = head.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+                  type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+              }) else { return }
+        NemotronHResidualRMSNorm.checkHeadProductsJoin(norm)
+        guard NemotronHResidualRMSNorm.headProductsJoinVerified else { return }
+        lock.withLock { headCopies = built }
+        FileHandle.standardError.write(Data("nemotron head zskip on: \(built.count) MoE layer\n".utf8))
+    }
+
+    /// R = 1: the slot kernel + reduce against the head's dense weighted fc2
+    /// (the production `applyWeighted` route) on six slots.
+    private static func matchesHead(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x26c0 + seed)), into: 4)
+        var same = MLXArray(true)
+        let routeSets: [[UInt32]] = [[3, 17, 42, 77, 100, 121], [127, 0, 64, 5, 90, 11]]
+        for (trial, routes) in routeSets.enumerated() {
+            let inds = MLXArray(routes)
+            let h = abs(MLXRandom.normal([6, 1856], key: keys[trial])) + 1e-3
+            let keep = MLXRandom.uniform(Float(0) ..< 1, [6, 1856], key: keys[2]) .< MLXArray(Float(0.08))
+            let slot = MLXArray((0 ..< 6).map(Int32.init)).reshaped(6, 1)
+            let column = MLXArray((0 ..< 1856).map(Int32.init)).reshaped(1, 1856)
+            let zero = MLXArray(Float(0))
+            let oneHot = which(column .== MLXArray(Int32(1800)), MLXArray(Float(1.5)), zero)
+            let sparse = which(slot .== MLXArray(Int32(2)), zero,
+                               which(slot .== MLXArray(Int32(3)), oneHot, which(keep, h, zero)))
+            let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
+            let scores = MLXRandom.uniform(Float(0) ..< 1, [6], key: keys[3])
+            for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
+                let act = (a * a).asType(.bfloat16)
+                let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 1, bank: bank,
+                    tail8: NemotronMoELeader.leaderTail8)
+                let got = run(act, inds, scores, copy: copy, rows: 1)
+                same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+            }
+        }
+        return same.item(Bool.self)
     }
 
     private enum BuildResult {

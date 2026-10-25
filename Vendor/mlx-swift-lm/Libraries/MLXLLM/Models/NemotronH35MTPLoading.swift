@@ -79,8 +79,12 @@ extension NemotronH35MTPAssistant {
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        // The MTP head's routed fc2 (the head exception): zero-skip copy for the
+        // R = 1 draft tail, kept only after its bit checks.
+        NemotronZSkip.prepareHead(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
+        if NemotronMTPDraftRow.gather { NemotronMTPPickRow.warm() }
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
