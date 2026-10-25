@@ -1642,6 +1642,154 @@ private let nemotronZSkipTiledSeqSource = """
   }
 """
 
+// Independent duplicate-expert two-slot kernel; original tile source retained.
+private let nemotronZSkipPairedSource = """
+constexpr int OT = 64;
+constexpr int COPY_OT = 128;
+constexpr int LPS = 32 / SGS;
+constexpr int chunks = K / 8;
+constexpr int tail = chunks - 224;
+constexpr int groups = K / 64;
+constexpr int PS = OT + 1;
+typedef float U;
+threadgroup int pairInfo[2];
+threadgroup float part[2 * 32 * PS];
+threadgroup T xsh[2 * K];
+threadgroup uchar cmask[2 * chunks];
+
+const int slot = int(threadgroup_position_in_grid.y);
+const int tile = int(threadgroup_position_in_grid.x);
+const int lid = int(thread_index_in_simdgroup);
+const int sg = int(simdgroup_index_in_threadgroup);
+const uint expert = inds[slot];
+if (sg == 0 && lid == 0) {
+  int rank = 0;
+  for (int i = 0; i < slot; i++) {
+    rank += inds[i] == expert ? 1 : 0;
+  }
+  int other = -1;
+  for (int i = slot + 1; i < SLOTS; i++) {
+    if (inds[i] == expert) { other = i; break; }
+  }
+  pairInfo[0] = rank;
+  pairInfo[1] = other;
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+// Consecutive equal-expert occurrences are paired by rank. Every odd rank
+// is written by the immediately preceding even owner, including duplicates
+// within a row; no assumption that top-K routes are unique is needed.
+if ((pairInfo[0] & 1) != 0) { return; }
+const int other = pairInfo[1];
+for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+  for (int r = 0; r < 2; r++) {
+    const int s = r == 0 ? slot : other;
+    uint m = 0;
+    for (int i = 0; i < 8; i++) {
+      T v = T(0);
+      uint16_t bits = 0;
+      if (s >= 0) {
+        v = x[s * K + 8 * c + i];
+        const device uint16_t* xb = (const device uint16_t*)(x + s * K + 8 * c);
+        bits = xb[i];
+      }
+      xsh[r * K + 8 * c + i] = v;
+      m |= (bits & 0x7fff) != 0 ? (1u << i) : 0u;
+    }
+    cmask[r * chunks + c] = uchar(m);
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+const int r = lid / 16;
+const int col = lid % 16;
+const ulong tb = (ulong)expert * (N / COPY_OT) + tile / 2;
+const int within = (tile % 2) * OT;
+const device uint16_t* wq = (const device uint16_t*)wk
+    + tb * K * 32 + within / 4 + col;
+const device T* sq = sk + tb * groups * COPY_OT + within + 4 * col;
+const device T* bq = bk + tb * groups * COPY_OT + within + 4 * col;
+for (int ll = 0; ll < LPS; ll++) {
+  const int l = sg + SGS * ll;
+  thread U p[4];
+  for (int o = 0; o < 4; o++) { p[o] = 0; }
+  const int count = l < tail ? 8 : 7;
+  for (int j = 0; j < count; j++) {
+    const int c = j < 7 ? l + 32 * j : 224 + l;
+    const uint m0 = cmask[c];
+    const uint m1 = cmask[chunks + c];
+    const uint both = m0 | m1;
+    if (both == 0) { continue; }
+    uint lo[4] = {0, 0, 0, 0};
+    uint hi[4] = {0, 0, 0, 0};
+    uint2 sr = uint2(0), br = uint2(0);
+    if (lid < 16) {
+      for (int i = 0; i < 4; i++) {
+        lo[i] = (both & (1u << i)) != 0
+            ? uint(wq[(8 * c + i) * 32]) : 0u;
+        hi[i] = (both & (16u << i)) != 0
+            ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+      }
+      const int gi = c / 8;
+      sr = *((const device uint2*)(sq + gi * COPY_OT));
+      br = *((const device uint2*)(bq + gi * COPY_OT));
+    }
+    // All 32 lanes reach each shuffle, irrespective of either row's mask.
+    // Upper16 lanes reuse raw words from the corresponding lower16 lane.
+    // Each row then restores its OWN mask before the original nibble swaps.
+    for (int o = 0; o < 4; o++) {
+      lo[o] = simd_shuffle(lo[o], ushort(col));
+      hi[o] = simd_shuffle(hi[o], ushort(col));
+    }
+    sr = uint2(simd_shuffle(sr.x, ushort(col)), simd_shuffle(sr.y, ushort(col)));
+    br = uint2(simd_shuffle(br.x, ushort(col)), simd_shuffle(br.y, ushort(col)));
+    const uint ownMask = r == 0 ? m0 : m1;
+    if (ownMask != 0) {
+      uint u[4];
+      for (int o = 0; o < 4; o++) {
+        const uint ownLo = (ownMask & (1u << o)) != 0 ? lo[o] : 0u;
+        const uint ownHi = (ownMask & (16u << o)) != 0 ? hi[o] : 0u;
+        u[o] = ownLo | (ownHi << 16);
+      }
+      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      thread U xt[8];
+      U sum = 0;
+      const threadgroup T* xv = xsh + r * K + 8 * c;
+      for (int i = 0; i < 8; i += 4) {
+        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+        xt[i] = xv[i];
+        xt[i + 1] = xv[i + 1] / 16.0f;
+        xt[i + 2] = xv[i + 2] / 256.0f;
+        xt[i + 3] = xv[i + 3] / 4096.0f;
+      }
+      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+      for (int o = 0; o < 4; o++) {
+        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+      }
+    }
+  }
+  for (int o = 0; o < 4; o++) {
+    part[(r * 32 + l) * PS + 4 * col + o] = p[o];
+  }
+}
+threadgroup_barrier(mem_flags::mem_threadgroup);
+for (int rr = 0; rr < 2; rr++) {
+  for (int q = 0; q < OT / SGS; q++) {
+    const int n = sg * (OT / SGS) + q;
+    const U value = simd_sum(part[(rr * 32 + lid) * PS + n]);
+    const int s = rr == 0 ? slot : other;
+    if (lid == 0 && s >= 0) {
+      const T h = nml_store<T, false>(value);
+      prod[s * N + tile * OT + n] = float(h) * scores[s] + 0.0f;
+    }
+  }
+}
+"""
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1706,6 +1854,14 @@ enum NemotronZSkip {
     /// if the staged one misses a bit check.
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
+    nonisolated(unsafe) private static var paired =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_PAIRS"] != "0"
+    private static let pairedSlotKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_tiled_equal_expert_pairs",
+        inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipPairedSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
     private static var kernel: MLXFast.MLXFastKernel {
         tiled ? tiledSlotKernel : (staged ? stagedSlotKernel : recordSlotKernel)
     }
@@ -1744,9 +1900,16 @@ enum NemotronZSkip {
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, reference: Bool = false) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
+        if tiled && paired && rows == 3 && !reference {
+            return pairedSlotKernel(
+                [copy.codes, copy.scales, copy.biases, x, inds, scores],
+                template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs), ("SLOTS", slots)],
+                grid: (threads * (2688 / 64), slots, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+        }
         return kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
@@ -1800,6 +1963,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, tiled, paired {
+            paired = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: pair product check missed; original tiled kernel\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled {
             // The tiled kernel missed a check: the K-major copy, every layer again.
             tiled = false
@@ -1876,11 +2045,28 @@ enum NemotronZSkip {
         let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
         let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[2])
         var same = MLXArray(true)
-        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
+        let pairRoutes: [[UInt32]] = [
+            routes,
+            Array(repeating: (offset + 13) % 128, count: 18),
+            (0 ..< 18).map { (offset + UInt32($0)) % 128 },
+            (0 ..< 18).map { (offset + UInt32($0 % 2)) % 128 },
+            (0 ..< 18).map { (offset + UInt32($0 < 17 ? 9 : 11)) % 128 },
+        ]
+        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16),
+                  MLXArray.zeros([18, 1856], dtype: .bfloat16)] {
             let act = (a * a).asType(.bfloat16)
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+            if tiled && paired {
+                for route in pairRoutes {
+                    let trialIndices = MLXArray(route)
+                    let baseline = products(act, trialIndices, scores, copy: copy, rows: 3, reference: true)
+                    let candidate = products(act, trialIndices, scores, copy: copy, rows: 3)
+                    same = logicalAnd(same,
+                        (candidate.view(dtype: .uint32) .== baseline.view(dtype: .uint32)).all())
+                }
+            }
         }
         return same.item(Bool.self)
     }
