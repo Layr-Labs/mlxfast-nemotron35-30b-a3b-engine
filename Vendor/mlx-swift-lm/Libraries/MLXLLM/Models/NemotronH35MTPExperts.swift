@@ -454,7 +454,7 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
+        result[r] += nml_qdot<U, values_per_thread, true>(wl, x_thread, s, b, sum);
       }
       ws += block_size / 2;
       sc += block_size / 64;
@@ -471,7 +471,7 @@ private let nemotronMoELeaderSource = """
         const device T* bl = bs + r * in_vec_size_g;
         U s = sl[0];
         U b = bl[0];
-        result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
+        result[r] += nml_qdot_safe<U, values_per_thread, true>(
             wl, x_thread, s, b, sum, remaining);
       }
     }
@@ -500,7 +500,7 @@ private let nemotronMoELeaderSource = """
         U s = sl[0];
         U b = bl[0];
         U value0, value1;
-        nml_qdot_pair<U, values_per_thread, R == 3>(
+        nml_qdot_pair<U, values_per_thread, true>(
             wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
         result0[r] += value0;
         result1[r] += value1;
@@ -523,7 +523,7 @@ private let nemotronMoELeaderSource = """
         U s = sl[0];
         U b = bl[0];
         U value0, value1;
-        nml_qdot_pair<U, values_per_thread, R == 3>(
+        nml_qdot_pair<U, values_per_thread, true>(
             wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
         result0[r] += value0;
         result1[r] += value1;
@@ -559,7 +559,7 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let gateUpAndPlan: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
-        let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
+        let preparedSource = nmlPreparedSource(nmlFC1SIMDRouteSource(nemotronMoELeaderSource), pointers: [
             ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
             ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
@@ -641,7 +641,7 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);
+          result[r] += nml_qdot<U, values_per_thread, true>(wl, x_thread, s, b, sum);
         }
         ws += block_size / 2;
         sc += block_size / 64;
@@ -658,7 +658,7 @@ private let nemotronMoELeaderWeightedSource = """
           const device T* bl = bs + r * in_vec_size_g;
           U s = sl[0];
           U b = bl[0];
-          result[r] += nml_qdot_safe<U, values_per_thread, R == 3>(
+          result[r] += nml_qdot_safe<U, values_per_thread, true>(
               wl, x_thread, s, b, sum, remaining);
         }
       }
@@ -686,7 +686,7 @@ private let nemotronMoELeaderWeightedSource = """
           U s = sl[0];
           U b = bl[0];
           U value0, value1;
-          nml_qdot_pair<U, values_per_thread, R == 3>(
+          nml_qdot_pair<U, values_per_thread, true>(
               wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
           result0[r] += value0;
           result1[r] += value1;
@@ -709,7 +709,7 @@ private let nemotronMoELeaderWeightedSource = """
           U s = sl[0];
           U b = bl[0];
           U value0, value1;
-          nml_qdot_pair<U, values_per_thread, R == 3>(
+          nml_qdot_pair<U, values_per_thread, true>(
               wl, x0_thread, x1_thread, s, b, sum0, sum1, remaining, value0, value1);
           result0[r] += value0;
           result1[r] += value1;
@@ -1145,6 +1145,34 @@ private final class NMLBalanceWeighted: Sendable {
     }
 }
 
+
+/// Compare the 18 route slots of R = 3, TOPK = 6 in parallel (lanes 0-17),
+/// without changing which occurrence leads or which next-row occurrence is
+/// its partner: simd_sum counts earlier-row occurrences (odd = follower),
+/// simd_min finds the first next-row slot. The router guarantees six distinct
+/// experts within each row. Other R / TOPK keep the original search.
+private func nmlFC1SIMDRouteSource(_ source: String) -> String {
+    guard let start = source.range(of: "  int before = 0;"),
+          let end = source.range(of: "\n\n  const int out_row =", range: start.upperBound..<source.endIndex)
+    else { preconditionFailure("FC1 route source changed") }
+    let range = start.lowerBound..<end.lowerBound
+    let original = String(source[range])
+    let replacement = """
+      int partner = -1;
+      if (R == 3 && TOPK == 6) {
+        // All 32 lanes participate before the uniform follower return.
+        const bool match = simd_lid < 18 ? inds[simd_lid] == expert : false;
+        const uint before = simd_sum(uint(match && int(simd_lid) < row * TOPK));
+        const int next = simd_min(match && int(simd_lid) >= (row + 1) * TOPK
+            ? int(simd_lid) : 18);
+        if ((before & 1u) != 0) { return; }
+        partner = next < 18 ? next : -1;
+      } else {
+        \(original.replacingOccurrences(of: "int partner = -1;", with: "partner = -1;"))
+      }
+    """
+    return source.replacingCharacters(in: range, with: replacement)
+}
 
 /// Reuse the entire accepted prepared FC1 body verbatim. The extra work runs
 /// in exactly one complete 64-thread TG: row-zero/slot-zero is always a leader,
