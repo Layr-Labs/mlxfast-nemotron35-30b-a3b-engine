@@ -1696,11 +1696,6 @@ enum NemotronZSkip {
     /// re-checks every layer) if the tiled kernel misses a bit check.
     nonisolated(unsafe) private static var tiled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TILED"] != "0"
-    /// SIMD groups per slot-kernel threadgroup: 16 halves each thread's lane
-    /// partials (two instead of four) with the same lane-to-chunk map, so every
-    /// partial, its order and the closing reduction are unchanged.
-    /// NEMOTRON_MTP_ZSKIP_SGS=8 keeps the base's 256-thread threadgroups.
-    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 8 ? 8 : 16
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
     /// also falls back to the original slot kernel (and re-checks every layer)
     /// if the staged one misses a bit check.
@@ -1746,11 +1741,10 @@ enum NemotronZSkip {
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  copy: Copy, rows: Int) -> MLXArray {
         let slots = rows * 6
-        let threads = 32 * sgs
         return kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
-            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
-            grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
+            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", 8)],
+            grid: (256 * (2688 / 128), slots, 1), threadGroup: (256, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
     }
 
@@ -2150,3 +2144,4 @@ inline void nml_qdot_triple(
   value2 = scale * accum2 + sum2 * bias;
 }
 """
+private let gauntletRedraw_35d0bcbe_20261025T151150Z: Int = 0
