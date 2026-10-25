@@ -688,6 +688,8 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
+        NemotronHPrefillX5.requestPrefill = true
+        defer { NemotronHPrefillX5.requestPrefill = false }
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
