@@ -293,9 +293,16 @@ enum NemotronHResidualRMSNorm {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
+    /// The captured verify's row counts: R = 3, and R = 4 (depth-3 verify)
+    /// unless NEMOTRON_MTP_FUSED_R4=0. Every join kernel is one threadgroup per
+    /// row; only the grid and the output row count follow R.
+    static let fusedR4 = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FUSED_R4"] != "0"
+    static func fusedRows(_ rows: Int) -> Bool { rows == 3 || (rows == 4 && fusedR4) }
+
     private static func plumbingRows(_ x: MLXArray, norm: RMSNorm) -> Bool {
         plumbingAvailable
-            && x.shape == [1, 3, 2688] && x.dtype == .bfloat16
+            && x.ndim == 3 && x.dim(0) == 1 && fusedRows(x.dim(1)) && x.dim(2) == 2688
+            && x.dtype == .bfloat16
             && type(of: norm) == RMSNorm.self
             && norm.weight.shape == [2688] && norm.weight.dtype == .bfloat16
     }
@@ -305,7 +312,7 @@ enum NemotronHResidualRMSNorm {
     static func applyPreparedRows(
         _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray)? {
-        if rhs.shape == [18 * 2688] {
+        if lhs.ndim == 3, rhs.shape == [lhs.dim(1) * 6 * 2688] {
             return applyProductsRows(lhs, rhs, shared: shared, norm: norm)
         }
         guard plumbingRows(lhs, norm: norm),
@@ -313,17 +320,18 @@ enum NemotronHResidualRMSNorm {
               shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
         else { return nil }
         let (axis, eps) = scalars(norm.eps)
-        let shapes = [lhs.shape, lhs.shape, [3, 11, 9 * 32]]
+        let rows = lhs.dim(1)
+        let shapes = [lhs.shape, lhs.shape, [rows, 11, 9 * 32]]
         let outputs: [MLXArray]
         if let shared {
             outputs = sumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
-                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                grid: (672 * rows, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
         } else {
             outputs = preparedKernel([lhs, rhs, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
-                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                grid: (672 * rows, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
         }
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
@@ -380,20 +388,22 @@ enum NemotronHResidualRMSNorm {
         guard plumbingRows(lhs, norm: norm), products.dtype == .float32, let shared,
               shared.shape == lhs.shape, shared.dtype == .bfloat16 else {
             // Not reachable on the plumbing route that requested products.
-            let routed = NemotronZSkip.reduceProducts(products, rows: 3)
+            let rows = lhs.dim(1)
+            let routed = NemotronZSkip.reduceProducts(products, rows: rows)
             let summed = lhs + (shared.map { routed + $0 } ?? routed)
             let normalized = norm(summed)
-            return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(3, 2688)))
+            return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(rows, 2688)))
         }
         let (axis, eps) = scalars(norm.eps)
+        let rows = lhs.dim(1)
         let outputs = sumProductsPreparedKernel([lhs, products, shared, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
+            grid: (672 * rows, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape, [rows, 11, 9 * 32]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
         // Reference: the separate top-six reduce, then the two-operand join.
-        let routed = NemotronZSkip.reduceProducts(products, rows: 3)
+        let routed = NemotronZSkip.reduceProducts(products, rows: rows)
         let expected = applyPreparedRows(lhs, routed, shared: shared, norm: norm)!
         // The prepared output's padding slots are never written; compare the
         // residual and the normalized rows it is formed from, as the base does.
@@ -411,8 +421,8 @@ enum NemotronHResidualRMSNorm {
         let (axis, eps) = scalars(norm.eps)
         let outputs = normPreparedKernel([x, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [x.shape, [3, 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+            grid: (672 * x.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [x.shape, [x.dim(1), 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
         let ok = (outputs[0].view(dtype: .uint16) .== norm(x).view(dtype: .uint16)).all()
         return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
@@ -928,12 +938,14 @@ extension NemotronHRMSNormGated {
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               type(of: self) == NemotronHRMSNormGated.self,
               groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
-              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
-              dt.dtype == .float32, dt.shape == [1, 3, 64],
+              convolution.ndim == 3, NemotronHResidualRMSNorm.fusedRows(convolution.dim(1)),
+              convolution.shape == [1, convolution.dim(1), 6144], convolution.dtype == .bfloat16,
+              dt.dtype == .float32, dt.shape == [1, convolution.dim(1), 64],
               state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              projected.shape == [1, convolution.dim(1), 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16
         else { return nil }
+        let length = convolution.dim(1)
         // Created and evaluated at load (`prepareCounter`), never inside a
         // compile trace; without it the two launches stay.
         guard NemotronHCompactSSMGated.counter != nil else { return nil }
@@ -941,10 +953,10 @@ extension NemotronHRMSNormGated {
             [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
              eps, NemotronHCompactSSMGated.counter!],
             template: [("T", DType.bfloat16), ("U", DType.float32),
-                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", length),
                        ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)],
             grid: (32, 64, 64), threadGroup: (32, 8, 1),
-            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
+            outputShapes: [[1, length, 64, 64], [1, 64, 64, 128], [1, length, 4096], [length, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
         return (outputs[2], outputs[3], outputs[1])
     }
@@ -2106,7 +2118,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         // layer's contiguous cache (the slice-update copies of K and V go
         // away); the serialized SDPA calls then read the cache behind that
         // launch. Same stored bytes, same attention.
-        if precomputed == nil, captureMTP, targetQKV, batch == 1, length == 3,
+        if precomputed == nil, captureMTP, targetQKV, batch == 1,
+           NemotronHResidualRMSNorm.fusedRows(length),
            NemotronMTPAttentionDirect.enabled,
            numHeads == 32, numKeyValueHeads == 2, headDim == 128,
            let layerCache = cache as? CBv2LayerCache,
@@ -4462,7 +4475,8 @@ private class NemotronHBackbone: Module {
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> (hidden: MLXArray, prepared: MLXArray?)? {
         guard NemotronHResidualRMSNorm.plumbingAvailable,
-              inputs.shape == [1, 3], let first = layers.first,
+              inputs.ndim == 2, inputs.dim(0) == 1, NemotronHResidualRMSNorm.fusedRows(inputs.dim(1)),
+              let first = layers.first,
               type(of: first.norm) == RMSNorm.self, first.norm.weight.dtype == .bfloat16
         else { return nil }
         let observation = CBv2ForwardShapeObservation.isActive
@@ -4731,7 +4745,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> (hidden: MLXArray, prepared: MLXArray?)? {
-        guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.shape == [1, 3] else { return nil }
+        guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.ndim == 2, inputs.dim(0) == 1,
+              NemotronHResidualRMSNorm.fusedRows(inputs.dim(1)) else { return nil }
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
                 preconditionFailure("NemotronH CBv2 target received legacy KV cache")

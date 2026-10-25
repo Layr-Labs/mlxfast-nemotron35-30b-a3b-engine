@@ -125,10 +125,12 @@ extension NemotronHMoE {
         let packed: MLXArray?
         if NemotronHResidualRMSNorm.preparedMoEEnabled, NemotronMoELeader.enabled,
            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-           NemotronMoELeader.preparedGateUp, x.shape == [1, 3, 2688], x.dtype == .bfloat16 {
+           NemotronMoELeader.preparedGateUp, x.ndim == 3, x.dim(0) == 1,
+           NemotronHResidualRMSNorm.fusedRows(x.dim(1)), x.dim(2) == 2688, x.dtype == .bfloat16 {
             // Share one dynamic operand buffer with both routed and shared up.
-            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
-                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
+            let rows = x.dim(1)
+            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: 2688)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(rows, 2688), pv: 8)
         } else {
             packed = nil
         }
@@ -411,7 +413,7 @@ private func nmlTail8Source(_ source: String) -> String? {
     guard source.components(separatedBy: typedef).count == 2 else { return nil }
     var s = source.replacingOccurrences(of: typedef, with:
         "  static_assert(K % values_per_thread == 0, \"tail lanes hold 8 values\");\n" + typedef)
-    for x in ["x0, x_thread", "x0, x0_thread", "x1, x1_thread", "x2, x2_thread"] {
+    for x in ["x0, x_thread", "x0, x0_thread", "x1, x1_thread", "x2, x2_thread", "x3, x3_thread"] {
         s = s.replacingOccurrences(
             of: "nml_load_vector_safe<T, U, values_per_thread>(\(x), remaining)",
             with: "nml_load_vector<T, U, values_per_thread>(\(x))")
@@ -420,6 +422,7 @@ private func nmlTail8Source(_ source: String) -> String? {
         ("sum, remaining)", "sum, values_per_thread)"),
         ("sum1, remaining, ", "sum1, values_per_thread, "),
         ("sum2,\n            remaining, ", "sum2,\n            values_per_thread, "),
+        ("sum3,\n            remaining, ", "sum3,\n            values_per_thread, "),
     ] {
         s = s.replacingOccurrences(of: from, with: to)
     }
@@ -648,6 +651,10 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    /// The R = 4 (depth-3 verify) prepared FC1 with the quad branch, tail8,
+    /// and its dictionary twin (no FC2 plan: the zero-skip slot kernel runs FC2).
+    let quadGateUpTail8: MLXFast.MLXFastKernel?
+    let quadGateUpTail8Dict: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -712,6 +719,29 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
+        }
+        let quadSource = nmlQuadGateUpSource(nemotronMoETripleGateUpSource)?
+            .replacingOccurrences(of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+            .replacingOccurrences(of: "x3 += block_size;", with: "x3 += PSTRIDE;")
+        let quadPointers = triplePointers + [
+            ("const device T* x3 = x + (XSLOT ? fourth : fourth / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x3 = prepared + (fourth / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ]
+        let quadPrepared = quadSource.flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: quadPointers) }
+        quadGateUpTail8 = quadPrepared.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_quad_prepared_fc1_tail8",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader + nemotronMoEQuadDecodeHeader)
+        }
+        quadGateUpTail8Dict = quadPrepared.flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_quad_prepared_fc1_tail8_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader + nemotronMoEQuadDecodeHeader)
         }
     }
 }
@@ -956,9 +986,29 @@ enum NemotronMoELeader {
     /// tail8: production calls only (the self-test references keep false).
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil, tail8: Bool = false) -> MLXArray {
+                      prepared: MLXArray? = nil, tail8: Bool = false,
+                      dict: NemotronSBDict.Dict? = nil, quad: Bool = true) -> MLXArray {
+        // R = 4 (depth-3 verify): the quad FC1, once `qualifyQuad` found it bit
+        // for bit equal to the pair leader below.
+        if quad, quadVerified, rows == 4, topK == 6, !perSlot, relu2,
+           bank.k == 2688, bank.n == 1856, x.shape == [4, 2688], x.dtype == .bfloat16,
+           let quadKernel = (dict != nil ? NemotronMoELeaderPreparedKernels.shared.quadGateUpTail8Dict
+                                         : NemotronMoELeaderPreparedKernels.shared.quadGateUpTail8) {
+            let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 4, k: bank.k)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+            return quadKernel(
+                dict != nil
+                    ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+                    : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                       NemotronBankBinding.bind(bank.biases), packed, inds],
+                template: [("T", x.dtype), ("R", 4), ("TOPK", 6), ("K", bank.k), ("N", bank.n),
+                           ("XSLOT", false), ("RELU2", true), ("RPS", 2)],
+                grid: (32, bank.n / 2, 24), threadGroup: (32, 2, 1),
+                outputShapes: [[24, bank.n]], outputDTypes: [x.dtype])[0]
+        }
         let rps = leaderResultsPerSimdgroup(rows: rows)
-        if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
+        if preparedGateUp, rows == 3 || (rows == 4 && NemotronMultiRowQMV.preparedR4),
+           !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
@@ -985,6 +1035,47 @@ enum NemotronMoELeader {
             threadGroup: (32, 2, 1),
             outputShapes: [[rows * topK, bank.n]],
             outputDTypes: [x.dtype])[0]
+    }
+
+    /// NEMOTRON_MTP_QUAD_FC1=0 keeps the R = 4 FC1 on the pair leader.
+    static let quadEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_QUAD_FC1"] != "0"
+    nonisolated(unsafe) static var quadVerified = false
+
+    /// Load time: the quad FC1 (and its dictionary twin) against the R = 4 pair
+    /// leader, bit for bit, on a real FC1 bank and seeded rows whose routes put
+    /// one expert on all four rows, one on three, pairs and singles.
+    static func qualifyQuad(_ model: Module) {
+        quadVerified = false
+        guard quadEnabled, preparedGateUp else { return }
+        func report(_ m: String) { FileHandle.standardError.write(Data("nemotron quad fc1: \(m)\n".utf8)) }
+        guard let moe = model.modules().compactMap({ $0 as? NemotronHMoE }).first,
+              let up = bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336] else { return report("off (no bank)") }
+        let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(moe.switchMLP.fc1) : nil
+        let routes: [[UInt32]] = [
+            [5, 9, 17, 40, 77, 100, 5, 9, 17, 41, 78, 101, 5, 9, 18, 42, 79, 102, 5, 10, 19, 43, 80, 103],
+            [1, 2, 3, 4, 6, 7, 1, 2, 3, 8, 11, 12, 1, 2, 13, 14, 15, 16, 1, 20, 21, 22, 23, 24],
+            [60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 81, 60, 61, 66, 72, 82, 83],
+        ]
+        var ok = true
+        for (i, route) in routes.enumerated() where ok {
+            let x = (MLXRandom.normal([4, 2688], key: MLXRandom.key(UInt64(0x9a4d + i))) * 0.7).asType(.bfloat16)
+            let inds = MLXArray(route)
+            let packed = NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+            quadVerified = true
+            let fast = apply(x, inds, rows: 4, topK: 6, bank: up, perSlot: false, relu2: true,
+                             prepared: packed, tail8: leaderTail8, dict: dict)
+            let plain = apply(x, inds, rows: 4, topK: 6, bank: up, perSlot: false, relu2: true,
+                              prepared: packed, tail8: leaderTail8, dict: nil)
+            quadVerified = false
+            let reference = apply(x, inds, rows: 4, topK: 6, bank: up, perSlot: false, relu2: true,
+                                  prepared: packed, tail8: leaderTail8, quad: false)
+            let same = logicalAnd((fast.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all(),
+                                  (plain.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all())
+            ok = same.item(Bool.self)
+        }
+        quadVerified = ok && NemotronMoELeaderPreparedKernels.shared.quadGateUpTail8 != nil
+        report(quadVerified ? "on (bitwise equal\(dict != nil ? ", dictionary twin" : ""))" : "off (differs)")
     }
 
     static let preparedGateUp = true
@@ -1113,7 +1204,8 @@ enum NemotronMoELeader {
                 balancePlan = fused.plan
             } else {
                 act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                    relu2: true, prepared: prepared, tail8: leaderTail8)
+                    relu2: true, prepared: prepared, tail8: leaderTail8,
+                    dict: rows == 4 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil)
                 balancePlan = nil
             }
         } else {
@@ -1127,7 +1219,7 @@ enum NemotronMoELeader {
         // `products`: the unreduced slot products for the captured verify's
         // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
         // itself (same expressions and order).
-        if products, let prod = rows == 3
+        if products, let prod = rows == 3 || rows == 4
             ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
             : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
@@ -1737,6 +1829,10 @@ private let nemotronZSkipTiledSeqSource = """
 // The chunk sum likewise reduces to x1 (+ x2), and the closing
 // scale * accum + sum * bias keeps the record's form. Chunks with three or
 // more non-zero values take the tiled kernel's statements unchanged.
+// In the sparse paths the nibble shift cancels the activation's power-of-two
+// scale exactly when the BF16 magnitude is at least 2^-110 and finite. Smaller
+// or non-finite values retain the complete tiled arithmetic below, avoiding
+// flush-to-zero differences from cancelling a subnormal intermediate.
 private let nemotronZSkipTiledFastSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
@@ -1758,12 +1854,16 @@ private let nemotronZSkipTiledFastSource = """
   const device T* xs = x + slot * K;
   for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
     const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
-    uint m = 0;
+    uint m = 0, unsafe = 0;
     for (int i = 0; i < 8; i++) {
-      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      const uint ab = uint(xb[i]) & 0x7fffu;
+      m |= ab != 0 ? (1u << i) : 0u;
+      unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
       xsh[8 * c + i] = xs[8 * c + i];
     }
-    cmask[c] = uchar(m);
+    // A full-mask sentinel sends tiny/nonfinite chunks to the unchanged dense
+    // arithmetic, without a second shared array or per-output exponent tests.
+    cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);
@@ -1786,8 +1886,7 @@ private let nemotronZSkipTiledFastSource = """
       if (popcount(m) == 1) {
         const int j1 = ctz(m);
         const T xvj = xsh[8 * c + j1];
-        const int jq = j1 & 3;
-        const U xtj = jq == 0 ? U(xvj) : (jq == 1 ? xvj / 16.0f : (jq == 2 ? xvj / 256.0f : xvj / 4096.0f));
+        const U xtj = U(xvj);
         const U sum1 = U(xvj);
         const uint w = uint(wq[(8 * c + j1) * 32]);
         const int gi = c / 8;
@@ -1796,7 +1895,7 @@ private let nemotronZSkipTiledFastSource = """
         const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
         const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
         for (int o = 0; o < 4; o++) {
-          const uint code = ((w >> (4 * o)) & 0xfu) << (4 * jq);
+          const uint code = ((w >> (4 * o)) & 0xfu);
           U accum = 0;
           accum += xtj * U(int(code));
           p[o] += as_type<float>(sv[o]) * accum + sum1 * as_type<float>(bv[o]);
@@ -1810,10 +1909,8 @@ private let nemotronZSkipTiledFastSource = """
         const uint w2 = uint(wq[(8 * c + j2) * 32]);
         const T xv1 = xsh[8 * c + j1];
         const T xv2 = xsh[8 * c + j2];
-        const int q1 = j1 & 3;
-        const int q2 = j2 & 3;
-        const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
-        const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
         const U sum2 = U(xv1) + U(xv2);
         const int gi = c / 8;
         const uint2 sr = *((const device uint2*)(sq + gi * OT));
@@ -1821,8 +1918,8 @@ private let nemotronZSkipTiledFastSource = """
         const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
         const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
         for (int o = 0; o < 4; o++) {
-          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
-          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
           const U accum = xt1 * c1 + xt2 * c2;
           p[o] += as_type<float>(sv[o]) * accum + sum2 * as_type<float>(bv[o]);
         }
@@ -2135,21 +2232,28 @@ enum NemotronZSkip {
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  owner: SwitchLinear) -> MLXArray? {
+        let rows = x.ndim == 2 ? x.dim(0) / 6 : 0
         guard joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
-              x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+              rows == 3 || (rows == 4 && wideEnabled),
+              x.shape == [rows * 6, 1856], x.dtype == .bfloat16,
+              inds.shape == [rows * 6], scores.shape == [rows * 6], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+        return products(x, inds, scores, copy: copy, rows: rows)
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
                          owner: SwitchLinear) -> MLXArray? {
-        guard rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+        // R = 4 (the depth-3 verify) runs the same slot kernel: every slot is
+        // its own threadgroup column and the reduce sums each row's six slots.
+        guard rows == 3 || (rows == 4 && wideEnabled), x.shape == [rows * 6, 1856], x.dtype == .bfloat16,
+              inds.shape == [rows * 6], scores.shape == [rows * 6], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        return run(x, inds, scores, copy: copy, rows: rows)
     }
+
+    /// NEMOTRON_MTP_ZSKIP_R4=0 keeps the depth-3 verify (R = 4) on the weighted leader kernel.
+    static let wideEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_R4"] != "0"
 
     // MARK: Draft head (one row per draft step)
     //
@@ -2622,6 +2726,116 @@ inline void nml_qdot_triple(
   value2 = scale * accum2 + sum2 * bias;
 }
 """
+
+// The triple decode with a fourth row: the same shared coefficient decode and
+// per-row term order, four independent accumulators (R = 4 verify).
+private let nemotronMoEQuadDecodeHeader = """
+template <typename U, int values_per_thread, bool HALF = false>
+inline void nml_qdot_quad(
+    const device uint8_t* w, const thread U* x0, const thread U* x1, const thread U* x2,
+    const thread U* x3, U scale, U bias, U sum0, U sum1, U sum2, U sum3, int N,
+    thread U& value0, thread U& value1, thread U& value2, thread U& value3) {
+  U accum0 = 0;
+  U accum1 = 0;
+  U accum2 = 0;
+  U accum3 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (N / 4); i++) {
+    const uint16_t q = ws[i];
+    const U a = q & 0x000f;
+    const U b = q & 0x00f0;
+    const U c = q & 0x0f00;
+    const U d = q & 0xf000;
+    accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+    accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+    accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+    accum3 += (x3[4 * i] * a + x3[4 * i + 1] * b + x3[4 * i + 2] * c + x3[4 * i + 3] * d);
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+  value2 = scale * accum2 + sum2 * bias;
+  value3 = scale * accum3 + sum3 * bias;
+}
+"""
+
+/// The triple FC1 source with a quad branch: at R = 4 the first row that
+/// routed to an expert leads every later row that did (up to three), walking
+/// the expert's weights once; solo, pair and triple branches are unchanged.
+/// Nil if the source no longer has the expected statements.
+private func nmlQuadGateUpSource(_ triple: String) -> String? {
+    var s = triple
+    let lead = "  if ((R == 3 ? before : (before & 1)) != 0) {"
+    let followers = """
+  int partner = -1;
+  int third = -1;
+  for (int r = R - 1; r > row; r--) {
+    for (int j = 0; j < TOPK; j++) {
+      if (inds[r * TOPK + j] == expert) {
+        if (R == 3) { third = partner; }
+        partner = r * TOPK + j;
+      }
+    }
+  }
+"""
+    let tripleOpen = "  } else if (third >= 0) {\n"
+    let pairOpen = "  } else {\n    const device T* x1 = x + (XSLOT ? partner"
+    guard s.components(separatedBy: lead).count == 2, s.components(separatedBy: followers).count == 2,
+          s.components(separatedBy: tripleOpen).count == 2, s.components(separatedBy: pairOpen).count == 2
+    else { return nil }
+    s = s.replacingOccurrences(of: lead, with: "  if ((R >= 3 ? before : (before & 1)) != 0) {")
+    s = s.replacingOccurrences(of: followers, with: """
+  int partner = -1;
+  int third = -1;
+  int fourth = -1;
+  for (int r = R - 1; r > row; r--) {
+    for (int j = 0; j < TOPK; j++) {
+      if (inds[r * TOPK + j] == expert) {
+        if (R >= 4) { fourth = third; }
+        if (R >= 3) { third = partner; }
+        partner = r * TOPK + j;
+      }
+    }
+  }
+
+""")
+    let a = s.range(of: tripleOpen)!, b = s.range(of: pairOpen)!
+    var quad = String(s[a.lowerBound ..< b.lowerBound])
+    let edits: [(String, String, Int)] = [
+        ("  } else if (third >= 0) {\n", "  } else if (fourth >= 0) {\n", 1),
+        ("    const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;\n",
+         "    const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;\n"
+         + "    const device T* x3 = x + (XSLOT ? fourth : fourth / TOPK) * K +\n        simd_lid * values_per_thread;\n", 1),
+        ("    device T* y2 = y + third * N + out_row;\n",
+         "    device T* y2 = y + third * N + out_row;\n    device T* y3 = y + fourth * N + out_row;\n", 1),
+        ("    thread U x2_thread[values_per_thread];\n",
+         "    thread U x2_thread[values_per_thread];\n    thread U x3_thread[values_per_thread];\n", 1),
+        ("    thread U result2[results_per_simdgroup] = {0};\n",
+         "    thread U result2[results_per_simdgroup] = {0};\n    thread U result3[results_per_simdgroup] = {0};\n", 1),
+        ("      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);\n",
+         "      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);\n"
+         + "      U sum3 = nml_load_vector<T, U, values_per_thread>(x3, x3_thread);\n", 1),
+        ("      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);\n",
+         "      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);\n"
+         + "      U sum3 = nml_load_vector_safe<T, U, values_per_thread>(x3, x3_thread, remaining);\n", 1),
+        ("        U value0, value1, value2;\n", "        U value0, value1, value2, value3;\n", 2),
+        ("        nml_qdot_triple<U, values_per_thread, R == 3>(\n            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,\n            values_per_thread, value0, value1, value2);\n",
+         "        nml_qdot_quad<U, values_per_thread>(\n            wl, x0_thread, x1_thread, x2_thread, x3_thread, s, b, sum0, sum1, sum2, sum3,\n            values_per_thread, value0, value1, value2, value3);\n", 1),
+        ("        nml_qdot_triple<U, values_per_thread, R == 3>(\n            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,\n            remaining, value0, value1, value2);\n",
+         "        nml_qdot_quad<U, values_per_thread>(\n            wl, x0_thread, x1_thread, x2_thread, x3_thread, s, b, sum0, sum1, sum2, sum3,\n            remaining, value0, value1, value2, value3);\n", 1),
+        ("        result2[r] += value2;\n", "        result2[r] += value2;\n        result3[r] += value3;\n", 2),
+        ("      x2 += block_size;\n", "      x2 += block_size;\n      x3 += block_size;\n", 1),
+        ("      result2[r] = simd_sum(result2[r]);\n",
+         "      result2[r] = simd_sum(result2[r]);\n      result3[r] = simd_sum(result3[r]);\n", 1),
+        ("        y2[r] = nml_store<T, RELU2>(result2[r]);\n",
+         "        y2[r] = nml_store<T, RELU2>(result2[r]);\n        y3[r] = nml_store<T, RELU2>(result3[r]);\n", 1),
+    ]
+    for (from, to, n) in edits {
+        guard quad.components(separatedBy: from).count - 1 == n else { return nil }
+        quad = quad.replacingOccurrences(of: from, with: to)
+    }
+    s.insert(contentsOf: quad, at: s.range(of: tripleOpen)!.lowerBound)
+    return s
+}
 
 // MARK: - Exact (scale, bias) pair dictionary for the R = 3 verify QMVs
 //
