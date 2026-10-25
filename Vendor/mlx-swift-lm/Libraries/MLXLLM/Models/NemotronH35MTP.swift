@@ -973,12 +973,13 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         let rowKeep = MLXArray(Int32(0) ..< Int32(rowLength)) .<= (row + Int32(rowFirst))
         let rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
             .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
-        let attended = module.maskedRowOutput(
-            fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
+        let selected = NemotronMTPSelectedDraftRows.select(
+            fused: spec.fused, queries: spec.queries, keys: spec.keys, values: spec.values, row: row)
+        let out = module.maskedFirstDraft(
+            fused: selected.fused, queries: selected.queries,
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
-        let out = module.finishPagedAttentionRow(attended)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
-        let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
+        let keys = selected.keys, values = selected.values
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.

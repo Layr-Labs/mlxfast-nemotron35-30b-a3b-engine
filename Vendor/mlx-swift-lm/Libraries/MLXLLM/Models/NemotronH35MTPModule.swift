@@ -191,6 +191,71 @@ enum NemotronMTPFrontNorms {
     }
 }
 
+/// Copy the device-selected post-verify row once for all four consumers.
+/// Every input remains immutable; preserve arbitrary head/row strides.
+enum NemotronMTPSelectedDraftRows {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SELECTED_ROWS"] != "0"
+    static let fusedTail = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SELECTED_TAIL"] != "0"
+    static let selfTest = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SELECTED_SELFTEST"] == "1"
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_selected_draft_rows_v1",
+        inputNames: ["fused", "queries", "keys", "values", "row"],
+        outputNames: ["fusedOut", "queryOut", "keyOut", "valueOut"],
+        source: """
+        const uint i = thread_position_in_grid.x;
+        const int r = row[0];
+        if (i < F) fusedOut[i] = fused[r * fused_strides[1] + i * fused_strides[2]];
+        if (i < QH * D) {
+            queryOut[i] = queries[(i / D) * queries_strides[1]
+                + r * queries_strides[2] + (i % D) * queries_strides[3]];
+        }
+        if (i < KH * D) {
+            keyOut[i] = keys[(i / D) * keys_strides[1]
+                + r * keys_strides[2] + (i % D) * keys_strides[3]];
+            valueOut[i] = values[(i / D) * values_strides[1]
+                + r * values_strides[2] + (i % D) * values_strides[3]];
+        }
+        """, ensureRowContiguous: false)
+
+    static func select(fused: MLXArray, queries: MLXArray, keys: MLXArray,
+                       values: MLXArray, row: MLXArray)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        func ordinary() -> [MLXArray] {
+            [take(fused, row, axis: 1), take(queries, row, axis: 2),
+             take(keys, row, axis: 2), take(values, row, axis: 2)]
+        }
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu, row.shape == [1], row.dtype == .int32,
+              fused.ndim == 3, fused.dim(0) == 1, fused.dim(1) > 0,
+              queries.ndim == 4, keys.ndim == 4, values.shape == keys.shape,
+              queries.dim(0) == 1, keys.dim(0) == 1,
+              queries.dim(2) == fused.dim(1), keys.dim(2) == fused.dim(1),
+              queries.dim(3) == keys.dim(3),
+              fused.dtype == .bfloat16, queries.dtype == fused.dtype,
+              keys.dtype == fused.dtype, values.dtype == fused.dtype
+        else {
+            let a = ordinary()
+            return (a[0], a[1], a[2], a[3])
+        }
+        let f = fused.dim(2), qh = queries.dim(1), kh = keys.dim(1), d = keys.dim(3)
+        var a = kernel([fused, queries, keys, values, row],
+            template: [("F", f), ("QH", qh), ("KH", kh), ("D", d)],
+            grid: (max(f, max(qh * d, kh * d)), 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, f], [1, qh, 1, d], [1, kh, 1, d], [1, kh, 1, d]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16])
+        if selfTest {
+            let expected = ordinary()
+            for i in a.indices {
+                let ok = (a[i].view(dtype: .uint16) .== expected[i].view(dtype: .uint16)).all()
+                a[i] = which(ok, a[i], MLXArray(Float.nan).asType(.bfloat16))
+            }
+        }
+        return (a[0], a[1], a[2], a[3])
+    }
+}
+
 final class NemotronH35MTPAttentionBlock: Module {
     let hiddenSize: Int
     @ModuleInfo(key: "eh_proj") var projection: Linear
@@ -290,11 +355,19 @@ final class NemotronH35MTPAttentionBlock: Module {
     func maskedRowOutput(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
+        fused + maskedRowAttention(queries: queries, keys: keys, values: values, mask: mask)
+    }
+
+    /// Project attention without consuming its residual, so the expert block
+    /// can join the BF16 residual add with its existing RMSNorm implementation.
+    func maskedRowAttention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries.asType(keys.dtype), keys: keys, values: values,
             scale: mixer.scale, mask: .array(mask))
         let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
-        return fused + nemotronR1Linear(merged, mixer.wo)
+        return nemotronR1Linear(merged, mixer.wo)
     }
 
     /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
@@ -610,6 +683,19 @@ final class NemotronH35MTPModule: Module {
     ) -> MLXArray {
         (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowOutput(
             fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+    }
+    /// Device-picked first draft, retaining the separate residual until the
+    /// existing exact expert-tail residual/RMS join.
+    func maskedFirstDraft(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        if !NemotronMTPSelectedDraftRows.fusedTail {
+            return finishPagedAttentionRow(maskedRowOutput(
+                fused: fused, queries: queries, keys: keys, values: values, mask: mask))
+        }
+        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowAttention(
+            queries: queries, keys: keys, values: values, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: fused, attention: attention)
     }
     /// The one-token draft step from `pagedDraftInputs` with its attention over
     /// explicit, masked K/V instead of the paged head cache.
