@@ -788,8 +788,8 @@ enum NemotronHeadPreparedActivation {
     /// prefetch) and the row -> SIMD-group geometry per [K, N]. Crown values
     /// (0, empty tables) keep the crown / m1 kernel objects, template lists,
     /// grid and threadgroup.
-    static let loadForm = 0
-    static let fastLoadForm = 0
+    static let loadForm = 2
+    static let fastLoadForm = 2
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
     static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
