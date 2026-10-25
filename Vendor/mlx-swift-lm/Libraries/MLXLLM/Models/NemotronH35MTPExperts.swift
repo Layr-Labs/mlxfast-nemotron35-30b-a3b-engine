@@ -1016,6 +1016,11 @@ enum NemotronMoELeader {
             ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
     }
 
+    /// SIMD groups per threadgroup of the triple FC1 launch
+    /// (NEMOTRON_MTP_FC1_SGT=2 keeps the base's 64-thread threadgroups).
+    static let fc1TripleSIMDGroups =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_SGT"] == "2" ? 2 : 4
+
     static func applyWithBalancePlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
         prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
@@ -1032,6 +1037,9 @@ enum NemotronMoELeader {
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = leaderResultsPerSimdgroup(rows: 3)
+        // SIMD groups per threadgroup of the triple kernel; every SIMD group
+        // keeps its rows and body, only their grouping into threadgroups changes.
+        let sgt = tripleGateUp ? fc1TripleSIMDGroups : 2
         // The selected triple kernel's dictionary twin, when `dict` is given.
         let kernels = NemotronMoELeaderPreparedKernels.shared
         let twin = dict == nil || !tripleGateUp ? nil
@@ -1045,8 +1053,8 @@ enum NemotronMoELeader {
                    NemotronBankBinding.bind(bank.biases), packed, inds],
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", false),
-                       ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+                       ("RELU2", relu2), ("RPS", rps), ("SGT", sgt)],
+            grid: (32, bank.n / rps, 18), threadGroup: (32, sgt, 1),
             outputShapes: [[18, bank.n], [36]], outputDTypes: [x.dtype, .int32])
         guard selfTest else { return (result[0], result[1]) }
         let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
@@ -2396,7 +2404,7 @@ private let nemotronMoETripleGateUpSource = """
     }
   }
 
-  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (SGT * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
