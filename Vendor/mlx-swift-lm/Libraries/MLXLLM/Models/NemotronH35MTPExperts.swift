@@ -1642,6 +1642,74 @@ private let nemotronZSkipTiledSeqSource = """
   }
 """
 
+// Current-call operands only: share the exact chunk mask, scaled activations
+// and bias sum across the tiled FC2 launch's 21 output tiles. No weight change.
+private let nemotronZSkipActivationSource = """
+  constexpr int chunks = K / 8;
+  const uint c = thread_position_in_grid.x;
+  const uint slot = thread_position_in_grid.y;
+  if (c >= chunks) { return; }
+  const device T* xv = x + slot * K + 8 * c;
+  const device uint16_t* xb = (const device uint16_t*)xv;
+  uint m = 0;
+  for (int i = 0; i < 8; i++) {
+    m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+  }
+  const uint base = (slot * chunks + c) * 9;
+  float sum = 0;
+  for (int i = 0; i < 8; i += 4) {
+    sum += float(xv[i]) + float(xv[i + 1]) + float(xv[i + 2]) + float(xv[i + 3]);
+    prepared[base + i] = float(xv[i]);
+    prepared[base + i + 1] = xv[i + 1] / 16.0f;
+    prepared[base + i + 2] = xv[i + 2] / 256.0f;
+    prepared[base + i + 3] = xv[i + 3] / 4096.0f;
+  }
+  prepared[base + 8] = sum;
+  live[slot * chunks + c] = m;
+"""
+
+private func nemotronZSkipPreparedSource() -> String {
+    var source = nemotronZSkipTiledSeqSource
+    let replacements: [(String, String)] = [
+        ("  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n", ""),
+        ("  const device T* xs = x + slot * K;\n", ""),
+        ("""
+  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+    const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+    uint m = 0;
+    for (int i = 0; i < 8; i++) {
+      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      xsh[8 * c + i] = xs[8 * c + i];
+    }
+    cmask[c] = uchar(m);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+""", ""),
+        ("      const uint m = cmask[c];", "      const uint m = live[slot * chunks + c];"),
+        ("""
+      U sum = 0;
+      const threadgroup T* xv = xsh + 8 * c;
+      for (int i = 0; i < 8; i += 4) {
+        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+        xt[i] = xv[i];
+        xt[i + 1] = xv[i + 1] / 16.0f;
+        xt[i + 2] = xv[i + 2] / 256.0f;
+        xt[i + 3] = xv[i + 3] / 4096.0f;
+      }
+""", """
+      const device float* pp = prepared + (slot * chunks + c) * 9;
+      const U sum = pp[8];
+      for (int i = 0; i < 8; i++) { xt[i] = pp[i]; }
+""")
+    ]
+    for (old, new) in replacements {
+        precondition(source.components(separatedBy: old).count == 2,
+                     "zskip prepared operands source anchor")
+        source = source.replacingOccurrences(of: old, with: new)
+    }
+    return source
+}
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1689,6 +1757,17 @@ enum NemotronZSkip {
     private static let tiledSlotKernel = MLXFast.metalKernel(
         name: "nemotron_zskip_fc2_slots_tiled", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
         outputNames: ["prod"], source: nemotronZSkipTiledSeqSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    static let prepareActivations =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_ACTPREP"] != "0"
+    private static let activationKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_chunk_operands_v1", inputNames: ["x"],
+        outputNames: ["prepared", "live"], source: nemotronZSkipActivationSource)
+    private static let preparedSlotKernel = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_tiled_prepared_v1",
+        inputNames: ["wk", "sk", "bk", "prepared", "live", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipPreparedSource(),
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
     /// The tile-major copy and its slot kernel unless NEMOTRON_MTP_ZSKIP_TILED=0.
@@ -1747,6 +1826,19 @@ enum NemotronZSkip {
                                  copy: Copy, rows: Int) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
+        if tiled, prepareActivations {
+            let chunks = 1856 / 8
+            let operands = activationKernel(
+                [x], template: [("T", x.dtype), ("K", 1856)],
+                grid: (chunks, slots, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[slots, chunks, 9], [slots, chunks]],
+                outputDTypes: [.float32, .uint32])
+            return preparedSlotKernel(
+                [copy.codes, copy.scales, copy.biases, operands[0], operands[1], inds, scores],
+                template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+                grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
+                outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+        }
         return kernel(
             [copy.codes, copy.scales, copy.biases, x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
