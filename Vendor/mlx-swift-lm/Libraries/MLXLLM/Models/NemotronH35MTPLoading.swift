@@ -97,6 +97,7 @@ extension NemotronH35MTPAssistant {
         // Keep last: it ends with Memory.clearCache().
         try NemotronDraftAttentionGeometry.warm()
         assistant.warmUpExactShapes()
+        assistant.prepareDecodeResidency()
         return assistant
     }
 }
@@ -309,5 +310,94 @@ extension NemotronH35MTPAssistant {
         // Release that private transaction through the ordinary discard path.
         discardRound(requestState: draftState)
         Stream.gpu.synchronize()
+    }
+}
+
+import Metal
+
+@_silgen_name("nemotron_decode_backing")
+private func nemotronDecodeBacking(_ opaque: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer?
+
+@available(macOS 15.0, *)
+final class NemotronDecodeResidency: @unchecked Sendable {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_RESIDENCY"] != "0"
+    static let seedLayers = 0
+    let arrays: [MLXArray]
+    let buffers: [any MTLBuffer]
+    let seedSet: any MTLResidencySet
+    let decodeSets: [any MTLResidencySet]
+    let owners: [ObjectIdentifier]
+    let cut: Int
+    let queue = DispatchQueue(label: "nemotron.decode.memory")
+
+    init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier]) {
+        guard Self.enabled, let device = MTLCreateSystemDefaultDevice() else { return nil }
+        let cut = min(Self.seedLayers, layers.count)
+        guard owners.count == layers.count else { return nil }
+        let groups = [head + layers.prefix(cut).flatMap { $0 }] + Array(layers.dropFirst(cut))
+        var buffers: [any MTLBuffer] = []
+        var seen = Set<ObjectIdentifier>()
+        var sets: [any MTLResidencySet] = []
+        for (i, group) in groups.enumerated() {
+            let descriptor = MTLResidencySetDescriptor()
+            descriptor.initialCapacity = group.count
+            guard let set = try? device.makeResidencySet(descriptor: descriptor) else { return nil }
+            var bytes = 0
+            for a in group {
+                guard let ctx = a.ctx.ctx, let ptr = nemotronDecodeBacking(ctx),
+                      let buffer = Unmanaged<AnyObject>.fromOpaque(ptr).takeUnretainedValue() as? any MTLBuffer
+                else { return nil }
+                if seen.insert(ObjectIdentifier(buffer)).inserted {
+                    buffers.append(buffer); bytes += buffer.length; set.addAllocation(buffer)
+                }
+            }
+            set.commit()
+            sets.append(set)
+        }
+        self.arrays = head + layers.flatMap { $0 }
+        self.buffers = buffers
+        self.seedSet = sets[0]
+        self.decodeSets = Array(sets.dropFirst())
+        self.owners = owners
+        self.cut = cut
+    }
+
+    final class Lease: CBv2MTPMemoryLease {
+        let owner: NemotronDecodeResidency
+        private var decoded = false
+        private var finished = false
+        init(_ owner: NemotronDecodeResidency) { self.owner = owner }
+        func beginDecode() {
+            guard !finished else { return }
+            if !decoded {
+                decoded = true
+                for (i, set) in owner.decodeSets.enumerated() {
+                    owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
+                }
+            }
+            _ = NemotronZSkip.snapshotCopyReadiness()
+        }
+        func finish() {
+            guard !finished else { return }
+            finished = true
+            let owner = owner
+            owner.queue.sync {
+                owner.seedSet.endResidency()
+                if decoded { for set in owner.decodeSets { set.endResidency() } }
+                NemotronZSkip.endCopyReadiness()
+            }
+        }
+        deinit { finish() }
+    }
+    private func request(_ set: any MTLResidencySet, phase: String, ready: [ObjectIdentifier]) {
+        queue.async {
+            set.requestResidency()
+            NemotronZSkip.markCopyReady(ready)
+        }
+    }
+    func begin() -> Lease {
+        NemotronZSkip.beginCopyReadiness(owners)
+        request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+        return Lease(self)
     }
 }
