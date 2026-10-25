@@ -197,6 +197,18 @@ extension NemotronHMamba2Mixer {
         }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
+        if length == 3, NemotronMTPExecution.batchedNorm,
+           let q = outProj as? QuantizedLinear, q.mode == .affine,
+           q.bits == 4, q.groupSize == 64, q.bias == nil,
+           q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+           q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+           q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
+           let fused = norm.compactSSMPreparedRows(
+               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+               projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state) {
+            return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
+                    padded, convolution, dt, fused.2]
+        }
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,

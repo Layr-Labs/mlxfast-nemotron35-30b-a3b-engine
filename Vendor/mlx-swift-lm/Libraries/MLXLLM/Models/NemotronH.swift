@@ -50,10 +50,6 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
-/// Layers between early asyncEval calls on the MTP prefill path only. The seed
-/// window is the first request after the engine drains MLX's buffer cache, so a
-/// shorter chunk hands its transient live set back to that cache sooner.
-/// `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
@@ -211,6 +207,29 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumPreparedSource(), ensureRowContiguous: true)
+
+    /// The MoE join reading the routed half as the six weighted slot products
+    /// of its row ([18 * 2688] FP32, slot-major): the zero-skip top-six reduce
+    /// (first slot, then `slot + total` in slot order, BF16 store) runs here
+    /// instead of in its own launch. Every later expression is unchanged.
+    private static func sumProductsPreparedSource() -> String {
+        let add = "T part = rhs[offset + i] + shared[offset + i];"
+        let s = sumPreparedSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        return s.replacingOccurrences(of: add, with: """
+            const size_t column = lid * n_reads + i;
+                            float total = rhs[size_t(gid * 6) * axis_size + column];
+                            for (int j = 1; j < 6; j++) {
+                                total = rhs[size_t(gid * 6 + j) * axis_size + column] + total;
+                            }
+                            T part = static_cast<T>(total) + shared[offset + i];
+            """)
+    }
+    private static let sumProductsPreparedKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_products_rms_prepared_bf16",
+        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: sumProductsPreparedSource(), ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
         name: "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
@@ -252,6 +271,9 @@ enum NemotronHResidualRMSNorm {
     static func applyPreparedRows(
         _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray)? {
+        if rhs.shape == [18 * 2688] {
+            return applyProductsRows(lhs, rhs, shared: shared, norm: norm)
+        }
         guard plumbingRows(lhs, norm: norm),
               rhs.shape == lhs.shape, rhs.dtype == .bfloat16,
               shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
@@ -278,6 +300,72 @@ enum NemotronHResidualRMSNorm {
         let ok = MLX.logicalAnd(
             (outputs[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
             (outputs[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
+        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[1], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[2], MLXArray(Float.nan)))
+    }
+
+    /// Set at load by `checkProductsJoin`; the verify asks the MoE for its
+    /// slot products only after the products join matched there.
+    nonisolated(unsafe) static var productsJoinVerified = false
+
+    /// Load time: the products join against the separate top-six reduce plus
+    /// the two-operand join, bit for bit, on seeded rows and a real norm.
+    static func checkProductsJoin(_ model: Module) {
+        productsJoinVerified = false
+        guard plumbingAvailable, let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+            type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+        }) else { return }
+        var ok = MLXArray(true)
+        for seed in 0 ..< 3 {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x6a01 + seed)), into: 3)
+            let lhs = MLXRandom.normal([1, 3, 2688], key: keys[0]).asType(.bfloat16)
+            var products = MLXRandom.normal([18 * 2688], scale: 0.05, key: keys[1])
+            if seed == 1 { products = which(abs(products) .< MLXArray(Float(0.03)), MLXArray(Float(0)), products) }
+            let shared = MLXRandom.normal([1, 3, 2688], scale: 0.1, key: keys[2]).asType(.bfloat16)
+            let fused = applyProductsRows(lhs, products, shared: shared, norm: norm)
+            guard let expected = applyPreparedRows(
+                lhs, NemotronZSkip.reduceProducts(products, rows: 3), shared: shared, norm: norm)
+            else { return }
+            ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                (fused.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                (fused.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()))
+        }
+        productsJoinVerified = ok.item(Bool.self)
+        if !productsJoinVerified {
+            FileHandle.standardError.write(
+                Data("nemotron zskip join off: the products join differs from reduce + join\n".utf8))
+        }
+    }
+
+    /// The MoE join over the routed slot products (`NemotronZSkip`): rhs is
+    /// [18 * 2688] FP32, slot-major (row r owns slots 6r ..< 6r + 6).
+    private static func applyProductsRows(
+        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray?, norm: RMSNorm
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        guard plumbingRows(lhs, norm: norm), products.dtype == .float32, let shared,
+              shared.shape == lhs.shape, shared.dtype == .bfloat16 else {
+            // Not reachable on the plumbing route that requested products.
+            let routed = NemotronZSkip.reduceProducts(products, rows: 3)
+            let summed = lhs + (shared.map { routed + $0 } ?? routed)
+            let normalized = norm(summed)
+            return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(3, 2688)))
+        }
+        let (axis, eps) = scalars(norm.eps)
+        let outputs = sumProductsPreparedKernel([lhs, products, shared, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
+        // Reference: the separate top-six reduce, then the two-operand join.
+        let routed = NemotronZSkip.reduceProducts(products, rows: 3)
+        let expected = applyPreparedRows(lhs, routed, shared: shared, norm: norm)!
+        // The prepared output's padding slots are never written; compare the
+        // residual and the normalized rows it is formed from, as the base does.
+        let ok = MLX.logicalAnd(
+            (outputs[0].view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+            (outputs[1].view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all())
         return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
                 which(ok, outputs[1], MLXArray(Float.nan).asType(.bfloat16)),
                 which(ok, outputs[2], MLXArray(Float.nan)))
@@ -407,7 +495,7 @@ enum NemotronHEmbeddingRows {
 
 // MARK: - MambaRMSNormGated
 
-private enum NemotronHGatedRMSKernel {
+enum NemotronHGatedRMSKernel {
     private static let source = """
             uint gid = threadgroup_position_in_grid.x;
             uint lid = thread_position_in_threadgroup.x;
@@ -569,6 +657,193 @@ class NemotronHRMSNormGated: Module {
         // Flatten back to [..., hidden] and apply learned weight
         let flattened = normed.reshaped(shape)
         return weight * flattened
+    }
+}
+
+
+// Compact verify SSM + gated RMS norm (+ out_proj preparation) in one launch.
+// The body up to the arrival is nemotron_mtp_ssm_compact's text (WO, L = 3)
+// and still stores y. Each 512-feature norm group is 8 heads = 64 of its
+// threadgroups; the last of those to finish (device counter per group, reset
+// by that group) runs nemotron_h_gated_rms_prepared_output's per-thread text
+// for the group's rows in order, on threads 0-127 (simdgroups 0-3, as in that
+// launch), reading the stored y and the gate in place from in_proj's
+// contiguous [1, 3, 10304] output (the gate is its first 4096 columns). Same y, same per-row code: y, the final
+// state, the normalized rows and the prepared activation are bitwise those of
+// the two launches, and the norm leaves the SSM -> out_proj dependency chain.
+enum NemotronHCompactSSMGated {
+    /// Off by default: the compact SSM launch and the gated-norm launch run
+    /// separately. NEMOTRON_SSM_GATED_FUSED=1 selects the one-launch form.
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_SSM_GATED_FUSED"] == "1"
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_gated_prepared",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: """
+            auto n = thread_position_in_grid.z;
+            auto h_idx = n % H;
+            auto g_idx = n / G;
+            constexpr int n_per_t = (Ds + 31) / 32;
+            auto ds_idx = thread_position_in_threadgroup.x;
+            auto d_idx = thread_position_in_grid.y;
+            float prior[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                prior[i] = state_in[n * Dh * Ds + d_idx * Ds + s_idx];
+            }
+            for (int t = 0; t < L; ++t) {
+                auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
+                auto C_ = conv + t * CD + CO + g_idx * Ds;
+                auto B_ = conv + t * CD + BO + g_idx * Ds;
+                auto dt_ = static_cast<float>(dt[t * H + n]);
+                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                auto dA = fast::exp(A * dt_);
+                float acc = 0.0;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                    auto state = dA * prior[i] + dB_by_x;
+                    if (t == L - 1) {
+                        state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                    }
+                    prior[i] = static_cast<U>(state);
+                    acc += state * C_[s_idx];
+                }
+                acc = simd_sum(acc);
+                if (thread_index_in_simdgroup == 0) {
+                    out[(t * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+                }
+            }
+
+            threadgroup uint gr_last;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            threadgroup T rounded[512];
+            const uint flat = thread_position_in_threadgroup.x + 32 * thread_position_in_threadgroup.y;
+            const uint grp = n / (512 / Dh);
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (flat == 0) {
+                const uint prev = atomic_fetch_add_explicit(
+                    (device atomic_uint*)(counter + grp), 1u, memory_order_relaxed);
+                gr_last = prev == uint((512 / Dh) * (Dh / 8)) - 1u ? 1u : 0u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (gr_last == 0u) { return; }
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            if (flat == 0) {
+                atomic_store_explicit((device atomic_uint*)(counter + grp), 0u, memory_order_relaxed);
+            }
+            uint simd_lane_id = thread_index_in_simdgroup;
+            uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint lid = flat;
+            const bool on = lid < 128;
+            for (int row = 0; row < L; ++row) {
+                const uint gid = uint(row) * uint(H * Dh / 512) + grp;
+                int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;
+                float acc = 0;
+                float thread_x[4];
+                if (on) {
+                    for (int i = 0; i < 4; i++) {
+                        int64_t f = feature + int64_t(i);
+                        T g = proj[int64_t(row) * PS + f];
+                        auto y = 1 / (1 + metal::exp(metal::abs(g)));
+                        T sig = g < 0 ? y : 1 - y;
+                        T activated = g * sig;
+                        T gated = out[int64_t(row) * (H * Dh) + f] * activated;
+                        thread_x[i] = gated;
+                        acc += thread_x[i] * thread_x[i];
+                    }
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) {
+                    local_sums[simd_lane_id] = 0;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (on && simd_lane_id == 0) {
+                    local_sums[simd_group_id] = acc;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc = simd_sum(local_sums[simd_lane_id]);
+                    if (simd_lane_id == 0) {
+                        local_inv_mean[0] = metal::precise::rsqrt(acc / 512 + eps);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (on) {
+                    for (int i = 0; i < 4; i++) {
+                        int64_t f = feature + int64_t(i);
+                        T normalized = static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                        T unweighted = identity * normalized;
+                        T weighted = weight[f] * unweighted;
+                        normed[int64_t(row) * (H * Dh) + f] = weighted;
+                        rounded[lid * 4 + i] = weighted;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lid < 32) {
+                    float values[16];
+                    float total = 0;
+                    for (int i = 0; i < 16; i += 4) {
+                        total += float(rounded[lid * 16 + i]) + float(rounded[lid * 16 + i + 1])
+                            + float(rounded[lid * 16 + i + 2]) + float(rounded[lid * 16 + i + 3]);
+                        values[i] = rounded[lid * 16 + i];
+                        values[i + 1] = rounded[lid * 16 + i + 1] / 16.0f;
+                        values[i + 2] = rounded[lid * 16 + i + 2] / 256.0f;
+                        values[i + 3] = rounded[lid * 16 + i + 3] / 4096.0f;
+                    }
+                    const int base = int(gid) * 17 * 32 + int(lid);
+                    for (int i = 0; i < 16; i++) prepared[base + i * 32] = values[i];
+                    prepared[base + 16 * 32] = total;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """)
+    /// Per-norm-group arrival counters; every launch leaves them at zero.
+    /// Launches are ordered (each layer's conv depends on the previous layer).
+    nonisolated(unsafe) static var counter: MLXArray?
+}
+
+extension NemotronHRMSNormGated {
+    /// nemotronMTPSSMCompact(steps = writeOutput = 3) + preparedRows in one
+    /// launch, under preparedRows' guards; returns (normalized, prepared, final
+    /// SSM state) or nil to keep the two launches.
+    func compactSSMPreparedRows(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
+        stateDim: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHRMSNormGated.self,
+              groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
+              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
+              dt.dtype == .float32, dt.shape == [1, 3, 64],
+              state.dtype == .float32, state.shape == [1, 64, 64, 128],
+              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              weight.shape == [4096], weight.dtype == .bfloat16
+        else { return nil }
+        if NemotronHCompactSSMGated.counter == nil {
+            let c = MLXArray.zeros([64], dtype: .uint32)
+            eval(c)
+            NemotronHCompactSSMGated.counter = c
+        }
+        let outputs = NemotronHCompactSSMGated.kernel(
+            [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
+             eps, NemotronHCompactSSMGated.counter!],
+            template: [("T", DType.bfloat16), ("U", DType.float32),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
+            outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
+        return (outputs[2], outputs[3], outputs[1])
     }
 }
 
@@ -3695,14 +3970,6 @@ private class NemotronHBackbone: Module {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
-                    // Engine prefill only (see `cbv2Hidden`). A chunk runs for
-                    // milliseconds while the host builds the next in well under
-                    // one, so without a wait the host encodes, and allocates,
-                    // every layer's intermediates before the first chunk
-                    // completes. Waiting on the previous chunk returns its
-                    // temporaries to MLX's buffer cache for the next chunk; this
-                    // chunk is already queued, so the GPU never waits on the
-                    // host. Evaluation order only; values are unchanged.
                     if recyclePrefillChunks {
                         if let previous = submittedPrefillChunk { eval(previous) }
                         submittedPrefillChunk = hidden
