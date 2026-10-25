@@ -876,7 +876,11 @@ enum NemotronMoELeader {
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              rows: Int, bank: Bank, plan: MLXArray? = nil) -> MLXArray {
+                              rows: Int, bank: Bank, plan: MLXArray? = nil,
+                              neuronMajor: MLXArray? = nil) -> MLXArray {
+        if rows == 3, let neuronMajor {
+            return NMLSparseDown.shared.run(x, inds, scores, bank, neuronMajor: neuronMajor)
+        }
         if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
         return NemotronMoELeaderWeightedKernel.shared.kernel(
             [bank.weight, bank.scales, bank.biases, x, inds, scores],
@@ -933,7 +937,8 @@ enum NemotronMoELeader {
             balancePlan = nil
         }
         var y = applyWeighted(act, flat, scores.reshaped(rows * 6),
-            rows: rows, bank: down, plan: balancePlan)
+            rows: rows, bank: down, plan: balancePlan,
+            neuronMajor: rows == 3 ? NMLSparseDown.shared.neuronMajor(for: mlp.fc2) : nil)
         if selfTest {
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -994,6 +999,8 @@ enum NemotronMoELeader {
             guard let up = bank(mlp.fc1, k: mlp.inputDims, dtype: .bfloat16),
                   let down = bank(mlp.fc2, k: up.n, dtype: .bfloat16) else { continue }
             let topK = moe.numExpertsPerTok
+            let neuronMajor = topK == 6 && down.weight.shape == [128, 2688, 232]
+                ? NMLSparseDown.shared.prepare(mlp.fc2, bank: down) : nil
             for rows in 1...4 {
                 guard seen.insert([rows, topK, up.k, up.n]).inserted else { continue }
                 let values: [UInt32] = (0..<(rows * topK)).map { UInt32($0 % topK) }
@@ -1013,6 +1020,10 @@ enum NemotronMoELeader {
                     let scores = MLXArray.ones([rows * topK], dtype: .float32)
                     outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down,
                         plan: fused?.plan))
+                    if rows == 3, let neuronMajor {
+                        outputs.append(applyWeighted(h, inds, scores, rows: rows, bank: down,
+                            neuronMajor: neuronMajor))
+                    }
                 }
             }
         }
@@ -1142,6 +1153,212 @@ private final class NMLBalanceWeighted: Sendable {
             template: [("T",x.dtype),("R",3),("TOPK",6),("K",bank.k),("N",bank.n)],
             grid: (32*(bank.n/4),6,1), threadGroup: (32,6,1),
             outputShapes: [[1,3,bank.n]], outputDTypes: [x.dtype])[0]
+    }
+}
+
+//
+//
+private let nmlNibbleQdotHeader = """
+template <typename U, int values_per_thread>
+inline U nml_qdot_nibbles(
+    const thread uint* v, const thread U* x_thread, U scale, U bias, U sum) {
+  U accum = 0;
+  for (int i = 0; i < (values_per_thread / 4); i++) {
+    const U a = U(v[4 * i]);
+    const U b1 = U(v[4 * i + 1] << 4);
+    const U c = U(v[4 * i + 2] << 8);
+    const U d = U(v[4 * i + 3] << 12);
+    accum +=
+        (x_thread[4 * i] * a +
+         x_thread[4 * i + 1] * b1 +
+         x_thread[4 * i + 2] * c +
+         x_thread[4 * i + 3] * d);
+  }
+  return scale * accum + sum * bias;
+}
+"""
+
+private let nmlSparseDownSource = """
+  constexpr int values_per_thread = 8;
+  constexpr int block_size = values_per_thread * 32;
+  constexpr int in_vec_size_g = K / 64;
+  constexpr int wt_row = N / 8;
+  constexpr int TILE = 64;
+  typedef float U;
+
+  const uint3 tid = threadgroup_position_in_grid;
+  const uint t = thread_position_in_threadgroup.x;
+  const uint simd_gid = simdgroup_index_in_threadgroup;
+  const uint simd_lid = thread_index_in_simdgroup;
+  const int lane = int(t / 8);
+  const int word = int(t % 8);
+  const int tile_out = int(tid.x) * TILE;
+
+  const int slot = int(tid.z);
+  const int row = slot / TOPK;
+  const uint expert = inds[slot];
+  int before = 0;
+  for (int r = 0; r < row; r++) {
+    for (int j = 0; j < TOPK; j++) {
+      before += inds[r * TOPK + j] == expert ? 1 : 0;
+    }
+  }
+  if ((before & 1) != 0) {
+    return;
+  }
+  int partner = -1;
+  for (int r = R - 1; r > row; r--) {
+    for (int j = 0; j < TOPK; j++) {
+      if (inds[r * TOPK + j] == expert) {
+        partner = r * TOPK + j;
+      }
+    }
+  }
+  const bool paired = partner >= 0;
+
+  threadgroup float acc_tg[2 * TILE * 32];
+
+  const int out0 = tile_out + word * 8;
+  const device uint32_t* wq = wt +
+      ((ulong)expert * K + lane * values_per_thread) * wt_row + out0 / 8;
+  const device T* sc = scales + ((ulong)expert * N + out0) * in_vec_size_g + lane / 8;
+  const device T* bs = biases + ((ulong)expert * N + out0) * in_vec_size_g + lane / 8;
+  const device T* x0 = x + slot * K + lane * values_per_thread;
+  const device T* x1 = x + (paired ? partner : slot) * K + lane * values_per_thread;
+
+  thread U result0[8] = {0};
+  thread U result1[8] = {0};
+  for (int k = 0; k < K; k += block_size) {
+    if (k + lane * values_per_thread < K) {
+      thread U x0_thread[values_per_thread];
+      thread U x1_thread[values_per_thread];
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0 + k, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1 + k, x1_thread);
+      uint q[values_per_thread];
+      bool live = false;
+      for (int j = 0; j < values_per_thread; j++) {
+        const bool on = x0_thread[j] != 0 || (paired && x1_thread[j] != 0);
+        q[j] = on ? wq[(ulong)(k + j) * wt_row] : 0u;
+        live = live || on;
+      }
+      if (live) {
+        for (int r = 0; r < 8; r++) {
+          U s = sc[r * in_vec_size_g + k / 64];
+          U b = bs[r * in_vec_size_g + k / 64];
+          uint v[values_per_thread];
+          for (int j = 0; j < values_per_thread; j++) {
+            v[j] = (q[j] >> (4 * r)) & 0xfu;
+          }
+          result0[r] += nml_qdot_nibbles<U, values_per_thread>(v, x0_thread, s, b, sum0);
+          if (paired) {
+            result1[r] += nml_qdot_nibbles<U, values_per_thread>(v, x1_thread, s, b, sum1);
+          }
+        }
+      }
+    }
+  }
+
+  for (int r = 0; r < 8; r++) {
+    acc_tg[(word * 8 + r) * 32 + lane] = result0[r];
+    acc_tg[TILE * 32 + (word * 8 + r) * 32 + lane] = result1[r];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = 0; i < TILE / 8; i++) {
+    const int o = int(simd_gid) * (TILE / 8) + i;
+    U value0 = simd_sum(acc_tg[o * 32 + simd_lid]);
+    if (simd_lid == 0) {
+      const T h0 = nml_store<T, false>(value0);
+      products[slot * N + tile_out + o] = float(h0) * scores[slot] + 0.0f;
+    }
+    if (paired) {
+      U value1 = simd_sum(acc_tg[TILE * 32 + o * 32 + simd_lid]);
+      if (simd_lid == 0) {
+        const T h1 = nml_store<T, false>(value1);
+        products[partner * N + tile_out + o] = float(h1) * scores[partner] + 0.0f;
+      }
+    }
+  }
+"""
+
+private let nmlSparseReduceSource = """
+  const uint o = thread_position_in_grid.x;
+  const uint row = thread_position_in_grid.y;
+  if (o >= uint(N)) {
+    return;
+  }
+  const int base = int(row) * TOPK;
+  float total = products[base * N + o];
+  for (int j = 1; j < TOPK; j++) {
+    total = products[(base + j) * N + o] + total;
+  }
+  y[row * N + o] = static_cast<T>(total);
+"""
+
+final class NMLSparseDown: @unchecked Sendable {
+    static let shared = NMLSparseDown()
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_NEURON_MAJOR_FC2"] != "0"
+    private let lock = NSLock()
+    private var banks: [ObjectIdentifier: MLXArray] = [:]
+    private let partials = MLXFast.metalKernel(
+        name: "nml_fc2_neuron_major_partials",
+        inputNames: ["wt", "scales", "biases", "x", "inds", "scores"],
+        outputNames: ["products"], source: nmlSparseDownSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nmlNibbleQdotHeader,
+        ensureRowContiguous: true)
+    private let reduce = MLXFast.metalKernel(
+        name: "nml_fc2_neuron_major_top6_sum",
+        inputNames: ["products"], outputNames: ["y"], source: nmlSparseReduceSource,
+        ensureRowContiguous: true)
+
+    func neuronMajor(for layer: SwitchLinear) -> MLXArray? {
+        guard Self.enabled else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return banks[ObjectIdentifier(layer)]
+    }
+
+    func prepare(_ layer: SwitchLinear, bank: NemotronMoELeader.Bank) -> MLXArray? {
+        guard Self.enabled, bank.n % 64 == 0 else { return nil }
+        if let existing = neuronMajor(for: layer) { return existing }
+        let weight = bank.weight
+        let experts = weight.dim(0), n = bank.n, k = bank.k
+        let shifts = MLXArray((0 ..< 8).map { UInt32(4 * $0) })
+        let mask = MLXArray(UInt32(15))
+        var parts: [MLXArray] = []
+        for start in stride(from: 0, to: experts, by: 8) {
+            let end = min(start + 8, experts)
+            let count = end - start
+            let nibbles = bitwiseAnd(
+                weight[start ..< end].expandedDimensions(axis: -1) >> shifts, mask)
+                .asType(.uint8).reshaped(count, n, k)
+            let columns = nibbles.transposed(0, 2, 1)
+                .reshaped(count, k, n / 8, 8).asType(.uint32)
+            var packed = columns[.ellipsis, 0]
+            for j in 1 ..< 8 {
+                packed = bitwiseOr(packed, columns[.ellipsis, j] << MLXArray(UInt32(4 * j)))
+            }
+            eval(packed)
+            parts.append(packed)
+        }
+        let result = concatenated(parts, axis: 0)
+        eval(result)
+        lock.lock()
+        banks[ObjectIdentifier(layer)] = result
+        lock.unlock()
+        return result
+    }
+
+    func run(_ x: MLXArray, _ ids: MLXArray, _ scores: MLXArray,
+             _ bank: NemotronMoELeader.Bank, neuronMajor: MLXArray) -> MLXArray {
+        let products = partials([neuronMajor, bank.scales, bank.biases, x, ids, scores],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6), ("K", bank.k), ("N", bank.n)],
+            grid: (256 * (bank.n / 64), 1, 18), threadGroup: (256, 1, 1),
+            outputShapes: [[18, bank.n]], outputDTypes: [.float32])[0]
+        return reduce([products],
+            template: [("T", x.dtype), ("TOPK", 6), ("N", bank.n)],
+            grid: (bank.n, 3, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, 3, bank.n]], outputDTypes: [x.dtype])[0]
     }
 }
 
