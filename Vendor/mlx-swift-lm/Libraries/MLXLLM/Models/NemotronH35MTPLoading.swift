@@ -321,7 +321,7 @@ private func nemotronDecodeBacking(_ opaque: UnsafeMutableRawPointer) -> UnsafeM
 @available(macOS 15.0, *)
 final class NemotronDecodeResidency: @unchecked Sendable {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_RESIDENCY"] != "0"
-    static let seedLayers = 0
+    static let seedLayers = 2
     let arrays: [MLXArray]
     let buffers: [any MTLBuffer]
     let seedSet: any MTLResidencySet
