@@ -296,7 +296,19 @@ private final class NemotronMTPDraftHead {
     }
 }
 
-/// Request-local embedded assistant with native paged attention. Each draft
+/// The assistant needs trusted append, rectangular attention and native roots
+/// from either of the existing cache implementations. Target cache selection
+/// remains outside this private draft-only boundary.
+protocol NemotronMTPDraftLayerCache: CBv2AttendingLayerCache, KVCache {
+    var mtpSerializesRectangularAttention: Bool { get set }
+    var mtpBatchesRectangularAttention: Bool { get set }
+    func appendTrusted(keys: MLXArray, values: MLXArray) -> [MLXArray]
+}
+
+extension PagedLayerCache: NemotronMTPDraftLayerCache {}
+extension CBv2LayerCache: NemotronMTPDraftLayerCache {}
+
+/// Request-local embedded assistant with private causal attention. Each draft
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
 /// proposal and is preserved by the durable prefix checkpoint codec.
@@ -306,6 +318,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     private let draftHead: NemotronMTPDraftHead
     private let kvOnlyHistory: Bool
     private let primePromptHistory: Bool
+    private let contiguousDraftKV: Bool
     private let draftLimit: Int
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
@@ -346,6 +359,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         self.kvOnlyHistory = ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_KV_ONLY_HISTORY"] != "0"
         self.primePromptHistory = primePromptHistory
         let environment = ProcessInfo.processInfo.environment
+        self.contiguousDraftKV = environment["NEMOTRON_MTP_CONTIGUOUS_KV"] != "0"
         let requested = maximumDraftTokens
             ?? Int(environment["DARKBLOOM_NEMOTRON35_MTP_MAX_DRAFT_TOKENS"] ?? "") ?? 7
         self.draftLimit = (1...7).contains(requested) ? requested : 7
@@ -399,7 +413,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
         }
-        var cache: PagedLayerCache {
+        var cache: any NemotronMTPDraftLayerCache {
             guard let paged else {
                 preconditionFailure("Nemotron MTP paged state was not configured")
             }
@@ -430,7 +444,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 let (sum, overflow) = total.addingReportingOverflow(bytes)
                 return overflow ? Int.max : sum
             }
-            let storage = paged?.backend.bytesWired ?? 0
+            let storage = paged?.storageBytes ?? 0
             let (total, overflow) = arraysBytes.addingReportingOverflow(storage)
             return overflow ? Int.max : total
         }
@@ -440,15 +454,36 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             !started || pendingTokens.reduce(0) { $0 + $1.dim(1) } > normalBacklogLimit
         }
     }
+    /// Historical name retained for the request-state interface. The native
+    /// Nemotron geometry uses one fixed-capacity contiguous row by default;
+    /// NEMOTRON_MTP_CONTIGUOUS_KV=0 retains the original paged implementation.
     final class PagedState {
-        let backend: PagedKVBackend
-        let row: PagedSequenceKV
-        let cache: PagedLayerCache
+        let backend: PagedKVBackend?
+        let row: any CBv2SequenceKV
+        let cache: any NemotronMTPDraftLayerCache
         let maximumSequenceLength: Int
         private var released = false
 
-        init(kind: CBv2LayerKind, dtype: DType, maximumSequenceLength: Int) throws {
+        var storageBytes: Int { backend?.bytesWired ?? row.byteCount }
+
+        init(kind: CBv2LayerKind, dtype: DType, maximumSequenceLength: Int,
+             useContiguous: Bool) throws {
             self.maximumSequenceLength = maximumSequenceLength
+            if useContiguous, kind.attention == .full, kind.sharesKVWithLayer == nil,
+               kind.kvHeads == 2, kind.queryHeads == 32, kind.headDim == 128,
+               maximumSequenceLength > 0, maximumSequenceLength <= Int(Int32.max),
+               [DType.bfloat16, .float32].contains(dtype),
+               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu {
+                // Allocate at the admitted maximum on the first append: no
+                // growth/copy is required as the draft history advances.
+                let contiguous = CBv2FullSequenceKV(
+                    promptLength: maximumSequenceLength, maxLength: maximumSequenceLength,
+                    kvHeads: kind.kvHeads, headDim: kind.headDim)
+                row = contiguous
+                cache = CBv2LayerCache(layerIndex: 0, kind: kind, rows: [contiguous])
+                backend = nil
+                return
+            }
             let elementBytes = dtype == .float32 ? 4 : 2
             let pageTokens = CBv2PagedDefaults.pageSize
             let pages = (maximumSequenceLength + pageTokens - 1) / pageTokens
@@ -471,23 +506,34 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                 throw CBv2KVError.backendIneligible(reason: "MTP backing geometry overflow")
             }
             let capacity = try Memory.allocationFootprintUpperBound(byteCount: storageBytes)
-            backend = try PagedKVBackend(layerKinds: [kind], config: .init(
+            let pagedBackend = try PagedKVBackend(layerKinds: [kind], config: .init(
                 capacityBytes: capacity, dtype: dtype, maxPrefillChunk: 512,
                 nominalMaxSequenceLength: storageLength,
                 segmentSizeBytes: storageBytes,
                 layerDTypes: [dtype]))
-            let state = try backend.makeSequenceState(
+            let state = try pagedBackend.makeSequenceState(
                 layerKinds: [kind], promptLength: 0, maxLength: storageLength)
             row = state[0] as! PagedSequenceKV
-            cache = backend.makeLayerCaches()[0]
-            cache.nemotronDraftAttention = true
+            let pagedCache = pagedBackend.makeLayerCaches()[0]
+            pagedCache.nemotronDraftAttention = true
+            cache = pagedCache
+            backend = pagedBackend
             cache.setRows([row])
+        }
+
+        func rollback(_ count: Int) {
+            row.rollback(count)
+            // Contiguous attention uses the row's logical prefix. Its cached
+            // device position array must describe that same frontier after an
+            // out-of-band speculative rewind. Preserve the paged fallback's
+            // original metadata/evaluation path.
+            if backend == nil { cache.setRows([row]) }
         }
 
         func release() {
             guard !released else { return }
             cache.setRows([])
-            backend.release([row])
+            backend?.release([row])
             released = true
         }
 
@@ -532,7 +578,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             modelLayerIndex: 0)
         let hiddenDType = target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype
         let dtype = module.projectedKVDType(hiddenDType: hiddenDType)
-        s.paged = try PagedState(kind: kind, dtype: dtype, maximumSequenceLength: bound)
+        s.paged = try PagedState(kind: kind, dtype: dtype, maximumSequenceLength: bound,
+                                 useContiguous: contiguousDraftKV)
     }
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
     public func draftStep(tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture) -> (tokens: MLXArray, hidden: MLXArray) {
@@ -659,9 +706,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             // Post-verify speculation already appended rows (target token r,
             // target hidden r) after the trusted seed row. Exact-greedy
             // acceptance makes rows 0..<n the accepted replay; keep them.
-            s.paged!.row.rollback(s.cacheOffset - (s.trustedOffset + n))
+            s.paged!.rollback(s.cacheOffset - (s.trustedOffset + n))
         } else {
-            s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
+            s.paged!.rollback(s.cacheOffset - s.trustedOffset)
             if n > 0 {
                 s.pendingTokens = [committedDraftTokens]
                 s.pendingHidden = [committedTargetHidden]
@@ -692,7 +739,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     public func discardRound(requestState: any CBv2MTPRequestState) {
         let s = state(requestState)
         guard s.stagedInputCount > 0 else { return }
-        s.paged!.row.rollback(s.cacheOffset - s.baseOffset)
+        s.paged!.rollback(s.cacheOffset - s.baseOffset)
         s.pendingTokens = s.savedTokens
         s.pendingHidden = s.savedHidden
         s.frontier = s.savedFrontier
@@ -802,7 +849,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
               targetHidden.shape == [1, width, target.configuration.hiddenSize]
         else { return }
         // Chained draft rows are never trusted; drop them before appending.
-        s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
+        s.paged!.rollback(s.cacheOffset - s.trustedOffset)
         // Attend the rows one query column at a time through the decode
         // kernel the one-token draft already uses (the verify column path):
         // each row is then bitwise a one-token draft step, and the kernel

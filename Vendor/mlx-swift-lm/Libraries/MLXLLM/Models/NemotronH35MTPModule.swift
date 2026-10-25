@@ -199,7 +199,7 @@ final class NemotronH35MTPAttentionBlock: Module {
 
 
     func appendTrustedKV(
-        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+        hidden: MLXArray, embedding: MLXArray, cache: any NemotronMTPDraftLayerCache
     ) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
         let batch = x.dim(0), length = x.dim(1)
@@ -464,7 +464,7 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(hidden: hidden, embedding: embedding, cache: cache)
     }
     func appendTrustedKV(
-        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+        hidden: MLXArray, embedding: MLXArray, cache: any NemotronMTPDraftLayerCache
     ) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
             hidden: hidden, embedding: embedding, cache: cache)

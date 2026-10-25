@@ -109,6 +109,20 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     // MARK: - CBv2AttendingLayerCache
 
+    /// Append already-trusted projected rows without evaluating attention.
+    /// Used by a private MTP head to catch up its own causal history. Returning
+    /// the complete native inner state keeps both slice updates and the offset
+    /// advance live until the caller's ordinary evaluation boundary.
+    public func appendTrusted(keys: MLXArray, values: MLXArray) -> [MLXArray] {
+        precondition(kind.sharesKVWithLayer == nil && rows.count == 1)
+        precondition(keys.ndim == 4 && keys.dim(0) == 1 && values.shape == keys.shape)
+        precondition(keys.dim(1) == kind.kvHeads && keys.dim(3) == kind.headDim)
+        precondition(keys.dtype == values.dtype)
+        let views = rows[0].update(keys: keys, values: values)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        return [views.0, views.1] + innerState()
+    }
+
     public func updateAndAttend(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
