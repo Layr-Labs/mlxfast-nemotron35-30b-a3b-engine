@@ -411,7 +411,13 @@ enum NemotronHResidualRMSNorm {
             template: [("T", DType.bfloat16)],
             grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
-        return (result[0], result[1])
+        guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
+        let summed = lhs + rhs
+        let ok = MLX.logicalAnd(
+            (result[0].view(dtype: .uint16) .== summed.view(dtype: .uint16)).all(),
+            (result[1].view(dtype: .uint16) .== norm(summed).view(dtype: .uint16)).all())
+        return (which(ok, result[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, result[1], MLXArray(Float.nan).asType(.bfloat16)))
     }
 
 

@@ -1336,6 +1336,107 @@ func nemotronR1Linear(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     return nemotronBitwiseOrNaN(out, linear(x))
 }
 
+/// Draft-side cuts on the device-picked post-verify row. Each has its own
+/// switch; NEMOTRON_MTP_DRAFT_EXACT=0 turns both off.
+enum NemotronMTPDraftRow {
+    private static func on(_ key: String) -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        return environment[key] != "0" && environment["NEMOTRON_MTP_DRAFT_EXACT"] != "0"
+    }
+    /// NEMOTRON_MTP_DRAFT_ROW_JOIN=0: the row keeps a stock residual add and
+    /// a stock rms before its one-token tail.
+    static let join = on("NEMOTRON_MTP_DRAFT_ROW_JOIN")
+    /// NEMOTRON_MTP_DRAFT_ROW_GATHER=0: the row's fused residual, query and
+    /// K/V stay four take gathers.
+    static let gather = on("NEMOTRON_MTP_DRAFT_ROW_GATHER")
+}
+
+/// The device-picked post-verify row of the front rows in one copy launch:
+/// take(fused, pick, axis: 1), take(queries, pick, axis: 2) and the same of
+/// keys and values. The inputs are the token-major projections behind the
+/// [1, H, W, D] views, so each picked row is one contiguous span; the outputs
+/// hold the same elements in the same order as the gathers' results.
+enum NemotronMTPPickRow {
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_pick_row_bf16",
+        inputNames: ["fused", "qrows", "krows", "vrows", "pick"],
+        outputNames: ["fused_row", "q_row", "k_row", "v_row"],
+        source: """
+            const uint t = thread_position_in_grid.x;
+            const size_t r = size_t(clamp(pick[0], 0, W - 1));
+            const uint quads_f = F / 4, quads_q = Q / 4, quads_kv = KV / 4;
+            if (t < quads_f) {
+                for (uint i = 0; i < 4; i++) fused_row[t * 4 + i] = fused[r * F + t * 4 + i];
+            } else if (t < quads_f + quads_q) {
+                const uint u = t - quads_f;
+                for (uint i = 0; i < 4; i++) q_row[u * 4 + i] = qrows[r * Q + u * 4 + i];
+            } else if (t < quads_f + quads_q + quads_kv) {
+                const uint u = t - quads_f - quads_q;
+                for (uint i = 0; i < 4; i++) k_row[u * 4 + i] = krows[r * KV + u * 4 + i];
+            } else if (t < quads_f + quads_q + 2 * quads_kv) {
+                const uint u = t - quads_f - quads_q - quads_kv;
+                for (uint i = 0; i < 4; i++) v_row[u * 4 + i] = vrows[r * KV + u * 4 + i];
+            }
+            """, ensureRowContiguous: true)
+
+    /// fused [1, W, F]; queries [1, Hq, W, D]; keys/values [1, Hk, W, D]
+    /// (transposed views of token-major rows); pick int32 [1]. nil: keep take.
+    static func apply(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, pick: MLXArray
+    ) -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)? {
+        guard NemotronMTPDraftRow.gather,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              pick.shape == [1], pick.dtype == .int32,
+              fused.ndim == 3, fused.dim(0) == 1, fused.dtype == .bfloat16,
+              queries.ndim == 4, queries.dim(0) == 1, queries.dtype == .bfloat16,
+              keys.ndim == 4, keys.dim(0) == 1, keys.dtype == .bfloat16,
+              values.shape == keys.shape, values.dtype == .bfloat16
+        else { return nil }
+        let width = fused.dim(1)
+        guard (1...16).contains(width), queries.dim(2) == width, keys.dim(2) == width else {
+            return nil
+        }
+        let f = fused.dim(2), q = queries.dim(1) * queries.dim(3), kv = keys.dim(1) * keys.dim(3)
+        guard f % 4 == 0, q % 4 == 0, kv % 4 == 0 else { return nil }
+        let threads = (f + q + 2 * kv) / 4
+        let outputs = kernel(
+            [fused, queries.transposed(0, 2, 1, 3), keys.transposed(0, 2, 1, 3),
+             values.transposed(0, 2, 1, 3), pick],
+            template: [("T", DType.bfloat16), ("W", width), ("F", f), ("Q", q), ("KV", kv)],
+            grid: (threads, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, f], [1, queries.dim(1), 1, queries.dim(3)],
+                           [1, keys.dim(1), 1, keys.dim(3)], [1, keys.dim(1), 1, keys.dim(3)]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .bfloat16])
+        guard NemotronMoELeader.selfTest else {
+            return (outputs[0], outputs[1], outputs[2], outputs[3])
+        }
+        let expected = [take(fused, pick, axis: 1), take(queries, pick, axis: 2),
+                        take(keys, pick, axis: 2), take(values, pick, axis: 2)]
+        var ok = MLXArray(true)
+        for (y, e) in zip(outputs, expected) {
+            ok = MLX.logicalAnd(ok, (y.view(dtype: .uint16) .== e.view(dtype: .uint16)).all())
+        }
+        let nan = MLXArray(Float.nan).asType(.bfloat16)
+        return (which(ok, outputs[0], nan), which(ok, outputs[1], nan),
+                which(ok, outputs[2], nan), which(ok, outputs[3], nan))
+    }
+
+    /// Load-time JIT for the post-verify widths (W is a template constant).
+    static func warm() {
+        var outputs: [MLXArray] = []
+        for width in 2 ... 4 {
+            let fused = MLXArray.zeros([1, width, 2688], dtype: .bfloat16)
+            let q = MLXArray.zeros([1, width, 32, 128], dtype: .bfloat16).transposed(0, 2, 1, 3)
+            let kv = MLXArray.zeros([1, width, 2, 128], dtype: .bfloat16).transposed(0, 2, 1, 3)
+            if let picked = apply(fused: fused, queries: q, keys: kv, values: kv,
+                                  pick: MLXArray([Int32(0)])) {
+                outputs += [picked.fused, picked.queries, picked.keys, picked.values]
+            }
+        }
+        if !outputs.isEmpty { eval(outputs) }
+    }
+}
+
 /// Self-test select: `y` where it is bitwise equal to `expected`, else NaN
 /// everywhere, so the token gate fails loudly on any difference.
 func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {

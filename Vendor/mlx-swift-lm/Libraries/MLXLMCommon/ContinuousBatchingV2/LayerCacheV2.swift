@@ -45,6 +45,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     public var positionOffsets: MLXArray { cachedPositionOffsets }
 
     private var cachedPositionOffsets: MLXArray
+    /// Host mirror of `cachedPositionOffsets` (same int32 values, advanced
+    /// with every device `+ L`). MTP verification hands the next offsets over
+    /// as a host-built array instead of a device add launch per layer
+    /// (`CBV2_MTP_HOST_POSITIONS=0` keeps the device add there too).
+    private var hostPositionOffsets: [Int32]
+    static let mtpHostPositions =
+        ProcessInfo.processInfo.environment["CBV2_MTP_HOST_POSITIONS"] != "0"
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
@@ -79,7 +86,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
-        self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
+        self.hostPositionOffsets = rows.map { Int32($0.absoluteOffset) }
+        self.cachedPositionOffsets = MLXArray(hostPositionOffsets)
     }
 
     // MARK: - Membership (the ONLY places positionOffsets is host-rebuilt)
@@ -152,7 +160,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             keepMask: keepMask, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(by: queries.dim(2), onHost: mtpSerializesRectangularAttention)
         return output
     }
 
@@ -181,7 +189,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             attendRows: attendRows)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(by: queries.dim(2), onHost: true)
         return outputs
     }
 
@@ -213,7 +221,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         let outputs = CBv2AttentionV1.attendSerialQueryRowsWritten(
             row: row, kind: kind, queries: queries, written: written,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(by: queries.dim(2), onHost: true)
         return outputs
     }
 
@@ -235,7 +243,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        advancePositionOffsets(by: keys.dim(2), onHost: false)
         return output
     }
 
@@ -262,11 +270,15 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
-        cachedPositionOffsets = Self.buildPositionOffsets(rows)
+        hostPositionOffsets = rows.map { Int32($0.absoluteOffset) }
+        cachedPositionOffsets = MLXArray(hostPositionOffsets)
     }
 
-    private static func buildPositionOffsets(_ rows: [CBv2SequenceKV]) -> MLXArray {
-        MLXArray(rows.map { Int32($0.absoluteOffset) })
+    private func advancePositionOffsets(by length: Int, onHost: Bool) {
+        let step = Int32(length)
+        hostPositionOffsets = hostPositionOffsets.map { $0 &+ step }
+        cachedPositionOffsets = onHost && Self.mtpHostPositions
+            ? MLXArray(hostPositionOffsets) : cachedPositionOffsets + step
     }
 }
 

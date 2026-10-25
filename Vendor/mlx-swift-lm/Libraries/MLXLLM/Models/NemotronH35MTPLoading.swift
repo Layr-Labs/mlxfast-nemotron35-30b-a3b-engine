@@ -81,6 +81,7 @@ extension NemotronH35MTPAssistant {
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
+        if NemotronMTPDraftRow.gather { NemotronMTPPickRow.warm() }
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(

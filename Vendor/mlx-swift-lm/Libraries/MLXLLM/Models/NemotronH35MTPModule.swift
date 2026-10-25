@@ -290,11 +290,20 @@ final class NemotronH35MTPAttentionBlock: Module {
     func maskedRowOutput(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
+        let parts = maskedRowParts(
+            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+        return parts.residual + parts.attention
+    }
+
+    /// `maskedRowOutput` before its residual add: (fused, projected attention).
+    func maskedRowParts(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> (residual: MLXArray, attention: MLXArray) {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries.asType(keys.dtype), keys: keys, values: values,
             scale: mixer.scale, mask: .array(mask))
         let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
-        return fused + nemotronR1Linear(merged, mixer.wo)
+        return (fused, nemotronR1Linear(merged, mixer.wo))
     }
 
     /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
@@ -646,6 +655,24 @@ final class NemotronH35MTPModule: Module {
     func finishPagedAttentionRow(_ attention: MLXArray) -> MLXArray {
         precondition(attention.ndim == 3 && attention.dim(0) == 1 && attention.dim(1) == 1)
         return (layers[1] as! NemotronH35MTPExpertBlock)(attention)
+    }
+
+    /// `finishPagedAttentionRow(maskedRowOutput(...))` for the device-picked
+    /// row. NEMOTRON_MTP_DRAFT_ROW_JOIN (default on): the residual add and the
+    /// tail's entry norm in the one residual/RMS join launch the second draft
+    /// already uses, instead of a stock add and a stock rms.
+    func finishMaskedRow(
+        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
+    ) -> MLXArray {
+        let block = layers[0] as! NemotronH35MTPAttentionBlock
+        guard NemotronMTPDraftRow.join else {
+            return finishPagedAttentionRow(block.maskedRowOutput(
+                fused: fused, queries: queries, keys: keys, values: values, mask: mask))
+        }
+        let parts = block.maskedRowParts(
+            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(
+            residual: parts.residual, attention: parts.attention)
     }
 
     func pagedForwardRows(
