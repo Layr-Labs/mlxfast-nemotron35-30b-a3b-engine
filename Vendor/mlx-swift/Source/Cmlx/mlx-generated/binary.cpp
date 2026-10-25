@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 namespace mlx::core::metal {
 
 const char* binary() {
@@ -216,3 +218,13 @@ template <
 }
 
 } // namespace mlx::core::metal
+
+namespace {
+
+[[maybe_unused]] const bool command_buffer_budgets = [] {
+  setenv("MLX_MAX_OPS_PER_BUFFER", "1000", 0);
+  setenv("MLX_MAX_MB_PER_BUFFER", "400", 0);
+  return true;
+}();
+
+}
