@@ -2113,6 +2113,8 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private func engineStep() {
         guard running else { return }
+        // Held head-chain submissions never outlive the step that held them.
+        defer { CBv2MTPSubmitMerge.flush() }
         if let suspendedAt = suspendStepExecutionAtCountForTesting,
             stepCount >= suspendedAt
         {
