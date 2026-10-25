@@ -203,14 +203,26 @@ extension NemotronHMamba2Mixer {
         }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
-        let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-            heads: heads, headDim: dim, groups: groups, stateDim: state,
-            steps: length, writeOutput: true)
+        let result: (output: MLXArray, finalState: MLXArray)
+        let joinedPrepared: (MLXArray, MLXArray)?
+        if let joined = NemotronMTPSSMGatedJoin.apply(
+            self, convolution: convolution, dt: dt, state: initialSSM, gate: gate) {
+            result = (joined.output, joined.finalState)
+            joinedPrepared = (joined.normalized, joined.prepared)
+        } else {
+            result = nemotronMTPSSMCompact(
+                convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                heads: heads, headDim: dim, groups: groups, stateDim: state,
+                steps: length, writeOutput: true)
+            joinedPrepared = nil
+        }
         let y = result.output.reshaped(batch, length, heads * dim)
         let normalized: MLXArray
         let prepared: MLXArray?
-        if NemotronMTPExecution.batchedNorm,
+        if let pair = joinedPrepared {
+            normalized = pair.0
+            prepared = pair.1
+        } else if NemotronMTPExecution.batchedNorm,
            let q = outProj as? QuantizedLinear, q.mode == .affine,
            q.bits == 4, q.groupSize == 64, q.bias == nil,
            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,

@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 private enum NemotronMTPSSMKernel {
     static let kernel = MLXFast.metalKernel(
@@ -159,6 +160,207 @@ func nemotronMTPSSMCompact(
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])
     return (outputs[0], outputs[1])
+}
+
+/// One current forward launch: original compact SSM, then the norm group's
+/// actual last producer performs the original gated RMS/prepared epilogue.
+/// Strict-prefix replay retains the original compact/grouped kernels.
+enum NemotronMTPSSMGatedJoin {
+    private static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_GATED_JOIN"] != "0"
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_GATED_PREPARED_OUT"] != "0"
+    private struct Entry {
+        let counter: MLXArray
+        let norm: ObjectIdentifier
+        let aLog: ObjectIdentifier
+        let d: ObjectIdentifier
+        let out: ObjectIdentifier
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [ObjectIdentifier: Entry] = [:]
+    nonisolated(unsafe) private static let identity = MLXArray(1).asType(.bfloat16)
+
+    private static func source() -> String {
+        let release = """
+
+          // All 256 producer threads publish their original BF16 outputs
+          // and FP32 state before this CTA can take its group ticket.
+          threadgroup_barrier(mem_flags::mem_device);
+          atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+          threadgroup uint join_ticket[1];
+          threadgroup float local_inv_mean[1];
+          threadgroup float local_sums[32];
+          threadgroup T rounded[512];
+          const uint join_linear = thread_position_in_threadgroup.x
+              + 32u * thread_position_in_threadgroup.y;
+          const uint join_group = uint(n) / 8u;
+          if (join_linear == 0) {
+            join_ticket[0] = atomic_fetch_add_explicit(
+                (device atomic_uint*)(counter + join_group), 1u, memory_order_relaxed);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (join_ticket[0] != 63u) return;
+          atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+          const device T* x = out;
+          for (int join_row = 0; join_row < L; join_row++) {
+        """
+        let finish = """
+
+            // Do not replace rounded/local reduction scratch until the
+            // first SIMD finished packing the previous row.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+          threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+          atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+          if (join_linear == 0) {
+            atomic_store_explicit((device atomic_uint*)(counter + join_group),
+                                  0u, memory_order_relaxed);
+          }
+        """
+        return NemotronMTPCompactSSMKernel.source + release
+            + NemotronHRMSNormGated.ssmPreparedJoinSource() + finish
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_gated_prepared_join",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "gate", "weight",
+                     "identity", "eps", "counter"],
+        outputNames: ["out", "state_out", "joined_norm", "prepared"],
+        source: source(), ensureRowContiguous: false, mutableInputs: ["counter"])
+
+    private static func run(_ mixer: NemotronHMamba2Mixer, convolution: MLXArray,
+                            dt: MLXArray, state: MLXArray, gate: MLXArray,
+                            counter: MLXArray, steps: Int) -> [MLXArray]? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: mixer) == NemotronHMamba2Mixer.self,
+              mixer.numHeads == 64, mixer.headDim == 64, mixer.numGroups == 8,
+              mixer.ssmStateSize == 128, mixer.convDim == 6144,
+              type(of: mixer.norm) == NemotronHRMSNormGated.self,
+              mixer.norm.groupSize == 512, mixer.norm.eps > 0, mixer.norm.eps.isFinite,
+              mixer.norm.weight.shape == [4096], mixer.norm.weight.dtype == .bfloat16,
+              let q = mixer.outProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
+              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
+              Array(convolution.strides.suffix(2)) == [6144, 1],
+              dt.shape == [1, 3, 64], dt.dtype == .float32,
+              Array(dt.strides.suffix(2)) == [64, 1],
+              mixer.aLog.shape == [64], mixer.aLog.strides == [1],
+              mixer.D.shape == [64], mixer.D.strides == [1],
+              state.shape == [1, 64, 64, 128], state.dtype == .float32,
+              Array(state.strides.suffix(3)) == [8192, 128, 1],
+              (1...3).contains(steps), gate.shape == [1, steps, 4096], gate.dtype == .bfloat16,
+              counter.shape == [8], counter.dtype == .uint32
+        else { return nil }
+        return kernel(
+            [convolution, mixer.aLog, mixer.D, dt, state, gate,
+             mixer.norm.weight, identity, mixer.norm.eps, counter],
+            template: [("T", DType.bfloat16), ("U", DType.float32), ("Dh", 64),
+                       ("Ds", 128), ("H", 64), ("G", 8), ("L", steps), ("CD", 6144),
+                       ("BO", 4096), ("CO", 5120), ("WO", true)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, steps, 64, 64], [1, 64, 64, 128],
+                           [1, steps, 4096], [steps, 8, 17 * 32]],
+            outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
+    }
+
+    static func apply(_ mixer: NemotronHMamba2Mixer, convolution: MLXArray,
+                      dt: MLXArray, state: MLXArray, gate: MLXArray)
+        -> (output: MLXArray, finalState: MLXArray, normalized: MLXArray, prepared: MLXArray)? {
+        guard enabled, NemotronMTPExecution.batchedNorm,
+              let entry = lock.withLock({ entries[ObjectIdentifier(mixer)] }),
+              entry.norm == ObjectIdentifier(mixer.norm), entry.aLog == ObjectIdentifier(mixer.aLog),
+              entry.d == ObjectIdentifier(mixer.D), entry.out == ObjectIdentifier(mixer.outProj),
+              let values = run(mixer, convolution: convolution, dt: dt, state: state,
+                               gate: gate, counter: entry.counter, steps: 3)
+        else { return nil }
+        guard NemotronMoELeader.selfTest else { return (values[0], values[1], values[2], values[3]) }
+        let expected = nemotronMTPSSMCompact(
+            convolution: convolution, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+            heads: 64, headDim: 64, groups: 8, stateDim: 128, steps: 3, writeOutput: true)
+        guard let pair = mixer.norm.preparedRows(expected.output.reshaped(1, 3, 4096), gate: gate)
+        else { return nil }
+        return (nemotronBitwiseOrNaN(values[0], expected.output),
+                nemotronBitwiseOrNaN(values[1], expected.finalState),
+                nemotronBitwiseOrNaN(values[2], pair.0), nemotronBitwiseOrNaN(values[3], pair.1))
+    }
+
+    static func qualify(_ model: Module) {
+        lock.withLock { entries = [:] }
+        guard enabled, nemotronMTPCompactSSM, NemotronMTPExecution.batchedM1,
+              NemotronMTPExecution.batchedNorm, NemotronMultiRowQMV.enabled,
+              NemotronMultiRowQMV.narrowEnabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu else { return }
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard mixers.count == 23 else { return }
+        var built: [ObjectIdentifier: Entry] = [:]
+        do {
+            let matched = try withError { () -> Bool in
+                for (layer, mixer) in mixers.enumerated() {
+                    let counter = MLXArray.zeros([8], dtype: .uint32)
+                    eval(counter)
+                    for test in 0..<3 {
+                        let keys = MLXRandom.split(
+                            key: MLXRandom.key(UInt64(0x55a000 + layer * 8 + test)), into: 4)
+                        let convolution = test == 2 ? MLXArray.zeros([1, 3, 6144], dtype: .bfloat16)
+                            : MLXRandom.normal([1, 3, 6144], dtype: .bfloat16, key: keys[0])
+                        let state = test == 2 ? MLXArray.zeros([1, 64, 64, 128], dtype: .float32)
+                            : MLXRandom.normal([1, 64, 64, 128], dtype: .float32,
+                                               scale: 0.1, key: keys[1])
+                        let rawDt = MLXRandom.normal([1, 3, 64], dtype: .bfloat16, key: keys[2])
+                        let dt = nemotronPrefillComputeDt(rawDt, mixer.dtBias, mixer.timeStepLimit)
+                        // Match production's strided z view of the full in_proj.
+                        let projected = MLXRandom.normal([1, 3, 10304], dtype: .bfloat16,
+                                                          scale: 2, key: keys[3])
+                        for keep in 1...3 {
+                            let gate = projected[0..., 0..<keep, 0..<4096]
+                            guard let got = run(mixer, convolution: convolution, dt: dt, state: state,
+                                                gate: gate, counter: counter, steps: keep)
+                            else { return false }
+                            let expected = nemotronMTPSSMCompact(
+                                convolution: convolution, ALog: mixer.aLog, D: mixer.D,
+                                dt: dt, state: state, heads: 64, headDim: 64, groups: 8,
+                                stateDim: 128, steps: keep, writeOutput: true)
+                            let normed: MLXArray, packed: MLXArray
+                            let y = expected.output.reshaped(1, keep, 4096)
+                            if let pair = mixer.norm.preparedRows(y, gate: gate) {
+                                normed = pair.0; packed = pair.1
+                            } else {
+                                normed = mixer.norm(y, gate: gate)
+                                packed = NemotronHeadPreparedActivation.prepareContiguousRows(
+                                    normed.reshaped(keep, 4096), pv: 16)
+                            }
+                            let same = logicalAnd(
+                                (got[0].view(dtype: .uint16) .== expected.output.view(dtype: .uint16)).all(),
+                                logicalAnd((got[1].view(dtype: .uint32) .== expected.finalState.view(dtype: .uint32)).all(),
+                                logicalAnd((got[2].view(dtype: .uint16) .== normed.view(dtype: .uint16)).all(),
+                                    (got[3].view(dtype: .uint32) .== packed.view(dtype: .uint32)).all())))
+                            eval(got[0], got[1], got[2], got[3], same)
+                            guard same.item(Bool.self), (counter .== MLXArray(UInt32(0))).all().item(Bool.self)
+                            else { return false }
+                        }
+                    }
+                    built[ObjectIdentifier(mixer)] = Entry(
+                        counter: counter, norm: ObjectIdentifier(mixer.norm),
+                        aLog: ObjectIdentifier(mixer.aLog), d: ObjectIdentifier(mixer.D),
+                        out: ObjectIdentifier(mixer.outProj))
+                }
+                return true
+            }
+            guard matched else { return report(false, layers: 0) }
+        } catch {
+            return report(false, layers: 0)
+        }
+        lock.withLock { entries = built }
+        report(true, layers: built.count)
+    }
+
+    private static func report(_ on: Bool, layers: Int) {
+        FileHandle.standardError.write(
+            Data("nemotron SSM gated join: \(on ? "on" : "off"), \(layers) qualified layers\n".utf8))
+    }
 }
 
 // MARK: - Grouped strict-prefix replay
