@@ -1887,7 +1887,7 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     guard s.components(separatedBy: pointers).count == 2 else { return nil }
     s = s.replacingOccurrences(of: pointers, with:
         "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;\n"
-        + "  const device float2* sbt = (const device float2*)bk;\n")
+        + "  const device uint* sbt = (const device uint*)bk;\n")
     var replaced = 0
     for indent in ["      ", "        "] {
         let from = indent + "const uint2 sr = *((const device uint2*)(sq + gi * OT));\n"
@@ -1895,12 +1895,12 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
             + indent + "const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};\n"
             + indent + "const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};\n"
         let to = indent + "const uint2 ir = *((const device uint2*)(sq + gi * OT));\n"
-            + indent + "const float2 e0 = sbt[ir.x & 0xffffu];\n"
-            + indent + "const float2 e1 = sbt[ir.x >> 16];\n"
-            + indent + "const float2 e2 = sbt[ir.y & 0xffffu];\n"
-            + indent + "const float2 e3 = sbt[ir.y >> 16];\n"
-            + indent + "const uint sv[4] = {as_type<uint>(e0.x), as_type<uint>(e1.x), as_type<uint>(e2.x), as_type<uint>(e3.x)};\n"
-            + indent + "const uint bv[4] = {as_type<uint>(e0.y), as_type<uint>(e1.y), as_type<uint>(e2.y), as_type<uint>(e3.y)};\n"
+            + indent + "const uint e0 = sbt[ir.x & 0xffffu];\n"
+            + indent + "const uint e1 = sbt[ir.x >> 16];\n"
+            + indent + "const uint e2 = sbt[ir.y & 0xffffu];\n"
+            + indent + "const uint e3 = sbt[ir.y >> 16];\n"
+            + indent + "const uint sv[4] = {e0 << 16, e1 << 16, e2 << 16, e3 << 16};\n"
+            + indent + "const uint bv[4] = {e0 & 0xffff0000u, e1 & 0xffff0000u, e2 & 0xffff0000u, e3 & 0xffff0000u};\n"
         replaced += s.components(separatedBy: from).count - 1
         s = s.replacingOccurrences(of: from, with: to)
     }
@@ -1977,7 +1977,7 @@ enum NemotronZSkip {
         let codes: MLXArray
         /// The tile-major scales, or with `dict` the tile-major uint16 pair index.
         let scales: MLXArray
-        /// The tile-major biases, or with `dict` the bank's FP32 pair table.
+        /// The tile-major biases, or with `dict` the bank's packed BF16 pair words.
         let biases: MLXArray
         var dict = false
     }
@@ -2080,7 +2080,16 @@ enum NemotronZSkip {
             }
             if sbDict, dictKernel != nil,
                let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
-                return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
+                // The shared dictionary's FP32 entries were widened exactly from BF16.
+                // Preserve both original 16-bit payloads in one word (scale low,
+                // bias high); the slot kernel restores their FP32 bits, not a
+                // numerical conversion. Other dictionary users retain d.table.
+                let words = d.table.view(dtype: .uint32).asArray(UInt32.self)
+                let packed = stride(from: 0, to: words.count, by: 2).map {
+                    (words[$0] >> 16) | (words[$0 + 1] & 0xffff0000)
+                }
+                return Copy(codes: codes, scales: tileMajor(d.index),
+                            biases: MLXArray(packed), dict: true)
             }
             return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
         }
