@@ -1735,8 +1735,6 @@ private let nemotronZSkipTiledSeqSource = """
 // four: at most 12 significant bits), so the record qdot's zero terms add +0
 // and its sum is the in-order sum of the non-zero terms: x1 * c1 (+ x2 * c2).
 // The chunk sum likewise reduces to x1 (+ x2), and the closing
-// scale * accum + sum * bias keeps the record's form. Chunks with three or
-// more non-zero values take the tiled kernel's statements unchanged.
 private let nemotronZSkipTiledFastSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
@@ -1828,34 +1826,77 @@ private let nemotronZSkipTiledFastSource = """
         }
         continue;
       }
-      thread U xt[8];
-      U sum = 0;
-      const threadgroup T* xv = xsh + 8 * c;
-      for (int i = 0; i < 8; i += 4) {
-        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
-        xt[i] = xv[i];
-        xt[i + 1] = xv[i + 1] / 16.0f;
-        xt[i + 2] = xv[i + 2] / 256.0f;
-        xt[i + 3] = xv[i + 3] / 4096.0f;
+      if (popcount(m) == 3) {
+        // The record sums each half of the chunk left to right and then adds
+        // the halves, so three non-zero terms associate as (t1 + t2) + t3
+        // unless only the first lies in the low half: t1 + (t2 + t3).
+        const int j1 = ctz(m);
+        const uint m2 = m & (m - 1);
+        const int j2 = ctz(m2);
+        const int j3 = ctz(m2 & (m2 - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const uint w3 = uint(wq[(8 * c + j3) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const T xv3 = xsh[8 * c + j3];
+        const int q1 = j1 & 3;
+        const int q2 = j2 & 3;
+        const int q3 = j3 & 3;
+        const U xt1 = q1 == 0 ? U(xv1) : (q1 == 1 ? xv1 / 16.0f : (q1 == 2 ? xv1 / 256.0f : xv1 / 4096.0f));
+        const U xt2 = q2 == 0 ? U(xv2) : (q2 == 1 ? xv2 / 16.0f : (q2 == 2 ? xv2 / 256.0f : xv2 / 4096.0f));
+        const U xt3 = q3 == 0 ? U(xv3) : (q3 == 1 ? xv3 / 16.0f : (q3 == 2 ? xv3 / 256.0f : xv3 / 4096.0f));
+        const bool split = j1 < 4 && j2 >= 4;
+        const U sum3 = split ? U(xv1) + (U(xv2) + U(xv3)) : (U(xv1) + U(xv2)) + U(xv3);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu) << (4 * q1)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu) << (4 * q2)));
+          const U c3 = U(int(((w3 >> (4 * o)) & 0xfu) << (4 * q3)));
+          const U accum = split ? xt1 * c1 + (xt2 * c2 + xt3 * c3) : (xt1 * c1 + xt2 * c2) + xt3 * c3;
+          p[o] += as_type<float>(sv[o]) * accum + sum3 * as_type<float>(bv[o]);
+        }
+        continue;
       }
-      uint u[4];
-      for (int i = 0; i < 4; i++) {
-        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
-        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
-        u[i] = lo | (hi << 16);
+      // Four or more non-zero values: the record's qdot sums the low half
+      // (inputs 0-3) and the high half (4-7) left to right from +0 and then
+      // adds the halves; its zero terms are exact no-ops, so walking the set
+      // bits in order into a low and a high accumulator gives the same sums.
+      thread U lo[4] = {0, 0, 0, 0};
+      thread U hi[4] = {0, 0, 0, 0};
+      U slo = 0;
+      U shi = 0;
+      for (uint r = m; r != 0; r &= r - 1) {
+        const int j = ctz(r);
+        const uint w = uint(wq[(8 * c + j) * 32]);
+        const T xvj = xsh[8 * c + j];
+        const int jq = j & 3;
+        const U xtj = jq == 0 ? U(xvj) : (jq == 1 ? xvj / 16.0f : (jq == 2 ? xvj / 256.0f : xvj / 4096.0f));
+        if (j < 4) {
+          slo += U(xvj);
+          for (int o = 0; o < 4; o++) {
+            lo[o] += xtj * U(int(((w >> (4 * o)) & 0xfu) << (4 * jq)));
+          }
+        } else {
+          shi += U(xvj);
+          for (int o = 0; o < 4; o++) {
+            hi[o] += xtj * U(int(((w >> (4 * o)) & 0xfu) << (4 * jq)));
+          }
+        }
       }
-      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
-      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
-      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
-      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      const U sumn = slo + shi;
       const int gi = c / 8;
       const uint2 sr = *((const device uint2*)(sq + gi * OT));
       const uint2 br = *((const device uint2*)(bq + gi * OT));
       const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
       const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
       for (int o = 0; o < 4; o++) {
-        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
-        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+        const U accum = lo[o] + hi[o];
+        p[o] += as_type<float>(sv[o]) * accum + sumn * as_type<float>(bv[o]);
       }
     }
     for (int o = 0; o < 4; o++) {
