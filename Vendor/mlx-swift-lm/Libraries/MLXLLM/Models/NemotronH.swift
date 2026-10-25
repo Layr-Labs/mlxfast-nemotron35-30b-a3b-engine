@@ -1821,6 +1821,7 @@ class NemotronHAttention: Module, NemotronHMixer {
         let length = x.dim(1)
         precondition(precomputed.map { $0.0.dim(0) == batch && $0.0.dim(1) == length } ?? true,
                      "NemotronH attention projections do not match their input rows")
+        (cache as? CBv2LayerCache)?.deferPositionOffsets = true
         // CBV2_KV_IN_PLACE_APPEND: on the captured [1, 3] verify window the
         // fused Q/K/V launch also stores the K/V rows straight into this
         // layer's contiguous cache (the slice-update copies of K and V go
@@ -1837,7 +1838,7 @@ class NemotronHAttention: Module, NemotronHMixer {
                kCache: target.keys, vCache: target.values,
                offset: target.offset, capacity: target.capacity)
         {
-            var queries = qkv.0.reshaped(batch, length, numHeads, headDim).transposed(0, 2, 1, 3)
+            var projectedQueries = qkv.0
             if NemotronMoELeader.selfTest {
                 // The cache rows just written must be bitwise the K/V rows
                 // the stock slice update would store; poison on a difference.
@@ -1850,10 +1851,12 @@ class NemotronHAttention: Module, NemotronHMixer {
                 }
                 let same = all(stored[0].view(dtype: .uint16) .== expected[0].view(dtype: .uint16))
                     .&& all(stored[1].view(dtype: .uint16) .== expected[1].view(dtype: .uint16))
-                queries = which(same, queries, MLXArray(Float.nan).asType(queries.dtype))
+                projectedQueries = which(same, projectedQueries, MLXArray(Float.nan).asType(projectedQueries.dtype))
             }
+            let queries = projectedQueries.reshaped(batch, length, numHeads, headDim).transposed(0, 2, 1, 3)
             let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
-                queries: queries, written: qkv.0, scale: scale, sinks: nil)
+                queries: queries, written: qkv.0, scale: scale, sinks: nil,
+                attendRows: NemotronMTPVerifySDPA.rows)
             return NemotronMTPAttentionDirect.project(rows, wo)
         }
         let (q, k, v) = precomputed ?? cbv2Projections(
@@ -2151,6 +2154,10 @@ class NemotronHMoEGate: Module {
     /// sigmoid/selection/normalization over the complete verification window.
     /// The multi-row kernel repeats the M=1 gemv per row in one launch.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        if topK == 6, nGroup == 1, topkGroup == 1, normTopkProb, routedScalingFactor == 2.5,
+           let fused = NemotronMTPRouterRowsSelect.run(x, weight, bias: eSCB) {
+            return fused
+        }
         let gates = NemotronMTPRouterRows.gates(x, weight)
             ?? nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
         return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,

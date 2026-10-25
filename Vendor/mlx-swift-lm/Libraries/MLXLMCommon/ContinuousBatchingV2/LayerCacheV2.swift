@@ -42,9 +42,25 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// step (it holds the offsets of the tokens about to be processed), and
     /// KV-shared layers must reuse the SOURCE layer's pre-update capture —
     /// the same discipline as `gemma4CapturePositionOffset`.
-    public var positionOffsets: MLXArray { cachedPositionOffsets }
+    public var positionOffsets: MLXArray {
+        if positionOffsetsDeferred { rebuildPositionOffsets() }
+        return cachedPositionOffsets
+    }
 
     private var cachedPositionOffsets: MLXArray
+
+    public var deferPositionOffsets = false
+    public static let deferPositionOffsetsAllowed =
+        ProcessInfo.processInfo.environment["NEMOTRON_TARGET_HOST_OFFSETS"] != "0"
+    private var positionOffsetsDeferred = false
+
+    private func advancePositionOffsets(by count: Int) {
+        if deferPositionOffsets && Self.deferPositionOffsetsAllowed {
+            positionOffsetsDeferred = true
+        } else {
+            cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+        }
+    }
 
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
@@ -152,7 +168,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             keepMask: keepMask, metadata: metadata, packet: packet)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(by: queries.dim(2))
         return output
     }
 
@@ -181,7 +197,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             attendRows: attendRows)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+        advancePositionOffsets(by: queries.dim(2))
         return outputs
     }
 
@@ -205,15 +221,16 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// new K/V into the target from `mtpInPlaceKVTarget` (`written` is any
     /// output of that kernel). Same per-query SDPA calls and offset advance.
     public func updateAndAttendSerialQueryRowsWritten(
-        queries: MLXArray, written: MLXArray, scale: Float, sinks: MLXArray?
+        queries: MLXArray, written: MLXArray, scale: Float, sinks: MLXArray?,
+        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
     ) -> [MLXArray] {
         guard let row = rows[0] as? CBv2FullSequenceKV else {
             preconditionFailure("CBv2LayerCache: in-place KV append on a non-contiguous row")
         }
         let outputs = CBv2AttentionV1.attendSerialQueryRowsWritten(
             row: row, kind: kind, queries: queries, written: written,
-            scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
+            scale: scale, sinks: sinks, softcap: attentionSoftcap, attendRows: attendRows)
+        advancePositionOffsets(by: queries.dim(2))
         return outputs
     }
 
@@ -235,7 +252,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             rows: rows, kind: kind,
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        advancePositionOffsets(by: keys.dim(2))
         return output
     }
 
@@ -260,6 +277,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     // MARK: - Private
 
     private func rebuildPositionOffsets() {
+        positionOffsetsDeferred = false
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = Self.buildPositionOffsets(rows)

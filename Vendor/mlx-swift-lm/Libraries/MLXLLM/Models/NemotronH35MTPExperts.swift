@@ -1669,6 +1669,7 @@ enum NemotronZSkip {
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+    nonisolated(unsafe) private static var oneRow: Set<ObjectIdentifier> = []
 
     private static let layout = MLXFast.metalKernel(
         name: "nemotron_zskip_kmajor_codes", inputNames: ["w"], outputNames: ["wk"],
@@ -1786,10 +1787,73 @@ enum NemotronZSkip {
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
                          owner: SwitchLinear) -> MLXArray? {
-        guard rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
-              let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        guard rows == 3 || rows == 1, x.shape == [rows * 6, 1856], x.dtype == .bfloat16,
+              inds.shape == [rows * 6], scores.shape == [rows * 6], scores.dtype == .float32,
+              let copy = lock.withLock({ () -> Copy? in
+                  let key = ObjectIdentifier(owner)
+                  return rows == 3 || oneRow.contains(key) ? copies[key] : nil
+              }) else { return nil }
+        return run(x, inds, scores, copy: copy, rows: rows)
+    }
+
+    static func prepareDraft(_ model: Module) {
+        guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu,
+              !lock.withLock({ copies.isEmpty }) else { return }
+        var added: [ObjectIdentifier: Copy] = [:]
+        for module in model.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  moe.numExpertsPerTok == 6, type(of: moe.switchMLP.fc2) == QuantizedSwitchLinear.self,
+                  let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                  down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
+                  down.biases.shape == down.scales.shape else { continue }
+            let copy = makeCopy(down)
+            eval(copy.codes, copy.scales, copy.biases)
+            let seed = 1000 + added.count
+            guard finite(down), matches(down, copy, seed: seed),
+                  matchesOneRow(down, copy, seed: seed) else {
+                FileHandle.standardError.write(
+                    Data("nemotron zskip draft off: MTP MoE layer \(added.count) failed its check\n".utf8))
+                return
+            }
+            added[ObjectIdentifier(moe.switchMLP.fc2)] = copy
+        }
+        lock.withLock {
+            for (key, copy) in added {
+                copies[key] = copy
+                oneRow.insert(key)
+            }
+        }
+        FileHandle.standardError.write(
+            Data("nemotron zskip draft on: \(added.count) MTP MoE layers\n".utf8))
+    }
+
+    private static func matchesOneRow(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
+        let offset = UInt32(seed) * 7
+        var routes: [UInt32] = [5, 33, 64, 90, 101, 127]
+        for i in routes.indices {
+            routes[i] = (routes[i] + offset) % 128
+        }
+        let inds = MLXArray(routes)
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x51c1 + seed)), into: 3)
+        let h = abs(MLXRandom.normal([6, 1856], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [6, 1856], key: keys[1]) .< MLXArray(Float(0.08))
+        let slot = MLXArray((0 ..< 6).map(Int32.init)).reshaped(6, 1)
+        let column = MLXArray((0 ..< 1856).map(Int32.init)).reshaped(1, 1856)
+        let zero = MLXArray(Float(0))
+        let oneHot = which(column .== MLXArray(Int32(1800)), MLXArray(Float(1.5)), zero)
+        let sparse = which(slot .== MLXArray(Int32(2)), zero,
+                           which(slot .== MLXArray(Int32(3)), oneHot, which(keep, h, zero)))
+        let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
+        let scores = MLXRandom.uniform(Float(0) ..< 1, [6], key: keys[2])
+        var same = MLXArray(true)
+        for a in [sparse.asType(.bfloat16), tail.asType(.bfloat16), h.asType(.bfloat16)] {
+            let act = (a * a).asType(.bfloat16)
+            let expected = NemotronMoELeader.applyWeighted(
+                act, inds, scores, rows: 1, bank: bank, tail8: NemotronMoELeader.leaderTail8)
+            let got = run(act, inds, scores, copy: copy, rows: 1)
+            same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+        }
+        return same.item(Bool.self)
     }
 
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
