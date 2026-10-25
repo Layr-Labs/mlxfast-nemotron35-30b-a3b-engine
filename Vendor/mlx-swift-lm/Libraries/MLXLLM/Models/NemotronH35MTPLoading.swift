@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -98,7 +99,18 @@ extension NemotronH35MTPAssistant {
         try NemotronDraftAttentionGeometry.warm()
         assistant.warmUpExactShapes()
         assistant.prepareDecodeResidency()
+        NemotronWiredAllocations.apply()
         return assistant
+    }
+}
+
+enum NemotronWiredAllocations {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_WIRED_ALLOCATIONS"] != "0"
+    static func apply() {
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+              let limit = GPU.maxRecommendedWorkingSetBytes(), limit > 0 else { return }
+        var previous: size_t = 0
+        _ = mlx_set_wired_limit(&previous, size_t(limit))
     }
 }
 
