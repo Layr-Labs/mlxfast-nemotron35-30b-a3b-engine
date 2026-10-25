@@ -403,7 +403,7 @@ enum NemotronHEmbeddingRows {
 
 // MARK: - MambaRMSNormGated
 
-private enum NemotronHGatedRMSKernel {
+enum NemotronHGatedRMSKernel {
     private static let source = """
             uint gid = threadgroup_position_in_grid.x;
             uint lid = thread_position_in_threadgroup.x;
@@ -565,6 +565,191 @@ class NemotronHRMSNormGated: Module {
         // Flatten back to [..., hidden] and apply learned weight
         let flattened = normed.reshaped(shape)
         return weight * flattened
+    }
+}
+
+
+// Compact verify SSM + gated RMS norm (+ out_proj preparation) in one launch.
+// The body up to the arrival is nemotron_mtp_ssm_compact's text (WO, L = 3)
+// and still stores y. Each 512-feature norm group is 8 heads = 64 of its
+// threadgroups; the last of those to finish (device counter per group, reset
+// by that group) runs nemotron_h_gated_rms_prepared_output's per-thread text
+// for the group's rows in order, on threads 0-127 (simdgroups 0-3, as in that
+// launch), reading the stored y and the gate in place from in_proj's
+// contiguous [1, 3, 10304] output (the gate is its first 4096 columns). Same y, same per-row code: y, the final
+// state, the normalized rows and the prepared activation are bitwise those of
+// the two launches, and the norm leaves the SSM -> out_proj dependency chain.
+enum NemotronHCompactSSMGated {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_SSM_GATED_FUSED"] != "0"
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_gated_prepared",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: """
+            auto n = thread_position_in_grid.z;
+            auto h_idx = n % H;
+            auto g_idx = n / G;
+            constexpr int n_per_t = (Ds + 31) / 32;
+            auto ds_idx = thread_position_in_threadgroup.x;
+            auto d_idx = thread_position_in_grid.y;
+            float prior[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                prior[i] = state_in[n * Dh * Ds + d_idx * Ds + s_idx];
+            }
+            for (int t = 0; t < L; ++t) {
+                auto x_ = static_cast<float>(conv[t * CD + n * Dh + d_idx]);
+                auto C_ = conv + t * CD + CO + g_idx * Ds;
+                auto B_ = conv + t * CD + BO + g_idx * Ds;
+                auto dt_ = static_cast<float>(dt[t * H + n]);
+                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                auto dA = fast::exp(A * dt_);
+                float acc = 0.0;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                    auto state = dA * prior[i] + dB_by_x;
+                    if (t == L - 1) {
+                        state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                    }
+                    prior[i] = static_cast<U>(state);
+                    acc += state * C_[s_idx];
+                }
+                acc = simd_sum(acc);
+                if (thread_index_in_simdgroup == 0) {
+                    out[(t * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+                }
+            }
+
+            threadgroup uint gr_last;
+            threadgroup float local_inv_mean[1];
+            threadgroup float local_sums[32];
+            threadgroup T rounded[512];
+            const uint flat = thread_position_in_threadgroup.x + 32 * thread_position_in_threadgroup.y;
+            const uint grp = n / (512 / Dh);
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (flat == 0) {
+                const uint prev = atomic_fetch_add_explicit(
+                    (device atomic_uint*)(counter + grp), 1u, memory_order_relaxed);
+                gr_last = prev == uint((512 / Dh) * (Dh / 8)) - 1u ? 1u : 0u;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (gr_last == 0u) { return; }
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+            if (flat == 0) {
+                atomic_store_explicit((device atomic_uint*)(counter + grp), 0u, memory_order_relaxed);
+            }
+            uint simd_lane_id = thread_index_in_simdgroup;
+            uint simd_group_id = simdgroup_index_in_threadgroup;
+            const uint lid = flat;
+            const bool on = lid < 128;
+            for (int row = 0; row < L; ++row) {
+                const uint gid = uint(row) * uint(H * Dh / 512) + grp;
+                int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;
+                float acc = 0;
+                float thread_x[4];
+                if (on) {
+                    for (int i = 0; i < 4; i++) {
+                        int64_t f = feature + int64_t(i);
+                        T g = proj[int64_t(row) * PS + f];
+                        auto y = 1 / (1 + metal::exp(metal::abs(g)));
+                        T sig = g < 0 ? y : 1 - y;
+                        T activated = g * sig;
+                        T gated = out[int64_t(row) * (H * Dh) + f] * activated;
+                        thread_x[i] = gated;
+                        acc += thread_x[i] * thread_x[i];
+                    }
+                }
+                acc = simd_sum(acc);
+                if (simd_group_id == 0) {
+                    local_sums[simd_lane_id] = 0;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (on && simd_lane_id == 0) {
+                    local_sums[simd_group_id] = acc;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (simd_group_id == 0) {
+                    acc = simd_sum(local_sums[simd_lane_id]);
+                    if (simd_lane_id == 0) {
+                        local_inv_mean[0] = metal::precise::rsqrt(acc / 512 + eps);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (on) {
+                    for (int i = 0; i < 4; i++) {
+                        int64_t f = feature + int64_t(i);
+                        T normalized = static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                        T unweighted = identity * normalized;
+                        T weighted = weight[f] * unweighted;
+                        normed[int64_t(row) * (H * Dh) + f] = weighted;
+                        rounded[lid * 4 + i] = weighted;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lid < 32) {
+                    float values[16];
+                    float total = 0;
+                    for (int i = 0; i < 16; i += 4) {
+                        total += float(rounded[lid * 16 + i]) + float(rounded[lid * 16 + i + 1])
+                            + float(rounded[lid * 16 + i + 2]) + float(rounded[lid * 16 + i + 3]);
+                        values[i] = rounded[lid * 16 + i];
+                        values[i + 1] = rounded[lid * 16 + i + 1] / 16.0f;
+                        values[i + 2] = rounded[lid * 16 + i + 2] / 256.0f;
+                        values[i + 3] = rounded[lid * 16 + i + 3] / 4096.0f;
+                    }
+                    const int base = int(gid) * 17 * 32 + int(lid);
+                    for (int i = 0; i < 16; i++) prepared[base + i * 32] = values[i];
+                    prepared[base + 16 * 32] = total;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            """)
+    /// Per-norm-group arrival counters; every launch leaves them at zero.
+    /// Launches are ordered (each layer's conv depends on the previous layer).
+    nonisolated(unsafe) static var counter: MLXArray?
+}
+
+extension NemotronHRMSNormGated {
+    /// nemotronMTPSSMCompact(steps = writeOutput = 3) + preparedRows in one
+    /// launch, under preparedRows' guards; returns (normalized, prepared, final
+    /// SSM state) or nil to keep the two launches.
+    func compactSSMPreparedRows(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
+        stateDim: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHRMSNormGated.self,
+              groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
+              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
+              dt.dtype == .float32, dt.shape == [1, 3, 64],
+              state.dtype == .float32, state.shape == [1, 64, 64, 128],
+              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              weight.shape == [4096], weight.dtype == .bfloat16
+        else { return nil }
+        if NemotronHCompactSSMGated.counter == nil {
+            let c = MLXArray.zeros([64], dtype: .uint32)
+            eval(c)
+            NemotronHCompactSSMGated.counter = c
+        }
+        let outputs = NemotronHCompactSSMGated.kernel(
+            [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
+             eps, NemotronHCompactSSMGated.counter!],
+            template: [("T", DType.bfloat16), ("U", DType.float32),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
+            outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
+        return (outputs[2], outputs[3], outputs[1])
     }
 }
 
@@ -4447,3 +4632,5 @@ public struct NemotronHConfiguration: Codable, Sendable {
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
 private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
+
+// Second measurement of Meganpark980320's submission 41673a07-39f4-4363-81a3-c9a7fb0c7a9c; code unchanged.
