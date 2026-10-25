@@ -970,9 +970,16 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         let rowHistory = paged.row.snapshot()
         let rowLength = rowHistory.keys.dim(2)
         let rowFirst = rowLength - spec.width
-        let rowKeep = MLXArray(Int32(0) ..< Int32(rowLength)) .<= (row + Int32(rowFirst))
-        let rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
-            .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
+        let fusedMasks = NemotronMTPDraftMasks.masks(
+            row: row, firstSpeculated: rowFirst, length: rowLength, dtype: rowHistory.keys.dtype)
+        let rowMask: MLXArray
+        if let fusedMasks {
+            rowMask = fusedMasks.0
+        } else {
+            let rowKeep = MLXArray(Int32(0) ..< Int32(rowLength)) .<= (row + Int32(rowFirst))
+            rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
+        }
         let attended = module.maskedRowOutput(
             fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
@@ -995,16 +1002,23 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         // the trusted prefix, post-verify rows 0...n for the device-picked n,
         // and the draft's own row; mask out the rows past n.
         if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged {
-            let history = paged.row.snapshot()
+            let history = paged.row.absoluteOffset == rowHistory.offset
+                && NemotronMTPDraftMasks.reuseSnapshot ? rowHistory : paged.row.snapshot()
             let length = history.keys.dim(2)
             let firstSpeculated = length - spec.width
             let own = module.draftKeyValues(inputs: inputs)
             let ownKeys = own.keys.asType(history.keys.dtype)
             let ownValues = own.values.asType(history.values.dtype)
-            let position = MLXArray(Int32(0) ..< Int32(length + 1))
-            let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
-            let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
-                .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
+            let mask: MLXArray
+            if let fusedMasks, length == rowLength, firstSpeculated == rowFirst,
+               history.keys.dtype == rowHistory.keys.dtype {
+                mask = fusedMasks.1
+            } else {
+                let position = MLXArray(Int32(0) ..< Int32(length + 1))
+                let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
+                mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                    .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
+            }
             let out2 = module.maskedSecondDraft(
                 inputs: inputs,
                 keys: concatenated([history.keys, ownKeys], axis: 2),
@@ -1045,6 +1059,42 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 enum NemotronH35MTPDeviceSecondDraft {
     static let enabled = NemotronH35MTPDeviceSecondFront.enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
+}
+
+enum NemotronMTPDraftMasks {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_MASKS"] != "0"
+    static let reuseSnapshot =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SNAPSHOT_REUSE"] != "0"
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_draft_masks",
+        inputNames: ["row", "params"], outputNames: ["first", "second"],
+        source: """
+            const int i = int(thread_position_in_grid.x);
+            const int last = row[0] + params[0];
+            const int n = params[1];
+            if (i < n) {
+                first[i] = i <= last ? T(0.0f) : T(-INFINITY);
+            }
+            if (i <= n) {
+                second[i] = (i <= last || i == n) ? T(0.0f) : T(-INFINITY);
+            }
+            """)
+
+    static func masks(row: MLXArray, firstSpeculated: Int, length: Int, dtype: DType)
+        -> (MLXArray, MLXArray)?
+    {
+        guard enabled, row.shape == [1], row.dtype == .int32, length > 0,
+              dtype == .bfloat16 || dtype == .float16 || dtype == .float32 else { return nil }
+        let params = MLXArray([Int32(firstSpeculated), Int32(length)])
+        let threads = ((length + 1 + 255) / 256) * 256
+        let out = kernel(
+            [row, params], template: [("T", dtype)],
+            grid: (threads, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, 1, length], [1, 1, 1, length + 1]],
+            outputDTypes: [dtype, dtype])
+        return (out[0], out[1])
+    }
 }
 
 enum NemotronH35MTPDeviceSecondFront {

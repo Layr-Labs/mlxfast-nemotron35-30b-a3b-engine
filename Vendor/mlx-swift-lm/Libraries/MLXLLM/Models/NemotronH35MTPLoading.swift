@@ -78,9 +78,11 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
+        NemotronSharedDownZSkip.prepare([target, assistant.module])
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
+        NemotronMTPRouterRowsSelect.qualify(target)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(

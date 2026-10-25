@@ -10,6 +10,9 @@ extension NemotronHMLP {
             return rows
         }
         let activated = nemotronMTPLinearRelu2Rows(x, upProj, prepared: prepared)
+        if x.dim(1) == 3, let skipped = NemotronSharedDownZSkip.apply(activated, down: downProj) {
+            return skipped
+        }
         return nemotronMTPLinearRows(activated, downProj)
     }
 }
@@ -1880,6 +1883,212 @@ enum NemotronZSkip {
             let act = (a * a).asType(.bfloat16)
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
+            same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+        }
+        return same.item(Bool.self)
+    }
+}
+
+//
+private let nemotronSharedDownZSkipSource = """
+  constexpr int OT = 128;
+  constexpr int LPS = 32 / SGS;
+  constexpr int chunks = K / 8;
+  constexpr int full = chunks / 32;
+  constexpr int tail = chunks - 32 * full;
+  constexpr int groups = K / 64;
+  constexpr int PS = OT + 1;
+  typedef float U;
+  threadgroup float part[32 * PS];
+  threadgroup T xsh[K];
+  threadgroup uchar cmask[chunks];
+
+  const int slot = int(threadgroup_position_in_grid.x);
+  const int tile = int(threadgroup_position_in_grid.y);
+  const int n0 = tile * OT;
+  const int lid = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const device T* xs = x + slot * K;
+  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+    const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+    uint m = 0;
+    for (int i = 0; i < 8; i++) {
+      m |= (xb[i] & 0x7fff) != 0 ? (1u << i) : 0u;
+      xsh[8 * c + i] = xs[8 * c + i];
+    }
+    cmask[c] = uchar(m);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const device uint16_t* wq = (const device uint16_t*)wk + (ulong)tile * K * 32 + lid;
+  const device T* sq = sk + (ulong)tile * groups * OT + 4 * lid;
+  const device T* bq = bk + (ulong)tile * groups * OT + 4 * lid;
+  for (int ll = 0; ll < LPS; ll++) {
+    const int l = sg + SGS * ll;
+    thread U p[4];
+    for (int o = 0; o < 4; o++) {
+      p[o] = 0;
+    }
+    const int count = l < tail ? full + 1 : full;
+    for (int j = 0; j < count; j++) {
+      const int c = j < full ? l + 32 * j : 32 * full + l;
+      const uint m = cmask[c];
+      if (m == 0) {
+        continue;
+      }
+      thread U xt[8];
+      U sum = 0;
+      const threadgroup T* xv = xsh + 8 * c;
+      for (int i = 0; i < 8; i += 4) {
+        sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+        xt[i] = xv[i];
+        xt[i + 1] = xv[i + 1] / 16.0f;
+        xt[i + 2] = xv[i + 2] / 256.0f;
+        xt[i + 3] = xv[i + 3] / 4096.0f;
+      }
+      uint u[4];
+      for (int i = 0; i < 4; i++) {
+        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;
+        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;
+        u[i] = lo | (hi << 16);
+      }
+      nmz_swap(u[0], u[1], 4, 0x0f0f0f0fu);
+      nmz_swap(u[2], u[3], 4, 0x0f0f0f0fu);
+      nmz_swap(u[0], u[2], 8, 0x00ff00ffu);
+      nmz_swap(u[1], u[3], 8, 0x00ff00ffu);
+      const int gi = c / 8;
+      const uint2 sr = *((const device uint2*)(sq + gi * OT));
+      const uint2 br = *((const device uint2*)(bq + gi * OT));
+      const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+      const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+      for (int o = 0; o < 4; o++) {
+        const uint16_t ws[2] = {uint16_t(u[o] & 0xffffu), uint16_t(u[o] >> 16)};
+        p[o] += nmz_qdot<U>(ws, xt, as_type<float>(sv[o]), as_type<float>(bv[o]), sum);
+      }
+    }
+    for (int o = 0; o < 4; o++) {
+      part[l * PS + 4 * lid + o] = p[o];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int q = 0; q < OT / SGS; q++) {
+    const int n = sg * (OT / SGS) + q;
+    const U r = simd_sum(part[lid * PS + n]);
+    if (lid == 0) {
+      y[slot * N + n0 + n] = nml_store<T, false>(r);
+    }
+  }
+"""
+
+enum NemotronSharedDownZSkip {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_DOWN_ZSKIP"] != "0"
+
+    struct Entry {
+        let copy: NemotronZSkip.Copy
+        let n: Int
+        let k: Int
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var entries: [ObjectIdentifier: Entry] = [:]
+
+    private static let layout = MLXFast.metalKernel(
+        name: "nemotron_shared_down_zskip_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
+        source: nemotronZSkipTiledLayoutSource)
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_shared_down_zskip_rows", inputNames: ["wk", "sk", "bk", "x"],
+        outputNames: ["y"], source: nemotronSharedDownZSkipSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+
+    private static func makeCopy(_ q: QuantizedLinear, biases: MLXArray, n: Int, k: Int)
+        -> NemotronZSkip.Copy
+    {
+        let tiles = n / 128, groups = k / 64
+        let codes = layout(
+            [q.weight], template: [("N", n), ("K", k)],
+            grid: (32 * tiles, k, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[tiles, k, 32]], outputDTypes: [.uint16])[0]
+        func tileMajor(_ a: MLXArray) -> MLXArray {
+            a.reshaped(tiles, 128, groups).transposed(0, 2, 1).contiguous()
+        }
+        return NemotronZSkip.Copy(
+            codes: codes, scales: tileMajor(q.scales), biases: tileMajor(biases))
+    }
+
+    private static func run(_ x: MLXArray, _ entry: Entry) -> MLXArray {
+        let threads = 32 * NemotronZSkip.sgs
+        return kernel(
+            [entry.copy.codes, entry.copy.scales, entry.copy.biases, x],
+            template: [("T", DType.bfloat16), ("K", entry.k), ("N", entry.n),
+                       ("SGS", NemotronZSkip.sgs)],
+            grid: (threads * 3, entry.n / 128, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[3, entry.n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func apply(_ activated: MLXArray, down: Linear) -> MLXArray? {
+        guard enabled, activated.ndim == 3, activated.dim(0) == 1, activated.dim(1) == 3,
+              activated.dtype == .bfloat16,
+              let entry = lock.withLock({ entries[ObjectIdentifier(down)] }),
+              activated.dim(2) == entry.k
+        else { return nil }
+        return run(activated.reshaped(3, entry.k), entry).reshaped(1, 3, entry.n)
+    }
+
+    static func prepare(_ models: [Module]) {
+        guard enabled, NemotronMTPExecution.batchedM1,
+              Device.defaultDevice().deviceType == .gpu else { return }
+        var built: [ObjectIdentifier: Entry] = [:]
+        for module in models.flatMap({ $0.modules() }) {
+            guard let moe = module as? NemotronHMoE, let mlp = moe.sharedExperts,
+                  type(of: mlp.downProj) == QuantizedLinear.self,
+                  let q = mlp.downProj as? QuantizedLinear,
+                  q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+                  let biases = q.biases, q.weight.ndim == 2, q.weight.dtype == .uint32,
+                  q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+            else { continue }
+            let n = q.weight.dim(0), k = q.weight.dim(1) * 8
+            guard n % 128 == 0, k % 64 == 0, k > 256 else { continue }
+            let entry = Entry(copy: makeCopy(q, biases: biases, n: n, k: k), n: n, k: k)
+            eval(entry.copy.codes, entry.copy.scales, entry.copy.biases)
+            guard finite(q.scales, biases), matches(q, entry, seed: built.count) else {
+                lock.withLock { entries = [:] }
+                FileHandle.standardError.write(
+                    Data("nemotron shared-down zskip off: layer \(built.count) failed its check\n".utf8))
+                return
+            }
+            built[ObjectIdentifier(mlp.downProj)] = entry
+        }
+        lock.withLock { entries = built }
+        FileHandle.standardError.write(
+            Data("nemotron shared-down zskip on: \(built.count) MoE layers\n".utf8))
+    }
+
+    private static func finite(_ scales: MLXArray, _ biases: MLXArray) -> Bool {
+        let limit = MLXArray(Float.infinity).asType(.bfloat16)
+        return logicalAnd((abs(scales) .< limit).all(), (abs(biases) .< limit).all())
+            .item(Bool.self)
+    }
+
+    private static func matches(_ q: QuantizedLinear, _ entry: Entry, seed: Int) -> Bool {
+        let k = entry.k, n = entry.n
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5d0e + seed)), into: 2)
+        let h = abs(MLXRandom.normal([3, k], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[1]) .< MLXArray(Float(0.1))
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+        let zero = MLXArray(Float(0))
+        let oneHot = which(column .== MLXArray(Int32(k - 7)), MLXArray(Float(1.5)), zero)
+        let sparse = which(row .== MLXArray(Int32(1)), zero,
+                           which(row .== MLXArray(Int32(2)), oneHot, which(keep, h, zero)))
+        let sharedMask = which(keep[0], h, zero)
+        let tail = which(column .>= MLXArray(Int32(k - 128)), h, zero)
+        var same = MLXArray(true)
+        for a in [sparse.asType(.bfloat16), sharedMask.asType(.bfloat16),
+                  tail.asType(.bfloat16), h.asType(.bfloat16)] {
+            let act = (a * a).asType(.bfloat16)
+            let expected = nemotronMTPLinearRows(act.reshaped(1, 3, k), q)
+            let got = run(act, entry).reshaped(1, 3, n)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
         }
         return same.item(Bool.self)
