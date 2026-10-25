@@ -75,12 +75,42 @@ enum PagedSegmentAttention {
         draftAttention: Bool = false,
         geometryOverride: NemotronDraftAttentionGeometry.Plan? = nil
     ) -> MLXArray {
-        var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
-        guard !group.writeValidation.isFaulted else { return q }
+        let flat = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
+        guard !group.writeValidation.isFaulted else { return flat }
         if let newKeys, let newValues {
             guard group.writeValidation.validate(keys: newKeys, values: newValues, expected: group.dtype)
-            else { return q }
+            else { return flat }
         }
+        let geometry = geometryOverride ?? NemotronDraftAttentionGeometry.select(
+            enabled: draftAttention, dtype: group.dtype, queryHeads: flat.dim(1),
+            kvHeads: group.key.kvHeads, headDim: flat.dim(2), pageSize: group.pageSize,
+            length: max(1, rows.map(\.info.attendLength).max() ?? 1), batch: flat.dim(0))
+        func run(_ plan: NemotronDraftAttentionGeometry.Plan?) -> NemotronDraftAttentionSchedule.Outputs {
+            decodeOutputs(queries: flat, newKeys: newKeys, newValues: newValues, group: group,
+                rows: rows, sinks: sinks, params: params, softcap: softcap, source: source,
+                dispatchCache: dispatchCache, geometry: plan)
+        }
+        if geometryOverride == nil, NemotronDraftAttentionSchedule.shadowPath != nil,
+           let geometry, !geometry.isStock {
+            let stock = run(geometry.stockTwin)
+            let candidate = run(geometry)
+            NemotronDraftAttentionSchedule.shadowRecord(stock, candidate,
+                describe: "b=\(flat.dim(0)) lens=\(rows.map(\.info.attendLength)) "
+                    + "write=\(newKeys != nil) ptok=\(geometry.ptok)")
+            return candidate.out
+        }
+        return run(geometry).out
+    }
+
+    /// One part + merge dispatch with an explicit geometry (nil = generic).
+    static func decodeOutputs(
+        queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
+        group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
+        sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
+        dispatchCache: PagedSegmentDispatchCache? = nil,
+        geometry: NemotronDraftAttentionGeometry.Plan?
+    ) -> NemotronDraftAttentionSchedule.Outputs {
+        var q = queries
         precondition(q.ndim == 3 && q.dim(0) == rows.count)
         precondition((newKeys == nil) == (newValues == nil))
         let dtype = group.dtype
@@ -88,9 +118,7 @@ enum PagedSegmentAttention {
         precondition(d == group.key.headDim && qh % kvh == 0)
         let gqa = qh / kvh
         let (seqinfo, maxLength) = PagedAttentionKernel.seqinfo(rows.map(\.info))
-        let geometry = geometryOverride ?? NemotronDraftAttentionGeometry.select(
-            enabled: draftAttention, dtype: dtype, queryHeads: qh, kvHeads: kvh,
-            headDim: d, pageSize: group.pageSize, length: maxLength, batch: b)
+        let schedule = geometry?.schedule ?? .init()
         let nsg = geometry == nil
             ? PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)! : 4
         let hpt = geometry?.hpt ?? PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
@@ -127,27 +155,45 @@ enum PagedSegmentAttention {
             let inputs = [q, k, v] + backing + [
                 seqinfo, params, group.writeFence, metadata.valueOffsets,
                 metadata.records, partials, meta]
-            group.writeFence = kernel(
-                key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
-                inputs,
-                template: [("T", dtype), ("D", d), ("S", group.pageSize),
-                           ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
-                           ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
-                           ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
-                           ("STRIDE", PagedSegmentDispatchPlan.recordStride)],
-                grid: (kvh * splits * 32 * nsg, bucket.workCount, 1),
-                threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
+            if schedule.isStock {
+                group.writeFence = kernel(
+                    key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
+                    inputs,
+                    template: [("T", dtype), ("D", d), ("S", group.pageSize),
+                               ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
+                               ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
+                               ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
+                               ("STRIDE", PagedSegmentDispatchPlan.recordStride)],
+                    grid: (kvh * splits * 32 * nsg, bucket.workCount, 1),
+                    threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
+            } else {
+                let psg = schedule.psg
+                let name = partKey.kernelName + "_x35\(schedule.tag)_segments\(bindingCount)_kvh\(kvh)"
+                group.writeFence = NemotronDraftAttentionSchedule.kernel(
+                    name: name, bindings: bindingCount, hasWrite: newKeys != nil, source: source)(
+                    inputs,
+                    template: [("T", dtype), ("D", d), ("S", group.pageSize),
+                               ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
+                               ("PSG", psg), ("QREG", schedule.qreg), ("HOIST", schedule.hoist),
+                               ("NEG", schedule.neg),
+                               ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
+                               ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
+                               ("STRIDE", PagedSegmentDispatchPlan.recordStride)],
+                    grid: (kvh * splits * 32 * psg, bucket.workCount, 1),
+                    threadGroup: (32 * psg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
+            }
         }
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok,
             headsPerThreadgroup: hpt)
         let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
-        return mergeKernel(key: mergeKey, source: source)(
+        let out = mergeKernel(key: mergeKey, source: source)(
             [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+        return .init(out: out, partials: partials, meta: meta)
     }
 }
 
