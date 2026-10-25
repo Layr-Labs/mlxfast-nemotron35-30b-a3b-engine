@@ -614,7 +614,7 @@ extension EngineLoopV2 {
                 // Deeper generations are submitted as soon as they are built
                 // too, so the head runs while the host builds the target
                 // graph. Evaluation order only; values are unchanged.
-                asyncEval(stepEvalTargets)
+                CBv2MTPSubmitMerge.submit(stepEvalTargets)
                 if draftIndex == 0 { mtp.recordEarlyDraftSubmission() }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = concatenated(nextRows, axis: 0)
