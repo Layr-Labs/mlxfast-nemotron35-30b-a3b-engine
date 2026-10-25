@@ -478,7 +478,7 @@ final class NemotronH35MTPExpertBlock: Module {
         let (indices, scores) = mixer.gate(h)
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP)
+                h, indices, scores, mixer.switchMLP, products: true)
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
