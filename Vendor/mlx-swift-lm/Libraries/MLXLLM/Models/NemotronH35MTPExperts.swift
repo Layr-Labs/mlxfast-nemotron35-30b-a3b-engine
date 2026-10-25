@@ -1880,27 +1880,34 @@ private let nemotronZSkipTiledFastSource = """
 // entry is the exact BF16 -> FP32 widening of the pair, so `sv` and `bv` hold
 // the same bits as the shifted BF16 words and every product is unchanged.
 // Nil when the source no longer has the expected statements.
-private func nemotronZSkipDictSource(_ source: String) -> String? {
+private func nemotronZSkipDictSource(_ source: String, wordTable: Bool = false) -> String? {
     var s = source
     let pointers = "  const device T* sq = sk + tb * groups * OT + 4 * lid;\n"
         + "  const device T* bq = bk + tb * groups * OT + 4 * lid;\n"
     guard s.components(separatedBy: pointers).count == 2 else { return nil }
     s = s.replacingOccurrences(of: pointers, with:
         "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;\n"
-        + "  const device float2* sbt = (const device float2*)bk;\n")
+        + (wordTable
+           ? "  const device uint* sbt = (const device uint*)bk;\n"
+           : "  const device float2* sbt = (const device float2*)bk;\n"))
     var replaced = 0
     for indent in ["      ", "        "] {
         let from = indent + "const uint2 sr = *((const device uint2*)(sq + gi * OT));\n"
             + indent + "const uint2 br = *((const device uint2*)(bq + gi * OT));\n"
             + indent + "const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};\n"
             + indent + "const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};\n"
+        let entryType = wordTable ? "uint" : "float2"
+        let values = wordTable
+            ? indent + "const uint sv[4] = {e0 << 16, e1 << 16, e2 << 16, e3 << 16};\n"
+                + indent + "const uint bv[4] = {e0 & 0xffff0000u, e1 & 0xffff0000u, e2 & 0xffff0000u, e3 & 0xffff0000u};\n"
+            : indent + "const uint sv[4] = {as_type<uint>(e0.x), as_type<uint>(e1.x), as_type<uint>(e2.x), as_type<uint>(e3.x)};\n"
+                + indent + "const uint bv[4] = {as_type<uint>(e0.y), as_type<uint>(e1.y), as_type<uint>(e2.y), as_type<uint>(e3.y)};\n"
         let to = indent + "const uint2 ir = *((const device uint2*)(sq + gi * OT));\n"
-            + indent + "const float2 e0 = sbt[ir.x & 0xffffu];\n"
-            + indent + "const float2 e1 = sbt[ir.x >> 16];\n"
-            + indent + "const float2 e2 = sbt[ir.y & 0xffffu];\n"
-            + indent + "const float2 e3 = sbt[ir.y >> 16];\n"
-            + indent + "const uint sv[4] = {as_type<uint>(e0.x), as_type<uint>(e1.x), as_type<uint>(e2.x), as_type<uint>(e3.x)};\n"
-            + indent + "const uint bv[4] = {as_type<uint>(e0.y), as_type<uint>(e1.y), as_type<uint>(e2.y), as_type<uint>(e3.y)};\n"
+            + indent + "const \(entryType) e0 = sbt[ir.x & 0xffffu];\n"
+            + indent + "const \(entryType) e1 = sbt[ir.x >> 16];\n"
+            + indent + "const \(entryType) e2 = sbt[ir.y & 0xffffu];\n"
+            + indent + "const \(entryType) e3 = sbt[ir.y >> 16];\n"
+            + values
         replaced += s.components(separatedBy: from).count - 1
         s = s.replacingOccurrences(of: from, with: to)
     }
@@ -1980,6 +1987,8 @@ enum NemotronZSkip {
         /// The tile-major biases, or with `dict` the bank's FP32 pair table.
         let biases: MLXArray
         var dict = false
+        /// A uint32 word retains the exact original BF16 scale/bias pair.
+        var wordTable = false
     }
 
     private static let lock = NSLock()
@@ -2034,6 +2043,37 @@ enum NemotronZSkip {
     private static var dictKernel: MLXFast.MLXFastKernel? {
         fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
     }
+    private static let tiledWordDictSlotKernel = nemotronZSkipDictSource(
+        nemotronZSkipTiledSeqSource, wordTable: true).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_sbword",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"],
+            source: $0, header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static let tiledFastWordDictSlotKernel = nemotronZSkipDictSource(
+        nemotronZSkipTiledFastSource, wordTable: true).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_fast_sbword",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"],
+            source: $0, header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static var wordTableKernel: MLXFast.MLXFastKernel? {
+        fast ? tiledFastWordDictSlotKernel : tiledWordDictSlotKernel
+    }
+    nonisolated(unsafe) private static var wordTableEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SB_WORD_TABLE"] != "0"
+    /// Load-time lossless round trip; production widens each component by bit placement.
+    private static func packedPairTable(_ table: MLXArray) -> MLXArray? {
+        guard table.dtype == .float32, table.ndim == 2, table.dim(0) > 0, table.dim(1) == 2
+        else { return nil }
+        let words = table.asType(.bfloat16).reshaped(-1).view(dtype: .uint32)
+        let decoded = words.view(dtype: .bfloat16).reshaped(table.shape).asType(.float32)
+        guard (decoded.view(dtype: .uint32) .== table.view(dtype: .uint32)).all().item(Bool.self)
+        else { return nil }
+        return words
+    }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
     /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
@@ -2080,6 +2120,10 @@ enum NemotronZSkip {
             }
             if sbDict, dictKernel != nil,
                let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
+                if wordTableEnabled, wordTableKernel != nil, let words = packedPairTable(d.table) {
+                    return Copy(codes: codes, scales: tileMajor(d.index), biases: words,
+                                dict: true, wordTable: true)
+                }
                 return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
             }
             return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
@@ -2105,7 +2149,7 @@ enum NemotronZSkip {
                                  copy: Copy, rows: Int) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
-        return (copy.dict ? dictKernel! : kernel)(
+        return (copy.wordTable ? wordTableKernel! : (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
@@ -2256,6 +2300,12 @@ enum NemotronZSkip {
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var result = build(model)
+        if case .kernelMiss = result, wordTableEnabled {
+            wordTableEnabled = false
+            FileHandle.standardError.write(
+                Data("nemotron zskip: word-table slot kernel differs; FP32 pair table\n".utf8))
+            result = build(model)
+        }
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
             sbDict = false
@@ -2288,8 +2338,9 @@ enum NemotronZSkip {
         case .built(let built):
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
+            let words = built.values.filter(\.wordTable).count
             FileHandle.standardError.write(
-                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, \(words) word tables\n".utf8))
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
