@@ -12,6 +12,7 @@ import MLXNN
 final class NemotronH35MTPCompactGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
+        let usesInProjConv: Bool
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private static let enabled =
@@ -36,10 +37,12 @@ final class NemotronH35MTPCompactGraphCache {
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared)
         }
         let usesPrepared = prepared != nil
+        let usesInProjConv = owner.mtpInProjConvDtQualified
         let slot = usesPrepared ? 1 : 0
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
-            if let entry = entries[slot], entry.identity == identity { return entry }
+            if let entry = entries[slot], entry.identity == identity,
+               entry.usesInProjConv == usesInProjConv { return entry }
             let state = owner.innerState()
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
@@ -48,7 +51,8 @@ final class NemotronH35MTPCompactGraphCache {
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[3] : nil)
             }
-            let replacement = Entry(identity: identity, function: function)
+            let replacement = Entry(identity: identity, usesInProjConv: usesInProjConv,
+                                    function: function)
             retired = entries[slot]
             entries[slot] = replacement
             return replacement
@@ -83,6 +87,78 @@ final class NemotronH35MTPCompactGraphCache {
 }
 
 extension NemotronHMamba2Mixer {
+    /// Official-worker load-only admission on every real Mamba layer. Probe
+    /// rows and history differ, so a row/channel mapping error cannot hide
+    /// behind an all-zero or repeated-row projection. No request state enters.
+    func qualifyInProjConvDt(activationDType: DType) -> Bool {
+        guard activationDType == .bfloat16, nemotronMTPCompactSSM,
+              hiddenSize == 2688, intermediateSize == 4096, convDim == 6144,
+              numHeads == 64, headDim == 64, ssmStateSize == 128,
+              convKernelSize == 4, conv1d.groups == convDim,
+              conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
+              let bias = conv1d.bias,
+              let q = inProj as? QuantizedLinear,
+              type(of: q) == QuantizedLinear.self else { return false }
+        do {
+            return try withError {
+                let old = MLXArray((0..<(3 * convDim)).map {
+                    Float(($0 / convDim) - 1) / 16
+                }).asType(.bfloat16).reshaped(1, 3, convDim)
+                let state = MLXArray.ones(
+                    [1, numHeads, headDim, ssmStateSize], dtype: .float32) * 0.25
+                for probe in 0..<3 {
+                    let x = MLXArray((0..<(3 * hiddenSize)).map { i -> Float in
+                        Float((i / hiddenSize) - 1) / 8
+                            + Float(((i + 3 * probe) % 17) - 8) / 16
+                    }).asType(.bfloat16).reshaped(3, hiddenSize)
+                    guard let fused = NemotronMambaInProjConvDt.apply(
+                        x, q, prepared: nil, oldState: old,
+                        convWeight: conv1d.weight, convBias: bias, dtBias: dtBias,
+                        timeStepLimit: timeStepLimit,
+                        convStart: intermediateSize, convDim: convDim, heads: numHeads)
+                    else { return false }
+                    let projected = nemotronMTPLinearRows(x.reshaped(1, 3, hiddenSize), inProj)
+                    let parts = split(projected,
+                        indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+                    let rawDt = parts[2].reshaped(1, 3, numHeads)
+                    guard let reference = packedConvDt(old, parts[1], rawDt) else { return false }
+                    let checks = [
+                        (fused.projected.view(dtype: .uint16)
+                            .== projected.reshaped(3, -1).view(dtype: .uint16)).all(),
+                        (fused.convolution.view(dtype: .uint16)
+                            .== reference.convolution.view(dtype: .uint16)).all(),
+                        (fused.padded.view(dtype: .uint16)
+                            .== reference.padded.view(dtype: .uint16)).all(),
+                        (fused.dt.view(dtype: .uint32)
+                            .== reference.dt.view(dtype: .uint32)).all(),
+                    ]
+                    for check in checks { if !check.item(Bool.self) { return false } }
+                    for keep in 1...3 {
+                        let a = nemotronMTPSSMCompact(
+                            convolution: fused.convolution, ALog: aLog, D: D, dt: fused.dt,
+                            state: state, heads: numHeads, headDim: headDim,
+                            groups: numGroups, stateDim: ssmStateSize,
+                            steps: keep, writeOutput: true)
+                        let b = nemotronMTPSSMCompact(
+                            convolution: reference.convolution, ALog: aLog, D: D, dt: reference.dt,
+                            state: state, heads: numHeads, headDim: headDim,
+                            groups: numGroups, stateDim: ssmStateSize,
+                            steps: keep, writeOutput: true)
+                        let same = MLX.logicalAnd(
+                            (a.finalState.view(dtype: .uint32)
+                                .== b.finalState.view(dtype: .uint32)).all(),
+                            (a.output.view(dtype: .uint16)
+                                .== b.output.view(dtype: .uint16)).all())
+                        if !same.item(Bool.self) { return false }
+                    }
+                }
+                return true
+            }
+        } catch {
+            return false
+        }
+    }
+
     func cbv2ForwardCaptured(
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
         recurrentState: [CBv2RecurrentStateEvaluation], prepared: MLXArray? = nil
@@ -161,14 +237,41 @@ extension NemotronHMamba2Mixer {
         prepared inputPrepared: MLXArray? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
-        let projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
+        // The window's conv, padded history and timestep come from in_proj's
+        // own epilogue when the shapes allow it (same values, one launch fewer).
+        var fusedWindow: (MLXArray, MLXArray, MLXArray)? = nil
+        let projected: MLXArray
+        if mtpInProjConvDtQualified,
+           batch == 1, hiddenStates.ndim == 3, convKernelSize == 4, conv1d.groups == convDim,
+           conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
+           let convBias = conv1d.bias, let q = inProj as? QuantizedLinear,
+           type(of: q) == QuantizedLinear.self,
+           let fused = NemotronMambaInProjConvDt.apply(
+               hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: inputPrepared,
+               oldState: convState, convWeight: conv1d.weight, convBias: convBias,
+               dtBias: dtBias, timeStepLimit: timeStepLimit,
+               convStart: intermediateSize, convDim: convDim, heads: numHeads) {
+            projected = fused.projected.reshaped(batch, length, -1)
+            fusedWindow = (fused.convolution, fused.padded, fused.dt)
+        } else {
+            projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
+        }
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let rawDt = parts[2].reshaped(batch, length, numHeads)
-        let (convolution, padded, dt) = packedConvDt(convState, input, rawDt) ?? {
-            let (convolution, padded) = packedConv(convState, input)
-            return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
-        }()
+        func separateWindow() -> (MLXArray, MLXArray, MLXArray) {
+            packedConvDt(convState, input, rawDt) ?? {
+                let (convolution, padded) = packedConv(convState, input)
+                return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
+            }()
+        }
+        var (convolution, padded, dt) = fusedWindow ?? separateWindow()
+        if fusedWindow != nil, NemotronMambaInProjConvDt.check {
+            let reference = separateWindow()
+            convolution = nemotronBitwiseOrNaN(convolution, reference.0)
+            padded = nemotronBitwiseOrNaN(padded, reference.1)
+            dt = nemotronBitwiseOrNaN(dt, reference.2)
+        }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
@@ -294,8 +397,16 @@ extension NemotronH35Model {
     /// a JIT compile never lands inside a timed decode window. Dummy inputs
     /// use the real parameter dtypes, hence the exact runtime instantiations.
     func warmMTPSSMKernels(activationDType: DType) {
-        guard let mixer = modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first
-        else { return }
+        let mixers = modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        if NemotronMambaInProjConvDt.enabled, nemotronMTPCompactSSM {
+            for layer in mixers {
+                layer.mtpInProjConvDtQualified = layer.qualifyInProjConvDt(
+                    activationDType: activationDType)
+            }
+            let admitted = mixers.filter { $0.mtpInProjConvDtQualified }.count
+            print("[nemotron-mtp-inproj-conv] worker admission: \(admitted)/\(mixers.count)")
+        }
+        guard let mixer = mixers.first else { return }
         let history = mixer.convKernelSize - 1
         let (heads, dim, groups, stateDim) =
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
