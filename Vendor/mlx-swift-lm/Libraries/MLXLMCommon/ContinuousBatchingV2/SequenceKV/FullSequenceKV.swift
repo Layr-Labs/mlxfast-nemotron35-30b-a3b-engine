@@ -7,6 +7,7 @@
 // a batch never touches this object (batch membership is just list membership
 // in `CBv2LayerCache.rows`).
 
+import Cmlx
 import Foundation
 import MLX
 
@@ -151,8 +152,8 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
-        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
+        keys = Self.write(keys!, newKeys, at: absoluteOffset)
+        values = Self.write(values!, newValues, at: absoluteOffset)
         absoluteOffset += n
 
         return (
@@ -200,6 +201,38 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     // MARK: - Private
+
+    /// `storage[..., offset ..< offset + n, :] = update` as one slice update
+    /// of the 4-D update as given. The subscript form drops the update's
+    /// leading singleton and reshapes it back, which copies a strided update
+    /// (the transposed K/V projection views) before the slice write; here the
+    /// slice write reads the strided view directly. The stored values are the
+    /// same. `NEMOTRON_KV_DIRECT_WRITE=0` keeps the subscript form.
+    static let directWrite =
+        ProcessInfo.processInfo.environment["NEMOTRON_KV_DIRECT_WRITE"] != "0"
+
+    private static func write(_ storage: MLXArray, _ update: MLXArray, at offset: Int) -> MLXArray {
+        guard directWrite, storage.ndim == 4, update.ndim == 4,
+              update.dim(0) == storage.dim(0), update.dim(1) == storage.dim(1),
+              update.dim(3) == storage.dim(3), update.dtype == storage.dtype
+        else {
+            var result = storage
+            result[.ellipsis, offset ..< (offset + update.dim(2)), 0...] = update
+            return result
+        }
+        let starts: [Int32] = [0, 0, Int32(offset), 0]
+        let stops: [Int32] = [
+            Int32(storage.dim(0)), Int32(storage.dim(1)), Int32(offset + update.dim(2)),
+            Int32(storage.dim(3)),
+        ]
+        let strides: [Int32] = [1, 1, 1, 1]
+        var result = mlx_array_new()
+        let rc = mlx_slice_update(
+            &result, storage.ctx, update.ctx, starts, starts.count, stops, stops.count,
+            strides, strides.count, StreamOrDevice.default.ctx)
+        precondition(rc == 0, "CBv2FullSequenceKV: mlx_slice_update failed with rc=\(rc)")
+        return MLXArray(result)
+    }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {
