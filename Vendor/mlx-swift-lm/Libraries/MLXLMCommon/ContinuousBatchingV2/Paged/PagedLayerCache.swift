@@ -53,7 +53,6 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     var attentionMetadata: CBv2AttentionMetadataForward?
     var attentionPacket: CBv2AttentionPacketForward?
 
-    /// Set only on the embedded assistant's private request-owned cache.
     public var nemotronDraftAttention = false
     public let layerIndex: Int
     public let kind: CBv2LayerKind

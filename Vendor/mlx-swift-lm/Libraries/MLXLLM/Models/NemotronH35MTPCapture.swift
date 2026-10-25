@@ -10,8 +10,22 @@ import MLXNN
 /// conv/SSM inputs and explicit replay-tape outputs. No evaluation object,
 /// transaction, prefix-replay closure or request identity enters this graph.
 final class NemotronH35MTPCompactGraphCache {
+    /// Native child identity is fixed-width metadata. Keep it inline so a
+    /// cache hit does not allocate a module array and an identifier array for
+    /// every Mamba layer in every verification window.
+    private struct Identity: Equatable {
+        let owner: ObjectIdentifier
+        let inProj: ObjectIdentifier
+        let conv1d: ObjectIdentifier
+        let norm: ObjectIdentifier
+        let outProj: ObjectIdentifier
+    }
     private struct Entry {
-        let identity: [ObjectIdentifier]
+        let identity: Identity
+        // Retain the identified children until this compiled graph retires,
+        // preventing address reuse from making a replacement look identical.
+        // The owner is deliberately excluded: it already owns this cache.
+        let retainedChildren: [Module]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private static let enabled =
@@ -48,7 +62,9 @@ final class NemotronH35MTPCompactGraphCache {
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[3] : nil)
             }
-            let replacement = Entry(identity: identity, function: function)
+            let replacement = Entry(identity: identity,
+                retainedChildren: [owner.inProj, owner.conv1d, owner.norm, owner.outProj],
+                function: function)
             retired = entries[slot]
             entries[slot] = replacement
             return replacement
@@ -67,7 +83,7 @@ final class NemotronH35MTPCompactGraphCache {
         return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
+    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> Identity? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -77,8 +93,9 @@ final class NemotronH35MTPCompactGraphCache {
               type(of: owner.conv1d) == Conv1d.self,
               type(of: owner.norm) == NemotronHRMSNormGated.self,
               linear(owner.inProj), linear(owner.outProj) else { return nil }
-        let modules: [Module] = [owner, owner.inProj, owner.conv1d, owner.norm, owner.outProj]
-        return modules.map(ObjectIdentifier.init)
+        return Identity(owner: ObjectIdentifier(owner), inProj: ObjectIdentifier(owner.inProj),
+            conv1d: ObjectIdentifier(owner.conv1d), norm: ObjectIdentifier(owner.norm),
+            outProj: ObjectIdentifier(owner.outProj))
     }
 }
 
@@ -161,40 +178,14 @@ extension NemotronHMamba2Mixer {
         prepared inputPrepared: MLXArray? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
-        // The window's conv, padded history and timestep come from in_proj's
-        // own epilogue when the shapes allow it (same values, one launch fewer).
-        var fusedWindow: (MLXArray, MLXArray, MLXArray)? = nil
-        let projected: MLXArray
-        if batch == 1, hiddenStates.ndim == 3, convKernelSize == 4, conv1d.groups == convDim,
-           conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
-           let convBias = conv1d.bias, let q = inProj as? QuantizedLinear,
-           type(of: q) == QuantizedLinear.self,
-           let fused = NemotronMambaInProjConvDt.apply(
-               hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: inputPrepared,
-               oldState: convState, convWeight: conv1d.weight, convBias: convBias,
-               dtBias: dtBias, timeStepLimit: timeStepLimit,
-               convStart: intermediateSize, convDim: convDim, heads: numHeads) {
-            projected = fused.projected.reshaped(batch, length, -1)
-            fusedWindow = (fused.convolution, fused.padded, fused.dt)
-        } else {
-            projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
-        }
+        let projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let rawDt = parts[2].reshaped(batch, length, numHeads)
-        func separateWindow() -> (MLXArray, MLXArray, MLXArray) {
-            packedConvDt(convState, input, rawDt) ?? {
-                let (convolution, padded) = packedConv(convState, input)
-                return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
-            }()
-        }
-        var (convolution, padded, dt) = fusedWindow ?? separateWindow()
-        if fusedWindow != nil, NemotronMambaInProjConvDt.check {
-            let reference = separateWindow()
-            convolution = nemotronBitwiseOrNaN(convolution, reference.0)
-            padded = nemotronBitwiseOrNaN(padded, reference.1)
-            dt = nemotronBitwiseOrNaN(dt, reference.2)
-        }
+        let (convolution, padded, dt) = packedConvDt(convState, input, rawDt) ?? {
+            let (convolution, padded) = packedConv(convState, input)
+            return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
+        }()
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let result = nemotronMTPSSMCompact(
