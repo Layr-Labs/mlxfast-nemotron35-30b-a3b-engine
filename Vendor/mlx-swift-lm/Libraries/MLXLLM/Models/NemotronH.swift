@@ -50,22 +50,9 @@ let nemotronEarlyEvalInterval = 4
 let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
-/// Layers per submitted chunk in a multi-token (prompt prefill) CBv2 forward,
-/// where each chunk also waits for the previous one so its temporaries return
-/// to MLX's buffer cache before the next chunk allocates. Every prompt prefill
-/// (engine request prefill and teacher-forced stepper alike) runs this one
-/// path. `NEMOTRON_PREFILL_REEVAL=0` restores the default spacing.
 let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
-
-/// Multi-token (prompt prefill) CBv2 forward: also submit after the first
-/// layer, as `nemotronVerifyFirstSubmit` does for the verify, so the GPU
-/// starts the first chunk while the host builds the next layer. Outside the
-/// recycling chain (the next chunk waits on nothing new). Evaluation order
-/// only. `NEMOTRON_PREFILL_FIRST_SUBMIT=0` keeps the plain interval.
-let nemotronPrefillFirstSubmit =
-    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FIRST_SUBMIT"] != "0"
 
 /// Squared ReLU activation: relu(x)^2
 private func relu2(_ x: MLXArray) -> MLXArray {
@@ -787,14 +774,9 @@ func nemotronPrefillComputeDt(
 /// identical input), and the CB repeat/promotion/exp/product/tril chain is
 /// one kernel with the same per-element arithmetic. Every matmul, cumsum
 /// and the state/output algebra is unchanged.
-/// `state == nil` is a fresh request's FP32 zero state (see
-/// `NemotronMambaZeroState`): the first window adds `decay * 0` per head
-/// instead of `decay * zeros` per element, and the window output reads a
-/// zero-stride +0.0 view, so every element sees the same IEEE operations
-/// on the same operands without a [b, h, dh, d] zero buffer.
 func nemotronSSMAttn(
     x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
-    dt: MLXArray, dtBias: MLXArray, state: MLXArray?,
+    dt: MLXArray, dtBias: MLXArray, state: MLXArray,
     timeStepLimit: (Float, Float)
 ) -> (MLXArray, MLXArray) {
     let (b, l, h, dh) = x.shape4
@@ -869,19 +851,11 @@ func nemotronSSMAttn(
         }
         var nextState = nextStateProduct
 
+        let previousState = currentState
         let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
-        let lastDecay = expDtACumsum[0..., -1, 0..., .newAxis, .newAxis]
-        let previousState: MLXArray
-        if let currentState {
-            previousState = currentState
-            nextState = nextState + lastDecay * previousState
-        } else {
-            // zeros(FP32) is uniform +0.0, so (decay * zeros)[h, i, k] is
-            // decay[h] * +0.0 for every (i, k): the same Multiply (same
-            // promotion and operand order) on [b, h, 1, 1], then the same Add.
-            previousState = NemotronMambaZeroState.view([b, h, dh, d], dtype: .float32)
-            nextState = nextState + lastDecay * NemotronMambaZeroState.scalar(.float32)
-        }
+        nextState =
+            nextState
+            + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
         if NemotronHPrefillX5.enabled, d == 128, dh % 32 == 0, h % g == 0,
            previousState.dtype == .float32, yWindow.dtype == .float32,
            expDtACumsum.dtype == .float32 {
@@ -904,37 +878,7 @@ func nemotronSSMAttn(
     }
 
     let y = MLX.concatenated(outputs, axis: 1) + x * D.reshaped(1, 1, h, 1)
-    return (y, currentState ?? MLXArray.zeros([b, h, dh, d], dtype: .float32))
-}
-
-/// Fresh-request Mamba prefill: a request with no recurrent input state
-/// starts from zero conv and SSM state. Instead of materialising
-/// [1, 3, convDim] BF16 and [1, H, Dh, Ds] FP32 zeros per layer (about 49 MB
-/// per request on the 23 Mamba layers), the conv history and the window
-/// output read a zero-stride view of one +0.0 scalar and the first scan
-/// window adds `decay * 0` per head. The values every kernel reads are the
-/// same +0.0, so outputs are bitwise identical, signed zeros and NaN
-/// propagation included. Restored, carried or partial state keeps the
-/// existing path. NEMOTRON_MAMBA_ZERO_STATE_SKIP=0 restores the zero buffers.
-enum NemotronMambaZeroState {
-    static let enabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MAMBA_ZERO_STATE_SKIP"] != "0"
-    nonisolated(unsafe) private static let float32Zero = MLXArray(Float(0))
-    nonisolated(unsafe) private static let bfloat16Zero = MLXArray(Float(0)).asType(.bfloat16)
-
-    /// +0.0 of `dtype`, the value `MLXArray.zeros(_:dtype:)` fills with.
-    static func scalar(_ dtype: DType) -> MLXArray {
-        switch dtype {
-        case .float32: return float32Zero
-        case .bfloat16: return bfloat16Zero
-        default: return MLXArray(Float(0)).asType(dtype)
-        }
-    }
-
-    /// `zeros(shape, dtype)` as a broadcast view: no buffer of `shape`.
-    static func view(_ shape: [Int], dtype: DType) -> MLXArray {
-        MLX.broadcast(scalar(dtype), to: shape)
-    }
+    return (y, currentState)
 }
 
 private let nemotronCompiledDecodeSSM = compile(shapeless: false) { (inputs: [MLXArray]) -> [MLXArray] in
@@ -1293,39 +1237,27 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let convInput = splits[1]
         let dt = splits[2]
 
-        // Fresh request (no row has any input state): zero state without
-        // zero buffers, see `NemotronMambaZeroState`.
-        let freshState = NemotronMambaZeroState.enabled
-            && recurrentState.allSatisfy { $0.inputState(modelLayerIndex: modelLayerIndex) == nil }
-        let convState: MLXArray
-        let ssmState: MLXArray?
-        if freshState {
-            convState = NemotronMambaZeroState.view(
-                [batch, max(0, convKernelSize - 1), convDim], dtype: hiddenStates.dtype)
-            ssmState = nil
-        } else {
-            var convRows: [MLXArray] = []
-            var ssmRows: [MLXArray] = []
-            convRows.reserveCapacity(batch)
-            ssmRows.reserveCapacity(batch)
-            for evaluation in recurrentState {
-                let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
-                convRows.append(
-                    state?.conv
-                        ?? MLXArray.zeros(
-                            [1, max(0, convKernelSize - 1), convDim],
-                            dtype: hiddenStates.dtype))
-                ssmRows.append(
-                    state?.ssm
-                        ?? MLXArray.zeros(
-                            [1, numHeads, headDim, ssmStateSize],
-                            dtype: .float32))
-            }
-            convState =
-                convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
-            ssmState =
-                ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+        var convRows: [MLXArray] = []
+        var ssmRows: [MLXArray] = []
+        convRows.reserveCapacity(batch)
+        ssmRows.reserveCapacity(batch)
+        for evaluation in recurrentState {
+            let state = evaluation.inputState(modelLayerIndex: modelLayerIndex)
+            convRows.append(
+                state?.conv
+                    ?? MLXArray.zeros(
+                        [1, max(0, convKernelSize - 1), convDim],
+                        dtype: hiddenStates.dtype))
+            ssmRows.append(
+                state?.ssm
+                    ?? MLXArray.zeros(
+                        [1, numHeads, headDim, ssmStateSize],
+                        dtype: .float32))
         }
+        let convState =
+            convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
+        let ssmState =
+            ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
 
         let (convOutput, padded) = packedConv(convState, convInput)
         let end = padded.dim(1)
@@ -1362,8 +1294,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             D: D,
             dt: dtArray,
             dtBias: dtBias,
-            state: ssmState
-                ?? MLXArray.zeros([batch, numHeads, headDim, ssmStateSize], dtype: .float32),
+            state: ssmState,
             timeStepLimit: timeStepLimit)
         let nextSSMState = nextState.asType(.float32)
 
@@ -1510,13 +1441,11 @@ class NemotronHAttention: Module, NemotronHMixer {
 
         // Keep parity with the selected MLX artifact's serial oracle: current
         // mlx-lm NemotronH attention does not apply RoPE despite rope_theta.
-        // Serialized MTP verify: o_proj reads the per-query outputs in place;
-        // the per-query SDPA calls run as one launch once qualified at load.
+        // Serialized MTP verify: o_proj reads the per-query outputs in place.
         if captureMTP, batch == 1, length > 1, NemotronMTPAttentionDirect.enabled,
            let layerCache = cache as? CBv2LayerCache,
            let rows = layerCache.updateAndAttendSerialQueryRows(
-               queries: queries, keys: keys, values: values, scale: scale, sinks: nil,
-               attendRows: NemotronMTPVerifySDPA.rows) {
+               queries: queries, keys: keys, values: values, scale: scale, sinks: nil) {
             return NemotronMTPAttentionDirect.project(rows, wo)
         }
         let output = cache.updateAndAttend(
@@ -1526,7 +1455,7 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo) : wo(merged)
     }
 
     // Protocol conformance
@@ -1576,7 +1505,7 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             if NemotronMoELeader.selfTest {
                 activated = nemotronBitwiseOrNaN(activated, relu2(upProj(x)).reshaped(1, 3712))
             }
-            return nemotronR1Linear(activated.reshaped(1, 1, 3712), downProj)
+            return downProj(activated.reshaped(1, 1, 3712))
         }
         return downProj(relu2(upProj(x)))
     }
@@ -3706,7 +3635,9 @@ private class NemotronHBackbone: Module {
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let observation = CBv2ForwardShapeObservation.isActive
             ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
@@ -3717,8 +3648,6 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
-        let prefillChunks = inputs.dim(1) > 1 && !captureMTP
-        let earlyEvalInterval = prefillChunks ? nemotronPrefillEvalInterval : nemotronEarlyEvalInterval
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
@@ -3758,30 +3687,17 @@ private class NemotronHBackbone: Module {
             // Start the GPU on the finished layers while the host builds the
             // rest of the graph. Evaluation order only; values are unchanged.
             if submitsEarly {
-                if prefillChunks {
+                if inputs.dim(1) > 1 && !captureMTP {
                     let group = (next - earlyEvalInterval)..<next
                     let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: group) }
                     asyncEval([hidden] + states)
-                    // Every prompt prefill. A chunk runs for milliseconds while
-                    // the host builds the next in well under one, so without a
-                    // wait the host encodes, and allocates, every layer's
-                    // intermediates before the first chunk completes. Waiting on
-                    // the previous chunk returns its temporaries to MLX's buffer
-                    // cache for the next chunk; this chunk is already queued, so
-                    // the GPU never waits on the host. Evaluation order only;
-                    // values are unchanged.
-                    if let previous = submittedPrefillChunk { eval(previous) }
-                    submittedPrefillChunk = hidden
+                    if recyclePrefillChunks {
+                        if let previous = submittedPrefillChunk { eval(previous) }
+                        submittedPrefillChunk = hidden
+                    }
                 } else {
                     asyncEval(hidden)
                 }
-            } else if prefillChunks && next == 1 && next < layers.count
-                && nemotronPrefillFirstSubmit {
-                // Layer 0 alone, ahead of the first chunk. Not recorded as a
-                // submitted chunk: the first chunk boundary still waits on
-                // nothing and every later wait is unchanged.
-                let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: 0 ..< 1) }
-                asyncEval([hidden] + states)
             }
         }
         precondition(
@@ -3871,24 +3787,6 @@ private final class NemotronHActivationDTypeMemo: @unchecked Sendable {
     }
 }
 
-/// One loaded model's input-independent engine-construction value (layer
-/// kinds, recurrent state geometry, probed dtypes), resolved on first use
-/// after the weights are bound and kept: it reads configuration and loaded
-/// parameter types only, never request tokens, bounds or state.
-final class NemotronHLoadedMemo<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var resolved: Value?
-
-    func value(_ resolve: () -> Value) -> Value {
-        lock.lock()
-        defer { lock.unlock() }
-        if let resolved { return resolved }
-        let value = resolve()
-        resolved = value
-        return value
-    }
-}
-
 // MARK: - Main Model (matches Python's Model class)
 
 public class NemotronHModel:
@@ -3900,8 +3798,6 @@ public class NemotronHModel:
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
     private let recurrentActivationDTypes = NemotronHActivationDTypeMemo()
-    private let layerKindsMemo = NemotronHLoadedMemo<[CBv2LayerKind]>()
-    private let recurrentStateSpecMemo = NemotronHLoadedMemo<CBv2RecurrentStateSpec>()
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
@@ -3910,19 +3806,15 @@ public class NemotronHModel:
     }
 
     public var cbv2LayerKinds: [CBv2LayerKind] {
-        layerKindsMemo.value { configuration.cbv2LayerKinds }
+        configuration.cbv2LayerKinds
     }
 
-    /// Memoized like the activation dtypes it is built from: every engine
-    /// and stepper adapter reads the same loaded-model geometry.
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
-        recurrentStateSpecMemo.value {
-            let activationDTypes = resolvedRecurrentActivationDTypes()
-            return configuration.cbv2RecurrentStateSpec(
-                activationDTypes: activationDTypes,
-                fallbackActivationDType:
-                    backbone.embeddings(MLXArray([0])).dtype)
-        }
+        let activationDTypes = resolvedRecurrentActivationDTypes()
+        return configuration.cbv2RecurrentStateSpec(
+            activationDTypes: activationDTypes,
+            fallbackActivationDType:
+                backbone.embeddings(MLXArray([0])).dtype)
     }
 
     public var cbv2Capabilities: CBv2ModelCapabilities {
@@ -4052,7 +3944,9 @@ public class NemotronHModel:
         _ inputs: MLXArray,
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        recyclePrefillChunks: Bool = false,
+        earlyEvalInterval: Int = nemotronEarlyEvalInterval
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -4061,7 +3955,8 @@ public class NemotronHModel:
             return attending
         }
         return backbone.cbv2Forward(
-            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP)
+            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP,
+            recyclePrefillChunks: recyclePrefillChunks, earlyEvalInterval: earlyEvalInterval)
     }
 
     /// Captured verify only; nil (nothing built) unless the fused join applies.

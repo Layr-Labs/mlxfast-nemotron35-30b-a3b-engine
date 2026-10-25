@@ -53,7 +53,6 @@ struct PagedAttentionKernelKey: Hashable {
     var partitionTokens: Int
     /// Pass A only: fuse the decode KV write into the kernel.
     var hasWrite: Bool = false
-    /// Part head split is a template and must have a distinct pipeline identity.
     var headsPerThreadgroup: Int = 0
 
     var kernelName: String {

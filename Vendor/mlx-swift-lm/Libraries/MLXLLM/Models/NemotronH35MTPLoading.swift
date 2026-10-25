@@ -75,15 +75,12 @@ extension NemotronH35MTPAssistant {
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
-        NemotronSharedUpPacking.verify(target)
-        NemotronZSkip.prepare(target)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPAttentionDirect.warm(target)
-        NemotronMTPVerifySDPA.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().

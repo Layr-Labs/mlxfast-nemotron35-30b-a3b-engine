@@ -737,14 +737,10 @@ enum CBv2AttentionV1 {
     /// concatenate that `updateAndAttend` would apply. Same KV update, same
     /// per-query SDPA calls. Only the serialized, span-free, keep-mask-free
     /// configuration is served; the caller checks that before calling.
-    /// `attendRows`, on a full-attention layer without sinks or softcap, gets
-    /// the queries, the updated K/V `[1, kvHeads, history + L, headDim]` and
-    /// the scale, and returns those per-query outputs bit for bit or nil.
     static func updateAndAttendSerialQueryRows(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?,
-        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
+        scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> [MLXArray] {
         precondition(
             queries.dim(0) == 1 && queries.dim(2) > 1,
@@ -753,10 +749,6 @@ enum CBv2AttentionV1 {
             sinks, kind: kind, queries: queries, softcap: softcap)
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if let attendRows, window(of: kind) == nil, effectiveSinks == nil, softcap == nil,
-           let outputs = attendRows(queries, cachedKeys, cachedValues, scale) {
-            return outputs
-        }
         return queryBlockOutputs(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
