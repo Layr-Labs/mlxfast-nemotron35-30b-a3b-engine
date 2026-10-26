@@ -2464,9 +2464,7 @@ enum NemotronZSkip {
             return
         }
         lock.withLock { draftCopies = built }
-        let dicts = built.values.filter(\.dict).count
-        FileHandle.standardError.write(
-            Data("nemotron draft zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+        FileHandle.standardError.write(Data("nemotron draft zskip on: \(built.count) MoE layers\n".utf8))
     }
 
     /// Seeded one-row cases against the production R = 1 kernel: sparse rows
