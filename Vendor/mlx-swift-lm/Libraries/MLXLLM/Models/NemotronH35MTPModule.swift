@@ -20,7 +20,11 @@ enum NemotronMTPFrontNorms {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FRONT"] != "0"
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED"] != "0"
-    private static let source = """
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_front_norms_concat_bf16",
+        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
+        outputNames: ["out"],
+        source: """
             constexpr uint n_reads = 4;
             const uint gid = threadgroup_position_in_grid.x;
             const uint lid = thread_position_in_threadgroup.x;
@@ -62,95 +66,7 @@ enum NemotronMTPFrontNorms {
                 out[target + i] = weight[lid * n_reads + i]
                     * static_cast<T>(thread_x[i] * local_inv_mean[0]);
             }
-            """
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_bf16",
-        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
-        outputNames: ["out"],
-        source: source, ensureRowContiguous: true)
-
-    /// The same launch also emitting eh_proj's prepared K=5376 activation
-    /// (the lane-coalesced FP32 buffer `nemotron_head_prepare_activation`
-    /// builds, PV 8: per 8-value chunk the nmr_load_vector values and sum,
-    /// from the BF16-rounded outputs). A chunk never straddles the two
-    /// halves, so each threadgroup prepares its own 336 chunks.
-    private static func preparedSource() -> String {
-        let scratch = "threadgroup float local_sums[32];"
-        // The literal's indentation is stripped to the closing delimiter's.
-        let store = "    out[target + i] = weight[lid * n_reads + i]\n"
-            + "        * static_cast<T>(thread_x[i] * local_inv_mean[0]);\n}"
-        precondition(source.components(separatedBy: scratch).count == 2)
-        precondition(source.components(separatedBy: store).count == 2)
-        return source.replacingOccurrences(of: scratch, with: scratch + "\nthreadgroup T rounded[2688];")
-            .replacingOccurrences(of: store, with: """
-                T value = weight[lid * n_reads + i]
-                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
-                out[target + i] = value;
-                rounded[lid * n_reads + i] = value;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 336) {
-                const int chunk = (second ? 336 : 0) + int(lid);
-                float values[8];
-                float total = 0;
-                for (int i = 0; i < 8; i += 4) {
-                    total += float(rounded[lid * 8 + i]) + float(rounded[lid * 8 + i + 1])
-                        + float(rounded[lid * 8 + i + 2]) + float(rounded[lid * 8 + i + 3]);
-                    values[i] = rounded[lid * 8 + i];
-                    values[i + 1] = rounded[lid * 8 + i + 1] / 16.0f;
-                    values[i + 2] = rounded[lid * 8 + i + 2] / 256.0f;
-                    values[i + 3] = rounded[lid * 8 + i + 3] / 4096.0f;
-                }
-                if (NG) total += 1.0f;
-                const int base = (int(row) * 21 + chunk / 32) * 9 * 32 + chunk % 32;
-                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
-                prepared[base + 8 * 32] = total;
-            }
-""")
-    }
-    private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_prepared_bf16",
-        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
-        outputNames: ["out", "prepared"],
-        source: preparedSource(), ensureRowContiguous: true)
-
-    /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
-    static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
-        -> (MLXArray, MLXArray)?
-    {
-        guard NemotronMTPDraftJoins.enabled, embedding.ndim == 3, embedding.dim(1) == 3,
-              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
-              let reference = eligible(embedding: embedding, hidden: hidden, enorm: enorm, hnorm: hnorm)
-        else { return nil }
-        let rows = embedding.dim(1)
-        let (a, e, h) = scalars(enorm.eps, hnorm.eps)
-        let outputs = preparedKernel([embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
-            template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
-            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
-        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
-        let expected = reference()
-        let packed = NemotronHeadPreparedActivation.pack(expected.reshaped(rows, 5376))
-        let ok = MLX.logicalAnd(
-            (outputs[0].view(dtype: .uint16) .== expected.view(dtype: .uint16)).all(),
-            (outputs[1].view(dtype: .uint32) .== packed.view(dtype: .uint32)).all())
-        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
-                which(ok, outputs[1], MLXArray(Float.nan)))
-    }
-
-    private static func eligible(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
-        -> (() -> MLXArray)?
-    {
-        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              embedding.ndim == 3, embedding.dim(0) == 1, (1...512).contains(embedding.dim(1)),
-              embedding.dim(2) == 2688, hidden.shape == embedding.shape,
-              embedding.dtype == .bfloat16, hidden.dtype == .bfloat16,
-              type(of: enorm) == RMSNorm.self, type(of: hnorm) == RMSNorm.self,
-              enorm.weight.shape == [2688], hnorm.weight.shape == [2688],
-              enorm.weight.dtype == .bfloat16, hnorm.weight.dtype == .bfloat16
-        else { return nil }
-        return { concatenated([enorm(embedding), hnorm(hidden)], axis: -1) }
-    }
+            """, ensureRowContiguous: true)
 
     nonisolated(unsafe) private static var axis: MLXArray?
     nonisolated(unsafe) private static var epsilons: [UInt32: MLXArray] = [:]
@@ -210,7 +126,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     private func fuse(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
-        nemotronR1Linear(joinedNorms(hidden: hidden, embedding: embedding), projection)
+        projection(joinedNorms(hidden: hidden, embedding: embedding))
     }
 
     private func joinedNorms(hidden: MLXArray, embedding: MLXArray) -> MLXArray {
@@ -256,65 +172,6 @@ final class NemotronH35MTPAttentionBlock: Module {
         return [front[0], front[1], q, k, v]
     }
 
-    /// `pagedForwardRows`' cache-free front: the fused residual rows and their
-    /// Q [1, heads, L, headDim] and K/V [1, kvHeads, L, headDim].
-    func frontRows(hidden: MLXArray, embedding: MLXArray)
-        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
-    {
-        // Draft-only joins at R = 3: the front norms also emit eh_proj's
-        // prepared input, and the attention norm wq's (NEMOTRON_MTP_DRAFT_JOINS).
-        let front = NemotronMTPFrontNorms.applyPrepared(
-            embedding: embedding, hidden: hidden, enorm: embeddingNorm, hnorm: hiddenNorm)
-        let joined = front?.0 ?? joinedNorms(hidden: hidden, embedding: embedding)
-        let fused = nemotronMTPLinearRows(joined, projection, prepared: front?.1)
-        var (x, xPrepared): (MLXArray, MLXArray?) = (norm(fused), nil)
-        if NemotronMTPDraftJoins.enabled,
-           let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: norm) {
-            (x, xPrepared) = pair
-            if NemotronMTPDraftJoins.negativeNorm {
-                xPrepared = NemotronHeadPreparedActivation.pack(fused.reshaped(3, 2688))
-            }
-        }
-        let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq, prepared: xPrepared)
-            .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
-            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
-            .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        return (fused, queries, keys, values)
-    }
-
-    /// One row's attention-block output (residual + projected attention) from
-    /// its query [1, heads, 1, headDim] over explicit K/V with an additive mask.
-    func maskedRowOutput(
-        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> MLXArray {
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries.asType(keys.dtype), keys: keys, values: values,
-            scale: mixer.scale, mask: .array(mask))
-        let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
-        return fused + nemotronR1Linear(merged, mixer.wo)
-    }
-
-    /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
-    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
-        (inputs[3].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3),
-         inputs[4].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3))
-    }
-
-    /// The attention of `pagedForwardParts(inputs:)` over explicit `keys` and
-    /// `values` with an additive `mask` (no cache access); output projected.
-    func maskedDraftAttention(
-        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> MLXArray {
-        let queries = inputs[2].reshaped(1, 1, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-            .asType(keys.dtype)
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: mixer.scale, mask: .array(mask))
-        return nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), mixer.wo)
-    }
-
     /// `pagedForwardParts` from `pagedDraftInputs` of the same inputs.
     func pagedForwardParts(
         inputs: [MLXArray], cache: any CBv2AttendingLayerCache
@@ -342,7 +199,7 @@ final class NemotronH35MTPAttentionBlock: Module {
 
 
     func appendTrustedKV(
-        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+        hidden: MLXArray, embedding: MLXArray, cache: any NemotronMTPDraftLayerCache
     ) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
         let batch = x.dim(0), length = x.dim(1)
@@ -478,7 +335,7 @@ final class NemotronH35MTPExpertBlock: Module {
         let (indices, scores) = mixer.gate(h)
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP, products: true)
+                h, indices, scores, mixer.switchMLP)
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
@@ -597,29 +454,6 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
     }
-    func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
-        (layers[0] as! NemotronH35MTPAttentionBlock).draftKeyValues(inputs: inputs)
-    }
-    func frontRows(hidden: MLXArray, embedding: MLXArray)
-        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
-    {
-        (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding)
-    }
-    func maskedRowOutput(
-        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> MLXArray {
-        (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowOutput(
-            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
-    }
-    /// The one-token draft step from `pagedDraftInputs` with its attention over
-    /// explicit, masked K/V instead of the paged head cache.
-    func maskedSecondDraft(
-        inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> MLXArray {
-        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedDraftAttention(
-            inputs: inputs, keys: keys, values: values, mask: mask)
-        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
-    }
     func pagedForward(inputs: [MLXArray], cache: any CBv2AttendingLayerCache) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
             inputs: inputs, cache: cache)
@@ -630,7 +464,7 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(hidden: hidden, embedding: embedding, cache: cache)
     }
     func appendTrustedKV(
-        hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
+        hidden: MLXArray, embedding: MLXArray, cache: any NemotronMTPDraftLayerCache
     ) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
             hidden: hidden, embedding: embedding, cache: cache)
@@ -673,12 +507,6 @@ extension NemotronH35Model: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
         cbv2TopTwoRows(logits)
     }
-
-    public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
-        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
-    {
-        cbv2TopTwoRowsPacket(logits, window: window)
-    }
 }
 
 extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
@@ -688,24 +516,13 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
-        NemotronHPrefillX5.requestPrefill = true
-        defer { NemotronHPrefillX5.requestPrefill = false }
-        let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
+        let hidden = cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState, recyclePrefillChunks: true,
+            earlyEvalInterval: nemotronPrefillEvalInterval)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
         case .lastPositionLogits: return (logits(last), hidden)
         }
     }
-}
-
-/// Draft-only prepared operands on the post-verify front (`frontRows`).
-/// NEMOTRON_MTP_DRAFT_JOINS=0 keeps the separate prepare launches; =negb /
-/// =negc are negative controls (each perturbs only its own piece's draft
-/// values, so acceptance must change while tokens stay the target's).
-enum NemotronMTPDraftJoins {
-    private static let setting = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_JOINS"]
-    static let enabled = setting != "0"
-    static let negativeFront = setting == "negb"
-    static let negativeNorm = setting == "negc"
 }

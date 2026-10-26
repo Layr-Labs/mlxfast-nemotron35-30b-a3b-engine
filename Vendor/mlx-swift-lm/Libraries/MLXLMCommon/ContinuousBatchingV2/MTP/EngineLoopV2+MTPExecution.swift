@@ -496,7 +496,6 @@ extension EngineLoopV2 {
         cacheInnerState: inout [MLXArray]
     ) throws -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
-        mtp.beginDecodeMemoryPreparation()
         let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
@@ -615,7 +614,7 @@ extension EngineLoopV2 {
                 // Deeper generations are submitted as soon as they are built
                 // too, so the head runs while the host builds the target
                 // graph. Evaluation order only; values are unchanged.
-                CBv2MTPSubmitMerge.submit(stepEvalTargets)
+                asyncEval(stepEvalTargets)
                 if draftIndex == 0 { mtp.recordEarlyDraftSubmission() }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
                 let stepTokens = concatenated(nextRows, axis: 0)
@@ -665,42 +664,20 @@ extension EngineLoopV2 {
             CBv2StepProfiler.record(
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
-        func concatenatedPacket() -> MLXArray {
-            var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
-            if let shortlist = target.shortlist {
-                packetParts.append(shortlist.massScaled.reshaped([-1]))
-            }
-            if CBv2MTPPolicyPacket.enabled, let values = target.policyTopTwo?.values {
-                packetParts.append(values.view(dtype: .int32).reshaped([-1]))
-            }
-            return concatenated(packetParts, axis: 0)
+        var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+        if let shortlist = target.shortlist {
+            packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
-        // The top-2 finalize already wrote this exact layout (drafts, top-1
-        // ids, top-2 value bits): no concatenate copies, and the retained
-        // draft ids are a view of it instead of a stack.
-        let acceptancePacket: MLXArray
-        var retainedDraftIDs = draftIDs
-        if let folded = target.packet, target.shortlist == nil, CBv2MTPPolicyPacket.enabled,
-            target.policyTopTwo != nil, folded.size == batch * k + batch * (k + 1) * 3
-        {
-            if CBv2MTPTopTwoPacket.selfTest {
-                let reference = concatenatedPacket()
-                eval(folded, reference)
-                precondition(
-                    folded.asArray(Int32.self) == reference.asArray(Int32.self),
-                    "CBv2 MTP: top-2 finalize packet differs from the concatenated packet")
-            }
-            acceptancePacket = folded
-            retainedDraftIDs = folded[0 ..< (batch * k)].reshaped([batch, k])
-        } else {
-            acceptancePacket = concatenatedPacket()
+        if CBv2MTPPolicyPacket.enabled, let values = target.policyTopTwo?.values {
+            packetParts.append(values.view(dtype: .int32).reshaped([-1]))
         }
+        let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
             k: k,
             rows: rowMetadata,
             acceptancePacket: acceptancePacket,
-            draftIDs: retainedDraftIDs,
+            draftIDs: draftIDs,
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,

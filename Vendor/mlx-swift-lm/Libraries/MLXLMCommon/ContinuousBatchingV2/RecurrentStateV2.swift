@@ -271,47 +271,12 @@ public struct CBv2RecurrentPrefixReplayStage {
     }
 }
 
-/// A strict-prefix commit whose replay graphs are built on first read
-/// instead of at commit: the next verify reaches layer L's committed state
-/// only when it builds layer L, so all but the first replay leave the host
-/// path that precedes the verify's first submission. Each layer is built at
-/// most once, by the same closure from the same inputs, and every reader
-/// (bound evaluations, snapshots, inspection) gets that one array.
-/// CBV2_MTP_LAZY_REPLAY=0 builds every layer at commit.
-fileprivate final class CBv2DeferredPrefixReplay {
-    static let enabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_LAZY_REPLAY"] != "0"
-
-    private let keep: Int
-    /// Unbuilt layers. A closure retains its tape until it is consumed.
-    private var replays: [Int: (Int) -> CBv2RecurrentLayerState]
-    private var built: [Int: CBv2RecurrentLayerState] = [:]
-
-    init(keep: Int, replays: [Int: (Int) -> CBv2RecurrentLayerState]) {
-        self.keep = keep
-        self.replays = replays
-    }
-
-    func layer(_ modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
-        if let state = built[modelLayerIndex] { return state }
-        guard let replay = replays.removeValue(forKey: modelLayerIndex) else { return nil }
-        let state = replay(keep)
-        built[modelLayerIndex] = state
-        return state
-    }
-
-    func all() -> [Int: CBv2RecurrentLayerState] {
-        for index in replays.keys.sorted() { _ = layer(index) }
-        return built
-    }
-}
-
 /// One request's recurrent state. Mutated only by the engine thread.
 public final class CBv2RecurrentRequestState {
     public let spec: CBv2RecurrentStateSpec
     public let byteCount: Int
     public var materializedByteCount: Int {
-        var total = committed.isEmpty && deferredCommitted == nil ? 0 : byteCount
+        var total = committed.isEmpty ? 0 : byteCount
         let (retainedTotal, retainedOverflow) = total.addingReportingOverflow(
             committedTransitionRetainedByteCount)
         if retainedOverflow { return Int.max }
@@ -353,11 +318,6 @@ public final class CBv2RecurrentRequestState {
     }
 
     private var committed: [Int: CBv2RecurrentLayerState] = [:]
-    /// Non-nil only after a strict-prefix commit, while `committed` is
-    /// empty: the confirmed state, built per layer on first read. Every
-    /// assignment of `committed` replaces it; `resolvedCommitted()` folds it
-    /// back for readers that take the whole state.
-    private var deferredCommitted: CBv2DeferredPrefixReplay?
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
     private var committedTransitionRetainedRoots: [MLXArray] = []
@@ -426,18 +386,7 @@ public final class CBv2RecurrentRequestState {
     /// itself in `CBv2RecurrentCaptureGeometry` rather than inferring it
     /// from the scheduler's optimistically advanced token cursor.
     public func confirmedStateSnapshot() -> [Int: CBv2RecurrentLayerState]? {
-        guard !isReleased else { return nil }
-        let layers = resolvedCommitted()
-        return layers.isEmpty ? nil : layers
-    }
-
-    /// `committed` with any deferred strict-prefix replays built (the same
-    /// arrays a bound evaluation already read, for layers it reached).
-    private func resolvedCommitted() -> [Int: CBv2RecurrentLayerState] {
-        if let deferred = deferredCommitted {
-            committed = deferred.all()
-            deferredCommitted = nil
-        }
+        guard !isReleased, !committed.isEmpty else { return nil }
         return committed
     }
 
@@ -464,7 +413,6 @@ public final class CBv2RecurrentRequestState {
         let input = last?.layers ?? committed
         let evaluation = CBv2RecurrentStateEvaluation(
             owner: self, generation: nextGeneration, input: input,
-            deferredInput: last == nil ? deferredCommitted : nil,
             requiredLayers: Set(spec.modelLayerIndices))
         nextGeneration &+= 1
         return evaluation
@@ -513,7 +461,6 @@ public final class CBv2RecurrentRequestState {
                         + "(got \(String(describing: keepPositions)))")
             }
             clearOlderTransitionRetention()
-            deferredCommitted = nil
             committed = first.layers.mapValues { layer in
                 CBv2RecurrentLayerState(
                     conv: layer.conv.map { $0[(keep - 1) ..< keep] },
@@ -539,18 +486,11 @@ public final class CBv2RecurrentRequestState {
                     "prefix replay commit requires a valid keepPositions")
             }
             clearOlderTransitionRetention()
-            deferredCommitted = nil
             let fullAcceptance = keep == positions
             if fullAcceptance {
                 committed = replay.mapValues { stage in
                     stage.fullAcceptance?() ?? stage.finalState
                 }
-            } else if CBv2DeferredPrefixReplay.enabled {
-                // Only the closures are kept: the same tape and input state
-                // the built graphs would retain, not the full-window finals.
-                committed = [:]
-                deferredCommitted = CBv2DeferredPrefixReplay(
-                    keep: keep, replays: replay.mapValues { $0.replay })
             } else {
                 committed = replay.mapValues { $0.replay(keep) }
             }
@@ -579,7 +519,6 @@ public final class CBv2RecurrentRequestState {
                     "keepPositions is only valid for captured or prefix replay verify windows")
             }
             clearOlderTransitionRetention()
-            deferredCommitted = nil
             committed = first.layers
         }
         pending.removeFirst()
@@ -596,7 +535,6 @@ public final class CBv2RecurrentRequestState {
     /// Test/integration inspection of the latest visible state.
     public func state(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
         pending.last?.layers[modelLayerIndex] ?? committed[modelLayerIndex]
-            ?? deferredCommitted?.layer(modelLayerIndex)
     }
 
     /// The engine has stopped and synchronized a failed planned cohort. No
@@ -613,9 +551,6 @@ public final class CBv2RecurrentRequestState {
                 "release with recurrent work still in flight")
         }
         committed.removeAll(keepingCapacity: false)
-        // Unbuilt replays were never submitted; dropping them only frees
-        // their closures. No binding is open here (guarded above).
-        deferredCommitted = nil
         committedTransitionGeneration = nil
         committedTransitionRetainedByteCount = 0
         committedTransitionRetainedRoots.removeAll(keepingCapacity: false)
@@ -631,9 +566,6 @@ public final class CBv2RecurrentStateEvaluation {
     private unowned let owner: CBv2RecurrentRequestState
     private let generation: UInt64
     private let input: [Int: CBv2RecurrentLayerState]
-    /// The owner's deferred strict-prefix commit when this binding reads
-    /// committed state: layers absent from `input` are built on first read.
-    private let deferredInput: CBv2DeferredPrefixReplay?
     private let requiredLayers: Set<Int>
     private var staged: [Int: CBv2RecurrentLayerState] = [:]
     private var stagedCapturedPositions: Int?
@@ -650,13 +582,11 @@ public final class CBv2RecurrentStateEvaluation {
 
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
-        input: [Int: CBv2RecurrentLayerState], deferredInput: CBv2DeferredPrefixReplay?,
-        requiredLayers: Set<Int>
+        input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>
     ) {
         self.owner = owner
         self.generation = generation
         self.input = input
-        self.deferredInput = deferredInput
         self.requiredLayers = requiredLayers
     }
 
@@ -665,7 +595,7 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     public func inputState(modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
-        input[modelLayerIndex] ?? deferredInput?.layer(modelLayerIndex)
+        input[modelLayerIndex]
     }
 
     /// Already-built roots only: schedule their identical graphs at an existing

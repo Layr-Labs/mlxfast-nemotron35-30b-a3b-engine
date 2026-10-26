@@ -33,7 +33,6 @@ extension EngineLoopV2 {
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
-        packet: MLXArray?,
         cacheInnerState: [MLXArray],
         diagnostics: [CBv2LogitDiagnosticPacket],
         recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
@@ -44,10 +43,6 @@ extension EngineLoopV2 {
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
-        // The acceptance packet written by the top-2 finalize itself
-        // (`CBv2MTPTopTwoPacket`); the engine uses it only for the plain
-        // argmax packet layout it reproduces.
-        var packet: MLXArray?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         var capturedInnerState: [MLXArray] = []
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
@@ -282,15 +277,7 @@ extension EngineLoopV2 {
                 let width = output.logits.dim(1)
                 let vocabulary = output.logits.dim(2)
                 let flat = output.logits.reshaped([1, batch * width, vocabulary])
-                let topTwo: (ids: MLXArray, values: MLXArray)
-                if !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
-                    let folded = provider.cbv2MTPTopTwoPacket(flat, window: tokens)
-                {
-                    topTwo = (folded.ids, folded.values)
-                    packet = folded.packet
-                } else {
-                    topTwo = provider.cbv2MTPTopTwo(flat)
-                }
+                let topTwo = provider.cbv2MTPTopTwo(flat)
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
                     topTwo.values.reshaped([batch, width, 2]).asType(.float32))
@@ -318,7 +305,7 @@ extension EngineLoopV2 {
         }
 
         return (
-            scores, hidden, shortlist, policyTopTwo, packet,
+            scores, hidden, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent)
     }
 
