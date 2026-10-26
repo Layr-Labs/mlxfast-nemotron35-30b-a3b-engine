@@ -191,7 +191,10 @@ extension NemotronH35MTPAssistant {
             backend.release(rows)
             try? recurrent.release()
         }
-        try configureRequestState(draftState, maximumSequenceLength: maxLength)
+        let liveBudget = max(0, Int(ProcessInfo.processInfo.environment[
+            "NEMOTRON_MTP_WARM_DECODE_BUDGET"] ?? "") ?? 4096)
+        try configureRequestState(
+            draftState, maximumSequenceLength: max(maxLength, promptLength + liveBudget))
         let storageRows = rows.compactMap { $0 }
         let vocabulary = target.configuration.vocabSize
         func cacheState() -> [MLXArray] { layerCaches.flatMap { $0.innerState() } }
@@ -526,4 +529,4 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Second measurement entry of this tree.
 
-// Second measurement of 208838c4.
+

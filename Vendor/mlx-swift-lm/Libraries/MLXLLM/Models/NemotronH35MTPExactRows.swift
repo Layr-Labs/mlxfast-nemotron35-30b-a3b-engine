@@ -1083,11 +1083,6 @@ enum NemotronSharedUpPacking {
 
     /// Load check of the dictionary twin on `q`: both outputs of both
     /// kernels on the same rows, bit for bit (nil when either cannot run).
-    /// The packed output is compared on the chunks the kernel writes and the
-    /// prepared QMV reads: [3, tiles, 9, 32] holds chunk t * 32 + lane at
-    /// [r, t, i, lane], and only chunks < N / 8 exist. The last tile's lanes
-    /// past N / 8 are never stored (their bytes are whatever the allocator
-    /// handed out) and never loaded (the reader's `remaining` is 0 there).
     static func dictMatches(_ x: MLXArray, _ q: QuantizedLinear) -> MLXArray? {
         guard dictKernel != nil, NemotronSBDict.dict(q) != nil,
               let a = dispatch(x, q, prepared: nil, sbDict: false),
@@ -1129,8 +1124,6 @@ enum NemotronSharedUpPacking {
         return (outputs[0], outputs[1])
     }
 
-    /// The shared relu2 rows [3, N] that `apply` hands the zero-skip shared down on its unpacked route, or nil
-    /// when `apply` would take another route (`NemotronFC2SharedColaunch` then keeps the separate launches).
     static func unpackedActivation(_ x: MLXArray, up: Linear, down: Linear,
                                    prepared: MLXArray?) -> MLXArray? {
         guard verified, !NemotronMoELeader.selfTest, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
