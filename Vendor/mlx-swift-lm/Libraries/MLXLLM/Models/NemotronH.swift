@@ -2722,6 +2722,15 @@ class NemotronHSwitchMLP: Module {
     /// sorted-rhs NAX gather, fc1/fc2 run its expert-run-aligned clone.
     /// Every value is bitwise identical to the unfused graph.
     func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray) -> MLXArray? {
+        fusedSortedCombine(x, indices, scores, addend: nil)?.out
+    }
+
+    /// `fusedSortedCombine`, and with `addend` (the shared-expert output,
+    /// same shape and dtype as the result) inside the request prefill, the
+    /// MoE block's `y + addend` in the combine launch; `added` says whether it
+    /// was applied.
+    func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, addend: MLXArray?)
+        -> (out: MLXArray, added: Bool)? {
         let k = indices.dim(-1)
         guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
               scores.shape == indices.shape,
@@ -2733,7 +2742,13 @@ class NemotronHSwitchMLP: Module {
         let kernels = NemotronHPrefillKernels.shared
         let order: MLXArray, inverse: MLXArray, idx: MLXArray
         var runTiles: NemotronHRunTiles? = nil
-        if NemotronHPrefillX5.enabled, let sorted = nemotronCountingSort(flat, experts: numExperts) {
+        var orderK: MLXArray? = nil
+        if NemotronPrefillCountingSort.verified, NemotronHPrefillX5.active,
+           let sorted = nemotronCountingSortChunked(flat, experts: numExperts, k: k) {
+            (order, inverse, idx) = (sorted.order, sorted.inverse, sorted.sorted)
+            runTiles = sorted.tiles
+            orderK = sorted.orderK
+        } else if NemotronHPrefillX5.enabled, let sorted = nemotronCountingSort(flat, experts: numExperts) {
             (order, inverse, idx) = (sorted.order, sorted.inverse, sorted.sorted)
             runTiles = sorted.tiles
         } else {
@@ -2745,7 +2760,7 @@ class NemotronHSwitchMLP: Module {
             idx = flat[order]
         }
         let xs = MLX.expandedDimensions(x, axes: [-2, -3])
-            .flattened(start: 0, end: -3)[order.floorDivide(k)]
+            .flattened(start: 0, end: -3)[orderK ?? order.floorDivide(k)]
         func gather(_ lin: SwitchLinear, _ input: MLXArray) -> MLXArray {
             if let tiles = runTiles, let q = lin as? QuantizedSwitchLinear,
                let fused = nemotronRunGather(input, q, tiles: tiles) {
@@ -2774,11 +2789,19 @@ class NemotronHSwitchMLP: Module {
         guard y.dim(-1) == inputDims, y.size == indices.size * inputDims else { return nil }
         var outShape = indices.shape
         outShape[outShape.count - 1] = inputDims
-        return kernels.combine(
+        if let addend, NemotronPrefillCombineAdd.verified, NemotronHPrefillX5.active,
+           y.dtype == .bfloat16, addend.shape == outShape, addend.dtype == y.dtype {
+            return (kernels.combineAdd(
+                [y, inverse, scores, inputDims, addend],
+                template: [("T", y.dtype), ("K", k)],
+                grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
+                outputShapes: [outShape], outputDTypes: [y.dtype])[0], true)
+        }
+        return (kernels.combine(
             [y, inverse, scores, inputDims],
             template: [("T", y.dtype), ("K", k)],
             grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
-            outputShapes: [outShape], outputDTypes: [y.dtype])[0]
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0], false)
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -2811,8 +2834,10 @@ private final class NemotronHPrefillKernels: Sendable {
     static let shared = NemotronHPrefillKernels()
     let inversePermutation: MLXFast.MLXFastKernel
     let countingSort: MLXFast.MLXFastKernel
+    let countingSortChunked: MLXFast.MLXFastKernel
     let relu2: MLXFast.MLXFastKernel
     let combine: MLXFast.MLXFastKernel
+    let combineAdd: MLXFast.MLXFastKernel
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
@@ -2870,10 +2895,18 @@ private final class NemotronHPrefillKernels: Sendable {
                     for (int ee = 0; ee < E; ++ee) {
                         int start = int(counts[ee * S]);
                         int end = (ee + 1 < E) ? int(counts[(ee + 1) * S]) : n;
-                        for (int r = start; r < end && t < tmax; r += BMT) {
+                        for (int r = start; r < end && t < tmax;) {
+                            const int remaining = end - r;
+                            // Where the original batch used 32-row tiles, preserve its
+                            // 48-row padded work for a 33...48 tail instead of rounding
+                            // that tail up to a 64-row NAX body.
+                            const int take = BMT == 64 && n / E < 64
+                                && remaining > 32 && remaining <= 48
+                                ? 32 : min(BMT, remaining);
                             tiles[3 * t] = r;
-                            tiles[3 * t + 1] = min(BMT, end - r);
+                            tiles[3 * t + 1] = take;
                             tiles[3 * t + 2] = ee;
+                            r += take;
                             t++;
                         }
                     }
@@ -2893,6 +2926,148 @@ private final class NemotronHPrefillKernels: Sendable {
                     }
                 }
             """)
+        // The same stable counting sort with each of the 32 simdgroups owning
+        // one input chunk: per-(expert, chunk) counts, one integer exclusive
+        // scan in (expert, chunk) order, and an in-order scatter 32 routes at
+        // a time (rank among equal experts from the block's lanes), so every
+        // route lands at the serial kernel's position. Also writes order / KK
+        // (the token row each sorted route gathers). Seed only, after
+        // `NemotronPrefillCountingSort.qualify`.
+        countingSortChunked = MLXFast.metalKernel(
+            name: "nemotron_moe_counting_sort_chunked",
+            inputNames: ["flat", "n", "tmax"], outputNames: ["order", "inv", "sorted", "tiles", "orderk"],
+            source: """
+                // Stable counting sort, chunk-parallel: simdgroup w owns flat
+                // chunk w. Position of route i (expert e, chunk w) = #routes
+                // with expert < e + #routes of e in chunks < w + #routes of e
+                // earlier in chunk w: the stable order of the serial kernel.
+                constexpr int W = THREADS / 32;
+                constexpr int PER = (E * W) / THREADS;
+                threadgroup uint tf[NMAX];
+                threadgroup atomic_uint table[E * W];
+                threadgroup uint sgsum[32];
+                threadgroup int tsum[32];
+                const uint tid = thread_position_in_threadgroup.x;
+                const uint lane = tid % 32;
+                const uint sg = tid / 32;
+                const int chunk = (n + W - 1) / W;
+                const int lo = min(n, int(sg) * chunk);
+                const int hi = min(n, lo + chunk);
+                for (int q = int(tid); q < E * W; q += THREADS) {
+                    atomic_store_explicit(&table[q], 0u, memory_order_relaxed);
+                }
+                for (int i = int(tid); i < n; i += THREADS) {
+                    tf[i] = flat[i];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int i = lo + int(lane); i < hi; i += 32) {
+                    const uint expert = tf[i];
+                    if (expert < uint(E)) {
+                        atomic_fetch_add_explicit(&table[expert * W + sg], 1u, memory_order_relaxed);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    // Exclusive scan of the (e, w) counts in index order (integers).
+                    uint v[PER];
+                    uint local = 0;
+                    for (int k = 0; k < PER; ++k) {
+                        v[k] = atomic_load_explicit(&table[tid * PER + k], memory_order_relaxed);
+                        local += v[k];
+                    }
+                    const uint pre = simd_prefix_exclusive_sum(local);
+                    if (lane == 31) { sgsum[sg] = pre + local; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0) {
+                        const uint w = sgsum[lane];
+                        sgsum[lane] = simd_prefix_exclusive_sum(w);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint base = pre + sgsum[sg];
+                    for (int k = 0; k < PER; ++k) {
+                        atomic_store_explicit(&table[tid * PER + k], base, memory_order_relaxed);
+                        base += v[k];
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    // Expert-run tiles of BMT rows: (first row, rows, expert), in
+                    // expert order, capped at tmax, then zero rows: the serial
+                    // loop's slots, each expert writing its own run of tiles.
+                    int start = 0, end = 0, nt = 0;
+                    if (tid < uint(E)) {
+                        start = int(atomic_load_explicit(&table[tid * W], memory_order_relaxed));
+                        end = (tid + 1 < uint(E))
+                            ? int(atomic_load_explicit(&table[(tid + 1) * W], memory_order_relaxed)) : n;
+                        const int length = end - start;
+                        const int tail = length % BMT;
+                        // Match the complete highest's adaptive 33...48 tail:
+                        // the final partial 64-row descriptor becomes 32 + rest.
+                        nt = (length + BMT - 1) / BMT
+                            + ((BMT == 64 && n / E < 64 && tail > 32 && tail <= 48) ? 1 : 0);
+                    }
+                    const int pre = simd_prefix_exclusive_sum(nt);
+                    if (lane == 31) { tsum[sg] = pre + nt; }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (sg == 0) {
+                        const int w = tsum[lane];
+                        const int tot = simd_sum(w);
+                        tsum[lane] = simd_prefix_exclusive_sum(w);
+                        if (lane == 0) { sgsum[0] = uint(tot); }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (tid < uint(E)) {
+                        int t = pre + tsum[sg];
+                        for (int r = start; r < end && t < tmax;) {
+                            const int remaining = end - r;
+                            const int take = BMT == 64 && n / E < 64
+                                && remaining > 32 && remaining <= 48
+                                ? 32 : min(BMT, remaining);
+                            tiles[3 * t] = r;
+                            tiles[3 * t + 1] = take;
+                            tiles[3 * t + 2] = int(tid);
+                            r += take;
+                            t++;
+                        }
+                    }
+                    for (int t = int(sgsum[0]) + int(tid); t < tmax; t += THREADS) {
+                        tiles[3 * t] = 0;
+                        tiles[3 * t + 1] = 0;
+                        tiles[3 * t + 2] = 0;
+                    }
+                }
+                // Scatter: 32 routes at a time per chunk, in input order; a
+                // route's rank among equal experts earlier in the block comes
+                // from the other lanes, the block's last such lane advances
+                // the (e, w) cursor.
+                for (int b = lo; b < hi; b += 32) {
+                    const int i = b + int(lane);
+                    const bool live = i < hi;
+                    const uint e = live ? tf[i] : 0xffffffffu;
+                    uint rank = 0;
+                    uint total = 0;
+                    for (uint l = 0; l < 32; ++l) {
+                        const uint o = simd_shuffle(e, ushort(l));
+                        const uint m = (o == e) ? 1u : 0u;
+                        total += m;
+                        rank += (l < lane) ? m : 0u;
+                    }
+                    uint base = 0;
+                    if (live && e < uint(E)) {
+                        base = atomic_load_explicit(&table[e * W + sg], memory_order_relaxed);
+                        const uint pos = base + rank;
+                        order[pos] = uint32_t(i);
+                        inv[i] = uint32_t(pos);
+                        sorted[pos] = uint32_t(e);
+                        orderk[pos] = uint32_t(i) / uint32_t(KK);
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    if (live && e < uint(E) && rank + 1 == total) {
+                        atomic_store_explicit(&table[e * W + sg], base + total, memory_order_relaxed);
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+""")
         inversePermutation = MLXFast.metalKernel(
             name: "nemotron_inverse_permutation",
             inputNames: ["order"], outputNames: ["inv"],
@@ -2943,12 +3118,46 @@ private final class NemotronHPrefillKernels: Sendable {
                     o[j] = static_cast<T>(total[j]);
                 }
             """)
+        // `combine` followed by the MoE block's `y + shared` (the stock
+        // T + T add) on each output element; seed only, after
+        // `NemotronPrefillCombineAdd.qualify`.
+        combineAdd = MLXFast.metalKernel(
+            name: "nemotron_moe_unsort_combine_add",
+            inputNames: ["y", "inv", "scores", "N", "addend"], outputNames: ["out"],
+            source: """
+                uint c = thread_position_in_grid.x * 4;
+                uint t = thread_position_in_grid.y;
+                float total[4];
+                for (int k = 0; k < K; ++k) {
+                    uint src = inv[t * K + k];
+                    float s = scores[t * K + k];
+                    const device T* row = y + size_t(src) * N + c;
+                    for (int j = 0; j < 4; ++j) {
+                        float v = static_cast<float>(row[j]);
+                        float p = v * s;
+                        float a = p + 0.0f;
+                        if (k == 0) {
+                            total[j] = a;
+                        } else {
+                            total[j] = a + total[j];
+                        }
+                    }
+                }
+                device T* o = out + size_t(t) * N + c;
+                const device T* a = addend + size_t(t) * N + c;
+                for (int j = 0; j < 4; ++j) {
+                    // astype(T), then the stock T + T add (float add, one rounding).
+                    const T r = static_cast<T>(total[j]);
+                    o[j] = static_cast<T>(static_cast<float>(r) + static_cast<float>(a[j]));
+                }
+            """)
     }
 }
 
-/// Rows per tile the stock gather_qmm_rhs_nax dispatch picks for M rows
-/// and E experts (`bm = (M / E < 64) ? 32 : 64` in quantized.cpp).
-func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { rows / experts < 64 ? 32 : 64 }
+/// Group expert runs into at most 64 rows. The launch uses the existing
+/// 32-row body for short descriptors, preserving its small-run work while
+/// letting busy experts share one weight load over a larger row segment.
+func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { 64 }
 
 /// Expert-run tiles [count, 3] int32 of `bm` rows: (first sorted row, rows,
 /// expert); trailing slots have rows == 0.
@@ -2971,13 +3180,168 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
     else { return nil }
     let n = flat.size
     let bm = nemotronGatherTileRows(rows: n, experts: experts)
-    let count = (n + bm - 1) / bm + experts
+    // Retain the original capacity bound: an adaptive run uses no more
+    // descriptors than its original 32/64-row partition, including split tails.
+    let capacityRows = n / experts < 64 ? 32 : 64
+    let count = (n + capacityRows - 1) / capacityRows + experts
     let out = NemotronHPrefillKernels.shared.countingSort(
         [flat, n, count], template: [("E", experts), ("THREADS", threads), ("BMT", bm)],
         grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
         outputShapes: [[n], [n], [n], [count, 3]],
         outputDTypes: [.uint32, .uint32, .uint32, .int32])
     return (out[0], out[1], out[2], NemotronHRunTiles(tiles: out[3], count: count, bm: bm, rows: n))
+}
+
+/// `nemotronCountingSort` through the chunk-parallel kernel, plus
+/// order / k; nil outside its shapes (n <= 3072, experts a multiple of 32).
+private func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
+    -> (order: MLXArray, inverse: MLXArray, sorted: MLXArray, tiles: NemotronHRunTiles,
+        orderK: MLXArray)?
+{
+    let threads = 1024
+    guard flat.ndim == 1, flat.dtype == .uint32, experts > 0, experts % 32 == 0,
+          experts * 32 <= 4 * threads, (experts * 32) % threads == 0,
+          flat.size > 0, flat.size <= 3072, k > 0
+    else { return nil }
+    let n = flat.size
+    let bm = nemotronGatherTileRows(rows: n, experts: experts)
+    // Same descriptor capacity and rows as the unchanged highest serial path.
+    let capacityRows = n / experts < 64 ? 32 : 64
+    let count = (n + capacityRows - 1) / capacityRows + experts
+    let out = NemotronHPrefillKernels.shared.countingSortChunked(
+        [flat, n, count],
+        template: [("E", experts), ("THREADS", threads), ("BMT", bm), ("NMAX", 3072), ("KK", k)],
+        grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
+        outputShapes: [[n], [n], [n], [count, 3], [n]],
+        outputDTypes: [.uint32, .uint32, .uint32, .int32, .uint32])
+    return (out[0], out[1], out[2], NemotronHRunTiles(tiles: out[3], count: count, bm: bm, rows: n),
+            out[4])
+}
+
+/// Seed-only MoE combine with the shared-expert add (`combineAdd`).
+/// `qualify` checks it bitwise against `combine` then the stock add on
+/// seeded random expert rows, routes, scores and addends.
+/// NEMOTRON_PREFILL_COMBINE_ADD=0 keeps the two launches.
+enum NemotronPrefillCombineAdd {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_COMBINE_ADD"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill combine add: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        let kernels = NemotronHPrefillKernels.shared
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, (tokens, k, n)) in [(488, 6, 2688), (97, 6, 2688), (16, 2, 64)].enumerated() {
+                    let seed = UInt64(0xc0a0_0000 + index)
+                    let y = MLXRandom.normal([tokens * k, n], dtype: .bfloat16, scale: 4,
+                                             key: MLXRandom.key(seed))
+                    let inv = argSort(MLXRandom.uniform(0 ..< 1, [tokens * k], key: MLXRandom.key(seed + 1)))
+                        .asType(.uint32)
+                    let scores = MLXRandom.uniform(0 ..< 1, [1, tokens, k], key: MLXRandom.key(seed + 2))
+                    let addend = MLXRandom.normal([1, tokens, n], dtype: .bfloat16, scale: 4,
+                                                  key: MLXRandom.key(seed + 3))
+                    let combined = kernels.combine(
+                        [y, inv, scores, n], template: [("T", DType.bfloat16), ("K", k)],
+                        grid: (n / 4, tokens, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[1, tokens, n]], outputDTypes: [.bfloat16])[0]
+                    let stock = combined + addend
+                    let fused = kernels.combineAdd(
+                        [y, inv, scores, n, addend], template: [("T", DType.bfloat16), ("K", k)],
+                        grid: (n / 4, tokens, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[1, tokens, n]], outputDTypes: [.bfloat16])[0]
+                    let same = (fused.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+                    if !same.item(Bool.self) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from combine + add after \(checked) cases)")
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`) chunk-parallel
+/// counting sort with the complete highest's adaptive descriptor tails. `qualify` runs it next to `nemotronCountingSort` on seeded
+/// top-k routes (skewed and uniform, 2 to 512 tokens) and engages it only if
+/// order, inverse, sorted ids and tiles are bitwise equal and order / k
+/// equals the stock floor divide. NEMOTRON_PREFILL_COUNTING_SORT=0 keeps the
+/// single-thread-scan kernel.
+enum NemotronPrefillCountingSort {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_COUNTING_SORT"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func qualify(experts: Int, k: Int) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill counting sort: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                func check(_ flat: MLXArray) -> Bool {
+                    guard let fast = nemotronCountingSortChunked(flat, experts: experts, k: k),
+                          let stock = nemotronCountingSort(flat, experts: experts),
+                          fast.tiles.count == stock.tiles.count,
+                          fast.tiles.bm == stock.tiles.bm,
+                          fast.tiles.tiles.shape == stock.tiles.tiles.shape
+                    else { return false }
+                    var same = MLXArray(true)
+                    for (a, b) in [(fast.order, stock.order), (fast.inverse, stock.inverse),
+                                   (fast.sorted, stock.sorted), (fast.orderK, stock.order.floorDivide(k))] {
+                        same = same .&& (a .== b).all()
+                    }
+                    same = same .&& (fast.tiles.tiles .== stock.tiles.tiles).all()
+                    return same.item(Bool.self)
+                }
+                // Exercise exact adaptive tails, skew and uneven SIMD chunks.
+                // These vectors are constructed only by the official worker.
+                for count in [1, 2, 9, 31, 32, 33, 48, 49, 64, 65, 97, 112, 128, 3071, 3072] {
+                    for routes in [
+                        [UInt32](repeating: 0, count: count),
+                        [UInt32](repeating: UInt32(experts - 1), count: count),
+                        (0..<count).map { UInt32(($0 * 7) % experts) }
+                    ] {
+                        if !check(MLXArray(routes)) { return false }
+                        checked += 1
+                    }
+                }
+                for (index, (tokens, skew)) in [(488, Float(2)), (488, 0), (512, 4), (300, 1), (9, 1), (2, 0)].enumerated() {
+                    let seed = UInt64(0x50c7_0000 + index)
+                    let logits = MLXRandom.normal([tokens, experts], key: MLXRandom.key(seed))
+                        + skew * MLXRandom.normal([1, experts], key: MLXRandom.key(seed + 1))
+                    let flat = argSort(-logits, axis: -1)[0..., ..<k].asType(.uint32).flattened()
+                    if !check(flat) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from the serial-scan kernel after \(checked) cases)")
+    }
+
+    /// Qualify with the target's first MoE layer shape.
+    static func qualify(_ target: Module) {
+        for module in target.modules() {
+            if let moe = module as? NemotronHMoE {
+                return qualify(experts: moe.switchMLP.numExperts, k: moe.numExpertsPerTok)
+            }
+        }
+        FileHandle.standardError.write(Data("nemotron prefill counting sort: off (no MoE layer)\n".utf8))
+    }
 }
 
 /// Compile the multi-token kernels at model load (same names, template
@@ -3014,7 +3378,7 @@ private func nemotronWarmUpPrefillKernels(
         grid: (4, 4, 64), threadGroup: (32, 8, 1),
         outputShapes: [[1, 64, 4, 4]], outputDTypes: [.float32])[0])
     if NemotronHPrefillX5.enabled {
-        // Counting sort for both tile heights (bm 32: rows / E < 64, else 64).
+        // Counting sort for small and large row sets, using the current descriptor bound.
         for n in [rows, 64 * experts] {
             if let cs = nemotronCountingSort(MLXArray.zeros([n], dtype: .uint32), experts: experts) {
                 arrays.append(cs.order)
@@ -4236,16 +4600,26 @@ private final class NemotronHRunGatherKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_gather_qmm_runs",
+            name: "nemotron_gather_qmm_runs_adaptive_tiles",
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
                 threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
-                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
-                    x, w, scales, biases, tiles, y, N, K, Ws,
-                    threadgroup_position_in_grid,
-                    simdgroup_index_in_threadgroup,
-                    thread_index_in_simdgroup);
+                // Descriptor length is uniform across the threadgroup. Both bodies
+                // retain the same K loop and independent per-row NAX fragment updates.
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
             """,
             header: nemotronRunGatherHeader)
     }
@@ -4255,7 +4629,7 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// (N block, expert-run tile). Only where stock GatherQMM takes the
 /// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
 /// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
-/// with the same bm; nil = use the stock op. ReLU2 is BF16-only and retains
+/// using the same per-row K fragment order; nil = use the stock op. ReLU2 is BF16-only and retains
 /// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
     _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
@@ -4317,16 +4691,21 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
+        // Request prefill: the shared-expert add rides the combine launch.
+        let shared: MLXArray? = NemotronPrefillCombineAdd.verified && NemotronHPrefillX5.active
+            ? sharedExperts.map { $0(x) } : nil
         var y: MLXArray
-        if let fused = switchMLP.fusedSortedCombine(x, inds, scores) {
-            y = fused
+        var added = false
+        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared) {
+            y = fused.out
+            added = fused.added
         } else {
             y = switchMLP(x, inds)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
 
-        if let sharedExperts {
-            y = y + sharedExperts(x)
+        if let sharedExperts, !added {
+            y = y + (shared ?? sharedExperts(x))
         }
 
         return y
@@ -4464,7 +4843,13 @@ private class NemotronHBlock: Module {
             precondition(
                 attentionCache == nil,
                 "NemotronH recurrent layer received attention KV")
-            output = (mixer as! NemotronHMamba2Mixer).cbv2ForwardCaptured(
+            let mamba = mixer as! NemotronHMamba2Mixer
+            if let joined = mamba.cbv2ForwardCapturedJoined(hidden,
+                modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
+                prepared: prepared, residual: x, nextNorm: nextNorm) {
+                return (joined.0, joined.1, joined.2)
+            }
+            output = mamba.cbv2ForwardCaptured(
                 hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                 prepared: prepared)
         case .attention:
@@ -4484,6 +4869,10 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
+            if let joined = moe.mtpForwardRowsJoined(hidden, prepared: prepared,
+                residual: x, nextNorm: nextNorm, layerIndex: modelLayerIndex) {
+                return (joined.0, joined.1, joined.2)
+            }
             if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
                 output = parts.0
                 shared = parts.1
