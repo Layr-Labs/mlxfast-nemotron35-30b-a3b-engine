@@ -91,6 +91,7 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
+        NemotronMTPDraftRouterQualification.run(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -101,6 +102,8 @@ extension NemotronH35MTPAssistant {
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
         NemotronPrefillCombineAdd.qualify()
+        NemotronPrefillScanExp.qualify()
+        NemotronPrefillBoundaryJoin.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -534,3 +537,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Second measurement of 208838c4.
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
+
+// Measurement 2 of 56613fd8 (13fa41c).
