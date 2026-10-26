@@ -751,6 +751,10 @@ enum NemotronMambaInProjConvDt {
 }
 
 enum NemotronHeadPreparedActivation {
+    /// The prepared-QMV body the shared up's R = 3 launch runs (crown form: no HF twin,
+    /// load form 0, two SIMD groups). Read by `NemotronMoEUpFC1CoLaunch`, which runs it
+    /// beside the routed FC1 in one grid.
+    static let preparedBodySource = nemotronHeadPreparedQMVSource
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
         outputNames: ["prepared"], source: nemotronHeadPrepareSource,
@@ -1131,14 +1135,39 @@ enum NemotronSharedUpPacking {
 
     /// The shared relu2 rows [3, N] that `apply` hands the zero-skip shared down on its unpacked route, or nil
     /// when `apply` would take another route (`NemotronFC2SharedColaunch` then keeps the separate launches).
+    /// True when `apply` takes the unpacked route for this call: the shared up's own
+    /// prepared QMV, no pack output. `NemotronMoEUpFC1CoLaunch` composes that same launch,
+    /// so it requires this and keeps the separate launches otherwise.
+    static func coversUnpacked(_ x: MLXArray, up: Linear, down: Linear,
+                               prepared: MLXArray?) -> Bool {
+        guard x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3 else { return false }
+        return unpackedOwner(up, down: down)
+    }
+
+    /// The same route's owner conditions, without a call's shape.
+    static func unpackedOwner(_ up: Linear, down: Linear) -> Bool {
+        guard verified, !NemotronMoELeader.selfTest, let q = up as? QuantizedLinear,
+              unpackedEnabled, NemotronSharedDownZSkip.covers(down),
+              unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) })
+        else { return false }
+        return true
+    }
+
     static func unpackedActivation(_ x: MLXArray, up: Linear, down: Linear,
                                    prepared: MLXArray?) -> MLXArray? {
-        guard verified, !NemotronMoELeader.selfTest, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
-              let q = up as? QuantizedLinear, unpackedEnabled, NemotronSharedDownZSkip.covers(down),
-              unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) })
-        else { return nil }
+        guard coversUnpacked(x, up: up, down: down, prepared: prepared),
+              let q = up as? QuantizedLinear else { return nil }
         return NemotronHeadPreparedActivation.apply(x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2,
                                                     prepared: prepared)
+    }
+
+    /// `apply`'s tail after the unpacked up rows: the shared down on `activated`
+    /// ([3, N] relu2 rows). Nil for a non-quantized shared up.
+    static func downRows(_ activated: MLXArray, up: Linear, down: Linear) -> MLXArray? {
+        guard let q = up as? QuantizedLinear else { return nil }
+        if let y = NemotronSharedDownZSkip.run(activated, owner: down) { return y }
+        return nemotronMTPLinearRows(
+            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: nil)
     }
 
     static func apply(_ x: MLXArray, up: Linear, down: Linear,
@@ -3084,106 +3113,6 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
-
-    /// Draft-only 2-bit screen records: each selected group's 64 head values
-    /// (dequantized from the head's own 4-bit codes) re-quantized on load to
-    /// 2 bits with their own minimum and step (round to nearest, clamped to
-    /// 0...3). Per row: 4 words of codes per selected group (value j of a
-    /// word at bits 2j), then one word per group holding the minimum (low
-    /// half) and the step (high half) as float16; 5 words per selected group
-    /// (rows from `rows` up: the upper group set). Only the screen's partial
-    /// pass reads them; the kept rows are rescored on the head itself.
-    static func packRecords2(
-        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
-        upperGroups: [Int]?
-    ) -> MLXArray {
-        let shifts = MLXArray((0..<16).map { UInt32(2 * $0) })
-        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
-            let columns = MLXArray(selected.flatMap { g in (0..<64).map { Int32(64 * g + $0) } })
-            var parts: [MLXArray] = []
-            for start in stride(from: range.lowerBound, to: range.upperBound, by: 8192) {
-                let r = start..<min(start + 8192, range.upperBound)
-                let values = take(
-                    dequantized(weight[r], scales: scales[r], biases: biases[r], groupSize: 64, bits: 4)
-                        .asType(.float32), columns, axis: 1
-                ).reshaped(r.count, selected.count, 64)
-                let low = values.min(axis: -1, keepDims: true)
-                let step = (values.max(axis: -1, keepDims: true) - low) / 3
-                let safe = which(step .== 0, MLXArray(Float(1)), step)
-                let codes = clip(round((values - low) / safe), min: 0, max: 3).asType(.uint32)
-                let words = (codes.reshaped(r.count, selected.count, 4, 16) << shifts).sum(axis: -1)
-                    .reshaped(r.count, selected.count * 4)
-                let lowBits = low.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let stepBits = step.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let part = concatenated([words.asType(.uint32), lowBits | (stepBits << 16)], axis: 1)
-                eval(part)
-                parts.append(part)
-            }
-            return concatenated(parts, axis: 0).reshaped(-1)
-        }
-        let lower = pack(0..<rows, groups)
-        guard let upperGroups else { return lower }
-        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
-    }
-
-    // The 2-bit record twin of the partial pass: lane l owns half-group l
-    // (32 values = two code words) of the selected groups; scores are
-    // step * sum(code * x) + minimum * sum(x) over the selected groups.
-    private static let record2PartialSource = """
-      constexpr int VPL = 32;
-      const int lane = int(thread_index_in_simdgroup);
-      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
-      const int row0 = sg * RPS;
-      const bool upper = row0 >= LO;
-      const int H = upper ? 2 * S2 : 2 * S;
-      const bool on = lane < H;
-      const int gi = lane >> 1;
-      const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
-      const int part = lane & 1;
-      const device T* xp = x + g * 64 + part * 32;
-      float xv[VPL];
-      float xs = 0.0f;
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < VPL; i += 8) {
-        _Pragma("clang loop unroll(full)")
-        for (int k = 0; k < 8; k++) {
-          const float xk = on ? float(xp[i + k]) : 0.0f;
-          xs += xk;
-          xv[i + k] = xk / float(1 << (2 * k));
-        }
-      }
-      _Pragma("clang loop unroll(full)")
-      for (int r = 0; r < RPS; r++) {
-        const int row = row0 + r;
-        float acc = 0.0f;
-        if (on) {
-          const device uint32_t* rp = rec + (upper
-              ? size_t(LO) * (5 * S) + size_t(row - LO) * (5 * S2) : size_t(row) * (5 * S));
-          const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);
-          const uint ld = rp[4 * (upper ? S2 : S) + gi];
-          const float lo = float(as_type<half>(ushort(ld & 0xffffu)));
-          const float d = float(as_type<half>(ushort(ld >> 16)));
-          float a = 0.0f;
-          _Pragma("clang loop unroll(full)")
-          for (int i = 0; i < VPL / 8; i++) {
-            const uint q = uint(ws[i]);
-            a += xv[8 * i] * float(q & 0x0003u) + xv[8 * i + 1] * float(q & 0x000cu)
-                + xv[8 * i + 2] * float(q & 0x0030u) + xv[8 * i + 3] * float(q & 0x00c0u)
-                + xv[8 * i + 4] * float(q & 0x0300u) + xv[8 * i + 5] * float(q & 0x0c00u)
-                + xv[8 * i + 6] * float(q & 0x3000u) + xv[8 * i + 7] * float(q & 0xc000u);
-          }
-          acc = d * a + lo * xs;
-        }
-        acc = simd_sum(acc);
-        if (lane == 0) {
-          scores[row] = acc;
-        }
-      }
-    """
-    private static let record2PartialKernel = MLXFast.metalKernel(
-        name: "nemotron_head_screen_partial_record2_affine2",
-        inputNames: ["rec", "x", "groups", "groups2"],
-        outputNames: ["scores"], source: record2PartialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3321,7 +3250,7 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
+        packed: MLXArray? = nil, records: MLXArray? = nil,
         counter: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
@@ -3332,12 +3261,7 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records2.map {
-            record2PartialKernel(
-                [$0, hidden, groups, upperGroups ?? groups], template: template,
-                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-                outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? records.map {
+        let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
