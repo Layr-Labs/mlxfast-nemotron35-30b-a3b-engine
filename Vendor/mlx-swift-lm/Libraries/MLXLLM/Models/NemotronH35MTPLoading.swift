@@ -471,15 +471,47 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         }
     }
 
+    /// CPU threads kept busy from a request's first verify until its lease
+    /// finishes (at most `decodeSpinMaxMillis`): the decode window's host side
+    /// then runs on an awake SoC. They touch no shared state other than their
+    /// stop flag, take no lock, allocate nothing and issue no GPU work.
+    /// NEMOTRON_DECODE_SPIN_THREADS=0 skips them.
+    static let decodeSpinThreads =
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_DECODE_SPIN_THREADS"] ?? "") ?? 2
+    static let decodeSpinMaxMillis: UInt64 = 2000
+    final class SpinStop: @unchecked Sendable {
+        private var stopped: Int32 = 0
+        func stop() { OSAtomicIncrement32Barrier(&stopped) }
+        var isStopped: Bool { OSAtomicAdd32Barrier(0, &stopped) != 0 }
+    }
+
     final class Lease: CBv2MTPMemoryLease {
         let owner: NemotronDecodeResidency
         private var decoded = false
         private var finished = false
+        private let spinStop = SpinStop()
         init(_ owner: NemotronDecodeResidency) { self.owner = owner }
+        private func startDecodeSpin() {
+            let threads = NemotronDecodeResidency.decodeSpinThreads
+            guard threads > 0 else { return }
+            let deadline = DispatchTime.now().uptimeNanoseconds
+                + NemotronDecodeResidency.decodeSpinMaxMillis * 1_000_000
+            let stop = spinStop
+            for _ in 0 ..< threads {
+                Thread.detachNewThread {
+                    var x: UInt64 = 1
+                    while !stop.isStopped && DispatchTime.now().uptimeNanoseconds < deadline {
+                        for _ in 0 ..< 1024 { x = x &* 6_364_136_223_846_793_005 &+ 1 }
+                    }
+                    _ = x
+                }
+            }
+        }
         func beginDecode() {
             guard !finished else { return }
             if !decoded {
                 decoded = true
+                startDecodeSpin()
                 for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
@@ -489,6 +521,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         func finish() {
             guard !finished else { return }
             finished = true
+            spinStop.stop()
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
                 // The requests stay standing; the next lease requests the same sets again.
@@ -575,5 +608,3 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
 
 // Measurement entry 2 of this tree.
-
-// Measurement entry 3 of this tree.
