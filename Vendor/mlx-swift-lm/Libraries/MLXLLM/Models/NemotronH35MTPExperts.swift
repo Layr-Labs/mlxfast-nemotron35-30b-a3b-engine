@@ -23,8 +23,9 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = prepared + 2 * parts + 4 * original-bank fallback.
-    private var entries: [Entry?] = Array(repeating: nil, count: 8)
+    /// Independent original routed/shared choices are fixed by the round snapshot.
+    /// Slot = prepared + 2 * parts + 4 * original routed + 8 * original shared.
+    private var entries: [Entry?] = Array(repeating: nil, count: 16)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
@@ -47,8 +48,12 @@ final class NemotronH35MTPGraphCache {
         let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
         let usesPrepared = prepared != nil
+        let originalShared = owner.sharedExperts.map {
+            NemotronZSkip.needsOriginalShared($0.downProj)
+        } ?? false
         let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
             + (NemotronZSkip.needsOriginal(owner.switchMLP.fc2) ? 4 : 0)
+            + (originalShared ? 8 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -2019,6 +2024,58 @@ enum NemotronZSkip {
     static func needsOriginal(_ owner: SwitchLinear) -> Bool {
         lock.withLock { roundOriginal.contains(ObjectIdentifier(owner)) }
     }
+    static func needsOriginalShared(_ owner: Linear) -> Bool {
+        lock.withLock { roundOriginal.contains(ObjectIdentifier(owner)) }
+    }
+
+    /// One inventory supplies both arrays and owners, so readiness cannot pair
+    /// an array group with a separately enumerated owner. Preserve the existing
+    /// routed seed prefix, then interleave remaining routed/shared copies by
+    /// numeric backbone layer. Keep a dictionary copy's table with its owner,
+    /// so readiness follows a completed request for all of that copy's backing.
+    static func decodeCopyMemoryGroups(_ model: Module, seedRoutedPrefix: Int)
+        -> [(arrays: [MLXArray], owner: ObjectIdentifier)]
+    {
+        let layers = model.namedModules().compactMap { name, module -> (Int, NemotronHMoE)? in
+            let parts = name.split(separator: ".")
+            guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count,
+                  let n = Int(parts[i + 1]), let moe = module as? NemotronHMoE else { return nil }
+            return (n, moe)
+        }.sorted { $0.0 < $1.0 }
+        typealias Group = (layer: Int, order: Int, arrays: [MLXArray], owner: ObjectIdentifier)
+        var routed: [Group] = [], shared: [Group] = []
+        var seen = Set<ObjectIdentifier>()
+        for (layer, moe) in layers {
+            let owner = ObjectIdentifier(moe.switchMLP.fc2)
+            if let copy = lock.withLock({ copies[owner] }), seen.insert(owner).inserted {
+                routed.append((layer, 0, [copy.codes, copy.scales, copy.biases], owner))
+            }
+            if let down = moe.sharedExperts?.downProj,
+               let arrays = NemotronSharedDownZSkip.residencyArrays(down) {
+                let identity = ObjectIdentifier(down)
+                if seen.insert(identity).inserted {
+                    shared.append((layer, 1, arrays, identity))
+                }
+            }
+        }
+        let cut = min(max(0, seedRoutedPrefix), routed.count)
+        let tail = (Array(routed.dropFirst(cut)) + shared).sorted {
+            $0.layer == $1.layer ? $0.order < $1.order : $0.layer < $1.layer
+        }
+        return (Array(routed.prefix(cut)) + tail).map { ($0.arrays, $0.owner) }
+    }
+
+    /// Load-time only, before the assistant creates any residency lease. The
+    /// existing private-state warm-up can compile native copy-route variants.
+    static func withOriginalCopyWarmup(_ owners: [ObjectIdentifier], _ body: () -> Void) {
+        let previous = lock.withLock { () -> Set<ObjectIdentifier> in
+            let previous = roundOriginal
+            roundOriginal.formUnion(owners)
+            return previous
+        }
+        defer { lock.withLock { roundOriginal = previous } }
+        body()
+    }
     static func decodeCopyOwners(_ model: Module) -> [ObjectIdentifier] {
         let supported = lock.withLock { Set(copies.keys) }
         return model.namedModules().compactMap { name, module -> (Int, ObjectIdentifier)? in
@@ -2220,6 +2277,11 @@ enum NemotronZSkip {
 
     /// The draft head's R = 1 weighted slot products ([6 * 2688] FP32), or nil
     /// when `owner` has no verified draft copy.
+    /// The draft copies' arrays (decode-only backing for the residency lease).
+    static var draftCopyArrays: [MLXArray] {
+        lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+
     static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               owner: SwitchLinear) -> MLXArray? {
         guard x.shape == [6, 1856], x.dtype == .bfloat16,
@@ -2408,6 +2470,204 @@ enum NemotronZSkip {
             let act = (a * a).asType(.bfloat16)
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
+            same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+        }
+        return same.item(Bool.self)
+    }
+}
+
+//
+enum NemotronSharedDownZSkip {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_DOWN_ZSKIP"] != "0"
+    private static let k = 3712
+    private static let n = 2688
+
+    private static let layout = MLXFast.metalKernel(
+        name: "nemotron_zskip_shared_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
+        source: nemotronZSkipTiledLayoutSource)
+    private static let kernel: MLXFast.MLXFastKernel? = {
+        let swaps: [(String, String)] = [
+            ("  constexpr int tail = chunks - 224;\n",
+             "  constexpr int full = chunks / 32;\n  constexpr int tail = chunks - 32 * full;\n"),
+            ("    const int count = l < tail ? 8 : 7;\n",
+             "    const int count = l < tail ? full + 1 : full;\n"),
+            ("      const int c = j < 7 ? l + 32 * j : 224 + l;\n",
+             "      const int c = j < full ? l + 32 * j : 32 * full + l;\n"),
+            ("      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;\n",
+             "      shared_y[slot * N + n0 + n] = h;\n"),
+        ]
+        var source = nemotronZSkipTiledFastSource
+        for (old, new) in swaps {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return MLXFast.metalKernel(
+            name: "nemotron_zskip_shared_down_tiled_fast",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"],
+            source: source,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }()
+
+    private struct Copy {
+        let owner: QuantizedLinear
+        let codes: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+    nonisolated(unsafe) private static var inds: MLXArray? = nil
+
+    /// Qualified immutable copies can start residency with AFC's existing
+    /// decode-only extras during the seed. Per-owner ready bits still require
+    /// the existing copy queue's completed request and round snapshot.
+    static var copyArrays: [MLXArray] {
+        guard enabled else { return [] }
+        return lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+
+    private static func admissible(_ q: QuantizedLinear) -> Bool {
+        type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
+            && q.groupSize == 64 && q.bias == nil
+            && q.weight.shape == [n, k / 8] && q.weight.dtype == .uint32
+            && q.scales.shape == [n, k / 64] && q.scales.dtype == .bfloat16
+            && q.biases?.shape == q.scales.shape && q.biases?.dtype == .bfloat16
+    }
+
+    private static func makeCopy(_ q: QuantizedLinear) -> Copy {
+        let tiles = n / 128, groups = k / 64
+        let codes = layout(
+            [q.weight.reshaped(1, n, k / 8)], template: [("N", n), ("K", k)],
+            grid: (32 * tiles, k, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[1, tiles, k, 32]], outputDTypes: [.uint16])[0]
+        func tileMajor(_ a: MLXArray) -> MLXArray {
+            a.reshaped(1, tiles, 128, groups).transposed(0, 1, 3, 2).contiguous()
+        }
+        return Copy(owner: q, codes: codes, scales: tileMajor(q.scales), biases: tileMajor(q.biases!))
+    }
+
+    private static func dispatch(_ x: MLXArray, _ copy: Copy, _ inds: MLXArray,
+                                 _ kernel: MLXFast.MLXFastKernel) -> MLXArray {
+        let sgs = NemotronZSkip.sgs
+        return kernel(
+            [copy.codes, copy.scales, copy.biases, x, inds],
+            template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", sgs)],
+            grid: (32 * sgs * (n / 128), 3, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[1, 3, n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func run(_ x: MLXArray, owner: Linear) -> MLXArray? {
+        guard enabled, let kernel, x.shape == [3, k], x.dtype == .bfloat16,
+              !NemotronZSkip.needsOriginalShared(owner) else { return nil }
+        let found = lock.withLock { () -> (Copy, MLXArray)? in
+            guard let copy = copies[ObjectIdentifier(owner)], copy.owner === owner, let inds else { return nil }
+            return (copy, inds)
+        }
+        guard let found else { return nil }
+        return dispatch(x, found.0, found.1, kernel)
+    }
+
+    /// The same immutable owner and round snapshot used by run; no evaluation.
+    static func isReady(_ owner: Linear) -> Bool {
+        guard enabled, kernel != nil, !NemotronZSkip.needsOriginalShared(owner) else { return false }
+        return lock.withLock {
+            guard let copy = copies[ObjectIdentifier(owner)] else { return false }
+            return copy.owner === owner
+        }
+    }
+
+    /// References to an already qualified copy; no evaluation or lock nesting.
+    static func residencyArrays(_ owner: Linear) -> [MLXArray]? {
+        guard enabled else { return nil }
+        return lock.withLock {
+            guard let copy = copies[ObjectIdentifier(owner)], copy.owner === owner else { return nil }
+            return [copy.codes, copy.scales, copy.biases]
+        }
+    }
+
+    static func warmOriginalRoutes(_ model: Module, _ body: () -> Void) {
+        let routed = NemotronZSkip.decodeCopyOwners(model)
+        let shared = model.modules().compactMap { module -> ObjectIdentifier? in
+            guard let down = (module as? NemotronHMoE)?.sharedExperts?.downProj,
+                  residencyArrays(down) != nil else { return nil }
+            return ObjectIdentifier(down)
+        }
+        // The normal warm-up already covered copy/copy. Compile both mixed
+        // choices and original/original before a real lease can choose them.
+        if !routed.isEmpty { NemotronZSkip.withOriginalCopyWarmup(routed, body) }
+        if !shared.isEmpty { NemotronZSkip.withOriginalCopyWarmup(shared, body) }
+        if !routed.isEmpty && !shared.isEmpty {
+            NemotronZSkip.withOriginalCopyWarmup(routed + shared, body)
+        }
+    }
+
+    static func prepare(_ model: Module) {
+        guard enabled, let kernel, NemotronMoELeader.enabled,
+              Device.defaultDevice().deviceType == .gpu else { return }
+        let zeros = MLXArray.zeros([3], dtype: .uint32)
+        eval(zeros)
+        var built: [ObjectIdentifier: Copy] = [:]
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let moe = module as? NemotronHMoE, let shared = moe.sharedExperts,
+                          let q = shared.downProj as? QuantizedLinear, admissible(q),
+                          built[ObjectIdentifier(q)] == nil else { continue }
+                    let copy = makeCopy(q)
+                    eval(copy.codes, copy.scales, copy.biases)
+                    guard finite(q), matches(q, copy, zeros, kernel, seed: built.count)
+                    else { return false }
+                    built[ObjectIdentifier(q)] = copy
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        lock.withLock {
+            copies = accepted ? built : [:]
+            inds = accepted ? zeros : nil
+        }
+        FileHandle.standardError.write(Data((accepted
+            ? "nemotron shared down zskip on: \(built.count) layers\n"
+            : "nemotron shared down zskip off\n").utf8))
+    }
+
+    private static func finite(_ q: QuantizedLinear) -> Bool {
+        let limit = MLXArray(Float.infinity).asType(.bfloat16)
+        return logicalAnd((abs(q.scales) .< limit).all(), (abs(q.biases!) .< limit).all())
+            .item(Bool.self)
+    }
+
+    private static func matches(_ q: QuantizedLinear, _ copy: Copy, _ inds: MLXArray,
+                                _ kernel: MLXFast.MLXFastKernel, seed: Int) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5d0e + seed)), into: 3)
+        let h = abs(MLXRandom.normal([3, k], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[1]) .< MLXArray(Float(0.16))
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+        let zero = MLXArray(Float(0))
+        let oneHot = which(column .== MLXArray(Int32(k - 100)), MLXArray(Float(1.5)), zero)
+        let sparse = which(row .== MLXArray(Int32(1)), zero,
+                           which(row .== MLXArray(Int32(2)), oneHot, which(keep, h, zero)))
+        let mixed = which(keep, h, zero)
+        let tail = which(column .>= MLXArray(Int32(k - 128)), h, zero)
+        let negative = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[2]) .< MLXArray(Float(0.05))
+        let negativeZero = MLXArray(Float(-0.0)).asType(.bfloat16)
+        var cases: [MLXArray] = []
+        for a in [sparse.asType(.bfloat16), mixed.asType(.bfloat16), tail.asType(.bfloat16),
+                  h.asType(.bfloat16)] {
+            cases.append((a * a).asType(.bfloat16))
+        }
+        cases.append(which(logicalAnd(cases[1] .== MLXArray(Float(0)).asType(.bfloat16), negative),
+                           negativeZero, cases[1]))
+        var same = MLXArray(true)
+        for act in cases {
+            let expected = nemotronMTPLinearRows(act.reshaped(1, 3, k), q)
+            let got = dispatch(act, copy, inds, kernel)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
         }
         return same.item(Bool.self)
@@ -2717,6 +2977,11 @@ enum NemotronSBDict {
     /// index is per expert and addressed from its base like the scales).
     static var indexArrays: [MLXArray] {
         lock.withLock { dicts.values.map { $0.index } }
+    }
+
+    /// Every built dictionary's index and table (decode-only backing for the residency lease).
+    static var allArrays: [MLXArray] {
+        lock.withLock { dicts.values.flatMap { [$0.index, $0.table] } }
     }
 
     /// One tensor's pair dictionary, or nil when its pairs need more than 16

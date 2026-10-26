@@ -52,6 +52,15 @@ private final class NemotronMTPDraftHead {
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
 
+    /// Qualified immutable screen backing is outside the registered module
+    /// tree. Include it in the existing decode lease, but never the mutable
+    /// fused-selection ticket counter or any request tensor.
+    var decodeResidencyArrays: [MLXArray] {
+        guard let screen else { return [] }
+        return [screen.groups] + [screen.upperGroups, screen.packed, screen.records]
+            .compactMap { $0 }
+    }
+
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
     /// `upper`: also screen the upper vocabulary half (when the plan has it).
@@ -404,9 +413,15 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     private var decodeResidency: AnyObject?
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
+            let groups = NemotronZSkip.decodeCopyMemoryGroups(
+                target, seedRoutedPrefix: NemotronDecodeResidency.seedLayers)
             decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 },
-                layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target))
+                head: module.parameters().flattened().map { $0.1 }
+                    + draftHead.decodeResidencyArrays,
+                layers: groups.map { $0.arrays }, owners: groups.map { $0.owner },
+                target: NemotronDecodeResidency.targetGroups(target),
+                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
+                    + NemotronSharedDownZSkip.copyArrays)
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
