@@ -2942,7 +2942,7 @@ enum NemotronHeadScreen {
     /// Kill switches (code constants; 0 = crown int -> float decode and the
     /// crown kernel objects): the draft screen's partial pass (gathered and
     /// packed) and its exact select rescore.
-    static let partialHalfDecodeForm = 0
+    static let partialHalfDecodeForm = 2
     static let selectHalfDecodeForm = 0
     static let partialHalfSwaps: [(String, String, Int)] = [
         ("const uint16_t q = ws[i];", "const float4 hq = nmr_half_decode4<HF>(ws, i);", 1),
