@@ -723,6 +723,8 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
+        // The byte rule stays lifted until this prefill is encoded (`NemotronPrefillRelaxCommit`).
+        NemotronPrefillRelaxCommit.relax()
         NemotronHPrefillX5.requestPrefill = true
         defer { NemotronHPrefillX5.requestPrefill = false }
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
