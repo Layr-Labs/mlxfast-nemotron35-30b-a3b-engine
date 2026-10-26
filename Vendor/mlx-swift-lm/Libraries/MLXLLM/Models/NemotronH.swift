@@ -58,15 +58,15 @@ let nemotronVerifyFirstSubmit =
 
 /// Captured verify only: the layer counts after which it submits (evaluation
 /// order only). Short chunks first, so the GPU has the verify's first layers
-/// while the host builds the next chunk, then one submit every seven layers to
+/// while the host builds the next chunk, then one submit every four layers to
 /// the end, so the GPU never waits on the host for a long tail chunk.
-/// `NEMOTRON_MTP_VERIFY_SUBMITS` takes a comma list ("1,4,13,26" is the
-/// previous schedule); setting `NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL` uses the
-/// interval instead.
+/// `NEMOTRON_MTP_VERIFY_SUBMITS` takes a comma list ("1,4,8,13,20,27,34,41,48"
+/// is the previous schedule, "1,4,13,26" the one before); setting
+/// `NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL` uses the interval instead.
 let nemotronVerifySubmitLayers: Set<Int>? = {
     let env = ProcessInfo.processInfo.environment
     guard env["NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL"] == nil else { return nil }
-    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,8,13,20,27,34,41,48")
+    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,8,12,16,20,24,28,32,36,40,44,48")
         .split(separator: ",").compactMap { Int($0) })
 }()
 
@@ -2600,6 +2600,24 @@ class NemotronHAttention: Module, NemotronHMixer {
             captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
+    }
+
+    /// `cbv2Projections` of one draft row (`targetQKV`) through the launch that
+    /// also stores the row's K/V into `kCache` / `vCache` ([1, 2, capacity,
+    /// 128] planes) at token `row`; nil (nothing built) when that launch does
+    /// not apply.
+    func cbv2ProjectionsWritingRow(
+        _ x: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+              let outputs = NemotronTargetQKV.applyWritingRow(
+                  x, query: wq, key: wk, value: wv, kCache: kCache, vCache: vCache,
+                  row: row, capacity: capacity)
+        else { return nil }
+        return NemotronMoELeader.selfTest
+            ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+               nemotronBitwiseOrNaN(outputs.2, wv(x)))
+            : outputs
     }
 
     /// `projections`, when given, are `cbv2Projections` of this same `x`
