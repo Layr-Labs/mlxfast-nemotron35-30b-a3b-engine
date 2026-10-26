@@ -2600,6 +2600,94 @@ enum NemotronHeadScreen {
             && recordPartialSource.contains("(rp + (lane >> 1) * 8 + part * 4)")
             && !recordPartialSource.contains("(w + ") && !recordPartialSource.contains("sb[size_t(row)")
     }
+    /// Per-draft activation-aware paired K-group selection. Set to 0 to
+    /// retain the fixed, packed load-time plan without the selector launch.
+    static let activationGroupsEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_ACTIVATION_GROUPS"] != "0"
+
+    // One SIMD group scores the 21 aligned pairs of 64-column groups. Each
+    // live lane owns one pair and accumulates its 128 x^2 * ||W[:,c]||^2
+    // terms in column order. The resulting rank chooses exactly S/2 pairs;
+    // popcount compacts them in ascending pair order for coalesced reads.
+    // This changes only a draft approximation, never target arithmetic.
+    private static let activationGroupSource = """
+      const uint lane = thread_index_in_simdgroup;
+      const bool active = lane < 21;
+      float lower = 0.0f;
+      float upper = 0.0f;
+      if (active) {
+        for (uint i = 0; i < 128; ++i) {
+          const uint c = lane * 128 + i;
+          const float v = float(x[c]);
+          const float xx = v * v;
+          lower += xx * lower_energy[c];
+          upper += xx * upper_energy[c];
+        }
+      }
+      const bool valid = simd_all(!active || (isfinite(lower) && isfinite(upper)));
+      if (!valid) {
+        if (lane < S) groups_out[lane] = fallback_groups[lane];
+        if (lane < S2) upper_groups_out[lane] = fallback_upper_groups[lane];
+        return;
+      }
+      uint lower_rank = 0;
+      uint upper_rank = 0;
+      for (ushort other = 0; other < 21; ++other) {
+        const float a = simd_shuffle(lower, other);
+        const float b = simd_shuffle(upper, other);
+        lower_rank += uint(a > lower || (a == lower && other < lane));
+        upper_rank += uint(b > upper || (b == upper && other < lane));
+      }
+      const bool keep_lower = active && lower_rank < S / 2;
+      const bool keep_upper = active && upper_rank < S2 / 2;
+      const uint lower_mask = simd_or(keep_lower ? (1u << lane) : 0u);
+      const uint upper_mask = simd_or(keep_upper ? (1u << lane) : 0u);
+      const uint earlier = (1u << lane) - 1u;
+      if (keep_lower) {
+        const uint slot = 2u * popcount(lower_mask & earlier);
+        groups_out[slot] = 2u * lane;
+        groups_out[slot + 1] = 2u * lane + 1u;
+      }
+      if (keep_upper) {
+        const uint slot = 2u * popcount(upper_mask & earlier);
+        upper_groups_out[slot] = 2u * lane;
+        upper_groups_out[slot + 1] = 2u * lane + 1u;
+      }
+    """
+    private static let activationGroupKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_activation_groups",
+        inputNames: ["x", "lower_energy", "upper_energy", "fallback_groups", "fallback_upper_groups"],
+        outputNames: ["groups_out", "upper_groups_out"],
+        source: activationGroupSource, ensureRowContiguous: true)
+
+    /// Dynamic group arrays stay GPU-resident and feed the packed or gathered
+    /// partial pass. Importance is derived once from frozen head weights;
+    /// `hidden` is already post-norm, including gamma. No target data changes.
+    static func selectActivationGroups(
+        _ hidden: MLXArray, lowerImportance: MLXArray, upperImportance: MLXArray,
+        fallbackGroups: MLXArray, fallbackUpperGroups: MLXArray?,
+        groupCount: Int, upperGroupCount: Int
+    ) -> (groups: MLXArray, upperGroups: MLXArray)? {
+        let upperCount = fallbackUpperGroups == nil ? groupCount : upperGroupCount
+        guard activationGroupsEnabled, hidden.shape == [1, 1, width],
+              hidden.dtype == .bfloat16, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu,
+              lowerImportance.shape == [width], upperImportance.shape == [width],
+              lowerImportance.dtype == .float32, upperImportance.dtype == .float32,
+              (2...16).contains(groupCount), groupCount % 2 == 0,
+              (2...16).contains(upperCount), upperCount % 2 == 0,
+              fallbackGroups.shape == [groupCount], fallbackGroups.dtype == .uint32,
+              fallbackUpperGroups == nil || (fallbackUpperGroups!.shape == [upperCount]
+                  && fallbackUpperGroups!.dtype == .uint32)
+        else { return nil }
+        let output = activationGroupKernel(
+            [hidden, lowerImportance, upperImportance, fallbackGroups, fallbackUpperGroups ?? fallbackGroups],
+            template: [("S", groupCount), ("S2", upperCount)],
+            grid: (32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[groupCount], [upperCount]], outputDTypes: [.uint32, .uint32])
+        return (output[0], output[1])
+    }
+
     static let width = 2688
     static let wordsPerRow = 336
     static let groupsPerRow = 42
@@ -2887,6 +2975,37 @@ enum NemotronHeadScreen {
         inputNames: ["rec", "x", "groups", "groups2"],
         outputNames: ["scores"], source: recordPartialSource)
 
+    /// All 21 aligned group pairs, each with a contiguous run of vocabulary rows.
+    /// A row/pair record has 18 words: (8 code words, packed scale/bias) twice.
+    /// Current GPU-selected group IDs choose records without gathering separate
+    /// coefficient arrays. The arithmetic and SIMD reduction are the gathered body's.
+    private static let groupRecordPartialSource = partialSource
+        .replacingOccurrences(
+            of: "const device uint16_t* ws = (const device uint16_t*)(w + size_t(row) * KW + woff);",
+            with: """
+                const device uint32_t* rp = rec
+                    + (size_t(g / 2) * 131072 + size_t(row)) * 18 + (g & 1) * 9;
+                const device uint16_t* ws = (const device uint16_t*)(rp + part * 4);
+                const device T* sb = (const device T*)(rp + 8);
+                """)
+        .replacingOccurrences(
+            of: "const float sc = float(scales[size_t(row) * KG + g]);",
+            with: "const float sc = float(sb[0]);")
+        .replacingOccurrences(
+            of: "const float bi = float(biases[size_t(row) * KG + g]);",
+            with: "const float bi = float(sb[1]);")
+    private static let groupRecordPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_group_records_affine4_gs64",
+        inputNames: ["rec", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: groupRecordPartialSource)
+
+    static func packGroupRecords(weight: MLXArray, scales: MLXArray, biases: MLXArray) -> MLXArray {
+        let sb = contiguous(stacked([scales, biases], axis: 2)).view(dtype: .uint32)
+        let rowGroups = concatenated(
+            [weight.reshaped(headRows, groupsPerRow, 8), sb], axis: 2)
+        return contiguous(rowGroups.reshaped(headRows, 21, 18).transposed(1, 0, 2)).reshaped(-1)
+    }
+
     /// [rows, 2 * groupCount] bf16: each row's selected scales then biases
     /// (rows from `rows` up: the upper group set, zero-padded). Copies of the
     /// head's own bytes, built once at load for the draft screen only.
@@ -3069,6 +3188,7 @@ enum NemotronHeadScreen {
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil,
         counter: MLXArray? = nil,
+        groupRecords: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
@@ -3078,20 +3198,29 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records.map {
-            (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+        let partial: [MLXArray]
+        if let groupRecords {
+            partial = groupRecordPartialKernel(
+                [groupRecords, hidden, groups, upperGroups ?? groups], template: template,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? packed.map {
-            (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+        } else if let records {
+            partial = (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
+                [records, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? (partialHalf ? partialHalfKernel : partialKernel)(
-            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: partialTemplate,
-            grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-            outputShapes: [[rows]], outputDTypes: [.float32]))[0]
+        } else if let packed {
+            partial = (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
+                [weight, packed, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])
+        } else {
+            partial = (partialHalf ? partialHalfKernel : partialKernel)(
+                [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])
+        }
+        let scores = partial[0]
         let chunks = rows / chunk
         let selectGroups = 8
         let selectHalf = selectHalfDecodeForm != 0

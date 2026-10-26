@@ -48,6 +48,9 @@ private final class NemotronMTPDraftHead {
         /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
         /// two-launch path bitwise.
         var counter: MLXArray? = nil
+        /// Weight-only energies and lossless all-pair records. Group selection uses
+        /// the current draft activation; target and exact rescore still read the head.
+        var activationPlan: (lower: MLXArray, upper: MLXArray, records: MLXArray)? = nil
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -57,8 +60,12 @@ private final class NemotronMTPDraftHead {
     /// fused-selection ticket counter or any request tensor.
     var decodeResidencyArrays: [MLXArray] {
         guard let screen else { return [] }
-        return [screen.groups] + [screen.upperGroups, screen.packed, screen.records]
+        var arrays = [screen.groups] + [screen.upperGroups, screen.packed, screen.records]
             .compactMap { $0 }
+        if let plan = screen.activationPlan {
+            arrays += [plan.lower, plan.upper, plan.records]
+        }
+        return arrays
     }
 
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
@@ -68,6 +75,23 @@ private final class NemotronMTPDraftHead {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
         else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
+        if let plan = screen.activationPlan,
+           let selected = NemotronHeadScreen.selectActivationGroups(
+               hidden, lowerImportance: plan.lower, upperImportance: plan.upper,
+               fallbackGroups: screen.groups, fallbackUpperGroups: screen.upperGroups,
+               groupCount: screen.groupCount, upperGroupCount: screen.upperGroupCount) {
+            let result = NemotronHeadScreen.run(
+                hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
+                groups: selected.groups, groupCount: screen.groupCount, chunk: screen.chunk,
+                keep: screen.keep,
+                upperGroups: upper && screen.upperGroups != nil ? selected.upperGroups : nil,
+                upperGroupCount: upper ? screen.upperGroupCount : 0,
+                counter: screen.counter, groupRecords: plan.records)
+            if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
+                checkAgainstStock(hidden, result, screen)
+            }
+            return result.id
+        }
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
@@ -147,6 +171,7 @@ private final class NemotronMTPDraftHead {
         // Weight-only importance per K-group: sum over the group's columns of
         // gamma[c]^2 * ||W[:, c]||^2 over the scored rows.
         let g = gamma.asType(.float32)
+        var columnEnergy: [Int: MLXArray] = [:]
         func selectGroups(_ rowRange: Range<Int>, count: Int) -> [Int] {
             var columns = MLXArray.zeros([k], dtype: .float32)
             for start in stride(from: rowRange.lowerBound, to: rowRange.upperBound, by: 8192) {
@@ -156,6 +181,7 @@ private final class NemotronMTPDraftHead {
                 columns = columns + (d * d).sum(axis: 0)
                 eval(columns)
             }
+            columnEnergy[rowRange.lowerBound] = columns
             let importance = (columns * g * g).reshaped(NemotronHeadScreen.groupsPerRow, 64)
                 .sum(axis: 1).asArray(Float.self)
             // Whole aligned 64-byte pairs (groups 2p, 2p + 1; rows are 1344 =
@@ -357,6 +383,95 @@ private final class NemotronMTPDraftHead {
                 fusedNote = "off (fused id differs)"
             }
         }
+        // Preserve packed reads for current-activation group selection. Every record
+        // holds the original code words and coefficient bits, including groups not
+        // used by the static plan. Only adopt after gathered/packed equality and exact
+        // candidate-logit qualification on both screened vocabulary sizes.
+        var activationNote = "off"
+        if NemotronHeadScreen.activationGroupsEnabled, let lower = columnEnergy[0] {
+            let upperEnergy = columnEnergy[rows] ?? lower
+            do {
+                let verified = try withError { () -> MLXArray? in
+                    let copy = NemotronHeadScreen.packGroupRecords(
+                        weight: head.weight, scales: head.scales, biases: biases)
+                    eval(copy)
+                    var state: UInt64 = 0xD1B5_4A32_D192_ED03
+                    for _ in 0..<4 {
+                        let t = (0..<k).map { _ -> Float in
+                            state = state &* 6364136223846793005 &+ 1442695040888963407
+                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                        }
+                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                        guard let selected = NemotronHeadScreen.selectActivationGroups(
+                            x, lowerImportance: lower, upperImportance: upperEnergy,
+                            fallbackGroups: plan.groups, fallbackUpperGroups: plan.upperGroups,
+                            groupCount: groupCount, upperGroupCount: plan.upperGroupCount)
+                        else { return nil }
+                        eval(selected.groups, selected.upperGroups)
+                        func valid(_ array: MLXArray, count: Int) -> Bool {
+                            let ids = array.asArray(UInt32.self)
+                            return ids.count == count && Set(ids).count == count
+                                && ids == ids.sorted() && ids.allSatisfy({ $0 < 42 })
+                                && stride(from: 0, to: count, by: 2).allSatisfy({
+                                    ids[$0] % 2 == 0 && ids[$0 + 1] == ids[$0] + 1
+                                })
+                        }
+                        guard valid(selected.groups, count: groupCount),
+                              valid(selected.upperGroups,
+                                  count: plan.upperGroups == nil ? groupCount : plan.upperGroupCount)
+                        else { return nil }
+                        let full = head(x)[0, -1].asType(.float32)
+                        eval(full)
+                        let fullValues = full.asArray(Float.self)
+                        for includeUpper in plan.upperGroups == nil ? [false] : [false, true] {
+                            func run(_ records: MLXArray?, counter: MLXArray?) -> NemotronHeadScreen.Result {
+                                NemotronHeadScreen.run(
+                                    x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                    groups: selected.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                                    upperGroups: includeUpper ? selected.upperGroups : nil,
+                                    upperGroupCount: includeUpper ? plan.upperGroupCount : 0,
+                                    counter: counter, groupRecords: records)
+                            }
+                            let reference = run(nil, counter: nil)
+                            let packed = run(copy, counter: plan.counter)
+                            let sameScores = (reference.scores.view(dtype: .uint32)
+                                .== packed.scores.view(dtype: .uint32)).all()
+                            let sameIds = (reference.candidateIds .== packed.candidateIds).all()
+                            let sameValues = (reference.candidateValues.view(dtype: .uint32)
+                                .== packed.candidateValues.view(dtype: .uint32)).all()
+                            let samePick = (reference.id .== packed.id).all()
+                            eval(sameScores, sameIds, sameValues, samePick)
+                            guard sameScores.item(Bool.self), sameIds.item(Bool.self),
+                                  sameValues.item(Bool.self), samePick.item(Bool.self)
+                            else { return nil }
+                            let ids = packed.candidateIds.asArray(Int32.self)
+                            let values = packed.candidateValues.asArray(Float.self)
+                            let scoredRows = includeUpper ? NemotronHeadScreen.headRows : rows
+                            guard ids.count == values.count, !ids.isEmpty,
+                                  Set(ids).count == ids.count,
+                                  ids.allSatisfy({ (0..<Int32(scoredRows)).contains($0) }),
+                                  zip(ids, values).allSatisfy({ fullValues[Int($0)].bitPattern == $1.bitPattern })
+                            else { return nil }
+                            var best = 0
+                            for i in ids.indices
+                            where values[i] > values[best] || (values[i] == values[best] && ids[i] < ids[best]) {
+                                best = i
+                            }
+                            guard packed.id.item(Int32.self) == ids[best] else { return nil }
+                        }
+                    }
+                    return copy
+                }
+                if let verified {
+                    plan.activationPlan = (lower, upperEnergy, verified)
+                    activationNote = "on (packed all-pair records, exact candidates qualified)"
+                } else {
+                    activationNote = "off (qualification failed)"
+                }
+            } catch {
+                activationNote = "off (\(error))"
+            }
+        }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -371,7 +486,7 @@ private final class NemotronMTPDraftHead {
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
             + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
-            + " qualified (synthetic agreement \(chosen.agree)/4)")
+            + " qualified (synthetic agreement \(chosen.agree)/4), activation groups \(activationNote)")
     }
 
     /// A request's drafts screen the upper vocabulary half while it committed
