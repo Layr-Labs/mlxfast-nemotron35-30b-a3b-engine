@@ -3080,12 +3080,14 @@ enum NemotronHeadScreen {
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [weight, NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? (partialHalf ? partialHalfKernel : partialKernel)(

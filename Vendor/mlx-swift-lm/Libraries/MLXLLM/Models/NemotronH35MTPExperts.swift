@@ -1972,6 +1972,61 @@ enum NemotronBankBinding {
         eval(made.values.map { $0.1 })
         lock.withLock { views.merge(made) { _, new in new } }
     }
+
+    static let tinyImmutableEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_TINY_IMMUTABLE_VIEWS"] != "0"
+
+    private static let denseAliasCheck = MLXFast.metalKernel(
+        name: "nemotron_dense_native_alias_check",
+        inputNames: ["original", "prefix"], outputNames: ["same"],
+        source: "same[0] = original == prefix ? uint(1) : uint(0);",
+        ensureRowContiguous: false)
+
+    private static func denseRowMajor(_ array: MLXArray) -> Bool {
+        var stride = 1
+        for (length, actual) in zip(array.shape, array.strides).reversed() {
+            if length > 1 && actual != stride { return false }
+            stride *= length
+        }
+        return true
+    }
+
+    /// Original immutable banks already registered by the record's warm pass.
+    /// Snapshot under the lock; alias construction/evaluation happens later.
+    static var registeredReadonlyArrays: [MLXArray] {
+        lock.withLock { views.values.map { $0.0 } }
+    }
+
+    /// Qualified immutable buffers outside the registered dense module tree.
+    /// Keep originals strongly owned and admit only exact device-pointer aliases.
+    static func warmReadonly(_ arrays: [MLXArray]) {
+        guard enabled, tinyImmutableEnabled else { return }
+        var made: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for array in arrays where array.ndim >= 1 && array.dim(0) > 1
+            && array.size >= 8 && denseRowMajor(array) {
+            guard made[ObjectIdentifier(array)] == nil else { continue }
+            // A row-major, zero-offset flat prefix keeps only eight elements
+            // in the binding descriptor, even for a large first expert/row.
+            let prefix = array.reshaped(-1)[0 ..< 8]
+            made[ObjectIdentifier(array)] = (array, prefix)
+        }
+        var qualified: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for (key, pair) in made {
+            guard pair.1.size >= 8, denseRowMajor(pair.1) else { continue }
+            do {
+                let same = try withError { () -> Bool in
+                    eval(pair.0, pair.1)
+                    return denseAliasCheck([pair.0, pair.1],
+                        grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.uint32])[0].item(UInt32.self) == 1
+                }
+                if same { qualified[key] = pair }
+            } catch {
+                continue
+            }
+        }
+        lock.withLock { views.merge(qualified) { _, new in new } }
+    }
 }
 
 enum NemotronZSkip {
