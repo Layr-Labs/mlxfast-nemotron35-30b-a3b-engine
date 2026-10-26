@@ -2201,8 +2201,9 @@ enum NemotronMTPRouterRows {
     // Router weights whose loaded layout is row-major [128, 2688]: there the
     // reference matmul(row, weight.T) takes the non-transposed gemv this kernel
     // repeats. Another layout makes MLX pick gemv_t, whose order differs, so
-    // only weights verified here at load take the fast path. Filled once by
-    // warm(), before any compile trace, from the frozen loaded weights.
+    // only weights verified here at load take the fast path. Filled by warm()
+    // (the target's routers, then the draft head's), before any compile
+    // trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
     static func isRowMajor(_ weight: MLXArray) -> Bool { rowMajor.contains(ObjectIdentifier(weight)) }
 
@@ -2306,10 +2307,13 @@ private let nemotronMTPRouterRowsSelectEpilogue = """
 /// `NemotronHRouterSelection`'s top-six selection (see the epilogue above).
 /// Used only after `qualify` found indices, weights and gates bitwise equal to
 /// the two launches. NEMOTRON_MTP_ROUTER_SELECT_FUSED=0 keeps the two launches.
+/// The draft head's one-row router (`exactOneTokenTail`) takes the same launch
+/// on its own counter once `qualifyDraft` matched it on the head's gate.
 enum NemotronMTPRouterRowsSelect {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
+    nonisolated(unsafe) static var draftVerified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
     nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
@@ -2336,7 +2340,15 @@ enum NemotronMTPRouterRowsSelect {
                     draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
+        launch(x, weight, bias: bias, force: force, draft: draft).map { ($0[1], $0[2]) }
+    }
+
+    /// `run`'s launch: [gates, indices, weights].
+    private static func launch(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool,
+                               draft: Bool) -> [MLXArray]?
+    {
+        guard enabled, force || (draft ? draftVerified : verified),
+              let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2346,12 +2358,11 @@ enum NemotronMTPRouterRowsSelect {
         else { return nil }
         let rows = x.dim(1)
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
-        let out = kernel([weight, x, kArray, nArray, bias, counter],
+        return kernel([weight, x, kArray, nArray, bias, counter],
             template: [("T", x.dtype), ("R", rows)],
             grid: (32 * (128 / rowsPerThreadgroup), 8, 1), threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128], [1, rows, 6], [1, rows, 6]],
             outputDTypes: [x.dtype, .uint32, .float32])
-        return (out[1], out[2])
     }
 
     /// Load time: the fused launch against the gemv + selection pair, bit for
@@ -2399,6 +2410,64 @@ enum NemotronMTPRouterRowsSelect {
             verified = false
         }
         report(verified ? "on (bitwise equal at R = 1...4)" : "off (differs or failed)")
+    }
+
+    /// Load time, after `qualify` and before any draft graph is traced: the
+    /// head's router (`exactOneTokenTail`, one row per draft step). Records the
+    /// head's row-major gate (`NemotronMTPRouterRows.warm`), then compares the
+    /// R = 1 launch on the draft counter with the two launches the draft takes
+    /// without it, the head gate's stock gemv `matmul(row, weight.T)` and
+    /// `NemotronHRouterSelection`: gates, indices and weights bit for bit on
+    /// seeded rows (each launched twice, so the counter reset is exercised).
+    /// Engages only if all match. NEMOTRON_MTP_DRAFT_ROUTER_FUSED=0 (or
+    /// NEMOTRON_MTP_DRAFT_FUSED=0) keeps the two launches.
+    static func qualifyDraft(_ head: Module) {
+        draftVerified = false
+        guard enabled, NemotronMTPDraftTail.oneLaunchRouter else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft router select fused: \(message)\n".utf8))
+        }
+        NemotronMTPRouterRows.warm(head)
+        let routers = head.modules().compactMap { $0 as? NemotronHMoEGate }
+        guard routers.count == 1, let gate = routers.first,
+              NemotronMTPRouterRows.isRowMajor(gate.weight),
+              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32,
+              gate.topK == 6, gate.nGroup == 1, gate.topkGroup == 1, gate.normTopkProb,
+              gate.routedScalingFactor == 2.5
+        else { return report("off (no row-major head router)") }
+        if draftCounter == nil {
+            let zero = MLXArray.zeros([1], dtype: .uint32)
+            eval(zero)
+            draftCounter = zero
+        }
+        var ok = MLXArray(true)
+        do {
+            let matched = try withError { () -> Bool in
+                for seed in 0 ..< 8 {
+                    let key = MLXRandom.key(UInt64(0xd7a5e1 + seed))
+                    let x = (MLXRandom.normal([1, 1, 2688], key: key) * Float(1 + seed % 4))
+                        .asType(.bfloat16)
+                    let gates = MLX.matmul(x, gate.weight.transposed())
+                    let reference = gate(x)
+                    for _ in 0 ..< 2 {
+                        guard let fused = launch(x, gate.weight, bias: gate.eSCB, force: true, draft: true)
+                        else { return false }
+                        ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                            (fused[0].view(dtype: .uint16) .== gates.view(dtype: .uint16)).all(),
+                            MLX.logicalAnd(
+                                (fused[1] .== reference.0).all(),
+                                (fused[2].view(dtype: .uint32) .== reference.1.view(dtype: .uint32)).all())))
+                        eval(ok, fused[0], fused[1], fused[2])
+                    }
+                }
+                return ok.item(Bool.self) && (draftCounter!.item(UInt32.self) == 0)
+            }
+            draftVerified = matched
+        } catch {
+            draftVerified = false
+        }
+        report(draftVerified ? "on (bitwise equal to the head's gemv + selection at R = 1)"
+            : "off (differs or failed)")
     }
 }
 
