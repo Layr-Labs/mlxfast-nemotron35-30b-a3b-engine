@@ -2030,6 +2030,10 @@ enum NemotronZSkip {
         }.sorted { $0.0 < $1.0 }.map { $0.1 }
     }
 
+    /// A dictionary copy's FP32 pair table is read by every decode slot launch, so it joins its layer's
+    /// residency set unless NEMOTRON_MTP_RESID=0.
+    static let residentTables = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESID"] != "0"
+
     /// Numeric backbone order, independent of dictionary iteration order.
     static func decodeCopyLayers(_ model: Module) -> [[MLXArray]] {
         let layers = model.namedModules().compactMap { name, module -> (Int, NemotronHMoE)? in
@@ -2041,7 +2045,7 @@ enum NemotronZSkip {
         return lock.withLock {
             layers.compactMap { _, moe in
                 guard let c = copies[ObjectIdentifier(moe.switchMLP.fc2)] else { return nil }
-                return c.dict ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
+                return c.dict && !residentTables ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
             }
         }
     }
