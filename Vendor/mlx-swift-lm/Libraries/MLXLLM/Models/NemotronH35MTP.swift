@@ -411,6 +411,16 @@ private final class NemotronMTPDraftHead {
 /// proposal and is preserved by the durable prefix checkpoint codec.
 public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, CBv2MTPMemoryPreparing, @unchecked Sendable {
     private var decodeResidency: AnyObject?
+    /// Load-time only, after screen/draft-copy/dictionary qualification and
+    /// before any private warm-up trace. Never include a ticket or request state.
+    func prepareImmutableDecodeBindings() {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_IMMUTABLE_VIEWS"] != "0" else { return }
+        NemotronBankBinding.warmReadonly(
+            NemotronBankBinding.registeredReadonlyArrays + draftHead.decodeResidencyArrays
+                + NemotronZSkip.copyArrays + NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
+                + NemotronSharedDownZSkip.readonlyArrays)
+    }
+
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
             decodeResidency = NemotronDecodeResidency(
