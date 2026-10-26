@@ -78,7 +78,10 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
+        NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
+        NemotronSharedUpPacking.prepareUnpacked(target)
+        NemotronFC2SharedColaunch.prepare(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
@@ -522,3 +525,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Second measurement of ff544a18.
 
 // Second measurement entry of this tree.
+
+// Second measurement of 208838c4.
+
+// Measurement 3 of 095b72ae (7c14b7b).
