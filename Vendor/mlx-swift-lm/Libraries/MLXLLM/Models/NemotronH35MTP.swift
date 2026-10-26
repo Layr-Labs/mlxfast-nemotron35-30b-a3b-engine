@@ -132,12 +132,12 @@ private final class NemotronMTPDraftHead {
         }
         let environment = ProcessInfo.processInfo.environment
         // NEMOTRON_MTP_HEAD_SCREEN_BITS=4 keeps the 4-bit screen (12 groups,
-        // upper 8, keep 16); the default 2-bit records read 16 / 6 groups and
-        // keep 24 rows per chunk for the exact rescore.
+        // upper 8, keep 16 per 1024 rows); the default 2-bit records read 16 /
+        // 6 groups and keep 12 rows per 512-row chunk for the exact rescore.
         let bits = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_BITS"] ?? "") ?? 2
         let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? (bits == 2 ? 16 : 12)
-        let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? 1024
-        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 24 : 16)
+        let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? (bits == 2 ? 512 : 1024)
+        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 12 : 16)
         let k = NemotronHeadScreen.width, rows = NemotronHeadScreen.rows
         guard (2...16).contains(groupCount), groupCount % 2 == 0,
               [512, 1024, 2048].contains(chunk), keep % 4 == 0, (4...min(chunk / 8, 64)).contains(keep),
@@ -1096,16 +1096,19 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        // The seed K/V gathers stay lazy: `prestageFirstDraft` reads them only
+        // when `readvanceTrusted` cannot re-expose the stored row.
+        let seedKV = NemotronMTPLazySeedKV.enabled ? [] : [keys, values]
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
         guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
-            CBv2MTPSubmitMerge.submit([ids, out, keys, values])
+            CBv2MTPSubmitMerge.submit([ids, out] + seedKV)
             return
         }
         let inputs = module.pagedDraftInputs(
             hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        var roots = [ids, out, keys, values] + inputs
+        var roots = [ids, out] + seedKV + inputs
         // The rest of the second draft too: its attention reads the head cache,
         // which still holds every post-verify row (they sit last). Attend over
         // the trusted prefix, post-verify rows 0...n for the device-picked n,
@@ -1162,6 +1165,12 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
             }
         }
     }
+}
+
+/// NEMOTRON_MTP_LAZY_SEED_KV=0 submits the device-picked first draft's seed
+/// K/V gathers with its ids and hidden again.
+enum NemotronMTPLazySeedKV {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_LAZY_SEED_KV"] != "0"
 }
 
 /// NEMOTRON_MTP_DEVICE_SECOND_FRONT=0 builds the whole second draft after
