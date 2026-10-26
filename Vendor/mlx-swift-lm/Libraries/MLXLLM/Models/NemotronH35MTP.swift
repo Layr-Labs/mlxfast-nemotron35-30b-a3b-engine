@@ -1007,10 +1007,9 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
                 .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
         }
-        let attended = module.maskedRowOutput(
+        let out = module.maskedRowForward(
             fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
-        let out = module.finishPagedAttentionRow(attended)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
