@@ -287,6 +287,9 @@ enum NemotronHResidualRMSNorm {
         return (axis, value)
     }
 
+    /// The join's scalar arguments (axis size, eps) for launches that run its statements elsewhere.
+    static func joinScalars(_ eps: Float) -> (MLXArray, MLXArray) { scalars(eps) }
+
     /// Configuration gate of the fused captured-verify joins (the consumers
     /// read a prepared activation only on the narrow multi-row route).
     static var plumbingAvailable: Bool {
@@ -593,6 +596,193 @@ enum NemotronHEmbeddingRows {
     }
 }
 
+enum NemotronHVerifyEntry {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_VERIFY_ENTRY_FUSED"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var admittedEmbedding: QuantizedEmbedding?
+    nonisolated(unsafe) private static var admittedNorm: RMSNorm?
+
+    static func matches(_ embedding: QuantizedEmbedding, _ norm: RMSNorm) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard let e = admittedEmbedding, let n = admittedNorm else { return false }
+        return e === embedding && n === norm
+    }
+
+    static func publish(_ embedding: QuantizedEmbedding, _ norm: RMSNorm, accepted: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        admittedEmbedding = accepted ? embedding : nil
+        admittedNorm = accepted ? norm : nil
+    }
+}
+
+extension NemotronHResidualRMSNorm {
+    private static func verifyEntrySource() -> String {
+        let add = "T sum = lhs[offset + i] + rhs[offset + i];"
+        let s = preparedSource()
+        precondition(s.components(separatedBy: add).count == 2)
+        return s.replacingOccurrences(of: add, with: """
+            const uint column = lid * n_reads + i;
+                            int64_t id = int64_t(ids[gid]);
+                            if (id < 0) {
+                                id += int64_t(V);
+                            }
+                            const device uint8_t* row = (const device uint8_t*)w + id * int64_t(BYTES);
+                            T scale = scales[id * int64_t(G) + int64_t(column / 64)];
+                            T bias = biases[id * int64_t(G) + int64_t(column / 64)];
+                            uint val = row[column / 2];
+                            uint8_t d;
+                            d = (val >> (4 * (column % 2))) & 0x0f;
+                            T sum = scale * d + bias;
+            """)
+    }
+    private static let verifyEntryKernel = MLXFast.metalKernel(
+        name: "nemotron_h_verify_entry_rms_prepared",
+        inputNames: ["ids", "w", "scales", "biases", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: verifyEntrySource(), ensureRowContiguous: true)
+
+    private static func verifyEntryRows(_ ids: MLXArray, _ q: QuantizedEmbedding, norm: RMSNorm)
+        -> [MLXArray]
+    {
+        let count: Int = ids.size
+        let dims: Int = 2688
+        let vocabulary: Int = q.weight.dim(0)
+        let biases: MLXArray = q.biases!
+        let (axis, eps) = scalars(norm.eps)
+        let inputs: [MLXArray] = [ids.reshaped(count), q.weight, q.scales, biases, norm.weight, axis, eps]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2), ("G", dims / 64),
+        ]
+        let residualShape: [Int] = [1, count, dims]
+        let preparedShape: [Int] = [count, 11, 288]
+        return verifyEntryKernel(
+            inputs, template: template,
+            grid: (672 * count, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [residualShape, residualShape, preparedShape],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+    }
+
+    private static func verifyEntryShape(_ embedding: Embedding, norm: RMSNorm) -> QuantizedEmbedding? {
+        guard NemotronHVerifyEntry.enabled, NemotronHEmbeddingRows.enabled else { return nil }
+        guard type(of: embedding) == QuantizedEmbedding.self,
+              let q = embedding as? QuantizedEmbedding else { return nil }
+        guard q.mode == .affine, q.bits == 4, q.groupSize == 64 else { return nil }
+        guard let biases = q.biases else { return nil }
+        let w: MLXArray = q.weight
+        guard w.dtype == .uint32, w.ndim == 2 else { return nil }
+        let vocabulary: Int = w.dim(0)
+        guard w.dim(1) == 336 else { return nil }
+        let groupShape: [Int] = [vocabulary, 42]
+        guard q.scales.dtype == .bfloat16, q.scales.shape == groupShape else { return nil }
+        guard biases.dtype == .bfloat16, biases.shape == groupShape else { return nil }
+        guard type(of: norm) == RMSNorm.self else { return nil }
+        let normShape: [Int] = [2688]
+        guard norm.weight.shape == normShape, norm.weight.dtype == .bfloat16 else { return nil }
+        return q
+    }
+
+    nonisolated(unsafe) private static let preparedWritten: MLXArray = {
+        var flags: [Bool] = []
+        flags.reserveCapacity(11 * 288)
+        for block in 0 ..< 11 {
+            for word in 0 ..< 288 {
+                let lane: Int = word % 32
+                let chunk: Int = block * 32 + lane
+                flags.append(chunk < 336)
+            }
+        }
+        return MLXArray(flags).reshaped(11, 288)
+    }()
+
+    private static func preparedEqual(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        let equal: MLXArray = a.view(dtype: .uint32) .== b.view(dtype: .uint32)
+        return which(preparedWritten, equal, MLXArray(true)).all()
+    }
+
+    private static func halfEqual(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        let equal: MLXArray = a.view(dtype: .uint16) .== b.view(dtype: .uint16)
+        return equal.all()
+    }
+
+    static func verifyEntry(_ tokens: MLXArray, _ embedding: Embedding, norm: RMSNorm)
+        -> (MLXArray, MLXArray, MLXArray)?
+    {
+        guard plumbingAvailable, tokens.shape == [1, 3] else { return nil }
+        guard tokens.dtype == .int32 || tokens.dtype == .uint32 else { return nil }
+        guard let q = verifyEntryShape(embedding, norm: norm) else { return nil }
+        guard NemotronHVerifyEntry.matches(q, norm) else { return nil }
+        let outputs = verifyEntryRows(tokens, q, norm: norm)
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
+        let hidden = embedding(tokens)
+        guard let expected = normPreparedRows(hidden, norm: norm) else { return nil }
+        let ok: MLXArray = preparedEqual(outputs[2], expected.1)
+        return (nemotronBitwiseOrNaN(outputs[0], hidden), nemotronBitwiseOrNaN(outputs[1], expected.0),
+                which(ok, outputs[2], MLXArray(Float.nan)))
+    }
+
+    static func qualifyVerifyEntry(_ embedding: Embedding, norm: RMSNorm) {
+        guard plumbingAvailable, let q = verifyEntryShape(embedding, norm: norm) else {
+            FileHandle.standardError.write(Data("nemotron verify entry: off\n".utf8))
+            return
+        }
+        let (axis, eps) = scalars(norm.eps)
+        func rows(_ ids: MLXArray) -> Bool {
+            let count: Int = ids.size
+            let got = verifyEntryRows(ids, q, norm: norm)
+            let hidden = embedding(ids)
+            let preparedShape: [Int] = [count, 11, 288]
+            let stock = normPreparedKernel([hidden, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672 * count, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: [hidden.shape, preparedShape],
+                outputDTypes: [.bfloat16, .float32])
+            let first: MLXArray = halfEqual(got[0], hidden)
+            let second: MLXArray = halfEqual(got[1], stock[0])
+            let third: MLXArray = preparedEqual(got[2], stock[1])
+            let all: MLXArray = MLX.logicalAnd(first, MLX.logicalAnd(second, third))
+            return all.item(Bool.self)
+        }
+        let vocabulary: Int = q.weight.dim(0)
+        NemotronHVerifyEntry.publish(q, norm, accepted: false)
+        var admitted = false
+        var note = "mismatch, stock kept"
+        do {
+            admitted = try withError { () -> Bool in
+                var start = 0
+                while start < vocabulary {
+                    let count: Int = min(4096, vocabulary - start)
+                    let range: Range<Int32> = Int32(start) ..< Int32(start + count)
+                    if !rows(MLXArray(range).reshaped(1, count)) { return false }
+                    start += count
+                }
+                var state: UInt64 = 0x3C6E_F372_FE94_F82B
+                func draw() -> Int {
+                    state = state &* 6364136223846793005 &+ 1442695040888963407
+                    return Int(state >> 33) % vocabulary
+                }
+                for _ in 0 ..< 8 {
+                    let signed: [Int32] = [Int32(draw()), Int32(draw()), Int32(draw())]
+                    if !rows(MLXArray(signed).reshaped(1, 3)) { return false }
+                    let unsigned: [UInt32] = [UInt32(draw()), UInt32(draw()), UInt32(draw())]
+                    if !rows(MLXArray(unsigned).reshaped(1, 3)) { return false }
+                }
+                let v32: Int32 = Int32(vocabulary)
+                let edgeA: [Int32] = [-v32, -1, 0]
+                let edgeB: [Int32] = [v32 - 1, -(v32 / 2), 1]
+                if !rows(MLXArray(edgeA).reshaped(1, 3)) { return false }
+                if !rows(MLXArray(edgeB).reshaped(1, 3)) { return false }
+                return true
+            }
+        } catch {
+            admitted = false
+            note = "\(error)"
+        }
+        NemotronHVerifyEntry.publish(q, norm, accepted: admitted)
+        let line = admitted ? "on (all \(vocabulary) rows bitwise equal)" : "off (\(note))"
+        FileHandle.standardError.write(Data("nemotron verify entry: \(line)\n".utf8))
+    }
+}
+
 // MARK: - MambaRMSNormGated
 
 enum NemotronHGatedRMSKernel {
@@ -773,12 +963,7 @@ class NemotronHRMSNormGated: Module {
 enum NemotronHCompactSSMGated {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_SSM_GATED_FUSED"] != "0"
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_ssm_compact_gated_prepared",
-        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
-                     "eps", "counter"],
-        outputNames: ["out", "state_out", "normed", "prepared"],
-        source: """
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -900,7 +1085,46 @@ enum NemotronHCompactSSMGated {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            """, mutableInputs: ["counter"])
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_gated_prepared",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: source, mutableInputs: ["counter"])
+    /// NEMOTRON_MTP_SSM_PENDING_FOLD (see NemotronMTPPendingSSM): the same
+    /// launch with `P` pending strict-prefix steps of earlier windows (`pconv`
+    /// [1, P, CD], `pdt` [1, P, H]) run first from `state_in`, with the
+    /// replay kernel's per-step statements (no y, no store), then the window
+    /// from the resulting state exactly as above.
+    static let pendingSource: String = {
+        let loop = "\nfor (int t = 0; t < L; ++t) {\n"
+        precondition(source.components(separatedBy: loop).count == 2, "pending ssm source")
+        let prelude = """
+                    for (int t = 0; t < P; ++t) {
+                        auto x_ = static_cast<float>(pconv[t * CD + n * Dh + d_idx]);
+                        auto B_ = pconv + t * CD + BO + g_idx * Ds;
+                        auto dt_ = static_cast<float>(pdt[t * H + n]);
+                        auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                        auto dA = fast::exp(A * dt_);
+                        for (int i = 0; i < n_per_t; ++i) {
+                            auto s_idx = n_per_t * ds_idx + i;
+                            if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                            auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                            auto state = dA * prior[i] + dB_by_x;
+                            prior[i] = static_cast<U>(state);
+                        }
+                    }
+
+        """
+        return source.replacingOccurrences(of: loop, with: "\n" + prelude + loop)
+    }()
+    static let pendingKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_gated_prepared_pending",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter", "pconv", "pdt"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: pendingSource, mutableInputs: ["counter"])
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -923,8 +1147,14 @@ extension NemotronHRMSNormGated {
     func compactSSMPreparedRows(
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
-        stateDim: Int
+        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
+        if let pending {
+            guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
+                  pending.conv.shape == [1, pending.steps, 6144], pending.conv.dtype == .bfloat16,
+                  pending.dt.shape == [1, pending.steps, 64], pending.dt.dtype == .float32
+            else { return nil }
+        }
         guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -939,12 +1169,21 @@ extension NemotronHRMSNormGated {
         // Created and evaluated at load (`prepareCounter`), never inside a
         // compile trace; without it the two launches stay.
         guard NemotronHCompactSSMGated.counter != nil else { return nil }
-        let outputs = NemotronHCompactSSMGated.kernel(
-            [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
-             eps, NemotronHCompactSSMGated.counter!],
-            template: [("T", DType.bfloat16), ("U", DType.float32),
-                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
-                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)],
+        var inputs: [any ScalarOrArray] = [
+            convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
+            eps, NemotronHCompactSSMGated.counter!]
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("U", DType.float32),
+            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+            ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
+        var kernel = NemotronHCompactSSMGated.kernel
+        if let pending {
+            inputs += [pending.conv, pending.dt]
+            template.append(("P", pending.steps))
+            kernel = NemotronHCompactSSMGated.pendingKernel
+        }
+        let outputs = kernel(
+            inputs, template: template,
             grid: (32, 64, 64), threadGroup: (32, 8, 1),
             outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
@@ -2634,10 +2873,18 @@ private final class NemotronHPrefillKernels: Sendable {
                     for (int ee = 0; ee < E; ++ee) {
                         int start = int(counts[ee * S]);
                         int end = (ee + 1 < E) ? int(counts[(ee + 1) * S]) : n;
-                        for (int r = start; r < end && t < tmax; r += BMT) {
+                        for (int r = start; r < end && t < tmax;) {
+                            const int remaining = end - r;
+                            // Where the original batch used 32-row tiles, preserve its
+                            // 48-row padded work for a 33...48 tail instead of rounding
+                            // that tail up to a 64-row NAX body.
+                            const int take = BMT == 64 && n / E < 64
+                                && remaining > 32 && remaining <= 48
+                                ? 32 : min(BMT, remaining);
                             tiles[3 * t] = r;
-                            tiles[3 * t + 1] = min(BMT, end - r);
+                            tiles[3 * t + 1] = take;
                             tiles[3 * t + 2] = ee;
+                            r += take;
                             t++;
                         }
                     }
@@ -2710,9 +2957,10 @@ private final class NemotronHPrefillKernels: Sendable {
     }
 }
 
-/// Rows per tile the stock gather_qmm_rhs_nax dispatch picks for M rows
-/// and E experts (`bm = (M / E < 64) ? 32 : 64` in quantized.cpp).
-func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { rows / experts < 64 ? 32 : 64 }
+/// Group expert runs into at most 64 rows. The launch uses the existing
+/// 32-row body for short descriptors, preserving its small-run work while
+/// letting busy experts share one weight load over a larger row segment.
+func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { 64 }
 
 /// Expert-run tiles [count, 3] int32 of `bm` rows: (first sorted row, rows,
 /// expert); trailing slots have rows == 0.
@@ -2735,7 +2983,10 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
     else { return nil }
     let n = flat.size
     let bm = nemotronGatherTileRows(rows: n, experts: experts)
-    let count = (n + bm - 1) / bm + experts
+    // Retain the original capacity bound: an adaptive run uses no more
+    // descriptors than its original 32/64-row partition, including split tails.
+    let capacityRows = n / experts < 64 ? 32 : 64
+    let count = (n + capacityRows - 1) / capacityRows + experts
     let out = NemotronHPrefillKernels.shared.countingSort(
         [flat, n, count], template: [("E", experts), ("THREADS", threads), ("BMT", bm)],
         grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
@@ -2778,7 +3029,7 @@ private func nemotronWarmUpPrefillKernels(
         grid: (4, 4, 64), threadGroup: (32, 8, 1),
         outputShapes: [[1, 64, 4, 4]], outputDTypes: [.float32])[0])
     if NemotronHPrefillX5.enabled {
-        // Counting sort for both tile heights (bm 32: rows / E < 64, else 64).
+        // Counting sort for small and large row sets, using the current descriptor bound.
         for n in [rows, 64 * experts] {
             if let cs = nemotronCountingSort(MLXArray.zeros([n], dtype: .uint32), experts: experts) {
                 arrays.append(cs.order)
@@ -4000,16 +4251,26 @@ private final class NemotronHRunGatherKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_gather_qmm_runs",
+            name: "nemotron_gather_qmm_runs_adaptive_tiles",
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
                 threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
-                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
-                    x, w, scales, biases, tiles, y, N, K, Ws,
-                    threadgroup_position_in_grid,
-                    simdgroup_index_in_threadgroup,
-                    thread_index_in_simdgroup);
+                // Descriptor length is uniform across the threadgroup. Both bodies
+                // retain the same K loop and independent per-row NAX fragment updates.
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
             """,
             header: nemotronRunGatherHeader)
     }
@@ -4019,7 +4280,7 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// (N block, expert-run tile). Only where stock GatherQMM takes the
 /// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
 /// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
-/// with the same bm; nil = use the stock op. ReLU2 is BF16-only and retains
+/// using the same per-row K fragment order; nil = use the stock op. ReLU2 is BF16-only and retains
 /// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
     _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
@@ -4248,7 +4509,12 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
+            // The MoE join inside the routed FC2 + shared down launch when it qualified.
+            if let outputs = moe.mtpForwardRowsJoined(hidden, prepared: prepared, lhs: x, norm: nextNorm) {
+                if outputs.count == 3 { return (outputs[0], outputs[1], outputs[2]) }
+                output = outputs[0]
+                shared = outputs[1]
+            } else if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
                 output = parts.0
                 shared = parts.1
             } else {
@@ -4472,15 +4738,23 @@ private class NemotronHBackbone: Module {
             : nil
         defer { observation?.end() }
         var hidden: MLXArray
-        if let rows = NemotronHEmbeddingRows.apply(inputs, embeddings) {
-            hidden = NemotronMoELeader.selfTest
-                ? nemotronBitwiseOrNaN(rows, embeddings(inputs)) : rows
+        var preparedNorm: MLXArray?
+        var preparedActivation: MLXArray?
+        if let entry = NemotronHResidualRMSNorm.verifyEntry(inputs, embeddings, norm: first.norm) {
+            hidden = entry.0
+            preparedNorm = entry.1
+            preparedActivation = entry.2
         } else {
-            hidden = embeddings(inputs)
+            if let rows = NemotronHEmbeddingRows.apply(inputs, embeddings) {
+                hidden = NemotronMoELeader.selfTest
+                    ? nemotronBitwiseOrNaN(rows, embeddings(inputs)) : rows
+            } else {
+                hidden = embeddings(inputs)
+            }
+            let entry = NemotronHResidualRMSNorm.normPreparedRows(hidden, norm: first.norm)
+            preparedNorm = entry?.0
+            preparedActivation = entry?.1
         }
-        let entry = NemotronHResidualRMSNorm.normPreparedRows(hidden, norm: first.norm)
-        var preparedNorm: MLXArray? = entry?.0
-        var preparedActivation: MLXArray? = entry?.1
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -4755,6 +5029,11 @@ public class NemotronHModel:
             return lmHead(hidden)
         }
         return backbone.embeddings.asLinear(hidden)
+    }
+
+    func prepareVerifyEntry() {
+        guard let first = backbone.layers.first else { return }
+        NemotronHResidualRMSNorm.qualifyVerifyEntry(backbone.embeddings, norm: first.norm)
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {
