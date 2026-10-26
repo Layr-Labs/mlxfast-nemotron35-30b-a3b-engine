@@ -82,6 +82,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     /// don't immediately grow the buffer.
     static let initialSlack = 256
 
+    /// Set by the Nemotron request prefill (the seed of the scored decode)
+    /// around its forward: a sequence's first write then builds the storage as
+    /// the update followed by the zero slack in one concatenate, instead of a
+    /// zero storage that a slice update rewrites whole. Same stored values,
+    /// same shape; the storage stays fresh and row-contiguous.
+    nonisolated(unsafe) public static var seedFirstWrite = false
+
     public private(set) var absoluteOffset: Int = 0
     public var retainedCount: Int { absoluteOffset }
 
@@ -149,6 +156,23 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             absoluteOffset + n <= maxLength,
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
+
+        if keys == nil, Self.seedFirstWrite, absoluteOffset == 0,
+           newKeys.ndim == 4, newValues.ndim == 4, newKeys.dim(0) == 1, newKeys.dim(1) == kvHeads,
+           newValues.dim(1) == kvHeads
+        {
+            let first = min(maxLength, max(capacity, n))
+            if first > n {
+                capacity = first
+                keys = Self.firstWrite(newKeys, capacity: first)
+                values = Self.firstWrite(newValues, capacity: first)
+                absoluteOffset = n
+                return (
+                    keys![.ellipsis, ..<absoluteOffset, 0...],
+                    values![.ellipsis, ..<absoluteOffset, 0...]
+                )
+            }
+        }
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
@@ -274,6 +298,15 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             strides, strides.count, StreamOrDevice.default.ctx)
         precondition(rc == 0, "CBv2FullSequenceKV: mlx_slice_update failed with rc=\(rc)")
         return MLXArray(result)
+    }
+
+    /// `[update, zeros]` along the token axis as one concatenate: the update
+    /// rows are copied once and only the slack rows are written as zeros.
+    private static func firstWrite(_ update: MLXArray, capacity: Int) -> MLXArray {
+        let slack = MLXArray.zeros(
+            [update.dim(0), update.dim(1), capacity - update.dim(2), update.dim(3)],
+            dtype: update.dtype)
+        return concatenated([update, slack], axis: 2)
     }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {

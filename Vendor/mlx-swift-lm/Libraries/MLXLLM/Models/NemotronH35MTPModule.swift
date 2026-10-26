@@ -721,7 +721,11 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
         NemotronHPrefillX5.requestPrefill = true
-        defer { NemotronHPrefillX5.requestPrefill = false }
+        CBv2FullSequenceKV.seedFirstWrite = NemotronHSeedX.kvEnabled
+        defer {
+            NemotronHPrefillX5.requestPrefill = false
+            CBv2FullSequenceKV.seedFirstWrite = false
+        }
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
@@ -729,6 +733,14 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         case .lastPositionLogits: return (logits(last), hidden)
         }
     }
+}
+
+extension NemotronHSeedX {
+    /// The attention caches' first write is one concatenate of the projected
+    /// rows and the zero slack (no whole-storage rewrite). Values are the
+    /// stored ones either way; NEMOTRON_MTP_SEEDX_KV=0 keeps the slice update.
+    static let kvEnabled = enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_SEEDX_KV"] != "0"
 }
 
 /// Draft-only prepared operands on the post-verify front (`frontRows`).
