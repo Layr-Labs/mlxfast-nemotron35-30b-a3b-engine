@@ -1100,7 +1100,17 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         else { return }
         let row = acceptedDrafts.asType(.int32)
         // The picked row attends the trusted prefix and post-verify rows 0...row.
-        let rowHistory = paged.row.snapshot()
+        // NEMOTRON_MTP_SECOND_DRAFT_KV_ROW: the snapshot carries one spare row
+        // per head, which the second draft's Q/K/V launch fills with that
+        // draft's own K/V; this row attends views of the gathered rows only.
+        let spare = NemotronMTPSecondDraftRow.enabled && draftLimit >= 2
+            && NemotronMTPDraftMasks.reuseSnapshot && NemotronTargetQKV.draftRowWriteVerified
+            ? paged.row.snapshotCombined(extraRows: 1) : nil
+        let rowHistory = spare.map {
+            (keys: $0.combined[0 ..< 1, 0..., 0..., 0 ..< $0.count].squeezed(axis: 0),
+             values: $0.combined[1 ..< 2, 0..., 0..., 0 ..< $0.count].squeezed(axis: 0),
+             offset: $0.offset)
+        } ?? paged.row.snapshot()
         let rowLength = rowHistory.keys.dim(2)
         let rowFirst = rowLength - spec.width
         let picked = walk.flatMap {
@@ -1136,8 +1146,18 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             CBv2MTPSubmitMerge.submit([ids, out] + seedKV)
             return
         }
-        let inputs = module.pagedDraftInputs(
-            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
+        let embedding = target.mtpEmbedding(ids.reshaped([1, 1]))
+        let inputs: [MLXArray]
+        var wroteRow = false
+        if let spare {
+            (inputs, wroteRow) = module.pagedDraftInputs(
+                hidden: out, embedding: embedding,
+                kCache: spare.combined[0 ..< 1].squeezed(axis: 0),
+                vCache: spare.combined[1 ..< 2].squeezed(axis: 0),
+                row: spare.count, capacity: spare.count + 1)
+        } else {
+            inputs = module.pagedDraftInputs(hidden: out, embedding: embedding)
+        }
         s.deviceSecondInputs = (inputs: inputs, from: out)
         var roots = [ids, out] + seedKV + inputs
         // The rest of the second draft too: its attention reads the head cache,
@@ -1148,8 +1168,9 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             // Nothing is appended to the head cache since `rowHistory` was
             // gathered, so its views are this snapshot; gather again only if
             // the row moved.
-            let history = paged.row.absoluteOffset == rowHistory.offset
-                && NemotronMTPDraftMasks.reuseSnapshot ? rowHistory : paged.row.snapshot()
+            let reused = paged.row.absoluteOffset == rowHistory.offset
+                && NemotronMTPDraftMasks.reuseSnapshot
+            let history = reused ? rowHistory : paged.row.snapshot()
             let length = history.keys.dim(2)
             let firstSpeculated = length - spec.width
             let own = module.draftKeyValues(inputs: inputs)
@@ -1165,10 +1186,19 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
                 mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
                     .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
             }
+            let attended: (keys: MLXArray, values: MLXArray)
+            if let spare, wroteRow, reused {
+                // The Q/K/V launch stored ownKeys / ownValues in the spare row:
+                // the whole snapshot, read behind that launch, is the
+                // concatenation below.
+                let written = depends(input: spare.combined, dependencies: [inputs[3]])
+                attended = (written[0 ..< 1].squeezed(axis: 0), written[1 ..< 2].squeezed(axis: 0))
+            } else {
+                attended = (concatenated([history.keys, ownKeys], axis: 2),
+                            concatenated([history.values, ownValues], axis: 2))
+            }
             let out2 = module.maskedSecondDraft(
-                inputs: inputs,
-                keys: concatenated([history.keys, ownKeys], axis: 2),
-                values: concatenated([history.values, ownValues], axis: 2), mask: mask)
+                inputs: inputs, keys: attended.keys, values: attended.values, mask: mask)
             let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
             s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
             roots += [ids2, out2, ownKeys, ownValues]
@@ -1211,6 +1241,17 @@ enum NemotronMTPLazySeedKV {
 enum NemotronH35MTPDeviceSecondDraft {
     static let enabled = NemotronH35MTPDeviceSecondFront.enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
+}
+
+/// The device second draft attends the head snapshot gathered with one spare
+/// row per head, which its own Q/K/V launch fills with the draft's K/V row
+/// (`NemotronTargetQKV.applyWritingRow`), instead of a concatenation of the
+/// snapshot and that row (two copies per plane). Same rows, same attention.
+/// Needs the direct paged read (CBV2_PAGED_READ_OUTPUT) and the launch's
+/// load-time qualification. NEMOTRON_MTP_SECOND_DRAFT_KV_ROW=0 concatenates.
+enum NemotronMTPSecondDraftRow {
+    static let enabled = NemotronH35MTPDeviceSecondDraft.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_SECOND_DRAFT_KV_ROW"] != "0"
 }
 
 /// The two additive masks of `speculateNextFirstDraft` from one launch:

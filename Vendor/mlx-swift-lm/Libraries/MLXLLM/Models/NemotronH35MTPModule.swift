@@ -257,6 +257,22 @@ final class NemotronH35MTPAttentionBlock: Module {
         return [front[0], front[1], q, k, v]
     }
 
+    /// `pagedDraftInputs` whose Q/K/V launch also stores the row's K/V into
+    /// `kCache` / `vCache` at token `row` (`cbv2ProjectionsWritingRow`);
+    /// `wroteRow` is false when the ordinary launch ran instead.
+    func pagedDraftInputs(
+        hidden: MLXArray, embedding: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int,
+        capacity: Int
+    ) -> (inputs: [MLXArray], wroteRow: Bool) {
+        let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
+        if NemotronMTPDraftTail.fusedQKV, let qkv = mixer.cbv2ProjectionsWritingRow(
+            front[1], kCache: kCache, vCache: vCache, row: row, capacity: capacity) {
+            return ([front[0], front[1], qkv.0, qkv.1, qkv.2], true)
+        }
+        let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
+        return ([front[0], front[1], q, k, v], false)
+    }
+
     /// `pagedForwardRows`' cache-free front: the fused residual rows and their
     /// Q [1, heads, L, headDim] and K/V [1, kvHeads, L, headDim].
     func frontRows(hidden: MLXArray, embedding: MLXArray)
@@ -614,6 +630,14 @@ final class NemotronH35MTPModule: Module {
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
+    }
+    func pagedDraftInputs(
+        hidden: MLXArray, embedding: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int,
+        capacity: Int
+    ) -> (inputs: [MLXArray], wroteRow: Bool) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
+            hidden: hidden, embedding: embedding, kCache: kCache, vCache: vCache, row: row,
+            capacity: capacity)
     }
     func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
         (layers[0] as! NemotronH35MTPAttentionBlock).draftKeyValues(inputs: inputs)
