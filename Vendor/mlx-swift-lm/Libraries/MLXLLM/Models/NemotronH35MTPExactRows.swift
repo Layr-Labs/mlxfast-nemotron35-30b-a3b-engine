@@ -909,14 +909,34 @@ enum NemotronHeadPreparedActivation {
 
     /// Feed the winner's prepared projection directly from the serialized
     /// SDPA rows. Same preparation arithmetic; only the source address moves.
+    static func packRows(_ rows: [MLXArray], k: Int) -> MLXArray {
+        let pv = k % 512 == 0 ? 16 : 8
+        return prepareRows(rows,
+            template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
+            grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+    }
+
+    /// The verify SDPA's own prepared copy of its three output rows (`NemotronMTPVerifySDPA`), handed to the
+    /// next `applyRows` of exactly those row arrays; any other rows prepare themselves.
+    private static let offeredLock = NSLock()
+    nonisolated(unsafe) private static var offered: (rows: [MLXArray], prepared: MLXArray)? = nil
+    static func offerPrepared(rows: [MLXArray], prepared: MLXArray) {
+        offeredLock.withLock { offered = (rows, prepared) }
+    }
+    private static func takeOffered(_ rows: [MLXArray]) -> MLXArray? {
+        offeredLock.withLock { () -> MLXArray? in
+            guard let o = offered, o.rows.count == rows.count else { return nil }
+            for i in 0 ..< rows.count where o.rows[i] !== rows[i] { return nil }
+            offered = nil
+            return o.prepared
+        }
+    }
+
     static func applyRows(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray {
         precondition(rows.count == 3)
         let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
-        let pv = k % 512 == 0 ? 16 : 8
-        let packed = prepareRows(rows,
-            template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
-            grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+        let packed = [(k == 4096 ? takeOffered(rows) : nil) ?? packRows(rows, k: k)]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
@@ -1867,6 +1887,51 @@ enum NemotronMTPVerifySDPA {
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out"],
         source: source(), ensureRowContiguous: false)
 
+    /// The same launch also writing the o_proj's prepared operand of its rows: after the output store, eight
+    /// threads per threadgroup run `nemotron_prepare_activation_query_rows3`'s statements on the 16-value chunks of
+    /// their head, read back from the stored BF16 output, so `prepared` holds the separate pack's bits. Used once
+    /// `qualify` matched it against that pack. NEMOTRON_MTP_VERIFY_SDPA_PACK=0 keeps the separate pack launch.
+    static let packEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_PACK"] != "0"
+    nonisolated(unsafe) private static var packVerified = false
+    private static let packKernel: MLXFast.MLXFastKernel? = {
+        var s = source()
+        let anchor = "  out += tid.z * tpg.x * V;\n"
+        guard s.components(separatedBy: anchor).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: anchor, with: anchor + "  device T* nmp_row = out;\n")
+        s += """
+          threadgroup_barrier(mem_flags::mem_device);
+          if (simd_gid == 0 && int(simd_lid) < V / PV) {
+            const int chunk = int(tid.x) * (V / PV) + int(simd_lid);
+            const int row = int(tid.z);
+            float values[PV];
+            const float total = nmr_load_vector<T, float, PV>(nmp_row + chunk * PV, values);
+            const int tiles = (KR / PV + 31) / 32;
+            const int base = (row * tiles + chunk / 32) * (PV + 1) * 32 + chunk % 32;
+            for (int i = 0; i < PV; i++) prepared[base + i * 32] = values[i];
+            prepared[base + PV * 32] = total;
+          }
+
+        """
+        return MLXFast.metalKernel(
+            name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_pack",
+            inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
+            source: s, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }()
+
+    private static func mergedPacked(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard let packKernel, queries.ndim == 4, queries.dim(2) == 3,
+              merged(queries, keys, values, scale, check: true) != nil else { return nil }
+        let outputs = packKernel(
+            [queries, keys, values, scaleArray(scale)],
+            template: [("T", DType.bfloat16), ("D", 128), ("V", 128), ("PV", 16), ("KR", 4096)],
+            grid: (32 * 1024, 1, 3), threadGroup: (1024, 1, 1),
+            outputShapes: [[3, 32, 128], [3, 8, 17 * 32]], outputDTypes: [DType.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
+
     nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
     private static let lock = NSLock()
     private static func scaleArray(_ scale: Float) -> MLXArray {
@@ -1883,7 +1948,7 @@ enum NemotronMTPVerifySDPA {
     /// switches to the two-pass kernel from 1024 keys ('d'/'s' GPUs) or 4096
     /// (GQA elsewhere), so every row stays below 1024 keys.
     private static func merged(
-        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float, check: Bool = false
     ) -> MLXArray? {
         let rows = queries.ndim == 4 ? queries.dim(2) : 0
         guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -1893,6 +1958,7 @@ enum NemotronMTPVerifySDPA {
               values.shape == keys.shape, (rows ..< 1024).contains(keys.dim(2)),
               queries.dtype == .bfloat16, keys.dtype == .bfloat16, values.dtype == .bfloat16
         else { return nil }
+        if check { return queries }
         return kernel(
             [queries, keys, values, scaleArray(scale)],
             template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
@@ -1927,7 +1993,14 @@ enum NemotronMTPVerifySDPA {
     static func rows(
         _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
     ) -> [MLXArray]? {
-        guard verified, let out = merged(queries, keys, values, scale) else { return nil }
+        guard verified else { return nil }
+        if packEnabled, packVerified, !NemotronMoELeader.selfTest,
+           case let (out, prepared)? = mergedPacked(queries, keys, values, scale) {
+            let outputs = split(out)
+            NemotronHeadPreparedActivation.offerPrepared(rows: outputs, prepared: prepared)
+            return outputs
+        }
+        guard let out = merged(queries, keys, values, scale) else { return nil }
         let outputs = split(out)
         guard NemotronMoELeader.selfTest else { return outputs }
         return zip(outputs, stock(queries, keys, values, scale)).map { nemotronBitwiseOrNaN($0, $1) }
@@ -1959,6 +2032,9 @@ enum NemotronMTPVerifySDPA {
         ]
         let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
         var checked = 0
+        var packChecked = 0
+        var packMatches = true
+        packVerified = false
         do {
             let matches = try withError { () -> Bool in
                 for bits in scaleBits.sorted() {
@@ -1988,6 +2064,17 @@ enum NemotronMTPVerifySDPA {
                                 same = same .&& (row.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
                             }
                             if !same.item(Bool.self) { return false }
+                            if packEnabled, rows == 3 {
+                                if case let (packedOut, prepared)? = mergedPacked(queries, keys, values, scale) {
+                                    let expected = NemotronHeadPreparedActivation.packRows(split(out), k: 4096)
+                                    let ok = (packedOut.view(dtype: .uint16) .== out.view(dtype: .uint16)).all()
+                                        .&& (prepared.view(dtype: .uint32) .== expected.view(dtype: .uint32)).all()
+                                    packChecked += 1
+                                    if !ok.item(Bool.self) { packMatches = false }
+                                } else {
+                                    packMatches = false
+                                }
+                            }
                             checked += 1
                         }
                     }
@@ -1995,8 +2082,13 @@ enum NemotronMTPVerifySDPA {
                 return true
             }
             verified = matches
+            packVerified = matches && packEnabled && packMatches && packChecked > 0
         } catch {
             return report("off (\(error))")
+        }
+        if packEnabled {
+            report(packVerified ? "pack on (\(packChecked) cases bitwise equal)"
+                : "pack off (prepared rows differ from the separate pack)")
         }
         report(verified
             ? "on (\(checked) cases bitwise equal, key loop \(unroll4 ? "unroll4" : "stock"))"
