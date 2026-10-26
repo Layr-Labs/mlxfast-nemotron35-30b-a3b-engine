@@ -17,12 +17,12 @@ final class NemotronH35MTPCompactGraphCache {
     private static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
     private let lock = NSLock()
-    /// [plain, consuming a prepared in_proj activation]: separate graphs.
-    private var entries: [Entry?] = [nil, nil]
+    private var entries: [Entry?] = Array(repeating: nil, count: 16)
 
     func callAsFunction(
         _ hidden: MLXArray, convState: MLXArray, initialSSM: MLXArray,
-        prepared: MLXArray? = nil, owner: NemotronHMamba2Mixer
+        prepared: MLXArray? = nil, replay: (conv: MLXArray, dt: MLXArray, keep: Int)? = nil,
+        owner: NemotronHMamba2Mixer
     ) -> [MLXArray] {
         guard Self.enabled, NemotronMTPExecution.batchedM1, NemotronMTPExecution.batchedNorm,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -30,13 +30,16 @@ final class NemotronH35MTPCompactGraphCache {
               hidden.dim(2) == 2688, hidden.dtype == .bfloat16,
               convState.shape == [1, 3, 6144], convState.dtype == .bfloat16,
               initialSSM.shape == [1, 64, 64, 128], initialSSM.dtype == .float32,
+              (replay?.keep ?? 0) < 8,
               let identity = Self.nativeIdentity(owner)
         else {
             return owner.mtpCompactArrays(
-                hidden, convState: convState, initialSSM: initialSSM, prepared: prepared)
+                hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
+                replay: replay)
         }
         let usesPrepared = prepared != nil
-        let slot = usesPrepared ? 1 : 0
+        let keep = replay?.keep ?? 0
+        let slot = (usesPrepared ? 1 : 0) + 2 * keep
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             if let entry = entries[slot], entry.identity == identity { return entry }
@@ -44,9 +47,12 @@ final class NemotronH35MTPCompactGraphCache {
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MTP Mamba-window owner") }
+                let base = usesPrepared ? 4 : 3
                 return owner.mtpCompactArrays(
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
-                    prepared: usesPrepared ? arrays[3] : nil)
+                    prepared: usesPrepared ? arrays[3] : nil,
+                    replay: keep > 0
+                        ? (conv: arrays[base], dt: arrays[base + 1], keep: keep) : nil)
             }
             let replacement = Entry(identity: identity, function: function)
             retired = entries[slot]
@@ -54,16 +60,19 @@ final class NemotronH35MTPCompactGraphCache {
             return replacement
         }
         let result = withExtendedLifetime(retired) {
-            current.function([hidden, convState, initialSSM] + (prepared.map { [$0] } ?? []))
+            current.function([hidden, convState, initialSSM] + (prepared.map { [$0] } ?? [])
+                + (replay.map { [$0.conv, $0.dt] } ?? []))
         }
-        guard result.count == 5 else {
+        guard result.count == (replay == nil ? 5 : 6) else {
             // Retain any enclosing MLX error while avoiding empty indexing.
             return owner.mtpCompactArrays(
-                hidden, convState: convState, initialSSM: initialSSM, prepared: prepared)
+                hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
+                replay: replay)
         }
         guard NemotronMoELeader.selfTest else { return result }
         // Reference: in_proj prepares its activation from `hidden` itself.
-        let expected = owner.mtpCompactArrays(hidden, convState: convState, initialSSM: initialSSM)
+        let expected = owner.mtpCompactArrays(
+            hidden, convState: convState, initialSSM: initialSSM, replay: replay)
         return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
     }
 
@@ -120,10 +129,13 @@ extension NemotronHMamba2Mixer {
         prepared: MLXArray? = nil
     ) -> MLXArray {
         let length = hiddenStates.dim(1)
+        let fold = NemotronMTPReplayFold.take(modelLayerIndex: modelLayerIndex, input: initialSSM)
         let arrays = mtpCompactGraphCache(
-            hiddenStates, convState: convState, initialSSM: initialSSM, prepared: prepared,
+            hiddenStates, convState: convState, initialSSM: fold?.state ?? initialSSM,
+            prepared: prepared, replay: fold.map { (conv: $0.conv, dt: $0.dt, keep: $0.keep) },
             owner: self)
         let (padded, convolution, dt, finalSSM) = (arrays[1], arrays[2], arrays[3], arrays[4])
+        let start = fold == nil ? initialSSM : arrays[5]
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
@@ -132,25 +144,28 @@ extension NemotronHMamba2Mixer {
         // NEMOTRON_MTP_SSM_REPLAY_GROUP: replay with this forward's other
         // Mamba layers in grouped launches (same per-layer statements).
         let grouped = NemotronMTPReplayGroup.join(evaluation, .init(
-            convolution: convolution, dt: dt, aLog: logA, D: skip, state: initialSSM,
+            convolution: convolution, dt: dt, aLog: logA, D: skip, state: start,
             heads: heads, headDim: dim, groups: groups, stateDim: state))
         do {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
                 finalConv: padded[0..., length ..< (length + history), 0...],
                 finalSSM: finalSSM,
-                materializedByteCount: tapeBytes + finalSSM.nbytes,
+                materializedByteCount: tapeBytes + finalSSM.nbytes + (fold == nil ? 0 : start.nbytes),
                 evaluationRoots: tape,
-                strictReplayRetainedByteCount: tapeBytes + initialSSM.nbytes,
-                strictReplayRetainedRoots: tape + [initialSSM],
+                strictReplayRetainedByteCount: tapeBytes + start.nbytes,
+                strictReplayRetainedRoots: tape + [start],
                 replay: { keep in
-                    CBv2RecurrentLayerState(
-                        conv: padded[0..., keep ..< (keep + history), 0...],
-                        ssm: grouped.map { $0.group.finalState(slot: $0.slot, keep: keep) }
-                            ?? nemotronMTPSSMCompact(
-                            convolution: convolution, ALog: logA, D: skip, dt: dt,
-                            state: initialSSM, heads: heads, headDim: dim, groups: groups,
-                            stateDim: state, steps: keep, writeOutput: false).finalState)
+                    let ssm = grouped.map { $0.group.finalState(slot: $0.slot, keep: keep) }
+                        ?? nemotronMTPSSMCompact(
+                        convolution: convolution, ALog: logA, D: skip, dt: dt,
+                        state: start, heads: heads, headDim: dim, groups: groups,
+                        stateDim: state, steps: keep, writeOutput: false).finalState
+                    NemotronMTPReplayFold.offer(
+                        modelLayerIndex: modelLayerIndex, output: ssm,
+                        conv: convolution, dt: dt, state: start, keep: keep)
+                    return CBv2RecurrentLayerState(
+                        conv: padded[0..., keep ..< (keep + history), 0...], ssm: ssm)
                 })
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
@@ -164,7 +179,8 @@ extension NemotronHMamba2Mixer {
     /// join from these exact BF16 rows (otherwise prepared here).
     func mtpCompactArrays(
         _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
-        prepared inputPrepared: MLXArray? = nil
+        prepared inputPrepared: MLXArray? = nil,
+        replay: (conv: MLXArray, dt: MLXArray, keep: Int)? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         // The window's conv, padded history and timestep come from in_proj's
@@ -203,6 +219,26 @@ extension NemotronHMamba2Mixer {
         }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
+        if let replay, length == 3, NemotronMTPExecution.batchedNorm,
+           let q = outProj as? QuantizedLinear, q.mode == .affine,
+           q.bits == 4, q.groupSize == 64, q.bias == nil,
+           q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+           q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+           q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
+           let folded = norm.compactSSMPreparedRows(
+               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+               projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
+               replay: replay) {
+            return [nemotronMTPLinearRows(folded.0, outProj, prepared: folded.1),
+                    padded, convolution, dt, folded.2, folded.3]
+        }
+        let start = replay.map {
+            nemotronMTPSSMCompact(
+                convolution: $0.conv, ALog: logA, D: skip, dt: $0.dt, state: initialSSM,
+                heads: heads, headDim: dim, groups: groups, stateDim: state,
+                steps: $0.keep, writeOutput: false).finalState
+        } ?? initialSSM
+        let replayed: [MLXArray] = replay == nil ? [] : [start]
         // NEMOTRON_SSM_GATED_FUSED: the compact SSM window, the gated RMS norm
         // and out_proj's prepared activation in one launch (see
         // NemotronHCompactSSMGated); the same normed rows, prepared activation
@@ -214,13 +250,13 @@ extension NemotronHMamba2Mixer {
            q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
            q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
            var fused = norm.compactSSMPreparedRows(
-               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+               convolution: convolution, ALog: logA, D: skip, dt: dt, state: start,
                projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state) {
             if NemotronMoELeader.selfTest {
                 // Reference: the two launches (compact SSM, then the gated
                 // norm with the prepared output) on the same operands.
                 let reference = nemotronMTPSSMCompact(
-                    convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                    convolution: convolution, ALog: logA, D: skip, dt: dt, state: start,
                     heads: heads, headDim: dim, groups: groups, stateDim: state,
                     steps: length, writeOutput: true)
                 if let pair = norm.preparedRows(
@@ -231,10 +267,10 @@ extension NemotronHMamba2Mixer {
                 }
             }
             return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
-                    padded, convolution, dt, fused.2]
+                    padded, convolution, dt, fused.2] + replayed
         }
         let result = nemotronMTPSSMCompact(
-            convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+            convolution: convolution, ALog: logA, D: skip, dt: dt, state: start,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
             steps: length, writeOutput: true)
         let y = result.output.reshaped(batch, length, heads * dim)
@@ -259,7 +295,7 @@ extension NemotronHMamba2Mixer {
             prepared = nil
         }
         return [nemotronMTPLinearRows(normalized, outProj, prepared: prepared),
-                padded, convolution, dt, result.finalState]
+                padded, convolution, dt, result.finalState] + replayed
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
@@ -377,6 +413,20 @@ extension NemotronH35Model {
             heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
             eval(fused.0, fused.1, fused.2)
         }
+        for keep in 1 ... 2 where NemotronMTPReplayFold.enabled {
+            if let folded = mixer.norm.compactSSMPreparedRows(
+                convolution: MLXArray.zeros([1, 3, mixer.convDim], dtype: .bfloat16),
+                ALog: mixer.aLog, D: mixer.D,
+                dt: MLXArray.zeros([1, 3, heads], dtype: .float32),
+                state: MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32),
+                projected: MLXArray.zeros(
+                    [1, 3, mixer.intermediateSize + mixer.convDim + heads], dtype: .bfloat16),
+                heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                replay: (conv: MLXArray.zeros([1, 3, mixer.convDim], dtype: .bfloat16),
+                         dt: MLXArray.zeros([1, 3, heads], dtype: .float32), keep: keep)) {
+                eval(folded.0, folded.1, folded.2, folded.3)
+            }
+        }
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = silu(mixer.conv1d(padded))
@@ -420,5 +470,44 @@ extension NemotronH35Model {
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
+    }
+}
+
+enum NemotronMTPReplayFold {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_REPLAY_FOLD"] != "0"
+
+    struct Pending {
+        let output: MLXArray
+        let conv: MLXArray
+        let dt: MLXArray
+        let state: MLXArray
+        let keep: Int
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var pending: [Int: Pending] = [:]
+
+    static func offer(
+        modelLayerIndex: Int, output: MLXArray, conv: MLXArray, dt: MLXArray,
+        state: MLXArray, keep: Int
+    ) {
+        guard enabled, (1 ... 2).contains(keep),
+              conv.shape == [1, 3, 6144], conv.dtype == .bfloat16,
+              dt.shape == [1, 3, 64], dt.dtype == .float32,
+              state.shape == [1, 64, 64, 128], state.dtype == .float32
+        else { return }
+        let entry = Pending(output: output, conv: conv, dt: dt, state: state, keep: keep)
+        lock.withLock { pending[modelLayerIndex] = entry }
+    }
+
+    static func take(modelLayerIndex: Int, input: MLXArray) -> Pending? {
+        guard enabled else { return nil }
+        return lock.withLock {
+            guard let entry = pending.removeValue(forKey: modelLayerIndex),
+                  entry.output === input
+            else { return nil }
+            return entry
+        }
     }
 }
