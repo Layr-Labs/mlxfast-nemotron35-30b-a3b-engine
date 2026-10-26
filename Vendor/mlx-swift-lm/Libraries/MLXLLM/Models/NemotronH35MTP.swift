@@ -418,7 +418,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                     + draftHead.decodeResidencyArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
-                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays)
+                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
+                    + NemotronSharedDownZSkip.copyArrays,
+                extraOwners: NemotronSharedDownZSkip.copyOwners)
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {

@@ -276,11 +276,14 @@ final class NemotronH35MTPAttentionBlock: Module {
             }
         }
         let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq, prepared: xPrepared)
+        let projections = NemotronMTPDraftTail.fusedQKV && length == 3
+            ? NemotronTargetQKV.apply(x, query: mixer.wq, key: mixer.wk, value: mixer.wv,
+                captureMTP: true, prepared: xPrepared) : nil
+        let queries = (projections?.0 ?? nemotronMTPLinearRows(x, mixer.wq, prepared: xPrepared))
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
+        let keys = (projections?.1 ?? nemotronMTPLinearRows(x, mixer.wk))
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
+        let values = (projections?.2 ?? nemotronMTPLinearRows(x, mixer.wv))
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
         return (fused, queries, keys, values)
     }
