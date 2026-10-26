@@ -1057,6 +1057,24 @@ private func nemotronSharedUpPackSource() -> String {
     for (int i = 0; i < 8; i++) packed[base + i * 32] = values[i];
     packed[base + 8 * 32] = total;
   }
+  // The dictionary qualification compares the whole packed allocation.
+  // Only the last chunk owns its unused lanes; initialize those words in
+  // both twins, leaving every live activation word and the check unchanged.
+  const int pack_chunks = out_vec_size / 8;
+  const int pack_tail = pack_chunks % 32;
+  if (pack_tail != 0 && int(tid.y) == pack_chunks - 1) {
+    const int padding_lanes = 32 - pack_tail;
+    const int packed_tiles = (pack_chunks + 31) / 32;
+    const int local_thread = int(simd_gid) * 32 + int(simd_lid);
+    for (int p = local_thread; p < R * 9 * padding_lanes;
+         p += num_simdgroups * 32) {
+      const int pad_lane = pack_tail + p % padding_lanes;
+      const int pad_word = (p / padding_lanes) % 9;
+      const int pad_row = p / (9 * padding_lanes);
+      const int pad_base = (pad_row * packed_tiles + pack_chunks / 32) * 9 * 32;
+      packed[pad_base + pad_word * 32 + pad_lane] = 0.0f;
+    }
+  }
 """
 }
 
@@ -1065,14 +1083,14 @@ enum NemotronSharedUpPacking {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PACK"] != "0"
     nonisolated(unsafe) private static var verified = false
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_shared_up_relu2_pack_r3",
+        name: "nemotron_shared_up_relu2_pack_r3_init_tail",
         inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
         outputNames: ["y", "packed"], source: nemotronSharedUpPackSource(),
         header: nemotronSharedUpPackHeader)
     /// The same launch reading (scale, bias) through `NemotronSBDict`.
     private static let dictKernel = nemotronSBDictSource(nemotronSharedUpPackSource()).map {
         MLXFast.metalKernel(
-            name: "nemotron_shared_up_relu2_pack_r3_sbd",
+            name: "nemotron_shared_up_relu2_pack_r3_sbd_init_tail",
             inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
             outputNames: ["y", "packed"], source: $0, header: nemotronSharedUpPackHeader)
     }
