@@ -342,6 +342,16 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
+    /// With target sets, the per-layer copy sets are requested on the target queue, each marking its layer ready
+    /// when its request returns, instead of at the first verify graph.
+    static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
+    private(set) var copiesEnqueued = false
+    /// With the copies on the target queue, the copy sets, the MTP head's set and the extras go out right after
+    /// the first `leadGroups` target groups (the embeddings and the first layers); the remaining target groups
+    /// follow them. A count at or above the number of target groups keeps every target group first.
+    static let leadGroups = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEAD_GROUPS"] ?? "") ?? 13
+    /// NEMOTRON_MTP_LATE_TARGETS=0 leaves the remaining target groups unrequested.
+    static let lateTargets = ProcessInfo.processInfo.environment["NEMOTRON_MTP_LATE_TARGETS"] != "0"
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
@@ -424,7 +434,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             if !decoded {
                 decoded = true
-                for (i, set) in owner.decodeSets.enumerated() {
+                for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
             }
@@ -445,7 +455,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             }
             owner.queue.sync {
                 owner.seedSet.endResidency()
-                if decoded { for set in owner.decodeSets { set.endResidency() } }
+                if decoded || owner.copiesEnqueued { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
         }
@@ -457,24 +467,43 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
     }
-    /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
-    /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
-    /// set keeps its own queue.
+    /// One serial order for the lease's first requests: the target's first `leadGroups` groups (the seed's
+    /// first weights, in backbone order), the copy sets, the MTP head's set, the decode-only extras, then the
+    /// target's remaining groups. With no target sets the head set keeps its own queue.
     func begin() -> Lease {
         NemotronZSkip.beginCopyReadiness(owners)
+        copiesEnqueued = false
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
-        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        let lead = Self.copiesAfterExtras ? min(max(Self.leadGroups, 0), targetSets.count) : targetSets.count
+        for set in targetSets.prefix(lead) { targetQueue.async { set.requestResidency() } }
+        if lead < targetSets.count { enqueueCopies() }
         let head = seedSet, ready = Array(owners.prefix(cut))
         targetQueue.async {
             head.requestResidency()
             NemotronZSkip.markCopyReady(ready)
         }
         for set in extraSets { targetQueue.async { set.requestResidency() } }
+        if lead == targetSets.count, Self.copiesAfterExtras { enqueueCopies() }
+        if Self.lateTargets {
+            for set in targetSets.dropFirst(lead) { targetQueue.async { set.requestResidency() } }
+        }
         return Lease(self)
+    }
+    /// The 23 copy sets on the target queue in backbone order, each marking its own layer ready when its
+    /// request returns.
+    private func enqueueCopies() {
+        copiesEnqueued = true
+        for (i, set) in decodeSets.enumerated() {
+            let ready = [owners[cut + i]]
+            targetQueue.async {
+                set.requestResidency()
+                NemotronZSkip.markCopyReady(ready)
+            }
+        }
     }
 }
 
