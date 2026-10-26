@@ -2201,9 +2201,8 @@ enum NemotronMTPRouterRows {
     // Router weights whose loaded layout is row-major [128, 2688]: there the
     // reference matmul(row, weight.T) takes the non-transposed gemv this kernel
     // repeats. Another layout makes MLX pick gemv_t, whose order differs, so
-    // only weights verified here at load take the fast path. Filled by warm()
-    // (the target's routers, then the draft head's), before any compile
-    // trace, from the frozen loaded weights.
+    // only weights verified here at load take the fast path. Filled once by
+    // warm(), before any compile trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
     static func isRowMajor(_ weight: MLXArray) -> Bool { rowMajor.contains(ObjectIdentifier(weight)) }
 
@@ -2307,13 +2306,10 @@ private let nemotronMTPRouterRowsSelectEpilogue = """
 /// `NemotronHRouterSelection`'s top-six selection (see the epilogue above).
 /// Used only after `qualify` found indices, weights and gates bitwise equal to
 /// the two launches. NEMOTRON_MTP_ROUTER_SELECT_FUSED=0 keeps the two launches.
-/// The draft head's one-row router (`exactOneTokenTail`) takes the same launch
-/// on its own counter once `qualifyDraft` matched it on the head's gate.
 enum NemotronMTPRouterRowsSelect {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
-    nonisolated(unsafe) static var draftVerified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
     nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
@@ -2340,15 +2336,7 @@ enum NemotronMTPRouterRowsSelect {
                     draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        launch(x, weight, bias: bias, force: force, draft: draft).map { ($0[1], $0[2]) }
-    }
-
-    /// `run`'s launch: [gates, indices, weights].
-    private static func launch(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool,
-                               draft: Bool) -> [MLXArray]?
-    {
-        guard enabled, force || (draft ? draftVerified : verified),
-              let counter = draft ? Self.draftCounter : Self.counter,
+        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2358,11 +2346,12 @@ enum NemotronMTPRouterRowsSelect {
         else { return nil }
         let rows = x.dim(1)
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
-        return kernel([weight, x, kArray, nArray, bias, counter],
+        let out = kernel([weight, x, kArray, nArray, bias, counter],
             template: [("T", x.dtype), ("R", rows)],
             grid: (32 * (128 / rowsPerThreadgroup), 8, 1), threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128], [1, rows, 6], [1, rows, 6]],
             outputDTypes: [x.dtype, .uint32, .float32])
+        return (out[1], out[2])
     }
 
     /// Load time: the fused launch against the gemv + selection pair, bit for
@@ -2410,64 +2399,6 @@ enum NemotronMTPRouterRowsSelect {
             verified = false
         }
         report(verified ? "on (bitwise equal at R = 1...4)" : "off (differs or failed)")
-    }
-
-    /// Load time, after `qualify` and before any draft graph is traced: the
-    /// head's router (`exactOneTokenTail`, one row per draft step). Records the
-    /// head's row-major gate (`NemotronMTPRouterRows.warm`), then compares the
-    /// R = 1 launch on the draft counter with the two launches the draft takes
-    /// without it, the head gate's stock gemv `matmul(row, weight.T)` and
-    /// `NemotronHRouterSelection`: gates, indices and weights bit for bit on
-    /// seeded rows (each launched twice, so the counter reset is exercised).
-    /// Engages only if all match. NEMOTRON_MTP_DRAFT_ROUTER_FUSED=0 (or
-    /// NEMOTRON_MTP_DRAFT_FUSED=0) keeps the two launches.
-    static func qualifyDraft(_ head: Module) {
-        draftVerified = false
-        guard enabled, NemotronMTPDraftTail.oneLaunchRouter else { return }
-        func report(_ message: String) {
-            FileHandle.standardError.write(Data("nemotron mtp draft router select fused: \(message)\n".utf8))
-        }
-        NemotronMTPRouterRows.warm(head)
-        let routers = head.modules().compactMap { $0 as? NemotronHMoEGate }
-        guard routers.count == 1, let gate = routers.first,
-              NemotronMTPRouterRows.isRowMajor(gate.weight),
-              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32,
-              gate.topK == 6, gate.nGroup == 1, gate.topkGroup == 1, gate.normTopkProb,
-              gate.routedScalingFactor == 2.5
-        else { return report("off (no row-major head router)") }
-        if draftCounter == nil {
-            let zero = MLXArray.zeros([1], dtype: .uint32)
-            eval(zero)
-            draftCounter = zero
-        }
-        var ok = MLXArray(true)
-        do {
-            let matched = try withError { () -> Bool in
-                for seed in 0 ..< 8 {
-                    let key = MLXRandom.key(UInt64(0xd7a5e1 + seed))
-                    let x = (MLXRandom.normal([1, 1, 2688], key: key) * Float(1 + seed % 4))
-                        .asType(.bfloat16)
-                    let gates = MLX.matmul(x, gate.weight.transposed())
-                    let reference = gate(x)
-                    for _ in 0 ..< 2 {
-                        guard let fused = launch(x, gate.weight, bias: gate.eSCB, force: true, draft: true)
-                        else { return false }
-                        ok = MLX.logicalAnd(ok, MLX.logicalAnd(
-                            (fused[0].view(dtype: .uint16) .== gates.view(dtype: .uint16)).all(),
-                            MLX.logicalAnd(
-                                (fused[1] .== reference.0).all(),
-                                (fused[2].view(dtype: .uint32) .== reference.1.view(dtype: .uint32)).all())))
-                        eval(ok, fused[0], fused[1], fused[2])
-                    }
-                }
-                return ok.item(Bool.self) && (draftCounter!.item(UInt32.self) == 0)
-            }
-            draftVerified = matched
-        } catch {
-            draftVerified = false
-        }
-        report(draftVerified ? "on (bitwise equal to the head's gemv + selection at R = 1)"
-            : "off (differs or failed)")
     }
 }
 
@@ -3153,106 +3084,6 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
-
-    /// Draft-only 2-bit screen records: each selected group's 64 head values
-    /// (dequantized from the head's own 4-bit codes) re-quantized on load to
-    /// 2 bits with their own minimum and step (round to nearest, clamped to
-    /// 0...3). Per row: 4 words of codes per selected group (value j of a
-    /// word at bits 2j), then one word per group holding the minimum (low
-    /// half) and the step (high half) as float16; 5 words per selected group
-    /// (rows from `rows` up: the upper group set). Only the screen's partial
-    /// pass reads them; the kept rows are rescored on the head itself.
-    static func packRecords2(
-        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
-        upperGroups: [Int]?
-    ) -> MLXArray {
-        let shifts = MLXArray((0..<16).map { UInt32(2 * $0) })
-        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
-            let columns = MLXArray(selected.flatMap { g in (0..<64).map { Int32(64 * g + $0) } })
-            var parts: [MLXArray] = []
-            for start in stride(from: range.lowerBound, to: range.upperBound, by: 8192) {
-                let r = start..<min(start + 8192, range.upperBound)
-                let values = take(
-                    dequantized(weight[r], scales: scales[r], biases: biases[r], groupSize: 64, bits: 4)
-                        .asType(.float32), columns, axis: 1
-                ).reshaped(r.count, selected.count, 64)
-                let low = values.min(axis: -1, keepDims: true)
-                let step = (values.max(axis: -1, keepDims: true) - low) / 3
-                let safe = which(step .== 0, MLXArray(Float(1)), step)
-                let codes = clip(round((values - low) / safe), min: 0, max: 3).asType(.uint32)
-                let words = (codes.reshaped(r.count, selected.count, 4, 16) << shifts).sum(axis: -1)
-                    .reshaped(r.count, selected.count * 4)
-                let lowBits = low.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let stepBits = step.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let part = concatenated([words.asType(.uint32), lowBits | (stepBits << 16)], axis: 1)
-                eval(part)
-                parts.append(part)
-            }
-            return concatenated(parts, axis: 0).reshaped(-1)
-        }
-        let lower = pack(0..<rows, groups)
-        guard let upperGroups else { return lower }
-        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
-    }
-
-    // The 2-bit record twin of the partial pass: lane l owns half-group l
-    // (32 values = two code words) of the selected groups; scores are
-    // step * sum(code * x) + minimum * sum(x) over the selected groups.
-    private static let record2PartialSource = """
-      constexpr int VPL = 32;
-      const int lane = int(thread_index_in_simdgroup);
-      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
-      const int row0 = sg * RPS;
-      const bool upper = row0 >= LO;
-      const int H = upper ? 2 * S2 : 2 * S;
-      const bool on = lane < H;
-      const int gi = lane >> 1;
-      const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
-      const int part = lane & 1;
-      const device T* xp = x + g * 64 + part * 32;
-      float xv[VPL];
-      float xs = 0.0f;
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < VPL; i += 8) {
-        _Pragma("clang loop unroll(full)")
-        for (int k = 0; k < 8; k++) {
-          const float xk = on ? float(xp[i + k]) : 0.0f;
-          xs += xk;
-          xv[i + k] = xk / float(1 << (2 * k));
-        }
-      }
-      _Pragma("clang loop unroll(full)")
-      for (int r = 0; r < RPS; r++) {
-        const int row = row0 + r;
-        float acc = 0.0f;
-        if (on) {
-          const device uint32_t* rp = rec + (upper
-              ? size_t(LO) * (5 * S) + size_t(row - LO) * (5 * S2) : size_t(row) * (5 * S));
-          const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);
-          const uint ld = rp[4 * (upper ? S2 : S) + gi];
-          const float lo = float(as_type<half>(ushort(ld & 0xffffu)));
-          const float d = float(as_type<half>(ushort(ld >> 16)));
-          float a = 0.0f;
-          _Pragma("clang loop unroll(full)")
-          for (int i = 0; i < VPL / 8; i++) {
-            const uint q = uint(ws[i]);
-            a += xv[8 * i] * float(q & 0x0003u) + xv[8 * i + 1] * float(q & 0x000cu)
-                + xv[8 * i + 2] * float(q & 0x0030u) + xv[8 * i + 3] * float(q & 0x00c0u)
-                + xv[8 * i + 4] * float(q & 0x0300u) + xv[8 * i + 5] * float(q & 0x0c00u)
-                + xv[8 * i + 6] * float(q & 0x3000u) + xv[8 * i + 7] * float(q & 0xc000u);
-          }
-          acc = d * a + lo * xs;
-        }
-        acc = simd_sum(acc);
-        if (lane == 0) {
-          scores[row] = acc;
-        }
-      }
-    """
-    private static let record2PartialKernel = MLXFast.metalKernel(
-        name: "nemotron_head_screen_partial_record2_affine2",
-        inputNames: ["rec", "x", "groups", "groups2"],
-        outputNames: ["scores"], source: record2PartialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3390,7 +3221,7 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
+        packed: MLXArray? = nil, records: MLXArray? = nil,
         counter: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
@@ -3401,12 +3232,7 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records2.map {
-            record2PartialKernel(
-                [$0, hidden, groups, upperGroups ?? groups], template: template,
-                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-                outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? records.map {
+        let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
