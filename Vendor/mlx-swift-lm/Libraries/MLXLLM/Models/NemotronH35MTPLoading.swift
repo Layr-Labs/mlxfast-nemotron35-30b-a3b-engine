@@ -346,6 +346,10 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// marking its layer ready when its request returns, instead of at the first verify graph.
     static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
     private(set) var copiesEnqueued = false
+    /// Published only after a normal lease drains both queues. Its immutable sets are still
+    /// requested, so a later lease can reuse that completed preparation without driver calls.
+    private let standingLock = NSLock()
+    private var hasStandingRequests = false
     /// The buffers of the residency sets are locked in memory (`mlock`) once at load, so a lease's request maps
     /// pages that stay wired between requests. NEMOTRON_MTP_MLOCK=targets locks only the target's groups;
     /// NEMOTRON_MTP_MLOCK=0 locks nothing.
@@ -465,9 +469,13 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             finished = true
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
-                // The requests stay standing; the next lease requests the same sets again.
+                // The requests stay standing. Publish completion only for the normal serial
+                // path, where begin() requested every set even if decode was never entered.
                 owner.targetQueue.sync {}
                 owner.queue.sync { NemotronZSkip.endCopyReadiness() }
+                if !owner.targetSets.isEmpty && NemotronDecodeResidency.copiesAfterExtras {
+                    owner.standingLock.withLock { owner.hasStandingRequests = true }
+                }
                 return
             }
             owner.targetQueue.sync {
@@ -493,6 +501,14 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     func begin() -> Lease {
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
+        if !Self.endsRequests, Self.copiesAfterExtras, !targetSets.isEmpty,
+           standingLock.withLock({ hasStandingRequests }) {
+            // Only completed requests can reach this path. beginDecode() still takes its
+            // ordinary readiness snapshot; no prompt state or numerical result is reused.
+            copiesEnqueued = true
+            NemotronZSkip.markCopyReady(owners)
+            return Lease(self)
+        }
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
