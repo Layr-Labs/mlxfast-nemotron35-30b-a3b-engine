@@ -649,6 +649,10 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    let tripleGateUp: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8: MLXFast.MLXFastKernel?
+    let tripleGateUpDict: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8Dict: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -712,6 +716,38 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUp = nmlPreparedSource(tripleSource, pointers: triplePointers).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8 = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpDict = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8Dict = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
     }
@@ -1060,6 +1096,47 @@ enum NemotronMoELeader {
             which(ok, result[1], referencePlan))
     }
 
+    static let elideUnreadPlan =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_PLAN_ELIDE"] != "0"
+
+    static func applyTripleWithoutPlan(
+        _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+    ) -> MLXArray? {
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
+        else { return nil }
+        let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+        guard tail8 || kernels.tripleGateUpAndPlan != nil else { return nil }
+        let useDict = dict != nil
+            && (tail8 ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
+        guard let kernel = useDict
+            ? (tail8 ? kernels.tripleGateUpTail8Dict : kernels.tripleGateUpDict)
+            : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let rps = leaderResultsPerSimdgroup(rows: 3)
+        let activation = kernel(
+            useDict
+                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+                : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                   NemotronBankBinding.bind(bank.biases), packed, inds],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+            outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+        guard selfTest else { return activation }
+        let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
+            perSlot: false, relu2: relu2, prepared: packed)
+        let ok = (activation.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+        return which(ok, activation, MLXArray(Float.nan).asType(x.dtype))
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -1107,9 +1184,14 @@ enum NemotronMoELeader {
         let act: MLXArray
         let balancePlan: MLXArray?
         if fuseRelu2 {
-            if rows == 3, let fused = applyWithBalancePlan(
-                xr, flat, bank: up, relu2: true, prepared: prepared,
-                dict: NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil) {
+            let dict = rows == 3 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
+            if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
+               let activation = applyTripleWithoutPlan(
+                   xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
+                act = activation
+                balancePlan = nil
+            } else if rows == 3, let fused = applyWithBalancePlan(
+                xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
                 act = fused.activation
                 balancePlan = fused.plan
             } else {
@@ -2030,6 +2112,8 @@ enum NemotronZSkip {
         }.sorted { $0.0 < $1.0 }.map { $0.1 }
     }
 
+    static let residentTables = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESID"] != "0"
+
     /// Numeric backbone order, independent of dictionary iteration order.
     static func decodeCopyLayers(_ model: Module) -> [[MLXArray]] {
         let layers = model.namedModules().compactMap { name, module -> (Int, NemotronHMoE)? in
@@ -2041,7 +2125,7 @@ enum NemotronZSkip {
         return lock.withLock {
             layers.compactMap { _, moe in
                 guard let c = copies[ObjectIdentifier(moe.switchMLP.fc2)] else { return nil }
-                return c.dict ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
+                return c.dict && !residentTables ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
             }
         }
     }
@@ -2223,6 +2307,20 @@ enum NemotronZSkip {
     /// The draft copies' arrays (decode-only backing for the residency lease).
     static var draftCopyArrays: [MLXArray] {
         lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+    static func withoutCopiedDraftBanks(_ module: Module) -> [MLXArray] {
+        let all = module.parameters().flattened().map { $0.1 }
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_RESIDENCY"] != "1" else { return all }
+        let copied = lock.withLock { Set(draftCopies.keys) }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, copied.contains(ObjectIdentifier(linear)) else { continue }
+            for (_, a) in linear.parameters().flattened() { skip.insert(ObjectIdentifier(a)) }
+        }
+        let kept = all.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(kept.count) arrays, \(all.count - kept.count) copied draft-bank arrays left out\n".utf8))
+        return kept
     }
 
     static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -2413,6 +2511,168 @@ enum NemotronZSkip {
             let act = (a * a).asType(.bfloat16)
             let expected = NemotronMoELeader.applyWeighted(act, inds, scores, rows: 3, bank: bank)
             let got = run(act, inds, scores, copy: copy)
+            same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
+        }
+        return same.item(Bool.self)
+    }
+}
+
+//
+enum NemotronSharedDownZSkip {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_DOWN_ZSKIP"] != "0"
+    private static let k = 3712
+    private static let n = 2688
+
+    private static let layout = MLXFast.metalKernel(
+        name: "nemotron_zskip_shared_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
+        source: nemotronZSkipTiledLayoutSource)
+    private static let kernel: MLXFast.MLXFastKernel? = {
+        let swaps: [(String, String)] = [
+            ("  constexpr int tail = chunks - 224;\n",
+             "  constexpr int full = chunks / 32;\n  constexpr int tail = chunks - 32 * full;\n"),
+            ("    const int count = l < tail ? 8 : 7;\n",
+             "    const int count = l < tail ? full + 1 : full;\n"),
+            ("      const int c = j < 7 ? l + 32 * j : 224 + l;\n",
+             "      const int c = j < full ? l + 32 * j : 32 * full + l;\n"),
+            ("      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;\n",
+             "      shared_y[slot * N + n0 + n] = h;\n"),
+        ]
+        var source = nemotronZSkipTiledFastSource
+        for (old, new) in swaps {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return MLXFast.metalKernel(
+            name: "nemotron_zskip_shared_down_tiled_fast",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"],
+            source: source,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }()
+
+    private struct Copy {
+        let codes: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var copies: [ObjectIdentifier: Copy] = [:]
+    nonisolated(unsafe) private static var inds: MLXArray? = nil
+    static var copyArrays: [MLXArray] {
+        lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+
+    private static func admissible(_ q: QuantizedLinear) -> Bool {
+        type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
+            && q.groupSize == 64 && q.bias == nil
+            && q.weight.shape == [n, k / 8] && q.weight.dtype == .uint32
+            && q.scales.shape == [n, k / 64] && q.scales.dtype == .bfloat16
+            && q.biases?.shape == q.scales.shape && q.biases?.dtype == .bfloat16
+    }
+
+    private static func makeCopy(_ q: QuantizedLinear) -> Copy {
+        let tiles = n / 128, groups = k / 64
+        let codes = layout(
+            [q.weight.reshaped(1, n, k / 8)], template: [("N", n), ("K", k)],
+            grid: (32 * tiles, k, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[1, tiles, k, 32]], outputDTypes: [.uint16])[0]
+        func tileMajor(_ a: MLXArray) -> MLXArray {
+            a.reshaped(1, tiles, 128, groups).transposed(0, 1, 3, 2).contiguous()
+        }
+        return Copy(codes: codes, scales: tileMajor(q.scales), biases: tileMajor(q.biases!))
+    }
+
+    private static func dispatch(_ x: MLXArray, _ copy: Copy, _ inds: MLXArray,
+                                 _ kernel: MLXFast.MLXFastKernel) -> MLXArray {
+        let sgs = NemotronZSkip.sgs
+        return kernel(
+            [copy.codes, copy.scales, copy.biases, x, inds],
+            template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", sgs)],
+            grid: (32 * sgs * (n / 128), 3, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[1, 3, n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func run(_ x: MLXArray, owner: Linear) -> MLXArray? {
+        guard enabled, let kernel, x.shape == [3, k], x.dtype == .bfloat16 else { return nil }
+        let found = lock.withLock { () -> (Copy, MLXArray)? in
+            guard let copy = copies[ObjectIdentifier(owner)], let inds else { return nil }
+            return (copy, inds)
+        }
+        guard let found else { return nil }
+        return dispatch(x, found.0, found.1, kernel)
+    }
+
+    static func covers(_ owner: Linear) -> Bool {
+        guard enabled, kernel != nil else { return false }
+        return lock.withLock { copies[ObjectIdentifier(owner)] != nil && inds != nil }
+    }
+
+    static func prepare(_ model: Module) {
+        guard enabled, let kernel, NemotronMoELeader.enabled,
+              Device.defaultDevice().deviceType == .gpu else { return }
+        let zeros = MLXArray.zeros([3], dtype: .uint32)
+        eval(zeros)
+        var built: [ObjectIdentifier: Copy] = [:]
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let moe = module as? NemotronHMoE, let shared = moe.sharedExperts,
+                          let q = shared.downProj as? QuantizedLinear, admissible(q),
+                          built[ObjectIdentifier(q)] == nil else { continue }
+                    let copy = makeCopy(q)
+                    eval(copy.codes, copy.scales, copy.biases)
+                    guard finite(q), matches(q, copy, zeros, kernel, seed: built.count)
+                    else { return false }
+                    built[ObjectIdentifier(q)] = copy
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        lock.withLock {
+            copies = accepted ? built : [:]
+            inds = accepted ? zeros : nil
+        }
+        FileHandle.standardError.write(Data((accepted
+            ? "nemotron shared down zskip on: \(built.count) layers\n"
+            : "nemotron shared down zskip off\n").utf8))
+    }
+
+    private static func finite(_ q: QuantizedLinear) -> Bool {
+        let limit = MLXArray(Float.infinity).asType(.bfloat16)
+        return logicalAnd((abs(q.scales) .< limit).all(), (abs(q.biases!) .< limit).all())
+            .item(Bool.self)
+    }
+
+    private static func matches(_ q: QuantizedLinear, _ copy: Copy, _ inds: MLXArray,
+                                _ kernel: MLXFast.MLXFastKernel, seed: Int) -> Bool {
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5d0e + seed)), into: 3)
+        let h = abs(MLXRandom.normal([3, k], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[1]) .< MLXArray(Float(0.16))
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+        let zero = MLXArray(Float(0))
+        let oneHot = which(column .== MLXArray(Int32(k - 100)), MLXArray(Float(1.5)), zero)
+        let sparse = which(row .== MLXArray(Int32(1)), zero,
+                           which(row .== MLXArray(Int32(2)), oneHot, which(keep, h, zero)))
+        let mixed = which(keep, h, zero)
+        let tail = which(column .>= MLXArray(Int32(k - 128)), h, zero)
+        let negative = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[2]) .< MLXArray(Float(0.05))
+        let negativeZero = MLXArray(Float(-0.0)).asType(.bfloat16)
+        var cases: [MLXArray] = []
+        for a in [sparse.asType(.bfloat16), mixed.asType(.bfloat16), tail.asType(.bfloat16),
+                  h.asType(.bfloat16)] {
+            cases.append((a * a).asType(.bfloat16))
+        }
+        cases.append(which(logicalAnd(cases[1] .== MLXArray(Float(0)).asType(.bfloat16), negative),
+                           negativeZero, cases[1]))
+        var same = MLXArray(true)
+        for act in cases {
+            let expected = nemotronMTPLinearRows(act.reshaped(1, 3, k), q)
+            let got = dispatch(act, copy, inds, kernel)
             same = logicalAnd(same, (got.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all())
         }
         return same.item(Bool.self)
