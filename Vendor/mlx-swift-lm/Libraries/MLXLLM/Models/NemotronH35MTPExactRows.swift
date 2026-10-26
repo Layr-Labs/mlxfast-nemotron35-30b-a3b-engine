@@ -1126,6 +1126,11 @@ enum NemotronSharedUpPacking {
             activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
                 x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
         }
+        if let y = NemotronSharedDownZSkip.run(activated, owner: down) {
+            guard NemotronMoELeader.selfTest else { return y }
+            return nemotronBitwiseOrNaN(y, nemotronMTPLinearRows(
+                activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1))
+        }
         return nemotronMTPLinearRows(
             activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
     }
@@ -2200,6 +2205,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
     /// order do not depend on which rows share a threadgroup, so the gates,
@@ -2220,10 +2226,11 @@ enum NemotronMTPRouterRowsSelect {
     /// x: [1, R, 2688] bf16 (R = 1...4), weight: a row-major [128, 2688] bf16
     /// router, bias: [128] fp32. Returns (indices [1, R, 6] uint32,
     /// weights [1, R, 6] fp32), or nil outside the qualified shapes.
-    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false)
+    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false,
+                    draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter,
+        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2257,6 +2264,9 @@ enum NemotronMTPRouterRowsSelect {
         let zero = MLXArray.zeros([1], dtype: .uint32)
         eval(zero)
         counter = zero
+        let draftZero = MLXArray.zeros([1], dtype: .uint32)
+        eval(draftZero)
+        draftCounter = draftZero
         var ok = MLXArray(true)
         do {
             let matched = try withError { () -> Bool in
@@ -3080,12 +3090,14 @@ enum NemotronHeadScreen {
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [weight, NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? (partialHalf ? partialHalfKernel : partialKernel)(
