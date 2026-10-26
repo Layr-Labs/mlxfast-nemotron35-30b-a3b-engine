@@ -79,6 +79,12 @@ let nemotronPrefillEvalInterval =
     ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_REEVAL"] == "0"
     ? nemotronEarlyEvalInterval : 2
 
+/// The seed's request prefill (`NemotronHPrefillX5.active`) also commits every
+/// layer between chunk boundaries; the waits stay at the boundaries and the
+/// stepper's prefill is unchanged. `NEMOTRON_SEED_LAYER_SUBMITS=0` skips it.
+let nemotronSeedLayerSubmits =
+    ProcessInfo.processInfo.environment["NEMOTRON_SEED_LAYER_SUBMITS"] != "0"
+
 /// Multi-token (prompt prefill) CBv2 forward: also submit after the first
 /// layer, as `nemotronVerifyFirstSubmit` does for the verify, so the GPU
 /// starts the first chunk while the host builds the next layer. Outside the
@@ -5332,6 +5338,14 @@ private class NemotronHBackbone: Module {
                 // submitted chunk: the first chunk boundary still waits on
                 // nothing and every later wait is unchanged.
                 let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: 0 ..< 1) }
+                asyncEval([hidden] + states)
+            } else if prefillChunks && next < layers.count && nemotronSeedLayerSubmits
+                && NemotronHPrefillX5.active {
+                // The seed's request prefill only: also commit each layer that
+                // is not a chunk boundary, so the GPU starts it while the host
+                // builds the next. Not recorded as a submitted chunk: the waits
+                // stay at the chunk boundaries. Evaluation order only.
+                let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: (next - 1) ..< next) }
                 asyncEval([hidden] + states)
             }
         }
