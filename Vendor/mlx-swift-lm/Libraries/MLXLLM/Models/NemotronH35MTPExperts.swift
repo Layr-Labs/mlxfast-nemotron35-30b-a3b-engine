@@ -2817,9 +2817,81 @@ enum NemotronFC2SharedColaunch {
           """
     }
 
+    private static func phaseBody(_ body: String) -> String? {
+        let outer = "  for (int ll = 0; ll < LPS; ll++) {\n"
+        let store = "      part[l * PS + 4 * lid + o] = p[o];\n"
+        let reduce = "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "  for (int q = 0; q < OT / SGS; q++) {\n"
+        guard body.components(separatedBy: outer).count == 2,
+              body.components(separatedBy: store).count == 2,
+              body.components(separatedBy: reduce).count == 2,
+              body.contains("    const int l = sg + SGS * ll;\n")
+        else { return nil }
+        let publish = "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "  for (int ll = 0; ll < LPS; ll++) {\n"
+            + "    const int l = sg + SGS * ll;\n"
+            + "    for (int o = 0; o < 4; o++) {\n"
+            + "      part[l * PS + 4 * lid + o] = nmc_kept[ll][o];\n"
+            + "    }\n"
+            + "  }\n"
+            + reduce
+        return body.replacingOccurrences(of: outer,
+                with: "  thread U nmc_kept[LPS][4];\n" + outer)
+            .replacingOccurrences(of: store, with: "      nmc_kept[ll][o] = p[o];\n")
+            .replacingOccurrences(of: reduce, with: publish)
+    }
+
+    private static func phaseSource(fc2: String, shared: String) -> String? {
+        let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
+        let views = "  threadgroup float* part = nmc_part;\n  threadgroup T* xsh = nmc_xsh;\n"
+            + "  threadgroup uchar* cmask = nmc_cmask;\n"
+        let slot = "  const int slot = int(threadgroup_position_in_grid.y);\n"
+        guard fc2.components(separatedBy: arrays).count == 2, fc2.components(separatedBy: slot).count == 2,
+              shared.components(separatedBy: arrays).count == 2, shared.components(separatedBy: slot).count == 2,
+              fc2.contains("constexpr int OT = 128;"), shared.contains("constexpr int OT = 128;")
+        else { return nil }
+        guard let phasedRouted = phaseBody(fc2), let phasedShared = phaseBody(shared)
+        else { return nil }
+        let routed = phasedRouted.replacingOccurrences(of: arrays, with: views)
+            .replacingOccurrences(of: slot, with: "  const int slot = nmc_row - (SDFIRST ? SROWS : 0);\n")
+        let down = phasedShared.replacingOccurrences(of: arrays, with: views)
+            .replacingOccurrences(of: slot, with: "  const int slot = nmc_row - (SDFIRST ? 0 : SLOTS);\n")
+        return """
+          static_assert(sizeof(T) * (KS > KF ? KS : KF) + (KS > KF ? KS : KF) / 8
+              <= 32 * (128 + 1) * sizeof(float), "co-launch input arena exceeds partial arena");
+          threadgroup float nmc_storage[32 * (128 + 1)];
+          threadgroup float* nmc_part = nmc_storage;
+          threadgroup T* nmc_xsh = reinterpret_cast<threadgroup T*>(nmc_storage);
+          threadgroup uchar* nmc_cmask =
+              reinterpret_cast<threadgroup uchar*>(nmc_xsh + (KS > KF ? KS : KF));
+          const int nmc_row = int(threadgroup_position_in_grid.y);
+          if (SDFIRST ? nmc_row >= SROWS : nmc_row < SLOTS) {
+            constexpr int K = KF;
+          \(routed)
+          } else {
+            constexpr int K = KS;
+            const auto wk = swk;
+            const auto sk = ssk;
+            const auto bk = sbk;
+            const auto x = sx;
+            const auto inds = sinds;
+          \(down)
+          }
+          """
+    }
+
     private static func make(_ name: String, fc2: String?) -> MLXFast.MLXFastKernel? {
         guard let fc2, let shared = NemotronSharedDownZSkip.source,
               let source = source(fc2: fc2, shared: shared) else { return nil }
+        return MLXFast.metalKernel(
+            name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"],
+            outputNames: ["prod", "shared_y"], source: source,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static func phaseMake(_ name: String, fc2: String?) -> MLXFast.MLXFastKernel? {
+        guard let fc2, let shared = NemotronSharedDownZSkip.source,
+              let source = phaseSource(fc2: fc2, shared: shared) else { return nil }
         return MLXFast.metalKernel(
             name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"],
             outputNames: ["prod", "shared_y"], source: source,
@@ -2831,6 +2903,14 @@ enum NemotronFC2SharedColaunch {
     private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd",
                                          fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
 
+    private static let phaseEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH_PHASE_ALIAS"] != "0" && enabled
+    private static let phasePlainKernel = phaseMake("nemotron_zskip_fc2_shared_down_phase_alias",
+                                                    fc2: nemotronZSkipTiledFastSource)
+    private static let phaseDictKernel = phaseMake("nemotron_zskip_fc2_shared_down_phase_alias_sbd",
+        fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+    nonisolated(unsafe) private static var phaseOwners: Set<ObjectIdentifier> = []
+
     private static let lock = NSLock()
     /// Routed FC2 owner -> its layer's shared down owner, for layers whose co-launch matched.
     nonisolated(unsafe) private static var pairs: [ObjectIdentifier: ObjectIdentifier] = [:]
@@ -2839,6 +2919,11 @@ enum NemotronFC2SharedColaunch {
     private static func kernel(for copy: NemotronZSkip.Copy) -> MLXFast.MLXFastKernel? {
         guard NemotronZSkip.tiled, NemotronZSkip.fast else { return nil }
         return copy.dict ? dictKernel : plainKernel
+    }
+
+    private static func phaseKernel(for copy: NemotronZSkip.Copy) -> MLXFast.MLXFastKernel? {
+        guard phaseEnabled, NemotronZSkip.tiled, NemotronZSkip.fast else { return nil }
+        return copy.dict ? phaseDictKernel : phasePlainKernel
     }
 
     private static func dispatch(
@@ -2875,7 +2960,9 @@ enum NemotronFC2SharedColaunch {
               let kernel = kernel(for: copy),
               let shared = sharedCopy(down)
         else { return nil }
-        return dispatch(kernel, x, inds, scores, copy, sx, shared.0, shared.1)
+        let phaseAdmitted = lock.withLock { phaseOwners.contains(ObjectIdentifier(fc2)) }
+        let selected = phaseAdmitted ? (phaseKernel(for: copy) ?? kernel) : kernel
+        return dispatch(selected, x, inds, scores, copy, sx, shared.0, shared.1)
     }
 
     private static func sharedCopy(_ down: Linear) -> (NemotronSharedDownZSkip.Copy, MLXArray)? {
@@ -2895,7 +2982,7 @@ enum NemotronFC2SharedColaunch {
     /// against the two separate kernels it replaces, bit for bit on both outputs (the FP32 slot products and the
     /// BF16 shared rows) over seeded relu2-like rows. Any miss keeps every layer on the separate launches.
     static func prepare(_ model: Module) {
-        lock.withLock { pairs = [:] }
+        lock.withLock { pairs = [:]; phaseOwners = [] }
         guard enabled, Device.defaultDevice().deviceType == .gpu,
               let sharedKernel = NemotronSharedDownZSkip.kernel else { return }
         var built: [ObjectIdentifier: ObjectIdentifier] = [:]
@@ -2926,6 +3013,40 @@ enum NemotronFC2SharedColaunch {
         }
         lock.withLock { pairs = built }
         FileHandle.standardError.write(Data("nemotron colaunch on: \(built.count) MoE layers\n".utf8))
+        preparePhased(model)
+    }
+
+    /// Qualify the new storage schedule separately. Refusal preserves the
+    /// complete highest's original co-launch owners and original pipelines.
+    private static func preparePhased(_ model: Module) {
+        guard phaseEnabled, let sharedKernel = NemotronSharedDownZSkip.kernel else { return }
+        var admitted: Set<ObjectIdentifier> = []
+        var refused = false
+        do {
+            try withError { () -> Void in
+                for module in model.modules() {
+                    guard let moe = module as? NemotronHMoE,
+                          let down = moe.sharedExperts?.downProj,
+                          covers(fc2: moe.switchMLP.fc2, down: down),
+                          let copy = NemotronZSkip.lock.withLock({
+                              NemotronZSkip.copies[ObjectIdentifier(moe.switchMLP.fc2)] }),
+                          let kernel = phaseKernel(for: copy),
+                          let shared = sharedCopy(down) else { continue }
+                    if matches(kernel, copy, shared.0, shared.1, sharedKernel, seed: admitted.count) {
+                        admitted.insert(ObjectIdentifier(moe.switchMLP.fc2))
+                    } else {
+                        refused = true
+                        break
+                    }
+                }
+            }
+        } catch {
+            refused = true
+        }
+        lock.withLock { phaseOwners = refused ? [] : admitted }
+        let count = refused ? 0 : admitted.count
+        FileHandle.standardError.write(Data(
+            "nemotron colaunch phase alias: \(count) layers; original co-launch retained on refusal\n".utf8))
     }
 
     private static func matches(_ kernel: MLXFast.MLXFastKernel, _ copy: NemotronZSkip.Copy,
