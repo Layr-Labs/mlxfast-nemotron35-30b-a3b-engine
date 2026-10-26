@@ -66,7 +66,7 @@ let nemotronVerifyFirstSubmit =
 let nemotronVerifySubmitLayers: Set<Int>? = {
     let env = ProcessInfo.processInfo.environment
     guard env["NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL"] == nil else { return nil }
-    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,8,13,20,27,34,41,48")
+    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,8,13,26,39")
         .split(separator: ",").compactMap { Int($0) })
 }()
 
@@ -2870,10 +2870,18 @@ private final class NemotronHPrefillKernels: Sendable {
                     for (int ee = 0; ee < E; ++ee) {
                         int start = int(counts[ee * S]);
                         int end = (ee + 1 < E) ? int(counts[(ee + 1) * S]) : n;
-                        for (int r = start; r < end && t < tmax; r += BMT) {
+                        for (int r = start; r < end && t < tmax;) {
+                            const int remaining = end - r;
+                            // Where the original batch used 32-row tiles, preserve its
+                            // 48-row padded work for a 33...48 tail instead of rounding
+                            // that tail up to a 64-row NAX body.
+                            const int take = BMT == 64 && n / E < 64
+                                && remaining > 32 && remaining <= 48
+                                ? 32 : min(BMT, remaining);
                             tiles[3 * t] = r;
-                            tiles[3 * t + 1] = min(BMT, end - r);
+                            tiles[3 * t + 1] = take;
                             tiles[3 * t + 2] = ee;
+                            r += take;
                             t++;
                         }
                     }
@@ -2946,9 +2954,10 @@ private final class NemotronHPrefillKernels: Sendable {
     }
 }
 
-/// Rows per tile the stock gather_qmm_rhs_nax dispatch picks for M rows
-/// and E experts (`bm = (M / E < 64) ? 32 : 64` in quantized.cpp).
-func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { rows / experts < 64 ? 32 : 64 }
+/// Group expert runs into at most 64 rows. The launch uses the existing
+/// 32-row body for short descriptors, preserving its small-run work while
+/// letting busy experts share one weight load over a larger row segment.
+func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { 64 }
 
 /// Expert-run tiles [count, 3] int32 of `bm` rows: (first sorted row, rows,
 /// expert); trailing slots have rows == 0.
@@ -2971,7 +2980,10 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
     else { return nil }
     let n = flat.size
     let bm = nemotronGatherTileRows(rows: n, experts: experts)
-    let count = (n + bm - 1) / bm + experts
+    // Retain the original capacity bound: an adaptive run uses no more
+    // descriptors than its original 32/64-row partition, including split tails.
+    let capacityRows = n / experts < 64 ? 32 : 64
+    let count = (n + capacityRows - 1) / capacityRows + experts
     let out = NemotronHPrefillKernels.shared.countingSort(
         [flat, n, count], template: [("E", experts), ("THREADS", threads), ("BMT", bm)],
         grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
@@ -3014,7 +3026,7 @@ private func nemotronWarmUpPrefillKernels(
         grid: (4, 4, 64), threadGroup: (32, 8, 1),
         outputShapes: [[1, 64, 4, 4]], outputDTypes: [.float32])[0])
     if NemotronHPrefillX5.enabled {
-        // Counting sort for both tile heights (bm 32: rows / E < 64, else 64).
+        // Counting sort for small and large row sets, using the current descriptor bound.
         for n in [rows, 64 * experts] {
             if let cs = nemotronCountingSort(MLXArray.zeros([n], dtype: .uint32), experts: experts) {
                 arrays.append(cs.order)
@@ -4236,16 +4248,26 @@ private final class NemotronHRunGatherKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_gather_qmm_runs",
+            name: "nemotron_gather_qmm_runs_adaptive_tiles",
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
                 threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
-                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
-                    x, w, scales, biases, tiles, y, N, K, Ws,
-                    threadgroup_position_in_grid,
-                    simdgroup_index_in_threadgroup,
-                    thread_index_in_simdgroup);
+                // Descriptor length is uniform across the threadgroup. Both bodies
+                // retain the same K loop and independent per-row NAX fragment updates.
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
             """,
             header: nemotronRunGatherHeader)
     }
@@ -4255,7 +4277,7 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// (N block, expert-run tile). Only where stock GatherQMM takes the
 /// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
 /// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
-/// with the same bm; nil = use the stock op. ReLU2 is BF16-only and retains
+/// using the same per-row K fragment order; nil = use the stock op. ReLU2 is BF16-only and retains
 /// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
     _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
@@ -4464,7 +4486,13 @@ private class NemotronHBlock: Module {
             precondition(
                 attentionCache == nil,
                 "NemotronH recurrent layer received attention KV")
-            output = (mixer as! NemotronHMamba2Mixer).cbv2ForwardCaptured(
+            let mamba = mixer as! NemotronHMamba2Mixer
+            if let joined = mamba.cbv2ForwardCapturedJoined(hidden,
+                modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
+                prepared: prepared, residual: x, nextNorm: nextNorm) {
+                return (joined.0, joined.1, joined.2)
+            }
+            output = mamba.cbv2ForwardCaptured(
                 hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                 prepared: prepared)
         case .attention:
@@ -4484,6 +4512,10 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
+            if let joined = moe.mtpForwardRowsJoined(hidden, prepared: prepared,
+                residual: x, nextNorm: nextNorm, layerIndex: modelLayerIndex) {
+                return (joined.0, joined.1, joined.2)
+            }
             if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
                 output = parts.0
                 shared = parts.1
