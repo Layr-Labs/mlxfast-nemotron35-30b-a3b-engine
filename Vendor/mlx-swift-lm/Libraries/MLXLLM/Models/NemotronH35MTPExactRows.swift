@@ -911,12 +911,22 @@ enum NemotronHeadPreparedActivation {
     /// SDPA rows. Same preparation arithmetic; only the source address moves.
     static func applyRows(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray {
         precondition(rows.count == 3)
-        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        return projectPrepared(packRows(rows, k: q.weight.dim(1) * 8), q)
+    }
+
+    /// The prepared activation `applyRows` builds from three row pointers.
+    static func packRows(_ rows: [MLXArray], k: Int) -> MLXArray {
         let pv = k % 512 == 0 ? 16 : 8
-        let packed = prepareRows(rows,
+        return prepareRows(rows,
             template: [("T", DType.bfloat16), ("K", k), ("PV", pv)],
             grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
-            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
+            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+    }
+
+    /// `applyRows`'s projection of an already prepared R = 3 activation.
+    static func projectPrepared(_ packed: MLXArray, _ q: QuantizedLinear) -> MLXArray {
+        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        let packed = [packed]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
@@ -1577,7 +1587,9 @@ enum NemotronMultiRowQMVRowInputs {
     /// Returns [R, N], bitwise equal to NemotronMultiRowQMV.apply on the
     /// [R, K] stack of the same rows, or nil wherever that call would not
     /// take the multi-row kernel.
-    static func apply(_ rows: [MLXArray], _ q: QuantizedLinear) -> MLXArray? {
+    /// `prepared`: the rows' prepared activation when their producer wrote
+    /// it (the verify SDPA launch), used where the rows would be prepared.
+    static func apply(_ rows: [MLXArray], _ q: QuantizedLinear, prepared: MLXArray? = nil) -> MLXArray? {
         guard NemotronMultiRowQMV.enabled, NemotronMTPExecution.batchedM1,
               (2...8).contains(rows.count),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
@@ -1589,6 +1601,9 @@ enum NemotronMultiRowQMVRowInputs {
               rows.allSatisfy({ $0.dtype == .bfloat16 && $0.size == k })
         else { return nil }
         if NemotronMultiRowQMV.narrowEnabled, rows.count == 3, n >= 2688 {
+            if let prepared, k == 4096, prepared.shape == [3, 8, 17 * 32], prepared.dtype == .float32 {
+                return NemotronHeadPreparedActivation.projectPrepared(prepared, q)
+            }
             return NemotronHeadPreparedActivation.applyRows(rows, q)
         }
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(k, n)
@@ -1624,7 +1639,8 @@ enum NemotronMTPAttentionDirect {
         }
         guard let q = wo as? QuantizedLinear,
               rows.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 && $0.dim(2) == 1 }),
-              let direct = NemotronMultiRowQMVRowInputs.apply(rows, q)
+              let direct = NemotronMultiRowQMVRowInputs.apply(
+                  rows, q, prepared: NemotronMTPVerifySDPA.takePrepared(rows))
         else { return original() }
         var y = direct.reshaped(1, length, q.weight.dim(0))
         if let bias = q.bias { y = y + bias }
@@ -1904,6 +1920,63 @@ enum NemotronMTPVerifySDPA {
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out"],
         source: source(), ensureRowContiguous: false)
 
+    /// The launch above whose epilogue also writes the o_proj's prepared
+    /// activation of the R rows (`NemotronHeadPreparedActivation.packRows`,
+    /// K = 4096, PV = 16): lane 0 of each SIMD group takes its four BF16
+    /// outputs just stored, one prepare group, and writes the group's scaled
+    /// values; then one lane per 16-value chunk adds the chunk's four group
+    /// sums in the prepare kernel's order. The separate prepare launch is not
+    /// needed. Used only after `qualify` found both outputs bitwise equal.
+    /// NEMOTRON_MTP_VERIFY_SDPA_PREPARED=0 keeps the prepare launch.
+    static let preparedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_PREPARED"] != "0"
+    nonisolated(unsafe) private static var preparedVerified = false
+    private static let preparedEpilogue = """
+
+  // The o_proj's prepared activation (PV 16) of this head's outputs.
+  threadgroup U prepared_parts[BN];
+  const int prepared_tiles = (int(tpg.x) * V / 16 + 31) / 32;
+  if (simd_lid == 0) {
+    const U x0 = U(static_cast<T>(o[0]));
+    const U x1 = U(static_cast<T>(o[1]));
+    const U x2 = U(static_cast<T>(o[2]));
+    const U x3 = U(static_cast<T>(o[3]));
+    prepared_parts[simd_gid] = x0 + x1 + x2 + x3;
+    const int chunk = int(tid.x) * (V / 16) + int(simd_gid) / 4;
+    const int base = (int(tid.z) * prepared_tiles + chunk / 32) * 17 * 32 + chunk % 32;
+    const int p = (int(simd_gid) % 4) * 4;
+    prepared[base + p * 32] = x0;
+    prepared[base + (p + 1) * 32] = x1 / 16.0f;
+    prepared[base + (p + 2) * 32] = x2 / 256.0f;
+    prepared[base + (p + 3) * 32] = x3 / 4096.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_gid == 0 && simd_lid < V / 16) {
+    const int chunk = int(tid.x) * (V / 16) + int(simd_lid);
+    const int base = (int(tid.z) * prepared_tiles + chunk / 32) * 17 * 32 + chunk % 32;
+    U total = 0;
+    total += prepared_parts[4 * simd_lid];
+    total += prepared_parts[4 * simd_lid + 1];
+    total += prepared_parts[4 * simd_lid + 2];
+    total += prepared_parts[4 * simd_lid + 3];
+    prepared[base + 16 * 32] = total;
+  }
+"""
+    private static let preparedKernel = MLXFast.metalKernel(
+        name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_prepared",
+        inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
+        source: source() + preparedEpilogue, ensureRowContiguous: false)
+    /// The last prepared activation `rows` built, keyed by its first row.
+    nonisolated(unsafe) private static var pendingPrepared: (key: ObjectIdentifier, prepared: MLXArray)?
+
+    /// The prepared activation `rows` built with these rows, once.
+    static func takePrepared(_ rows: [MLXArray]) -> MLXArray? {
+        guard let pending = pendingPrepared, rows.count == 3, pending.key == ObjectIdentifier(rows[0])
+        else { return nil }
+        pendingPrepared = nil
+        return pending.prepared
+    }
+
     nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
     private static let lock = NSLock()
     private static func scaleArray(_ scale: Float) -> MLXArray {
@@ -1937,6 +2010,20 @@ enum NemotronMTPVerifySDPA {
             outputShapes: [[rows, 32, 128]], outputDTypes: [DType.bfloat16])[0]
     }
 
+    /// `merged` plus the R = 3 prepared activation from the same launch.
+    private static func mergedPrepared(
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+    ) -> (MLXArray, MLXArray)? {
+        guard queries.ndim == 4, queries.dim(2) == 3,
+              merged(queries, keys, values, scale) != nil else { return nil }
+        let outputs = preparedKernel(
+            [queries, keys, values, scaleArray(scale)],
+            template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
+            grid: (32 * 1024, 1, 3), threadGroup: (1024, 1, 1),
+            outputShapes: [[3, 32, 128], [3, 8, 17 * 32]], outputDTypes: [DType.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
+
     /// The per-query calls `CBv2AttentionV1.queryBlockOutputs` makes for the
     /// serialized verify of a full-attention layer (block size 1, no sinks):
     /// row r attends keys [0, history + r + 1) with no mask.
@@ -1964,7 +2051,14 @@ enum NemotronMTPVerifySDPA {
     static func rows(
         _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
     ) -> [MLXArray]? {
-        guard verified, let out = merged(queries, keys, values, scale) else { return nil }
+        guard verified else { return nil }
+        if preparedVerified, let (out, prepared) = mergedPrepared(queries, keys, values, scale) {
+            let outputs = split(out)
+            pendingPrepared = (ObjectIdentifier(outputs[0]), prepared)
+            guard NemotronMoELeader.selfTest else { return outputs }
+            return zip(outputs, stock(queries, keys, values, scale)).map { nemotronBitwiseOrNaN($0, $1) }
+        }
+        guard let out = merged(queries, keys, values, scale) else { return nil }
         let outputs = split(out)
         guard NemotronMoELeader.selfTest else { return outputs }
         return zip(outputs, stock(queries, keys, values, scale)).map { nemotronBitwiseOrNaN($0, $1) }
@@ -2038,6 +2132,56 @@ enum NemotronMTPVerifySDPA {
         report(verified
             ? "on (\(checked) cases bitwise equal, key loop \(unroll4 ? "unroll4" : "stock"))"
             : "off (outputs differ from the stock launches after \(checked) cases)")
+        if verified { qualifyPrepared(scaleBits.sorted()) }
+    }
+
+    /// Load-time bit check of `mergedPrepared` (R = 3) against `merged` and
+    /// the prepare launch on the same rows, on seeded random inputs.
+    private static func qualifyPrepared(_ scales: [UInt32]) {
+        preparedVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp verify sdpa prepared: \(message)\n".utf8))
+        }
+        guard preparedEnabled else { return report("off (setting)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for bits in scales {
+                    let scale = Float(bitPattern: bits)
+                    for (i, history) in [0, 31, 94, 127, 488, 616, 1020].enumerated() {
+                        let seed = UInt64(0x5d9b_0000 + i)
+                        let qScale: Float = [1, 4, 16][i % 3]
+                        let kvScale: Float = [1, 4, 8][i % 3]
+                        let capacity = history + 3 + 37
+                        let q = MLXRandom.normal(
+                            [1, 3, 4096], dtype: .bfloat16, scale: qScale, key: MLXRandom.key(seed))
+                        let k = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                            key: MLXRandom.key(seed &+ 0x100))
+                        let v = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                            key: MLXRandom.key(seed &+ 0x200))
+                        let queries = q.reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+                        let keys = k[.ellipsis, ..<(history + 3), 0...]
+                        let values = v[.ellipsis, ..<(history + 3), 0...]
+                        guard let out = merged(queries, keys, values, scale),
+                              let (fusedOut, prepared) = mergedPrepared(queries, keys, values, scale)
+                        else { return false }
+                        let expected = NemotronHeadPreparedActivation.packRows(split(out), k: 4096)
+                        let same = (fusedOut.view(dtype: .uint16) .== out.view(dtype: .uint16)).all()
+                            .&& (prepared.view(dtype: .uint32) .== expected.view(dtype: .uint32)).all()
+                        if !same.item(Bool.self) { return false }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            preparedVerified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(preparedVerified ? "on (\(checked) cases bitwise equal)"
+                                : "off (differs from the prepare launch after \(checked) cases)")
     }
 }
 

@@ -107,6 +107,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillSharedRelu2.qualify(target)
         NemotronPrefillDirectFC1.qualify(target)
         NemotronPrefillSharedUpGather.qualify(target)
+        NemotronPrefillGatherWide.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
         NemotronPrefillDtxDecay4.qualify()
         NemotronPrefillScanExp.qualify()
@@ -575,5 +576,3 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
 
 // Measurement entry 2 of this tree.
-
-// Measurement entry 3 of this tree.

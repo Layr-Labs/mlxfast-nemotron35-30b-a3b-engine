@@ -5037,7 +5037,7 @@ class NemotronHSwitchMLP: Module {
             .flattened(start: 0, end: -3)[orderK ?? order.floorDivide(k)]
         func gather(_ lin: SwitchLinear, _ input: MLXArray) -> MLXArray {
             if let tiles = runTiles, let q = lin as? QuantizedSwitchLinear,
-               let fused = nemotronRunGather(input, q, tiles: tiles) {
+               let fused = nemotronRunGather(input, q, tiles: tiles, wide: NemotronPrefillGatherWide.active) {
                 return fused
             }
             return lin(input, idx, sortedIndices: true)
@@ -7012,7 +7012,33 @@ METAL_FUNC void nemotron_gather_qmm_runs_impl(
 private final class NemotronHRunGatherKernel: Sendable {
     static let shared = NemotronHRunGatherKernel()
     let kernel: MLXFast.MLXFastKernel
+    /// The same kernel with four SIMD groups across N (BN 128, 256 threads):
+    /// each SIMD group keeps its 16- or 32-row by 32-column fragment tile, K
+    /// loop and NAX MMA sequence; a threadgroup covers twice the columns, so
+    /// each expert run's A rows are read by half as many threadgroups.
+    let wide: MLXFast.MLXFastKernel
     private init() {
+        wide = MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_adaptive_tiles_wn4",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, 32, BN, BK, 2, 4, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 4, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
+            """,
+            header: nemotronRunGatherHeader)
         kernel = MLXFast.metalKernel(
             name: "nemotron_gather_qmm_runs_adaptive_tiles",
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
@@ -7047,7 +7073,7 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
     _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
-    relu2: Bool = false
+    relu2: Bool = false, wide: Bool = false
 ) -> MLXArray? {
     guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
           x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16 || x.dtype == .float16,
@@ -7063,12 +7089,101 @@ func nemotronRunGather(
           ops.weight.dim(2) * 8 == k, k % 64 == 0,
           ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
     else { return nil }
+    if wide {
+        return NemotronHRunGatherKernel.shared.wide(
+            [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k],
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 128), ("BK", 64),
+                       ("ALIGN_N", nOut % 128 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", relu2)],
+            grid: (((nOut + 127) / 128) * 256, tiles.count, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+    }
     return NemotronHRunGatherKernel.shared.kernel(
         [x, ops.weight, ops.scales, biases, tiles.tiles, nOut, k],
         template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
                    ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", relu2)],
         grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
         outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): the run gathers
+/// (routed fc2, the direct-input routed fc1, the shared expert's up gather)
+/// launch `NemotronHRunGatherKernel.wide` and the direct kernel's wide twin:
+/// BN 128 over four SIMD groups across N instead of BN 64 over two. Every SIMD
+/// group's fragment tile, A loads, dequantized B tile values, K loop and NAX
+/// MMA sequence are the BN 64 kernel's, so each output element is the same
+/// sum in the same order. `qualify` compares the wide launches with the BN 64
+/// ones bit for bit on the target's MoE fc1, fc2 and shared up projection with
+/// seeded inputs and routes. NEMOTRON_PREFILL_GATHER_WIDE=0 keeps BN 64.
+enum NemotronPrefillGatherWide {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_GATHER_WIDE"] != "0"
+    nonisolated(unsafe) static var verified = false
+    static var active: Bool { verified && NemotronHPrefillX5.active }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill gather wide: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather, NemotronPrefillCountingSort.verified else {
+            return report("off (setting)")
+        }
+        guard let moe = target.modules().compactMap({ $0 as? NemotronHMoE }).first,
+              let fc1 = moe.switchMLP.fc1 as? QuantizedSwitchLinear,
+              let fc2 = moe.switchMLP.fc2 as? QuantizedSwitchLinear
+        else { return report("off (no quantized MoE)") }
+        let experts = moe.switchMLP.numExperts, k = moe.numExpertsPerTok
+        let width = moe.switchMLP.inputDims
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, (tokens, skew)) in [(488, Float(2)), (488, 0), (488, 9), (300, 4), (97, 1)].enumerated() {
+                    let seed = UInt64(0x9b1d_0000 + index)
+                    let logits = MLXRandom.normal([tokens, experts], key: MLXRandom.key(seed))
+                        + skew * MLXRandom.normal([1, experts], key: MLXRandom.key(seed + 1))
+                    let flat = argSort(-logits, axis: -1)[0..., ..<k].asType(.uint32).flattened()
+                    guard let sorted = nemotronCountingSortChunked(flat, experts: experts, k: k) else {
+                        return false
+                    }
+                    let x = MLXRandom.normal([1, tokens, width], scale: 2, key: MLXRandom.key(seed + 2))
+                        .asType(.bfloat16)
+                    let xs = MLX.expandedDimensions(x, axes: [-2, -3])
+                        .flattened(start: 0, end: -3)[sorted.orderK]
+                    guard let narrow1 = nemotronRunGather(xs, fc1, tiles: sorted.tiles, relu2: true),
+                          let wide1 = nemotronRunGather(xs, fc1, tiles: sorted.tiles, relu2: true, wide: true)
+                    else { return false }
+                    let act = MLXRandom.normal([tokens * k, 1, fc2.nemotronGatherOperands(for: .bfloat16).weight.dim(2) * 8], scale: 2,
+                                               key: MLXRandom.key(seed + 3)).asType(.bfloat16)
+                    guard let narrow2 = nemotronRunGather(act, fc2, tiles: sorted.tiles),
+                          let wide2 = nemotronRunGather(act, fc2, tiles: sorted.tiles, wide: true)
+                    else { return false }
+                    var same = (wide1.view(dtype: .uint16) .== narrow1.view(dtype: .uint16)).all()
+                        .&& (wide2.view(dtype: .uint16) .== narrow2.view(dtype: .uint16)).all()
+                    if NemotronPrefillDirectFC1.verified {
+                        guard let d64 = NemotronPrefillDirectFC1.launchForCheck(
+                                  x.reshaped(tokens, 1, width), fc1, rows: sorted.orderK, tiles: sorted.tiles, wide: false),
+                              let d128 = NemotronPrefillDirectFC1.launchForCheck(
+                                  x.reshaped(tokens, 1, width), fc1, rows: sorted.orderK, tiles: sorted.tiles, wide: true)
+                        else { return false }
+                        same = same .&& (d128.view(dtype: .uint16) .== d64.view(dtype: .uint16)).all()
+                    }
+                    if NemotronPrefillSharedUpGather.verified, let mlp = moe.sharedExperts {
+                        guard let s64 = NemotronPrefillSharedUpGather.launchForCheck(x, mlp.upProj, wide: false),
+                              let s128 = NemotronPrefillSharedUpGather.launchForCheck(x, mlp.upProj, wide: true)
+                        else { return false }
+                        same = same .&& (s128.view(dtype: .uint16) .== s64.view(dtype: .uint16)).all()
+                    }
+                    if !same.item(Bool.self) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from the BN 64 run gathers after \(checked) cases)")
+    }
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) routed fc1: the
@@ -7164,6 +7279,31 @@ const device T* xn = x;
         return source
     }()
 
+    /// `kernel` with four SIMD groups across N (BN 128); see `NemotronPrefillGatherWide`.
+    private static let wideKernel: MLXFast.MLXFastKernel? = NemotronPrefillDirectFC1.header.map { header in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_direct_input_wn4",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_direct_impl<T, GS, BITS, 32, BN, BK, 2, 4, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, routed_rows, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_direct_impl<T, GS, BITS, BM, BN, BK, 2, 4, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, routed_rows, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
+            """,
+            header: header)
+    }
+
     private static let kernel: MLXFast.MLXFastKernel? = NemotronPrefillDirectFC1.header.map { header in
         MLXFast.metalKernel(
             name: "nemotron_gather_qmm_runs_direct_input",
@@ -7194,11 +7334,17 @@ const device T* xn = x;
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
                       tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, rows: rows, tiles: tiles)
+        return launch(x, lin, rows: rows, tiles: tiles, wide: NemotronPrefillGatherWide.active)
+    }
+
+    /// `launch` for `NemotronPrefillGatherWide.qualify`.
+    static func launchForCheck(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
+                               tiles: NemotronHRunTiles, wide: Bool) -> MLXArray? {
+        launch(x, lin, rows: rows, tiles: tiles, wide: wide)
     }
 
     private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
-                               tiles: NemotronHRunTiles) -> MLXArray? {
+                               tiles: NemotronHRunTiles, wide: Bool = false) -> MLXArray? {
         guard let kernel, NemotronHPrefillX5.runGather,
               lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
@@ -7215,6 +7361,14 @@ const device T* xn = x;
               ops.weight.dim(2) * 8 == k, k % 64 == 0,
               ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
         else { return nil }
+        if wide, let wideKernel {
+            return wideKernel(
+                [x, ops.weight, ops.scales, biases, tiles.tiles, rows, nOut, k],
+                template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 128), ("BK", 64),
+                           ("ALIGN_N", nOut % 128 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", true)],
+                grid: (((nOut + 127) / 128) * 256, tiles.count, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+        }
         return kernel(
             [x, ops.weight, ops.scales, biases, tiles.tiles, rows, nOut, k],
             template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
@@ -7284,10 +7438,15 @@ enum NemotronPrefillSharedUpGather {
 
     static func apply(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, up)
+        return launch(x, up, wide: NemotronPrefillGatherWide.active)
     }
 
-    private static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+    /// `launch` for `NemotronPrefillGatherWide.qualify`.
+    static func launchForCheck(_ x: MLXArray, _ up: Linear, wide: Bool) -> MLXArray? {
+        launch(x, up, wide: wide)
+    }
+
+    private static func launch(_ x: MLXArray, _ up: Linear, wide: Bool = false) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let q = up as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
               q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases = q.biases,
               x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -7308,6 +7467,16 @@ enum NemotronPrefillSharedUpGather {
             desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
         }
         let tiles = MLXArray(desc).reshaped(count, 3)
+        if wide {
+            let y = NemotronHRunGatherKernel.shared.wide(
+                [x.reshaped(rows, 1, k), q.weight.expandedDimensions(axis: 0), q.scales.expandedDimensions(axis: 0),
+                 biases.expandedDimensions(axis: 0), tiles, nOut, k],
+                template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", 64), ("BN", 128), ("BK", 64),
+                           ("ALIGN_N", nOut % 128 == 0), ("ALIGN_K", true), ("RELU2", true)],
+                grid: (((nOut + 127) / 128) * 256, count, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+            return y.reshaped(1, rows, nOut)
+        }
         let y = NemotronHRunGatherKernel.shared.kernel(
             [x.reshaped(rows, 1, k), q.weight.expandedDimensions(axis: 0), q.scales.expandedDimensions(axis: 0),
              biases.expandedDimensions(axis: 0), tiles, nOut, k],
