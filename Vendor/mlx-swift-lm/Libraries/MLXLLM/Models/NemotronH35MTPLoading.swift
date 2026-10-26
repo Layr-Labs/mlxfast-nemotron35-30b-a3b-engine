@@ -85,7 +85,6 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
-        target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
@@ -97,10 +96,7 @@ extension NemotronH35MTPAssistant {
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
-        NemotronPrefillConvDt.qualify(target)
-        NemotronFreshStateUpdate.qualify()
-        NemotronPrefillCountingSort.qualify(target)
-        NemotronPrefillCombineAdd.qualify()
+        try NemotronHScanWindowFusion.prepare()
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -533,4 +529,3 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Second measurement entry of this tree.
 
 // Second measurement of 208838c4.
-// e-man07: third measurement of c28 (b550b079, 2dbff4f2).
