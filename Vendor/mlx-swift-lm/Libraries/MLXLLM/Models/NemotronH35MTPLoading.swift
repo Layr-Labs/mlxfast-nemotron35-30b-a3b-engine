@@ -342,6 +342,31 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
+    /// With target sets, the per-layer copy sets are requested on the target queue right after the extras, each
+    /// marking its layer ready when its request returns, instead of at the first verify graph.
+    static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
+    private(set) var copiesEnqueued = false
+    /// The buffers of the residency sets are locked in memory (`mlock`) once at load, so a lease's request maps
+    /// pages that stay wired between requests. NEMOTRON_MTP_MLOCK=targets locks only the target's groups;
+    /// NEMOTRON_MTP_MLOCK=0 locks nothing.
+    static let lockMode = ProcessInfo.processInfo.environment["NEMOTRON_MTP_MLOCK"] ?? "all"
+    /// `mlock` of every distinct buffer of `sets`: (buffers locked, bytes locked).
+    static func lockPages(_ sets: [any MTLResidencySet]) -> (Int, Int) {
+        var seen = Set<ObjectIdentifier>()
+        var count = 0, bytes = 0
+        for set in sets {
+            for allocation in set.allAllocations {
+                guard let buffer = allocation as? any MTLBuffer,
+                      seen.insert(ObjectIdentifier(buffer)).inserted,
+                      buffer.storageMode == .shared, buffer.length > 0,
+                      mlock(buffer.contents(), buffer.length) == 0
+                else { continue }
+                count += 1
+                bytes += buffer.length
+            }
+        }
+        return (count, bytes)
+    }
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
@@ -413,6 +438,11 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         self.decodeSets = Array(sets.dropFirst())
         self.owners = owners
         self.cut = cut
+        if Self.lockMode != "0" {
+            let locked = Self.lockPages(Self.lockMode == "targets" ? targetSets : targetSets + extraSets + sets)
+            FileHandle.standardError.write(Data(
+                "nemotron residency mlock: \(locked.0) buffers, \(locked.1 >> 20) MiB\n".utf8))
+        }
     }
 
     final class Lease: CBv2MTPMemoryLease {
@@ -424,7 +454,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             if !decoded {
                 decoded = true
-                for (i, set) in owner.decodeSets.enumerated() {
+                for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
             }
@@ -445,7 +475,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             }
             owner.queue.sync {
                 owner.seedSet.endResidency()
-                if decoded { for set in owner.decodeSets { set.endResidency() } }
+                if decoded || owner.copiesEnqueued { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
         }
@@ -462,6 +492,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// set keeps its own queue.
     func begin() -> Lease {
         NemotronZSkip.beginCopyReadiness(owners)
+        copiesEnqueued = false
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
@@ -474,6 +505,16 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
         for set in extraSets { targetQueue.async { set.requestResidency() } }
+        if Self.copiesAfterExtras {
+            copiesEnqueued = true
+            for (i, set) in decodeSets.enumerated() {
+                let ready = [owners[cut + i]]
+                targetQueue.async {
+                    set.requestResidency()
+                    NemotronZSkip.markCopyReady(ready)
+                }
+            }
+        }
         return Lease(self)
     }
 }
