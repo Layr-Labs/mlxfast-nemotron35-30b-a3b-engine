@@ -1972,6 +1972,60 @@ enum NemotronBankBinding {
         eval(made.values.map { $0.1 })
         lock.withLock { views.merge(made) { _, new in new } }
     }
+
+    static let denseEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DENSE_VIEWS"] != "0"
+
+    private static let denseAliasCheck = MLXFast.metalKernel(
+        name: "nemotron_dense_native_alias_check",
+        inputNames: ["original", "prefix"], outputNames: ["same"],
+        source: "same[0] = original == prefix ? uint(1) : uint(0);",
+        ensureRowContiguous: false)
+
+    private static func denseRowMajor(_ array: MLXArray) -> Bool {
+        var stride = 1
+        for (length, actual) in zip(array.shape, array.strides).reversed() {
+            if length > 1 && actual != stride { return false }
+            stride *= length
+        }
+        return true
+    }
+
+    static func warmDense(_ model: Module) {
+        guard enabled, denseEnabled else { return }
+        var arrays: [MLXArray] = []
+        for module in model.modules() {
+            guard type(of: module) == QuantizedLinear.self,
+                  let q = module as? QuantizedLinear else { continue }
+            arrays.append(q.weight)
+            arrays.append(q.scales)
+            if let biases = q.biases { arrays.append(biases) }
+        }
+        var made: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for array in arrays where array.ndim >= 1 && array.dim(0) > 1
+            && array.size >= 8 && denseRowMajor(array) {
+            guard made[ObjectIdentifier(array)] == nil else { continue }
+            let perRow = max(1, array.size / array.dim(0))
+            let rows = min(array.dim(0), (8 + perRow - 1) / perRow)
+            made[ObjectIdentifier(array)] = (array, array[0 ..< rows])
+        }
+        var qualified: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
+        for (key, pair) in made {
+            guard pair.1.size >= 8, denseRowMajor(pair.1) else { continue }
+            do {
+                let same = try withError { () -> Bool in
+                    eval(pair.0, pair.1)
+                    return denseAliasCheck([pair.0, pair.1],
+                        grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.uint32])[0].item(UInt32.self) == 1
+                }
+                if same { qualified[key] = pair }
+            } catch {
+                continue
+            }
+        }
+        lock.withLock { views.merge(qualified) { _, new in new } }
+    }
 }
 
 enum NemotronZSkip {

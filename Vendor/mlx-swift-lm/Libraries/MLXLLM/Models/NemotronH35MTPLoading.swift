@@ -81,6 +81,8 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
+        NemotronBankBinding.warmDense(target)
+        NemotronBankBinding.warmDense(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
