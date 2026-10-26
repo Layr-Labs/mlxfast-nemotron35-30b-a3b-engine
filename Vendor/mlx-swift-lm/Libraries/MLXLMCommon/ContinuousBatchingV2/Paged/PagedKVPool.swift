@@ -914,6 +914,20 @@ public final class PagedKVPool {
         return (keys, values)
     }
 
+    /// `gather` as the direct single-segment read with `extraRows` spare rows
+    /// per head after the gathered ones (`PagedSegmentTransfers.gatherDirect`):
+    /// [2, 1, kvHeads, count + extraRows, headDim], keys then values. The
+    /// spare rows are the caller's to store. nil (nothing built) when that
+    /// read does not apply.
+    func gatherDirect(
+        group key: PagedKVGroupKey, pages: [Int32], firstSlot: Int, count: Int, extraRows: Int
+    ) -> MLXArray? {
+        let g = group(key)
+        guard g.segmentLayout != nil else { return nil }
+        return PagedSegmentTransfers.gatherDirect(
+            group: g, pages: pages, firstSlot: firstSlot, count: count, extraRows: extraRows)
+    }
+
     // MARK: - Accounting
 
     /// Truthful bytes behind pages sequences have actually touched.
