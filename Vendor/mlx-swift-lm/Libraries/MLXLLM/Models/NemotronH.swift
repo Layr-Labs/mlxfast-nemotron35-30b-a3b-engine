@@ -997,6 +997,7 @@ private final class NemotronHScanKernels: Sendable {
     let stateUpdate: MLXFast.MLXFastKernel
     let dtxDecayT: MLXFast.MLXFastKernel
     let windowOutFinal: MLXFast.MLXFastKernel
+    let windowOutZeroFinal: MLXFast.MLXFastKernel
     private init() {
         // (dtx * decay) written as the contiguous [B, H, DH, n] array that
         // `.swappedAxes(1, 2).swappedAxes(2, 3).reshaped(...)` copies it into:
@@ -1244,6 +1245,76 @@ private final class NemotronHScanKernels: Sendable {
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                 }
             """, ensureRowContiguous: false)
+        // First window with a nil input state: every DH row reads the same
+        // runtime zero. Compute its state @ C once per head/token, with the
+        // same four-term lane sum and stored reduction tree as windowOutFinal.
+        windowOutZeroFinal = MLXFast.metalKernel(
+            name: "nemotron_ssm_window_out_zero_final",
+            inputNames: ["state", "C", "y", "ec", "n", "X", "Dw", "s0", "xs"], outputNames: ["out"],
+            source: """
+                threadgroup float part[4][32];
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint bh = threadgroup_position_in_grid.z;
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                const int k0 = int(lane) * 4;
+                const int t0 = int(threadgroup_position_in_grid.y) * TC;
+                const int t1 = min(t0 + TC, n);
+                const device float* sp = state + bb * state_strides[0] + hh * state_strides[1];
+                float st[4];
+                for (int tn = 0; tn < 4; ++tn) {
+                    st[tn] = sp[(k0 + tn) * state_strides[3]];
+                }
+                const device CT* cp = C + bb * C_strides[0] + (hh / R) * C_strides[2];
+                const float dv = static_cast<float>(Dw[hh * Dw_strides[0]]);
+                for (int t = t0 + int(sg); t < t1; t += 4) {
+                    float cv[4];
+                    for (int tn = 0; tn < 4; ++tn) {
+                        cv[tn] = static_cast<float>(cp[t * C_strides[1] + (k0 + tn) * C_strides[3]]);
+                    }
+                    float acc = 0.0f;
+                    for (int tn = 0; tn < 4; ++tn) {
+                        acc += st[tn] * cv[tn];
+                    }
+                    part[sg][lane] = acc;
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                    float yp = 0.0f;
+                    if (lane == 0) {
+                        const threadgroup float* v = part[sg];
+                        float a[16];
+                        for (int q = 0; q < 16; ++q) {
+                            a[q] = v[q] + v[q + 16];
+                        }
+                        float b[8];
+                        for (int q = 0; q < 8; ++q) {
+                            b[q] = a[q] + a[q + 8];
+                        }
+                        float c[4];
+                        for (int q = 0; q < 4; ++q) {
+                            c[q] = b[q] + b[q + 4];
+                        }
+                        const float d0 = c[0] + c[2];
+                        const float d1 = c[1] + c[3];
+                        yp = d0 + d1;
+                    }
+                    yp = simd_shuffle(yp, 0);
+                    const float e = ec[bb * ec_strides[0] + t * ec_strides[1] + hh * ec_strides[2]];
+                    for (int i = int(lane); i < DH; i += 32) {
+                        const float p = e * yp;
+                        const float yv = y[bb * y_strides[0] + hh * y_strides[1] + t * y_strides[2]
+                            + i * y_strides[3]];
+                        const float u = yv + p;
+                        const OT w = static_cast<OT>(u);
+                        const float xv = static_cast<float>(X[bb * X_strides[0] + (xs + t) * X_strides[1]
+                            + hh * X_strides[2] + i * X_strides[3]]);
+                        const OT xd = static_cast<OT>(xv * dv);
+                        const OT o = static_cast<OT>(static_cast<float>(w) + static_cast<float>(xd));
+                        out[((size_t(bb) * LT + s0 + t) * H + hh) * DH + i] = o;
+                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            """, ensureRowContiguous: false)
         // Fused segsum (tril(x, -1) -> cumsum(axis -2) in strided_scan order)
         // + exp + CB product + tril, plus the decay's last row.
         scanDecay = MLXFast.metalKernel(
@@ -1475,12 +1546,22 @@ func nemotronSSMAttn(
             let prior: MLXArray = copied == 0 ? stepC
                 : outputs.count == 1 ? outputs[0] : MLX.concatenated(outputs, axis: 1)
             let copyBlocks = (copied + 31) / 32
-            let fused = NemotronHScanKernels.shared.windowOutFinal(
-                [previousState, stepC, yWindow, expDtACumsum, n, x, D, prior, copied, start],
-                template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
-                           ("DH", dh), ("TC", 32), ("LT", last ? l : n), ("COPY", copied > 0)],
-                grid: (dh / 32 * 128, (n + 31) / 32 + copyBlocks, b * h), threadGroup: (128, 1, 1),
-                outputShapes: [[b, last ? l : n, h, dh]], outputDTypes: [x.dtype])[0]
+            let fused: MLXArray
+            if currentState == nil {
+                fused = NemotronHScanKernels.shared.windowOutZeroFinal(
+                    [previousState, stepC, yWindow, expDtACumsum, n, x, D, copied, start],
+                    template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
+                               ("DH", dh), ("TC", 32), ("LT", last ? l : n)],
+                    grid: (128, (n + 31) / 32, b * h), threadGroup: (128, 1, 1),
+                    outputShapes: [[b, last ? l : n, h, dh]], outputDTypes: [x.dtype])[0]
+            } else {
+                fused = NemotronHScanKernels.shared.windowOutFinal(
+                    [previousState, stepC, yWindow, expDtACumsum, n, x, D, prior, copied, start],
+                    template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
+                               ("DH", dh), ("TC", 32), ("LT", last ? l : n), ("COPY", copied > 0)],
+                    grid: (dh / 32 * 128, (n + 31) / 32 + copyBlocks, b * h), threadGroup: (128, 1, 1),
+                    outputShapes: [[b, last ? l : n, h, dh]], outputDTypes: [x.dtype])[0]
+            }
             if last {
                 return (fused, nextState)
             }
