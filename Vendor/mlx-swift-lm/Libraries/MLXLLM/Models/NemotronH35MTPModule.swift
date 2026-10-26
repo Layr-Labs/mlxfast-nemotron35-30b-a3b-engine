@@ -257,6 +257,22 @@ final class NemotronH35MTPAttentionBlock: Module {
         return [front[0], front[1], q, k, v]
     }
 
+    /// `pagedDraftInputs` whose Q/K/V launch also stores the row's K/V into
+    /// `kCache` / `vCache` at token `row` (`cbv2ProjectionsWritingRow`);
+    /// `wroteRow` is false when the ordinary launch ran instead.
+    func pagedDraftInputs(
+        hidden: MLXArray, embedding: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int,
+        capacity: Int
+    ) -> (inputs: [MLXArray], wroteRow: Bool) {
+        let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
+        if NemotronMTPDraftTail.fusedQKV, let qkv = mixer.cbv2ProjectionsWritingRow(
+            front[1], kCache: kCache, vCache: vCache, row: row, capacity: capacity) {
+            return ([front[0], front[1], qkv.0, qkv.1, qkv.2], true)
+        }
+        let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
+        return ([front[0], front[1], q, k, v], false)
+    }
+
     /// `pagedForwardRows`' cache-free front: the fused residual rows and their
     /// Q [1, heads, L, headDim] and K/V [1, kvHeads, L, headDim].
     func frontRows(hidden: MLXArray, embedding: MLXArray)
@@ -277,11 +293,14 @@ final class NemotronH35MTPAttentionBlock: Module {
             }
         }
         let batch = x.dim(0), length = x.dim(1)
-        let queries = nemotronMTPLinearRows(x, mixer.wq, prepared: xPrepared)
+        // Q, K and V in one launch once qualified (NEMOTRON_MTP_DRAFT_ROWS_QKV).
+        let (q, k, v) = NemotronMTPFrontRowsQKV.apply(x, prepared: xPrepared, mixer: mixer)
+            ?? NemotronMTPFrontRowsQKV.separate(x, prepared: xPrepared, mixer: mixer)
+        let queries = q
             .reshaped(batch, length, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let keys = nemotronMTPLinearRows(x, mixer.wk)
+        let keys = k
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = nemotronMTPLinearRows(x, mixer.wv)
+        let values = v
             .reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
         return (fused, queries, keys, values)
     }
@@ -612,6 +631,14 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
     }
+    func pagedDraftInputs(
+        hidden: MLXArray, embedding: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int,
+        capacity: Int
+    ) -> (inputs: [MLXArray], wroteRow: Bool) {
+        (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
+            hidden: hidden, embedding: embedding, kCache: kCache, vCache: vCache, row: row,
+            capacity: capacity)
+    }
     func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
         (layers[0] as! NemotronH35MTPAttentionBlock).draftKeyValues(inputs: inputs)
     }
@@ -740,4 +767,78 @@ enum NemotronMTPDraftJoins {
     static let enabled = setting != "0"
     static let negativeFront = setting == "negb"
     static let negativeNorm = setting == "negc"
+}
+
+/// The post-verify front's Q/K/V (`frontRows`, R = 3 or 4) in one launch: the
+/// verify's fused Q/K/V (`NemotronTargetQKV.apply` on captured rows, fed the
+/// attention norm's prepared rows) on the head's wq, wk and wv instead of the
+/// prepared wq projection and the wk and wv projections. Each Q, K and V tile
+/// keeps its projection's row body; used only after `qualify` found q, k and v
+/// bitwise equal to the three launches on the head's weights.
+/// NEMOTRON_MTP_DRAFT_ROWS_QKV=0 (or NEMOTRON_MTP_DRAFT_FUSED=0) keeps them.
+enum NemotronMTPFrontRowsQKV {
+    static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ROWS_QKV"] != "0"
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FUSED"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func apply(_ x: MLXArray, prepared: MLXArray?, mixer: NemotronHAttention)
+        -> (MLXArray, MLXArray, MLXArray)?
+    {
+        verified ? launch(x, prepared: prepared, mixer: mixer) : nil
+    }
+
+    private static func launch(_ x: MLXArray, prepared: MLXArray?, mixer: NemotronHAttention)
+        -> (MLXArray, MLXArray, MLXArray)?
+    {
+        guard enabled, mixer.numHeads == 32, mixer.numKeyValueHeads == 2, mixer.headDim == 128,
+              x.ndim == 3, x.dim(0) == 1, [3, 4].contains(x.dim(1))
+        else { return nil }
+        return NemotronTargetQKV.apply(
+            x, query: mixer.wq, key: mixer.wk, value: mixer.wv, captureMTP: true, prepared: prepared)
+    }
+
+    /// `frontRows`' three projections without the fused launch.
+    static func separate(_ x: MLXArray, prepared: MLXArray?, mixer: NemotronHAttention)
+        -> (MLXArray, MLXArray, MLXArray)
+    {
+        (nemotronMTPLinearRows(x, mixer.wq, prepared: prepared),
+         nemotronMTPLinearRows(x, mixer.wk), nemotronMTPLinearRows(x, mixer.wv))
+    }
+
+    /// Load time, before the post-verify warm-up: the fused launch against the
+    /// three projections, bit for bit in q, k and v, with the head's weights and
+    /// attention norm on seeded residual rows: R = 3 with the norm's prepared
+    /// rows (as `frontRows` passes them) and without, and R = 4.
+    static func qualify(_ block: NemotronH35MTPAttentionBlock) {
+        verified = false
+        guard enabled else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft rows qkv fused: \(message)\n".utf8))
+        }
+        var ok = MLXArray(true)
+        let cases = [(3, true), (3, true), (3, false), (4, false), (4, false)]
+        for (seed, (rows, joined)) in cases.enumerated() {
+            let key = MLXRandom.key(UInt64(0x9f40 + seed))
+            let fused = (MLXRandom.normal([1, rows, 2688], key: key) * Float(1 + seed))
+                .asType(.bfloat16)
+            var (x, prepared): (MLXArray, MLXArray?) = (block.norm(fused), nil)
+            if joined, NemotronMTPDraftJoins.enabled,
+               let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: block.norm) {
+                (x, prepared) = pair
+            }
+            guard let a = launch(x, prepared: prepared, mixer: block.mixer) else {
+                return report("off (the head's projections do not fit the fused launch)")
+            }
+            let b = separate(x, prepared: prepared, mixer: block.mixer)
+            for (u, w) in [(a.0, b.0), (a.1, b.1), (a.2, b.2)] {
+                ok = MLX.logicalAnd(ok, (u.view(dtype: .uint16) .== w.view(dtype: .uint16)).all())
+            }
+            eval(ok)
+        }
+        verified = ok.item(Bool.self)
+        report(verified
+            ? "on (q, k, v bitwise equal to the three launches in \(cases.count) cases at R = 3, 4)"
+            : "off (q, k or v differs from the three launches)")
+    }
 }
