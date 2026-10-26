@@ -287,6 +287,9 @@ enum NemotronHResidualRMSNorm {
         return (axis, value)
     }
 
+    /// The join's scalar arguments (axis size, eps) for launches that run its statements elsewhere.
+    static func joinScalars(_ eps: Float) -> (MLXArray, MLXArray) { scalars(eps) }
+
     /// Configuration gate of the fused captured-verify joins (the consumers
     /// read a prepared activation only on the narrow multi-row route).
     static var plumbingAvailable: Bool {
@@ -4484,7 +4487,12 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
+            // The MoE join inside the routed FC2 + shared down launch when it qualified.
+            if let outputs = moe.mtpForwardRowsJoined(hidden, prepared: prepared, lhs: x, norm: nextNorm) {
+                if outputs.count == 3 { return (outputs[0], outputs[1], outputs[2]) }
+                output = outputs[0]
+                shared = outputs[1]
+            } else if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
                 output = parts.0
                 shared = parts.1
             } else {
@@ -4820,6 +4828,19 @@ public class NemotronHModel:
 
     public var loraLayers: [Module] {
         backbone.layers
+    }
+
+    /// The exact owner/next-norm pairs used by cbv2ForwardCapturedFused.
+    /// Used only by load-time admission, never inferred from module traversal order.
+    func mtpJoinedMoENormOwners() -> [(moe: NemotronHMoE, norm: RMSNorm)] {
+        let layers = backbone.layers
+        var result: [(moe: NemotronHMoE, norm: RMSNorm)] = []
+        for (index, layer) in layers.enumerated() where layer.blockType == .moe {
+            guard let moe = layer.mixer as? NemotronHMoE else { continue }
+            let next = index + 1
+            result.append((moe, next < layers.count ? layers[next].norm : backbone.normF))
+        }
+        return result
     }
 
     public var cbv2LayerKinds: [CBv2LayerKind] {

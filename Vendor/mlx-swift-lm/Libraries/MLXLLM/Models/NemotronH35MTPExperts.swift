@@ -23,8 +23,8 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    /// Slot = prepared + 2 * parts + 4 * original-bank fallback.
-    private var entries: [Entry?] = Array(repeating: nil, count: 8)
+    /// Slot = prepared + 2 * parts + 4 * original-bank fallback + 8 * joined.
+    private var entries: [Entry?] = Array(repeating: nil, count: 16)
     private var generations = 0
     private var calls = 0
     var generationCount: Int { lock.withLock { generations } }
@@ -37,18 +37,23 @@ final class NemotronH35MTPGraphCache {
 
     /// parts: [routed, shared] before their Add (owner must have shared experts).
     func outputs(_ x: MLXArray, prepared: MLXArray?, parts: Bool,
-                 owner: NemotronHMoE) -> [MLXArray] {
+                 owner: NemotronHMoE,
+                 join: (lhs: MLXArray, norm: RMSNorm, weight: MLXArray)? = nil) -> [MLXArray] {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
         // child identity cheaply, and collect array handles only on a miss.
         // Unknown subclasses retain the fully reflective fallback.
         let nativeIdentity = Self.nativeIdentity(owner)
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
-        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
-            + (parameters ?? []).map(ObjectIdentifier.init))
+        let identity = (nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
+            + (parameters ?? []).map(ObjectIdentifier.init)))
+            + (join.map { [ObjectIdentifier($0.norm), ObjectIdentifier($0.norm.weight)] } ?? [])
         let usesPrepared = prepared != nil
         let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
-            + (NemotronZSkip.needsOriginal(owner.switchMLP.fc2) ? 4 : 0)
+            + (NemotronZSkip.needsOriginal(owner.switchMLP.fc2) ? 4 : 0) + (join != nil ? 8 : 0)
+        // The joined entry takes the residual input and the next norm's weight as dynamic inputs; the norm
+        // module itself (eps) is fixed per entry, so its identity joins the entry's identity.
+        let joinNorm = join?.norm
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -56,8 +61,10 @@ final class NemotronH35MTPGraphCache {
             let state = parameters ?? owner.innerState()
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
+                let base = usesPrepared ? 2 : 1
                 return owner.mtpForwardRowsUncompiledOutputs(arrays[0],
-                    prepared: usesPrepared ? arrays[1] : nil, parts: parts)
+                    prepared: usesPrepared ? arrays[1] : nil, parts: parts,
+                    join: joinNorm.map { (lhs: arrays[base], norm: $0, weight: arrays[base + 1]) })
             }
             let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
             retired = entries[slot]
@@ -67,7 +74,8 @@ final class NemotronH35MTPGraphCache {
         }
         // Destroy retired compiler entries outside this helper's lock; compiler
         // evaluation owns a separate global/per-function lock ordering.
-        return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
+        let inputs = (prepared.map { [x, $0] } ?? [x]) + (join.map { [$0.lhs, $0.weight] } ?? [])
+        return withExtendedLifetime(retired) { current.function(inputs) }
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
@@ -113,6 +121,24 @@ extension NemotronHMoE {
         return outputs.count == 2 ? (outputs[0], outputs[1]) : nil
     }
 
+    /// Captured-verify MoE with its layer join: [residual, normalized, prepared] when the routed FC2 + shared
+    /// down launch ran the join (`NemotronFC2SharedColaunch.runJoined`), else [routed, shared] as
+    /// `mtpForwardRowsParts` returns them (the caller then runs the join), or nil.
+    func mtpForwardRowsJoined(_ x: MLXArray, prepared: MLXArray?, lhs: MLXArray, norm: RMSNorm) -> [MLXArray]? {
+        guard sharedExperts != nil, NemotronMTPExecution.batchedM1,
+              NemotronHResidualRMSNorm.plumbingAvailable, NemotronFC2SharedColaunch.joinVerified,
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              lhs.shape == [1, 3, 2688], lhs.dtype == .bfloat16,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16 else { return nil }
+        let outputs = NemotronMTPExecution.compiledMoE
+            ? mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true, owner: self,
+                                           join: (lhs: lhs, norm: norm, weight: norm.weight))
+            : mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: true,
+                                              join: (lhs: lhs, norm: norm, weight: norm.weight))
+        return outputs.count == 2 || outputs.count == 3 ? outputs : nil
+    }
+
     func mtpForwardRowsUncompiled(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
         mtpForwardRowsUncompiledOutputs(x, prepared: prepared, parts: false)[0]
     }
@@ -120,7 +146,8 @@ extension NemotronHMoE {
     /// [routed + shared], or [routed, shared] when `parts` (shared experts
     /// present, batched M=1 route).
     func mtpForwardRowsUncompiledOutputs(
-        _ x: MLXArray, prepared: MLXArray?, parts: Bool
+        _ x: MLXArray, prepared: MLXArray?, parts: Bool,
+        join: (lhs: MLXArray, norm: RMSNorm, weight: MLXArray)? = nil
     ) -> [MLXArray] {
         guard NemotronMTPExecution.batchedM1 else { return [nemotronMTPMapRows(x) { self($0) }] }
         let packed: MLXArray?
@@ -150,6 +177,7 @@ extension NemotronHMoE {
         let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
         let colaunch = products && NemotronFC2SharedColaunch.enabled
             ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
+        colaunch?.join = join
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
             y = reduced
@@ -158,6 +186,7 @@ extension NemotronHMoE {
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
         guard let sharedExperts else { return [y] }
+        if let joined = colaunch?.joined { return [joined.0, joined.1, joined.2] }
         let shared = colaunch?.rows ?? sharedExperts.mtpForwardRows(x, prepared: packed)
         return parts ? [y, shared] : [y + shared]
     }
@@ -2785,6 +2814,112 @@ enum NemotronSharedDownZSkip {
     }
 }
 
+// MARK: - The MoE layer join as the epilogue of the routed FC2 + shared down launch
+//
+// The captured verify's MoE join (`NemotronHResidualRMSNorm`'s products join: the six slot products summed in slot
+// order, the BF16 routed row plus the shared row, the residual add, the RMS norm, the norm weight and the prepared
+// K = 2688 activation of the next layer) runs in the routed FC2 + shared down launch instead of its own launch after
+// it. Every threadgroup of that launch writes its products or shared row slice as before; it then orders those
+// stores before a device ticket on its verify row's counter (6 slot rows and 1 shared row of 21 tiles each: 147
+// tickets). The threadgroup that takes a row's last ticket orders the other threadgroups' stores before its reads
+// and runs the join's statements for that row. The join was written for 672 threads (21 SIMD groups, four
+// values each); here each SIMD group of the launch's threadgroup runs those of the 21 SIMD-group positions
+// congruent to it, with the same lanes, the same four-value loops, the same `simd_sum`, the same zero-padded
+// cross-SIMD-group `simd_sum`, `precise::rsqrt`, weight product and prepared epilogue. The BF16 sums the join keeps in
+// `thread_x` are kept in threadgroup memory (the exact BF16 values, widened to the same floats) and overwritten by
+// the normalized values the prepared epilogue reads. The row's counter is reset to zero by the same threadgroup.
+private let nemotronProductsJoinEpilogue = """
+
+  threadgroup uint nfj_ticket[1];
+  threadgroup float nfj_sums[32];
+  threadgroup float nfj_inv[1];
+  const int nfj_r = SDFIRST ? (nmc_row < SROWS ? nmc_row : (nmc_row - SROWS) / 6)
+                            : (nmc_row < SLOTS ? nmc_row / 6 : nmc_row - SLOTS);
+  const uint nfj_tid = thread_position_in_threadgroup.x;
+  threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+  if (nfj_tid == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    nfj_ticket[0] = atomic_fetch_add_explicit(
+        (device atomic_uint*)jcounter + nfj_r, 1u, memory_order_relaxed);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (nfj_ticket[0] != uint(JPER - 1)) { return; }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  {
+    constexpr uint n_reads = 4;
+    const uint gid = uint(nfj_r);
+    const uint simd_lane_id = thread_index_in_simdgroup;
+    const uint simd_group_id = simdgroup_index_in_threadgroup;
+    threadgroup T* rounded = nmc_xsh;
+    if (simd_group_id == 0) {
+      nfj_sums[simd_lane_id] = 0;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint vs = simd_group_id; vs < 21; vs += SGS) {
+      const uint lid = vs * 32 + simd_lane_id;
+      const size_t offset = size_t(gid) * jaxis + lid * n_reads;
+      float acc = 0;
+      float thread_x[n_reads];
+      for (uint i = 0; i < n_reads; i++) {
+        const size_t column = lid * n_reads + i;
+        float total = prod[size_t(gid * 6) * jaxis + column];
+        for (int j = 1; j < 6; j++) {
+          total = prod[size_t(gid * 6 + j) * jaxis + column] + total;
+        }
+        T part = static_cast<T>(total) + shared_y[offset + i];
+        T sum = jlhs[offset + i] + part;
+        jresidual[offset + i] = sum;
+        rounded[lid * n_reads + i] = sum;
+        thread_x[i] = sum;
+        acc += thread_x[i] * thread_x[i];
+      }
+      acc = simd_sum(acc);
+      if (simd_lane_id == 0) {
+        nfj_sums[vs] = acc;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group_id == 0) {
+      const float acc = simd_sum(nfj_sums[simd_lane_id]);
+      if (simd_lane_id == 0) {
+        nfj_inv[0] = metal::precise::rsqrt(acc / jaxis + jeps);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint vs = simd_group_id; vs < 21; vs += SGS) {
+      const uint lid = vs * 32 + simd_lane_id;
+      const size_t offset = size_t(gid) * jaxis + lid * n_reads;
+      for (uint i = 0; i < n_reads; i++) {
+        const float x_i = rounded[lid * n_reads + i];
+        T value = jweight[lid * n_reads + i]
+            * static_cast<T>(x_i * nfj_inv[0]);
+        jnormalized[offset + i] = value;
+        rounded[lid * n_reads + i] = value;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (nfj_tid < 336) {
+      const int chunk = int(nfj_tid);
+      float values[8];
+      float total = 0;
+      for (int i = 0; i < 8; i += 4) {
+        total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
+            + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
+        values[i] = rounded[chunk * 8 + i];
+        values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
+        values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
+        values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
+      }
+      const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
+      for (int i = 0; i < 8; i++) jprepared[base + i * 32] = values[i];
+      jprepared[base + 8 * 32] = total;
+    }
+    if (nfj_tid == 0) {
+      atomic_store_explicit((device atomic_uint*)jcounter + nfj_r, 0u, memory_order_relaxed);
+    }
+  }
+"""
+
 // MARK: - Routed FC2 + shared down in one launch
 //
 // The captured verify's routed FC2 slot kernel (18 slot rows of 21 tiles) and the shared-expert down zero-skip
@@ -2811,6 +2946,10 @@ enum NemotronFC2SharedColaunch {
         let x: MLXArray
         let prepared: MLXArray?
         var rows: MLXArray? = nil
+        /// The layer join's residual input and next norm, when the caller asked for the joined launch.
+        var join: (lhs: MLXArray, norm: RMSNorm, weight: MLXArray)? = nil
+        /// (residual, normalized, prepared) when the joined launch ran.
+        var joined: (MLXArray, MLXArray, MLXArray)? = nil
         init(mlp: NemotronHMLP, x: MLXArray, prepared: MLXArray?) {
             self.mlp = mlp
             self.x = x
@@ -2824,14 +2963,22 @@ enum NemotronFC2SharedColaunch {
         let down = shared.mlp.downProj
         guard covers(fc2: fc2, down: down),
               let sx = NemotronSharedUpPacking.unpackedActivation(
-                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared),
-              let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
+                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared)
+        else { return nil }
+        if let join = shared.join,
+           let five = runJoined(x, inds, scores, fc2: fc2, sx: sx, down: down,
+                                lhs: join.lhs, norm: join.norm, weight: join.weight) {
+            shared.rows = five[1]
+            shared.joined = (five[2], five[3], five[4])
+            return five[0]
+        }
+        guard let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
         shared.rows = pair.1
         return pair.0
     }
 
     /// `fc2`: the routed slot kernel's source (plain or dictionary); `shared`: `NemotronSharedDownZSkip.source`.
-    private static func source(fc2: String, shared: String) -> String? {
+    private static func source(fc2: String, shared: String, join: Bool = false) -> String? {
         let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
         let views = "  threadgroup float* part = nmc_part;\n  threadgroup T* xsh = nmc_xsh;\n"
             + "  threadgroup uchar* cmask = nmc_cmask;\n"
@@ -2861,22 +3008,37 @@ enum NemotronFC2SharedColaunch {
             const auto inds = sinds;
           \(down)
           }
-          """
+          """ + (join ? nemotronProductsJoinEpilogue : "")
     }
 
-    private static func make(_ name: String, fc2: String?) -> MLXFast.MLXFastKernel? {
+    private static func make(_ name: String, fc2: String?, join: Bool = false) -> MLXFast.MLXFastKernel? {
         guard let fc2, let shared = NemotronSharedDownZSkip.source,
-              let source = source(fc2: fc2, shared: shared) else { return nil }
+              let original = source(fc2: fc2, shared: shared, join: join) else { return nil }
+        // Both producers and last-ticket consumers use coherent device aliases.
+        // The original unjoined co-launch source is byte-for-byte untouched.
+        let source = join
+            ? "  coherent(device) device float* nfj_prod = (coherent(device) device float*)prod;\n"
+                + "  coherent(device) device T* nfj_shared = (coherent(device) device T*)shared_y;\n"
+                + original.replacingOccurrences(of: "prod[", with: "nfj_prod[")
+                    .replacingOccurrences(of: "shared_y[", with: "nfj_shared[")
+            : original
+        let inputs = ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"]
+            + (join ? ["jlhs", "jweight", "jaxis", "jeps", "jcounter"] : [])
         return MLXFast.metalKernel(
-            name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"],
-            outputNames: ["prod", "shared_y"], source: source,
+            name: name, inputNames: inputs,
+            outputNames: ["prod", "shared_y"] + (join ? ["jresidual", "jnormalized", "jprepared"] : []),
+            source: source,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
-            ensureRowContiguous: true)
+            ensureRowContiguous: true, mutableInputs: join ? ["jcounter"] : [])
     }
     private static let plainKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast",
                                           fc2: nemotronZSkipTiledFastSource)
     private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd",
                                          fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+    private static let plainJoinKernel = make("nemotron_zskip_fc2_shared_down_join_coherent_tiled_fast",
+                                              fc2: nemotronZSkipTiledFastSource, join: true)
+    private static let dictJoinKernel = make("nemotron_zskip_fc2_shared_down_join_coherent_tiled_fast_sbd",
+                                             fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource), join: true)
 
     private static let lock = NSLock()
     /// Routed FC2 owner -> its layer's shared down owner, for layers whose co-launch matched.
@@ -2923,6 +3085,140 @@ enum NemotronFC2SharedColaunch {
               let shared = sharedCopy(down)
         else { return nil }
         return dispatch(kernel, x, inds, scores, copy, sx, shared.0, shared.1)
+    }
+
+    /// Set at load by `prepareJoin` when every paired layer's joined launch matched the launch plus the
+    /// separate products join. NEMOTRON_MTP_FC2_JOIN=0 keeps the separate join.
+    static let joinEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_JOIN"] != "0"
+    nonisolated(unsafe) static var joinVerified = false
+    nonisolated(unsafe) private static var joinCounter: MLXArray? = nil
+
+    /// [prod, shared_y, residual, normalized, prepared] of the joined launch, or nil when it does not apply.
+    static func runJoined(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, fc2: SwitchLinear,
+                          sx: MLXArray, down: Linear, lhs: MLXArray, norm: RMSNorm,
+                          weight: MLXArray) -> [MLXArray]? {
+        guard joinEnabled, joinVerified, let counter = joinCounter,
+              NemotronHResidualRMSNorm.plumbingAvailable,
+              lhs.shape == [1, 3, 2688], lhs.dtype == .bfloat16, type(of: norm) == RMSNorm.self,
+              weight.shape == [2688], weight.dtype == .bfloat16,
+              enabled, !NemotronZSkip.needsOriginal(fc2), NemotronZSkip.joinReduce,
+              NemotronHResidualRMSNorm.productsJoinVerified,
+              x.shape == [18, 1856], x.dtype == .bfloat16,
+              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+              sx.shape == [3, NemotronSharedDownZSkip.k], sx.dtype == .bfloat16,
+              NemotronSharedDownZSkip.enabled,
+              lock.withLock({ pairs[ObjectIdentifier(fc2)] == ObjectIdentifier(down) }),
+              let copy = NemotronZSkip.lock.withLock({ NemotronZSkip.copies[ObjectIdentifier(fc2)] }),
+              let kernel = joinKernel(for: copy),
+              let shared = sharedCopy(down)
+        else { return nil }
+        let (axis, eps) = NemotronHResidualRMSNorm.joinScalars(norm.eps)
+        return dispatchJoined(kernel, x, inds, scores, copy, sx, shared.0, shared.1,
+                              lhs: lhs, weight: weight, axis: axis, eps: eps, counter: counter)
+    }
+
+    private static func joinKernel(for copy: NemotronZSkip.Copy) -> MLXFast.MLXFastKernel? {
+        // The prepared tail has 336 independent eight-value chunks. The
+        // unchanged 8-SIMD original co-launch remains available, without join.
+        guard NemotronZSkip.tiled, NemotronZSkip.fast, NemotronZSkip.sgs >= 11 else { return nil }
+        return copy.dict ? dictJoinKernel : plainJoinKernel
+    }
+
+    private static func dispatchJoined(
+        _ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+        _ copy: NemotronZSkip.Copy, _ sx: MLXArray, _ shared: NemotronSharedDownZSkip.Copy, _ sinds: MLXArray,
+        lhs: MLXArray, weight: MLXArray, axis: MLXArray, eps: MLXArray, counter: MLXArray
+    ) -> [MLXArray] {
+        let sgs = NemotronZSkip.sgs
+        let tiles = 2688 / 128
+        return kernel(
+            [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores,
+             shared.codes, shared.scales, shared.biases, sx, sinds,
+             lhs, weight, axis, eps, counter],
+            template: [("T", DType.bfloat16), ("KF", 1856), ("KS", NemotronSharedDownZSkip.k),
+                       ("N", 2688), ("SGS", sgs), ("SLOTS", slots), ("SROWS", sharedRows),
+                       ("SDFIRST", sharedFirst), ("JPER", (slots / sharedRows + 1) * tiles)],
+            grid: (32 * sgs * tiles, slots + sharedRows, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[slots * 2688], [1, sharedRows, NemotronSharedDownZSkip.n],
+                           [1, 3, 2688], [1, 3, 2688], [3, 11, 9 * 32]],
+            outputDTypes: [.float32, .bfloat16, .bfloat16, .bfloat16, .float32])
+    }
+
+    /// Load time, after `prepare` and `NemotronHResidualRMSNorm.checkProductsJoin`: every paired layer's joined
+    /// launch against the launch plus the separate products join, bit for bit on the products, the shared rows,
+    /// the residual, the normalized rows and every prepared word the join writes, on seeded rows with the real
+    /// norm weights (two rounds, so the counter resets are exercised). Any miss keeps the separate join.
+    static func prepareJoin(_ model: NemotronHModel) {
+        joinVerified = false
+        joinCounter = nil
+        guard joinEnabled, NemotronHResidualRMSNorm.plumbingAvailable,
+              NemotronHResidualRMSNorm.productsJoinVerified,
+              !lock.withLock({ pairs.isEmpty }) else { return }
+        let zero = MLXArray.zeros([3], dtype: .uint32)
+        eval(zero)
+        joinCounter = zero
+        let owners = model.mtpJoinedMoENormOwners()
+        guard !owners.isEmpty else { return }
+        var ok = true
+        var layers = 0
+        do {
+            try withError { () -> Void in
+                for owner in owners {
+                    let moe = owner.moe
+                    let norm = owner.norm
+                    guard ok, type(of: norm) == RMSNorm.self,
+                          norm.weight.shape == [2688], norm.weight.dtype == .bfloat16,
+                          let downLinear = moe.sharedExperts?.downProj,
+                          lock.withLock({ pairs[ObjectIdentifier(moe.switchMLP.fc2)] == ObjectIdentifier(downLinear) }),
+                          let copy = NemotronZSkip.lock.withLock({
+                              NemotronZSkip.copies[ObjectIdentifier(moe.switchMLP.fc2)] }),
+                          let plain = kernel(for: copy), let joined = joinKernel(for: copy),
+                          let shared = sharedCopy(downLinear) else { ok = false; return }
+                    for round in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xf10e + layers * 4 + round)), into: 5)
+                        let h = (abs(MLXRandom.normal([18, 1856], key: keys[0])) * 0.5).asType(.bfloat16)
+                        let keep = MLXRandom.uniform(Float(0) ..< 1, [18, 1856], key: keys[1]) .< MLXArray(Float(0.1))
+                        let xr = which(keep, h, MLXArray(Float(0)).asType(.bfloat16))
+                        let sxr = (abs(MLXRandom.normal([3, NemotronSharedDownZSkip.k], key: keys[2])) * 0.3)
+                            .asType(.bfloat16)
+                        let lhs = MLXRandom.normal([1, 3, 2688], key: keys[3]).asType(.bfloat16)
+                        let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[4])
+                        var routes: [UInt32] = [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127]
+                        for i in routes.indices { routes[i] = (routes[i] + UInt32(layers * 5 + round)) % 128 }
+                        let inds = MLXArray(routes)
+                        let (axis, eps) = NemotronHResidualRMSNorm.joinScalars(norm.eps)
+                        let got = dispatchJoined(joined, xr, inds, scores, copy, sxr, shared.0, shared.1,
+                                                 lhs: lhs, weight: norm.weight, axis: axis, eps: eps, counter: zero)
+                        let pair = dispatch(plain, xr, inds, scores, copy, sxr, shared.0, shared.1)
+                        guard let expected = NemotronHResidualRMSNorm.applyPreparedRows(
+                            lhs, pair.0, shared: pair.1, norm: norm) else { ok = false; return }
+                        let chunks = MLXArray((0 ..< (11 * 32)).map { Int32($0) }).reshaped(1, 11, 1, 32) .< MLXArray(Int32(336))
+                        func written(_ p: MLXArray) -> MLXArray {
+                            which(chunks, p.reshaped(3, 11, 9, 32).view(dtype: .uint32), MLXArray(UInt32(0)))
+                        }
+                        let same = MLX.logicalAnd(MLX.logicalAnd(MLX.logicalAnd(
+                            (got[0].view(dtype: .uint32) .== pair.0.view(dtype: .uint32)).all(),
+                            (got[1].view(dtype: .uint16) .== pair.1.view(dtype: .uint16)).all()),
+                            MLX.logicalAnd(
+                                (got[2].view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                                (got[3].view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all())),
+                            (written(got[4]) .== written(expected.2)).all())
+                        eval(same)
+                        let counts = zero.asArray(UInt32.self)
+                        if !same.item(Bool.self) || counts != [0, 0, 0] { ok = false; return }
+                    }
+                    layers += 1
+                }
+            }
+        } catch {
+            ok = false
+        }
+        joinVerified = ok && layers == owners.count && layers > 0
+        if !joinVerified { joinCounter = nil }
+        FileHandle.standardError.write(Data((joinVerified
+            ? "nemotron fc2 join on: \(layers) MoE layers bitwise equal\n"
+            : "nemotron fc2 join off (differs or failed at layer \(layers))\n").utf8))
     }
 
     private static func sharedCopy(_ down: Linear) -> (NemotronSharedDownZSkip.Copy, MLXArray)? {
