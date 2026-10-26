@@ -640,7 +640,13 @@ private final class NemotronMoELeaderKernel: Sendable {
 }
 
 private final class NemotronMoELeaderPreparedKernels: Sendable {
-    static let shared = NemotronMoELeaderPreparedKernels()
+    static let shared = NemotronMoELeaderPreparedKernels(simdRoute: false)
+    /// The triple FC1 family with its route search on SIMD votes.
+    static let simdRoute = NemotronMoELeader.simdRoute
+        ? NemotronMoELeaderPreparedKernels(simdRoute: true) : nil
+    static var active: NemotronMoELeaderPreparedKernels {
+        NemotronMoELeader.routeQualified ? simdRoute ?? shared : shared
+    }
     let gateUp: MLXFast.MLXFastKernel?
     let gateUpAndPlan: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlan: MLXFast.MLXFastKernel?
@@ -649,8 +655,9 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
-    private init() {
+    private init(simdRoute: Bool) {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
+        let route = simdRoute ? "_sr" : ""
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
             ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
@@ -672,8 +679,9 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
         }
         // Select only the source's R3 FC1 traversal; weighted FC2 retains
         // the complete winner's paired body and original 36-word plan.
-        let tripleSource = nemotronMoETripleGateUpSource.replacingOccurrences(
-            of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+        let tripleSource = (simdRoute
+            ? nmlTripleSIMDRouteSource(nemotronMoETripleGateUpSource) : nemotronMoETripleGateUpSource)
+            .replacingOccurrences(of: "x2 += block_size;", with: "x2 += PSTRIDE;")
         let triplePointers = [
             ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
@@ -684,7 +692,7 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
         ]
         tripleGateUpAndPlan = nmlPreparedSource(tripleSource, pointers: triplePointers).map {
             MLXFast.metalKernel(
-                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan",
+                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan\(route)",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
                 header: header + nemotronMoETripleDecodeHeader)
@@ -692,7 +700,7 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
         tripleGateUpAndPlanTail8 = nmlTail8Source(tripleSource)
             .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
             MLXFast.metalKernel(
-                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan",
+                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan\(route)",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: nmlFC1WithBalancePlanSource($0),
                 header: header + nemotronMoETripleDecodeHeader)
@@ -700,7 +708,7 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
         tripleGateUpAndPlanDict = nmlPreparedSource(tripleSource, pointers: triplePointers)
             .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
             MLXFast.metalKernel(
-                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan_sbd",
+                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan_sbd\(route)",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
@@ -709,7 +717,7 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
             .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
             .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
             MLXFast.metalKernel(
-                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd",
+                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd\(route)",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
@@ -922,6 +930,47 @@ enum NemotronMoELeader {
     }
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
+    /// NEMOTRON_MTP_PORT3_1=0 keeps the triple FC1's nested route search.
+    static let simdRoute = ProcessInfo.processInfo.environment["NEMOTRON_MTP_PORT3_1"] != "0"
+    nonisolated(unsafe) static var routeQualified = false
+
+    /// Load time, before any verify graph is traced: the SIMD-vote triple FC1
+    /// against the nested search on a real fc1 bank, bitwise (activations and
+    /// FC2 plan), over routes with no, paired and three-way shared experts.
+    /// Any difference keeps the nested search.
+    static func qualifyRoute(_ model: Module) {
+        routeQualified = false
+        guard simdRoute,
+              let moe = model.modules().lazy.compactMap({ $0 as? NemotronHMoE }).first,
+              let up = bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16)
+        else { return }
+        let routes: [[UInt32]] = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+            [0, 1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0, 12, 13, 14, 15, 16],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 6],
+            [7, 1, 2, 3, 4, 5, 8, 9, 7, 10, 11, 12, 13, 14, 15, 16, 17, 7],
+            [0, 1, 2, 3, 4, 5, 5, 4, 3, 2, 1, 0, 0, 2, 4, 6, 8, 10],
+            [127, 64, 3, 99, 12, 45, 45, 127, 77, 3, 100, 1, 99, 45, 64, 2, 127, 50],
+        ]
+        var same = true
+        for (seed, route) in routes.enumerated() {
+            let x = (MLXRandom.normal([3, 2688], key: MLXRandom.key(UInt64(0x5e17 + seed))) * 0.5)
+                .asType(.bfloat16)
+            let inds = MLXArray(route)
+            guard let a = applyWithBalancePlan(x, inds, bank: up, relu2: fuseRelu2,
+                                               prepared: nil, simdRoute: true),
+                  let b = applyWithBalancePlan(x, inds, bank: up, relu2: fuseRelu2,
+                                               prepared: nil, simdRoute: false)
+            else { return }
+            same = same && MLX.logicalAnd(
+                (a.activation.view(dtype: .uint16) .== b.activation.view(dtype: .uint16)).all(),
+                (a.plan .== b.plan).all()).item(Bool.self)
+        }
+        routeQualified = same
+        FileHandle.standardError.write(
+            Data("nemotron fc1 simd route \(same ? "on" : "off"): \(routes.count) routes\n".utf8))
+    }
 
     struct Bank {
         let weight: MLXArray
@@ -1012,29 +1061,30 @@ enum NemotronMoELeader {
     /// Both outputs are fresh current-call arrays; no planner state persists.
     /// The dictionary twin of the triple FC1 this process selects, if built.
     static var dictFC1Available: Bool {
-        let kernels = NemotronMoELeaderPreparedKernels.shared
+        let kernels = NemotronMoELeaderPreparedKernels.active
         return tripleGateUp && (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
             ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
     }
 
     static func applyWithBalancePlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, simdRoute: Bool? = nil
     ) -> (activation: MLXArray, plan: MLXArray)? {
-        guard fuseBalancePlan, preparedGateUp,
+        let kernels = simdRoute == nil ? NemotronMoELeaderPreparedKernels.active
+            : simdRoute! ? NemotronMoELeaderPreparedKernels.simdRoute : NemotronMoELeaderPreparedKernels.shared
+        guard let kernels, fuseBalancePlan, preparedGateUp,
               x.shape == [3, 2688], x.dtype == .bfloat16,
               inds.shape == [18], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
               let kernel = (tripleGateUp
-                  ? (fc1Tail8 ? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlanTail8 : nil)
-                      ?? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlan : nil)
-                  ?? NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+                  ? (fc1Tail8 ? kernels.tripleGateUpAndPlanTail8 : nil)
+                      ?? kernels.tripleGateUpAndPlan : nil)
+                  ?? kernels.gateUpAndPlan
         else { return nil }
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = leaderResultsPerSimdgroup(rows: 3)
         // The selected triple kernel's dictionary twin, when `dict` is given.
-        let kernels = NemotronMoELeaderPreparedKernels.shared
         let twin = dict == nil || !tripleGateUp ? nil
             : (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
                 ? kernels.tripleGateUpAndPlanTail8Dict
@@ -1372,6 +1422,38 @@ private final class NMLBalanceWeighted: Sendable {
 /// in exactly one complete 64-thread TG: row-zero/slot-zero is always a leader,
 /// so its original follower return cannot skip the plan. FC2 already depends
 /// on FC1; reading the plan adds no dependency on a different producer.
+/// The triple FC1's route search on SIMD votes over the 18 route slots of
+/// R = 3, TOPK = 6 (lanes 0-17): any earlier-row occurrence returns the
+/// follower, the lowest later-row slot is the partner and a higher one the
+/// third, as the nested search picks them. The router gives six distinct
+/// experts per row, so a later row matches at most once.
+private func nmlTripleSIMDRouteSource(_ source: String) -> String {
+    guard let start = source.range(of: "  int before = 0;"),
+          let end = source.range(of: "\n\n  const int out_row =", range: start.upperBound..<source.endIndex)
+    else { preconditionFailure("triple FC1 route source changed") }
+    let range = start.lowerBound..<end.lowerBound
+    let original = String(source[range])
+    precondition(original.contains("int partner = -1;") && original.contains("int third = -1;"))
+    let replacement = """
+      int partner = -1;
+      int third = -1;
+      if (R == 3 && TOPK == 6) {
+        // All 32 lanes vote before the uniform follower return.
+        const bool match = simd_lid < 18 ? inds[simd_lid] == expert : false;
+        if (simd_any(match && int(simd_lid) < row * TOPK)) { return; }
+        const bool later = match && int(simd_lid) >= (row + 1) * TOPK;
+        const int first = simd_min(later ? int(simd_lid) : 18);
+        const int last = simd_max(later ? int(simd_lid) : -1);
+        partner = first < 18 ? first : -1;
+        third = last > first ? last : -1;
+      } else {
+        \(original.replacingOccurrences(of: "int partner = -1;", with: "partner = -1;")
+            .replacingOccurrences(of: "int third = -1;", with: "third = -1;"))
+      }
+    """
+    return source.replacingCharacters(in: range, with: replacement)
+}
+
 private func nmlFC1WithBalancePlanSource(_ preparedFC1: String) -> String {
     let lane = "const uint lane = thread_position_in_grid.x;"
     let store = "for (uint i = lane; i < 36; i += 32)"

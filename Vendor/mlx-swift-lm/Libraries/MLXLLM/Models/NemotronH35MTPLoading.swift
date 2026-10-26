@@ -76,6 +76,7 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
         // Load-time JIT of the exact verify kernels (kernel agent hook).
+        NemotronMoELeader.qualifyRoute(target)
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
         NemotronSBDict.prepare(target)
