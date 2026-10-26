@@ -406,12 +406,6 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
         }
         return provider.cbv2MTPTopTwo(logits)
     }
-
-    public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
-        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
-    {
-        (model as? any CBv2MTPPolicyTopTwoProviding)?.cbv2MTPTopTwoPacket(logits, window: window)
-    }
 }
 
 extension CBv2SteppableLanguageModelAdapter:
