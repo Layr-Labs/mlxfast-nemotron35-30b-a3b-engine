@@ -216,3 +216,17 @@ template <
 }
 
 } // namespace mlx::core::metal
+
+#include <cstdlib>
+
+namespace {
+
+struct CommandBufferOpCountOnly {
+  CommandBufferOpCountOnly() {
+    ::setenv("MLX_MAX_MB_PER_BUFFER", "1048576", 0);
+  }
+};
+
+const CommandBufferOpCountOnly command_buffer_op_count_only;
+
+}
