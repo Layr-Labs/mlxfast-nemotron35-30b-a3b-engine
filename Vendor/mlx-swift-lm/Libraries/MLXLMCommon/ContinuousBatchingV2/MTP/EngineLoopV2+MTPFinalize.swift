@@ -272,6 +272,8 @@ extension EngineLoopV2 {
                 // while the host finishes finalize and plans the next step:
                 // let the drafter submit the next round's first draft now.
                 if CBv2MTPFirstDraftPrestage.enabled, carryShortlist == nil,
+                    (!CBv2MTPFirstDraftPrestage.skipTerminalPrefetch
+                        || rec.request.maxTokens - rec.generatedTokenCount > 1),
                     let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
                     let state = metadata.assistantState
                 {
@@ -521,6 +523,11 @@ public enum CBv2MTPFirstDraftPrestage {
     /// CBV2_MTP_PRESTAGE_FIRST_DRAFT=0 restores submission at round build.
     public static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_PRESTAGE_FIRST_DRAFT"] != "0"
+    /// A remaining single output cannot use another speculative round. This
+    /// only skips optional next-round prefetch, never current verification or
+    /// assistant finalize. Set 0 to retain the complete original schedule.
+    public static let skipTerminalPrefetch =
+        ProcessInfo.processInfo.environment["CBV2_MTP_SKIP_TERMINAL_PREFETCH"] != "0"
     /// CBV2_MTP_SPECULATE_AFTER_VERIFY=0 disables the post-verify head rows.
     public static let speculateAfterVerify = enabled
         && ProcessInfo.processInfo.environment["CBV2_MTP_SPECULATE_AFTER_VERIFY"] != "0"
@@ -582,6 +589,16 @@ extension EngineLoopV2 {
         defer { CBv2MTPSubmitMerge.flush() }
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
+            // This row must emit at least one target-authoritative token in
+            // finalize (or be discarded). At <=2 remaining, any continuing
+            // row has <=1 slot: mtpDepthWithinOutputBudget then yields zero.
+            // The request's immutable max and confirmed token count are owned
+            // by the engine; no acceptance readback or output-FIFO guess.
+            if CBv2MTPFirstDraftPrestage.skipTerminalPrefetch,
+                let rec = scheduler.record(for: row.id),
+                rec.request.maxTokens - rec.generatedTokenCount <= 2 {
+                continue
+            }
             speculator.speculateAfterVerify(
                 targetTokens: targets[index ..< (index + 1)],
                 targetHidden: verify.lastHidden[index ..< (index + 1)],
