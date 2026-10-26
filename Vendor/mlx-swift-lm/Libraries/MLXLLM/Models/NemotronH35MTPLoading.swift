@@ -353,6 +353,10 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// pages that stay wired between requests. NEMOTRON_MTP_MLOCK=targets locks only the target's groups;
     /// NEMOTRON_MTP_MLOCK=0 locks nothing.
     static let lockMode = ProcessInfo.processInfo.environment["NEMOTRON_MTP_MLOCK"] ?? "all"
+    /// With target sets, the decode-only requests (the MTP head's set, the extras and the per-layer copy sets)
+    /// go on the target queue before the target's own groups, so the copies can be ready when the first
+    /// verify graph runs. NEMOTRON_MTP_DECODE_SETS_FIRST=0 keeps the target groups first.
+    static let decodeSetsFirst = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_SETS_FIRST"] != "0"
     /// `mlock` of every distinct buffer of `sets`: (buffers locked, bytes locked).
     static func lockPages(_ sets: [any MTLResidencySet]) -> (Int, Int) {
         var seen = Set<ObjectIdentifier>()
@@ -501,7 +505,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
-        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        if !Self.decodeSetsFirst {
+            for set in targetSets { targetQueue.async { set.requestResidency() } }
+        }
         let head = seedSet, ready = Array(owners.prefix(cut))
         targetQueue.async {
             head.requestResidency()
@@ -517,6 +523,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                     NemotronZSkip.markCopyReady(ready)
                 }
             }
+        }
+        if Self.decodeSetsFirst {
+            for set in targetSets { targetQueue.async { set.requestResidency() } }
         }
         return Lease(self)
     }
