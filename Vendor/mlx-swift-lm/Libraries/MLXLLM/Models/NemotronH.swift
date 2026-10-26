@@ -1221,6 +1221,59 @@ enum NemotronHPrefillX5 {
     static var active: Bool { !seedOnly || requestPrefill }
 }
 
+/// Seed-only: a fresh request's first scan window computes
+/// `next + lastDecay * (+0.0)` (a [b, h, 1, 1] multiply, then a broadcast
+/// add) through `stateUpdate` with the zero-stride +0.0 state, i.e. the same
+/// `e * 0` and add per element in one launch. `qualify` checks it bitwise
+/// against the stock pair (signed zeros, infinities and NaN included).
+/// NEMOTRON_FRESH_STATE_UPDATE=0 keeps the stock pair.
+enum NemotronFreshStateUpdate {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FRESH_STATE_UPDATE"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron fresh state update: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.ssmStateUpdate else { return report("off (setting)") }
+        let (h, dh, d) = (64, 64, 128)
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, n) in [256, 232, 9, 1].enumerated() {
+                    let seed = UInt64(0x5f7e_0000 + index)
+                    var prod = MLXRandom.normal([1, h, dh, d], dtype: .float32, scale: 3,
+                                                key: MLXRandom.key(seed))
+                    // Special values in the product and the decay.
+                    let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000), Float(bitPattern: 0x8001_0000), 3e38])
+                    prod = concatenated([specials, prod.reshaped(-1)[8...]]).reshaped(1, h, dh, d)
+                    var ec = MLXRandom.uniform(0 ..< 1, [1, n, h], key: MLXRandom.key(seed + 1))
+                    ec = concatenated([ec.reshaped(-1)[..<(n * h - 4)],
+                                       MLXArray([Float(0), .infinity, .nan, 1e-30])]).reshaped(1, n, h)
+                    let zero = NemotronMambaZeroState.view([1, h, dh, d], dtype: .float32)
+                    let fused = NemotronHScanKernels.shared.stateUpdate(
+                        [prod, zero, ec, n],
+                        template: [("H", h), ("DH", dh), ("DS", d)],
+                        grid: (dh * d / 4, h, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, h, dh, d]], outputDTypes: [.float32])[0]
+                    let lastDecay = ec[0..., -1, 0..., .newAxis, .newAxis]
+                    let stock = prod + lastDecay * NemotronMambaZeroState.scalar(.float32)
+                    let same = (fused.view(dtype: .uint32) .== stock.view(dtype: .uint32)).all()
+                    if !same.item(Bool.self) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from the stock pair after \(checked) cases)")
+    }
+}
+
 // MARK: - Multi-token SSM scan (copy of SSM.swift ssmAttn, fewer copies)
 
 /// tril(CB_g * exp(S), 0) with CB broadcast over the R heads of its group:
@@ -1591,16 +1644,24 @@ func nemotronPrefillComputeDt(
 func nemotronSSMAttn(
     x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
     dt: MLXArray, dtBias: MLXArray, state: MLXArray?,
-    timeStepLimit: (Float, Float)
+    timeStepLimit: (Float, Float),
+    prepared: (dtA: MLXArray, dtx: MLXArray)? = nil
 ) -> (MLXArray, MLXArray) {
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
 
-    let dt = nemotronPrefillComputeDt(dt, dtBias, timeStepLimit)
     let repeats = h / g
-    let A = -MLX.exp(ALog).asType(dt.dtype)
-    let dtA = dt * A.reshaped(1, 1, -1)
-    let dtx = dt.reshaped(b, l, h, 1) * x
+    let dtA: MLXArray
+    let dtx: MLXArray
+    if let prepared {
+        // `NemotronPrefillConvDt`: the same dtA and dtx, bit for bit.
+        (dtA, dtx) = prepared
+    } else {
+        let dt = nemotronPrefillComputeDt(dt, dtBias, timeStepLimit)
+        let A = -MLX.exp(ALog).asType(dt.dtype)
+        dtA = dt * A.reshaped(1, 1, -1)
+        dtx = dt.reshaped(b, l, h, 1) * x
+    }
 
     let step = 256
     // The fused epilogue needs every window on the windowOut path below,
@@ -1703,7 +1764,19 @@ func nemotronSSMAttn(
             // decay[h] * +0.0 for every (i, k): the same Multiply (same
             // promotion and operand order) on [b, h, 1, 1], then the same Add.
             previousState = NemotronMambaZeroState.view([b, h, dh, d], dtype: .float32)
-            nextState = nextState + lastDecay * NemotronMambaZeroState.scalar(.float32)
+            if NemotronFreshStateUpdate.verified, NemotronHPrefillX5.ssmStateUpdate,
+               NemotronHPrefillX5.active, nextState.dtype == .float32,
+               expDtACumsum.dtype == .float32, nextState.shape == [b, h, dh, d], d % 4 == 0 {
+                // The same e * (+0.0) then add per element, in one launch
+                // (`NemotronFreshStateUpdate`).
+                nextState = NemotronHScanKernels.shared.stateUpdate(
+                    [nextState, previousState, expDtACumsum, n],
+                    template: [("H", h), ("DH", dh), ("DS", d)],
+                    grid: (dh * d / 4, b * h, 1), threadGroup: (256, 1, 1),
+                    outputShapes: [[b, h, dh, d]], outputDTypes: [.float32])[0]
+            } else {
+                nextState = nextState + lastDecay * NemotronMambaZeroState.scalar(.float32)
+            }
         }
         if fuseEpilogue {
             precondition(previousState.dtype == .float32 && yWindow.dtype == .float32
@@ -1912,6 +1985,151 @@ private enum NemotronRequestConvHistory {
             """, ensureRowContiguous: false)
 }
 
+/// Seed-only request-prefill front of a Mamba layer in one launch: the
+/// stock `silu(conv1d(concatenated([oldState, input])))` (the statements of
+/// `nemotron_packed_conv_silu`), the conv history rows, and the scan inputs
+/// `dtA = dt * A` and `dtx = dt * float(x)` with dt the statements of
+/// `nemotron_packed_conv_silu_dt` (= `nemotronCompiledPrefillDt`). Each x
+/// thread recomputes its head's dt with those statements; every output
+/// element is one product of the same operands as the stock op. Replaces
+/// the concatenate, depthwise conv, bias add, SiLU, dt transform, dtA and
+/// dtx multiplies, the x promotion and the history copy.
+/// Used only inside the request prefill (`NemotronHPrefillX5.active`) after
+/// `qualify` found all four outputs bitwise equal to the stock graph.
+/// NEMOTRON_PREFILL_CONV_DT=0 keeps the stock graph.
+enum NemotronPrefillConvDt {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_CONV_DT"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static let header = """
+        inline float nemotron_prefill_dt(float v, float lo, float hi) {
+            float sp;
+            if (metal::isnan(v)) {
+                sp = metal::numeric_limits<float>::quiet_NaN();
+            } else {
+                constexpr float inf = metal::numeric_limits<float>::infinity();
+                float maxval = metal::max(v, 0.0f);
+                float minval = metal::min(v, 0.0f);
+                sp = (minval == -inf || maxval == inf)
+                    ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+            }
+            float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+            return metal::isnan(m) ? m : (m < hi ? m : hi);
+        }
+        """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_prefill_conv_silu_dt",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A"],
+        outputNames: ["out", "hist", "dtA", "dtx"],
+        source: """
+            const int is1 = int(input_strides[1]), is2 = int(input_strides[2]);
+            const int os1 = int(oldState_strides[1]), os2 = int(oldState_strides[2]);
+            const int ws0 = int(weight_strides[0]), ws1 = int(weight_strides[1]);
+            const int ds1 = int(dtIn_strides[1]), ds2 = int(dtIn_strides[2]);
+            int channel = int(thread_position_in_grid.x);
+            int position = int(thread_position_in_grid.y);
+            if (channel >= C) {
+                int head = channel - C;
+                if (head >= H) return;
+                float dtv = nemotron_prefill_dt(
+                    static_cast<float>(dtIn[position * ds1 + head * ds2])
+                    + static_cast<float>(dtBias[head * dtBias_strides[0]]), dtLo, dtHi);
+                dtA[position * H + head] = dtv * A[head * A_strides[0]];
+                return;
+            }
+            if (position >= L - 3) {
+                hist[(position - (L - 3)) * C + channel] =
+                    input[position * is1 + channel * is2];
+            }
+            float acc = 0;
+            for (int i = 0; i < 4; ++i) {
+                int row = position + int(i);
+                T value = row < 3
+                    ? oldState[row * os1 + channel * os2]
+                    : input[(row - 3) * is1 + channel * is2];
+                acc += static_cast<float>(value)
+                    * weight[channel * ws0 + int(i) * ws1];
+            }
+            T convolved = static_cast<T>(acc);
+            T x = convolved + bias[channel * bias_strides[0]];
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            T sigmoid = x < 0 ? y : 1 - y;
+            T o = x * sigmoid;
+            out[position * C + channel] = o;
+            // x threadgroups (uniform: C and H * DH are multiples of the
+            // 256-thread group): the group's 256 / DH heads' dt once each.
+            const int c0 = int(threadgroup_position_in_grid.x) * 256;
+            if (c0 < H * DH) {
+                threadgroup float tdt[256 / DH];
+                const uint lt = thread_position_in_threadgroup.x;
+                if (lt < 256 / DH) {
+                    const int head = c0 / DH + int(lt);
+                    tdt[lt] = nemotron_prefill_dt(
+                        static_cast<float>(dtIn[position * ds1 + head * ds2])
+                        + static_cast<float>(dtBias[head * dtBias_strides[0]]), dtLo, dtHi);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float dtv = tdt[(channel - c0) / DH];
+                dtx[position * (H * DH) + channel] = dtv * static_cast<float>(o);
+            }
+            """, header: header, ensureRowContiguous: false)
+
+    /// Load-time bit check against the stock graph with real layers' conv
+    /// weights, dt bias, A_log and limits, on seeded random inputs: fresh
+    /// zero-stride and carried conv state, strided split views of a
+    /// projection row block, prompt lengths 9 to 1024.
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill conv dt: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        let mixers = target.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard let firstMixer = mixers.first, let lastMixer = mixers.last else {
+            return report("off (no Mamba layer)")
+        }
+        let cases: [(Int, Bool)] = [(488, true), (488, false), (9, true), (300, false), (1024, true)]
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (mi, mixer) in [firstMixer, lastMixer].enumerated() {
+                    for (ci, (length, fresh)) in cases.enumerated() {
+                        let seed = UInt64(0x7c0d_0000 + mi * 64 + ci)
+                        let width = mixer.intermediateSize + mixer.convDim + mixer.numHeads
+                        let projected = MLXRandom.normal(
+                            [1, length, width + 5], dtype: .bfloat16, scale: 2, key: MLXRandom.key(seed))
+                        let input = projected[
+                            0..., 0..., mixer.intermediateSize ..< (mixer.intermediateSize + mixer.convDim)]
+                        let dt = projected[0..., 0..., (mixer.intermediateSize + mixer.convDim) ..< width]
+                        let oldState = fresh
+                            ? NemotronMambaZeroState.view([1, 3, mixer.convDim], dtype: .bfloat16)
+                            : MLXRandom.normal(
+                                [1, 3, mixer.convDim], dtype: .bfloat16, key: MLXRandom.key(seed + 1))
+                        guard let fused = mixer.prefillConvDt(oldState, input, dt) else { return false }
+                        let stock = mixer.stockPrefillConvDt(oldState, input, dt)
+                        var same = MLXArray(true)
+                        for (a, b) in [(fused.0, stock.0), (fused.1, stock.1)] {
+                            same = same .&& (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                        }
+                        for (a, b) in [(fused.2, stock.2), (fused.3, stock.3)] {
+                            same = same .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                        }
+                        if !same.item(Bool.self) { return false }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from the stock graph after \(checked) cases)")
+    }
+}
+
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
@@ -1976,6 +2194,54 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         self._outProj.wrappedValue = Linear(intermediateSize, hiddenSize, bias: args.mambaProjBias)
 
         super.init()
+    }
+
+    /// `NemotronPrefillConvDt` for a [1, L > 8] request prefill: (SiLU conv
+    /// output, conv history [1, 3, C], dtA [1, L, H], dtx [1, L, H, Dh]);
+    /// nil when the shapes or dtypes are not the kernel's.
+    func prefillConvDt(_ oldState: MLXArray, _ input: MLXArray, _ dt: MLXArray)
+        -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard convKernelSize == 4, oldState.shape == [1, 3, convDim],
+            input.ndim == 3, input.dim(0) == 1, input.dim(1) > 8,
+            input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
+            conv1d.weight.dtype == .bfloat16, conv1d.weight.shape == [convDim, 4, 1],
+            conv1d.groups == convDim, conv1d.stride == 1, conv1d.dilation == 1,
+            conv1d.padding == 0, let bias = conv1d.bias,
+            bias.dtype == .bfloat16, bias.shape == [convDim],
+            dt.shape == [1, input.dim(1), numHeads], dt.dtype == .bfloat16,
+            dtBias.shape == [numHeads], [DType.bfloat16, .float32].contains(dtBias.dtype),
+            aLog.shape == [numHeads], intermediateSize == numHeads * headDim,
+            convDim % 256 == 0, intermediateSize % 256 == 0, 256 % headDim == 0,
+            input.dim(1) <= 65536,  // 32-bit indexing: <= 65536 rows of the in_proj split (row width 10304)
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return nil }
+        let length = input.dim(1)
+        let A = -MLX.exp(aLog).asType(.float32)
+        let arrays = NemotronPrefillConvDt.kernel(
+            [oldState, input, conv1d.weight, bias, dt, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), A],
+            template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads), ("DH", headDim),
+                       ("L", length)],
+            grid: (convDim + numHeads, length, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, length, convDim], [1, 3, convDim], [1, length, numHeads],
+                           [1, length, numHeads, headDim]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32, .float32])
+        return (arrays[0], arrays[1], arrays[2], arrays[3])
+    }
+
+    /// The stock graph `prefillConvDt` replaces (for its load-time check).
+    func stockPrefillConvDt(_ oldState: MLXArray, _ input: MLXArray, _ dt: MLXArray)
+        -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+        let padded = concatenated([oldState, input], axis: 1)
+        let convolution = silu(conv1d(padded))
+        let end = padded.dim(1)
+        let history = padded[0..., (end - 3) ..< end, 0...]
+        let length = input.dim(1)
+        let t = nemotronPrefillComputeDt(dt.reshaped(1, length, numHeads), dtBias, timeStepLimit)
+        let A = -MLX.exp(aLog).asType(t.dtype)
+        let x = split(convolution, indices: [intermediateSize], axis: -1)[0]
+            .reshaped(1, length, numHeads, headDim)
+        return (convolution, history, t * A.reshaped(1, 1, -1), t.reshaped(1, length, numHeads, 1) * x)
     }
 
     func packedConv(_ oldState: MLXArray, _ input: MLXArray)
@@ -2168,17 +2434,29 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
                 ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
         }
 
-        let (convOutput, padded) = packedConv(convState, convInput)
-        let end = padded.dim(1)
-        let history = padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        // Seed request prefill: conv, history and the scan's dtA / dtx in one
+        // launch (`NemotronPrefillConvDt`, bitwise the stock graph).
+        let front = NemotronPrefillConvDt.verified && NemotronHPrefillX5.active
+            && hiddenStates.dim(1) > 8
+            ? prefillConvDt(convState, convInput, dt) : nil
+        let convOutput: MLXArray
         let nextConvState: MLXArray
-        if hiddenStates.dim(1) > 8 {
-            nextConvState = NemotronRequestConvHistory.copy(
-                [history], template: [("N", history.dim(1)), ("C", convDim)],
-                grid: (convDim, history.dim(1), batch), threadGroup: (256, 1, 1),
-                outputShapes: [history.shape], outputDTypes: [history.dtype])[0]
+        if let front {
+            convOutput = front.0
+            nextConvState = front.1
         } else {
-            nextConvState = history
+            let (packedOutput, padded) = packedConv(convState, convInput)
+            convOutput = packedOutput
+            let end = padded.dim(1)
+            let history = padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+            if hiddenStates.dim(1) > 8 {
+                nextConvState = NemotronRequestConvHistory.copy(
+                    [history], template: [("N", history.dim(1)), ("C", convDim)],
+                    grid: (convDim, history.dim(1), batch), threadGroup: (256, 1, 1),
+                    outputShapes: [history.shape], outputDTypes: [history.dtype])[0]
+            } else {
+                nextConvState = history
+            }
         }
         let convSplits = split(
             convOutput,
@@ -2194,7 +2472,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let (y, nextState) = convOutput.dim(1) > 1
             ? nemotronSSMAttn(
                 x: hidden, ALog: aLog, B: B, C: C, D: D, dt: dtArray,
-                dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit)
+                dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit,
+                prepared: front.map { (dtA: $0.2, dtx: $0.3) })
             : nemotronDecodeSSM(
             hiddenStates: hidden,
             ALog: aLog,
