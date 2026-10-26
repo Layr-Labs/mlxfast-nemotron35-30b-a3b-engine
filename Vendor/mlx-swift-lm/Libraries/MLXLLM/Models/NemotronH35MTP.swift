@@ -571,6 +571,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var pendingTokens: [MLXArray] = []
         var pendingHidden: [MLXArray] = []
         var frontier: MLXArray?
+        /// The prompt's embedding rows for `pendingTokens` (seed only), taken
+        /// from the target's prefill instead of gathered again.
+        var primeEmbedding: MLXArray?
         var savedTokens: [MLXArray] = []
         var savedHidden: [MLXArray] = []
         var savedFrontier: MLXArray?
@@ -779,6 +782,15 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // the bridge between prefill chunks. The final frontier pairs with the
         // next observed token or the seed supplied to draftStep.
         if s.started || primePromptHistory {
+            // Seed only: the target's prefill kept this prompt's embedding
+            // rows; rows 1..<n are the embeddings of the pending ids below.
+            s.primeEmbedding = nil
+            if let stash = NemotronHSeedX.seedEmbedding, stash.inputs === observation.tokens,
+               !s.started, s.frontier == nil, s.pendingTokens.isEmpty, n > 1,
+               stash.rows.shape == [1, n, target.configuration.hiddenSize] {
+                s.primeEmbedding = stash.rows[0..., 1 ..< n, 0...]
+            }
+            NemotronHSeedX.seedEmbedding = nil
             if let previous = s.frontier {
                 s.pendingTokens.append(observation.tokens[0..., 0..<1])
                 s.pendingHidden.append(previous)
@@ -828,11 +840,17 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         if primePromptHistory && !s.started && !s.pendingTokens.isEmpty {
             let ids = concatenated(s.pendingTokens, axis: 1)
             let rows = concatenated(s.pendingHidden, axis: 1)
+            let kept = s.pendingTokens.count == 1 && s.primeEmbedding?.dim(1) == ids.dim(1)
+                ? s.primeEmbedding : nil
+            s.primeEmbedding = nil
+            if kept != nil { NemotronHSeedX.reportPrimeEngaged(ids.dim(1)) }
             for start in stride(from: 0, to: ids.dim(1), by: 512) {
                 let end = min(start + 512, ids.dim(1))
+                let embedding = kept.map { rows in rows[0..., start..<end, 0...] }
+                    ?? target.mtpEmbedding(ids[0..., start..<end])
                 let primed = module.appendTrustedKV(
                     hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+                    embedding: embedding, cache: s.cache)
                 asyncEval(primed)
                 s.roots = primed
             }
