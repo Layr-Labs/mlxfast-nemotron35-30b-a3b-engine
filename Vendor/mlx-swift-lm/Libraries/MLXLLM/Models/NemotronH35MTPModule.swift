@@ -272,7 +272,7 @@ final class NemotronH35MTPAttentionBlock: Module {
            let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: norm) {
             (x, xPrepared) = pair
             if NemotronMTPDraftJoins.negativeNorm {
-                xPrepared = NemotronHeadPreparedActivation.pack(fused.reshaped(3, 2688))
+                xPrepared = NemotronHeadPreparedActivation.pack(fused.reshaped(fused.dim(1), 2688))
             }
         }
         let batch = x.dim(0), length = x.dim(1)
