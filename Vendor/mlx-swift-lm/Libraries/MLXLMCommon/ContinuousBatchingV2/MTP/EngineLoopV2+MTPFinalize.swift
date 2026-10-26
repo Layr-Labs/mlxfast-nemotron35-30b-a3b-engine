@@ -488,8 +488,23 @@ public protocol CBv2MTPDeviceAcceptedPrestaging: CBv2MTPFirstDraftPrestaging {
     /// After `speculateAfterVerify`. acceptedDrafts: [1] int32, the leading
     /// draft matches in the acceptance packet.
     func speculateNextFirstDraft(acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState)
+    /// The same, also handed the walk's own operands, so a drafter may repeat
+    /// the walk inside its first consumer launch. `acceptedDrafts` is lazy:
+    /// nothing launches it unless the drafter reads it.
+    func speculateNextFirstDraft(
+        acceptedDrafts: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands,
+        requestState: any CBv2MTPRequestState)
     /// Before `finalizeRound`: the host walk's accept count.
     func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState)
+}
+
+extension CBv2MTPDeviceAcceptedPrestaging {
+    public func speculateNextFirstDraft(
+        acceptedDrafts: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands,
+        requestState: any CBv2MTPRequestState
+    ) {
+        speculateNextFirstDraft(acceptedDrafts: acceptedDrafts, requestState: requestState)
+    }
 }
 
 /// The acceptance readback polls the packet's completion event instead of
@@ -589,9 +604,14 @@ extension EngineLoopV2 {
             if CBv2MTPFirstDraftPrestage.deviceAccepted, verify.k > 0,
                 let deviceAccepted = speculator as? any CBv2MTPDeviceAcceptedPrestaging
             {
-                deviceAccepted.speculateNextFirstDraft(
-                    acceptedDrafts: Self.mtpDeviceAcceptedDrafts(verify, row: index),
-                    requestState: state)
+                let acceptedDrafts = Self.mtpDeviceAcceptedDrafts(verify, row: index)
+                if let walk = Self.mtpDeviceAcceptWalkOperands(verify, row: index) {
+                    deviceAccepted.speculateNextFirstDraft(
+                        acceptedDrafts: acceptedDrafts, walk: walk, requestState: state)
+                } else {
+                    deviceAccepted.speculateNextFirstDraft(
+                        acceptedDrafts: acceptedDrafts, requestState: state)
+                }
             }
         }
     }
@@ -621,6 +641,16 @@ extension EngineLoopV2 {
         }
         return walked
     }
+
+    /// The operands `mtpDeviceAcceptedDrafts` walks for one row, when its walk
+    /// is the one-launch kernel (CBV2_MTP_ACCEPT_WALK); nil otherwise.
+    static func mtpDeviceAcceptWalkOperands(_ verify: CBv2MTPRoundInFlight.Verify, row: Int)
+        -> CBv2MTPDeviceAcceptWalk.Operands?
+    {
+        let k = verify.k, width = k + 1, draftCount = verify.rows.count * k
+        return CBv2MTPDeviceAcceptWalk.operands(
+            verify.acceptancePacket, count: k, drafts: row * k, targets: draftCount + row * width)
+    }
 }
 
 /// CBV2_MTP_ACCEPT_WALK: the device accept walk of one row (the number of
@@ -645,12 +675,35 @@ public enum CBv2MTPDeviceAcceptWalk {
             }
             """)
 
-    /// nil (nothing built) when the switch is off or the packet is not the
-    /// 1-D int32 acceptance packet holding both ranges.
-    static func apply(_ packet: MLXArray, count: Int, drafts: Int, targets: Int) -> MLXArray? {
+    /// One row's walk: the count of leading `packet[targets + a] ==
+    /// packet[drafts + a]`, a < count, over the 1-D int32 acceptance packet.
+    public struct Operands {
+        public let packet: MLXArray
+        public let count: Int
+        public let drafts: Int
+        public let targets: Int
+
+        public init(packet: MLXArray, count: Int, drafts: Int, targets: Int) {
+            self.packet = packet
+            self.count = count
+            self.drafts = drafts
+            self.targets = targets
+        }
+    }
+
+    /// `apply`'s operands, under the same switch and checks (nothing built).
+    static func operands(_ packet: MLXArray, count: Int, drafts: Int, targets: Int) -> Operands? {
         guard CBv2CriticalPathCuts.acceptWalkKernel, packet.ndim == 1, packet.dtype == .int32,
               count > 0, drafts >= 0, targets >= 0,
               drafts + count <= packet.dim(0), targets + count <= packet.dim(0)
+        else { return nil }
+        return Operands(packet: packet, count: count, drafts: drafts, targets: targets)
+    }
+
+    /// nil (nothing built) when the switch is off or the packet is not the
+    /// 1-D int32 acceptance packet holding both ranges.
+    static func apply(_ packet: MLXArray, count: Int, drafts: Int, targets: Int) -> MLXArray? {
+        guard operands(packet, count: count, drafts: drafts, targets: targets) != nil
         else { return nil }
         return kernel(
             [packet, MLXArray([Int32(count), Int32(drafts), Int32(targets)])],
