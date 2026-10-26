@@ -2323,9 +2323,12 @@ enum NemotronMTPRouterRowsSelect {
         name: "nemotron_mtp_router_rows_select",
         inputNames: ["w", "x", "K", "N", "bias", "counter"],
         outputNames: ["y", "indices", "weights"],
-        source: nemotronSwapped(nemotronMTPRouterRowsSource, [
-            ("  constexpr int TM = 4;\n", "  constexpr int TM = \(rowsPerThreadgroup);\n", 1),
-        ]) + nemotronMTPRouterRowsSelectEpilogue,
+        source: "  coherent(device) device T* published_y = (coherent(device) device T*)y;\n"
+            + nemotronSwapped(nemotronMTPRouterRowsSource + nemotronMTPRouterRowsSelectEpilogue, [
+                ("  constexpr int TM = 4;\n", "  constexpr int TM = \(rowsPerThreadgroup);\n", 1),
+                ("y[r * out_vec_size + out_row + tm]", "published_y[r * out_vec_size + out_row + tm]", 1),
+                ("float(y[row * out_vec_size + id])", "float(published_y[row * out_vec_size + id])", 1),
+            ]),
         header: NemotronHRouterSelection.sigmoidHeader,
         ensureRowContiguous: true, mutableInputs: ["counter"])
 
