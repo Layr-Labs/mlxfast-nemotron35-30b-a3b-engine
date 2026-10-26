@@ -229,6 +229,9 @@ extension NemotronH35MTPAssistant {
         // acceptance (one-token accepted-history replay, every finalize
         // branch), then every shallower width.
         var rounds = [(depth, min(2, depth + 1)), (depth, depth + 1), (depth, 1)]
+        // Consume the one-position prefix at native width as well, so both
+        // replay-fold graph variants are traced before serving requests.
+        if depth == 2, NemotronMTPReplayFold.enabled { rounds.append((depth, depth + 1)) }
         for k in (1..<depth).reversed() { rounds += [(k, k + 1), (k, 1)] }
         for (k, confirmed) in rounds {
             var tokens = seed, hidden = carry

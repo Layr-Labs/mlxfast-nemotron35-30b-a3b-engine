@@ -776,7 +776,39 @@ enum NemotronHCompactSSMGated {
         inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
-        source: """
+        source: source, mutableInputs: ["counter"])
+    static let replayKernel: MLXFast.MLXFastKernel? = {
+        let anchor = "for (int t = 0; t < L; ++t) {"
+        let parts = source.components(separatedBy: anchor)
+        guard parts.count == 2 else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_mtp_ssm_compact_gated_prepared_replay",
+            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                         "eps", "counter", "rconv", "rdt"],
+            outputNames: ["out", "state_out", "normed", "prepared", "state_mid"],
+            source: parts[0] + replayPrefix + anchor + parts[1], mutableInputs: ["counter"])
+    }()
+    private static let replayPrefix = """
+        for (int t = 0; t < K; ++t) {
+            auto x_ = static_cast<float>(rconv[t * CD + n * Dh + d_idx]);
+            auto B_ = rconv + t * CD + BO + g_idx * Ds;
+            auto dt_ = static_cast<float>(rdt[t * H + n]);
+            auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+            auto dA = fast::exp(A * dt_);
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                auto state = dA * prior[i] + dB_by_x;
+                if (t == K - 1) {
+                    state_mid[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                }
+                prior[i] = static_cast<U>(state);
+            }
+        }
+
+        """
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -898,7 +930,7 @@ enum NemotronHCompactSSMGated {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            """, mutableInputs: ["counter"])
+            """
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -923,20 +955,10 @@ extension NemotronHRMSNormGated {
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int
     ) -> (MLXArray, MLXArray, MLXArray)? {
-        guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
-              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
-              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              type(of: self) == NemotronHRMSNormGated.self,
-              groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
-              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
-              dt.dtype == .float32, dt.shape == [1, 3, 64],
-              state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
-              weight.shape == [4096], weight.dtype == .bfloat16
+        guard compactSSMPreparedEligible(
+                convolution: convolution, dt: dt, state: state, projected: projected,
+                heads: heads, headDim: headDim, groups: groups, stateDim: stateDim)
         else { return nil }
-        // Created and evaluated at load (`prepareCounter`), never inside a
-        // compile trace; without it the two launches stay.
-        guard NemotronHCompactSSMGated.counter != nil else { return nil }
         let outputs = NemotronHCompactSSMGated.kernel(
             [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
              eps, NemotronHCompactSSMGated.counter!],
@@ -947,6 +969,51 @@ extension NemotronHRMSNormGated {
             outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
         return (outputs[2], outputs[3], outputs[1])
+    }
+
+    func compactSSMPreparedRows(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
+        stateDim: Int, replay: (conv: MLXArray, dt: MLXArray, keep: Int)
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard let kernel = NemotronHCompactSSMGated.replayKernel, (1 ... 2).contains(replay.keep),
+              replay.conv.shape == [1, 3, 6144], replay.conv.dtype == .bfloat16,
+              replay.dt.shape == [1, 3, 64], replay.dt.dtype == .float32,
+              compactSSMPreparedEligible(
+                convolution: convolution, dt: dt, state: state, projected: projected,
+                heads: heads, headDim: headDim, groups: groups, stateDim: stateDim)
+        else { return nil }
+        let outputs = kernel(
+            [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
+             eps, NemotronHCompactSSMGated.counter!, replay.conv, replay.dt],
+            template: [("T", DType.bfloat16), ("U", DType.float32),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304),
+                       ("K", replay.keep)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32],
+                           [1, 64, 64, 128]],
+            outputDTypes: [.bfloat16, .float32, .bfloat16, .float32, .float32])
+        return (outputs[2], outputs[3], outputs[1], outputs[4])
+    }
+
+    private func compactSSMPreparedEligible(
+        convolution: MLXArray, dt: MLXArray, state: MLXArray, projected: MLXArray,
+        heads: Int, headDim: Int, groups: Int, stateDim: Int
+    ) -> Bool {
+        // Created and evaluated at load (`prepareCounter`), never inside a
+        // compile trace; without it the two launches stay.
+        NemotronHCompactSSMGated.enabled && NemotronMTPExecution.batchedNorm
+            && NemotronMultiRowQMV.enabled && NemotronMultiRowQMV.narrowEnabled
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && type(of: self) == NemotronHRMSNormGated.self
+            && groupSize == 512 && heads == 64 && headDim == 64 && groups == 8 && stateDim == 128
+            && convolution.shape == [1, 3, 6144] && convolution.dtype == .bfloat16
+            && dt.dtype == .float32 && dt.shape == [1, 3, 64]
+            && state.dtype == .float32 && state.shape == [1, 64, 64, 128]
+            && projected.shape == [1, 3, 10304] && projected.dtype == .bfloat16
+            && weight.shape == [4096] && weight.dtype == .bfloat16
+            && NemotronHCompactSSMGated.counter != nil
     }
 }
 
@@ -2632,10 +2699,18 @@ private final class NemotronHPrefillKernels: Sendable {
                     for (int ee = 0; ee < E; ++ee) {
                         int start = int(counts[ee * S]);
                         int end = (ee + 1 < E) ? int(counts[(ee + 1) * S]) : n;
-                        for (int r = start; r < end && t < tmax; r += BMT) {
+                        for (int r = start; r < end && t < tmax;) {
+                            const int remaining = end - r;
+                            // Where the original batch used 32-row tiles, preserve its
+                            // 48-row padded work for a 33...48 tail instead of rounding
+                            // that tail up to a 64-row NAX body.
+                            const int take = BMT == 64 && n / E < 64
+                                && remaining > 32 && remaining <= 48
+                                ? 32 : min(BMT, remaining);
                             tiles[3 * t] = r;
-                            tiles[3 * t + 1] = min(BMT, end - r);
+                            tiles[3 * t + 1] = take;
                             tiles[3 * t + 2] = ee;
+                            r += take;
                             t++;
                         }
                     }
@@ -2708,9 +2783,10 @@ private final class NemotronHPrefillKernels: Sendable {
     }
 }
 
-/// Rows per tile the stock gather_qmm_rhs_nax dispatch picks for M rows
-/// and E experts (`bm = (M / E < 64) ? 32 : 64` in quantized.cpp).
-func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { rows / experts < 64 ? 32 : 64 }
+/// Group expert runs into at most 64 rows. The launch uses the existing
+/// 32-row body for short descriptors, preserving its small-run work while
+/// letting busy experts share one weight load over a larger row segment.
+func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { 64 }
 
 /// Expert-run tiles [count, 3] int32 of `bm` rows: (first sorted row, rows,
 /// expert); trailing slots have rows == 0.
@@ -2733,7 +2809,10 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
     else { return nil }
     let n = flat.size
     let bm = nemotronGatherTileRows(rows: n, experts: experts)
-    let count = (n + bm - 1) / bm + experts
+    // Retain the original capacity bound: an adaptive run uses no more
+    // descriptors than its original 32/64-row partition, including split tails.
+    let capacityRows = n / experts < 64 ? 32 : 64
+    let count = (n + capacityRows - 1) / capacityRows + experts
     let out = NemotronHPrefillKernels.shared.countingSort(
         [flat, n, count], template: [("E", experts), ("THREADS", threads), ("BMT", bm)],
         grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
@@ -2776,7 +2855,7 @@ private func nemotronWarmUpPrefillKernels(
         grid: (4, 4, 64), threadGroup: (32, 8, 1),
         outputShapes: [[1, 64, 4, 4]], outputDTypes: [.float32])[0])
     if NemotronHPrefillX5.enabled {
-        // Counting sort for both tile heights (bm 32: rows / E < 64, else 64).
+        // Counting sort for small and large row sets, using the current descriptor bound.
         for n in [rows, 64 * experts] {
             if let cs = nemotronCountingSort(MLXArray.zeros([n], dtype: .uint32), experts: experts) {
                 arrays.append(cs.order)
@@ -3998,16 +4077,26 @@ private final class NemotronHRunGatherKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_gather_qmm_runs",
+            name: "nemotron_gather_qmm_runs_adaptive_tiles",
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
                 threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
-                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
-                    x, w, scales, biases, tiles, y, N, K, Ws,
-                    threadgroup_position_in_grid,
-                    simdgroup_index_in_threadgroup,
-                    thread_index_in_simdgroup);
+                // Descriptor length is uniform across the threadgroup. Both bodies
+                // retain the same K loop and independent per-row NAX fragment updates.
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
             """,
             header: nemotronRunGatherHeader)
     }
@@ -4017,7 +4106,7 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// (N block, expert-run tile). Only where stock GatherQMM takes the
 /// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
 /// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
-/// with the same bm; nil = use the stock op. ReLU2 is BF16-only and retains
+/// using the same per-row K fragment order; nil = use the stock op. ReLU2 is BF16-only and retains
 /// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
     _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,

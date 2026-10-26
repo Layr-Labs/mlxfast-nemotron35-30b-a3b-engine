@@ -201,13 +201,38 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     }
 }
 
+/// Request-owned representation of an exact recurrent state. Readers that
+/// need the canonical tensor materialize it lazily; model-specific forwards
+/// may consume the representation directly. Implementations must return the
+/// same array on repeated reads and retain no request-external lookup table.
+public protocol CBv2DeferredRecurrentSSM: AnyObject {
+    var materializedSSM: MLXArray { get }
+    /// Tensor roots that make the exact representation ready. This may be a
+    /// checkpoint and input tape rather than a full state write. The stage
+    /// must charge all retained roots through its existing byte accounting.
+    var evaluationRoots: [MLXArray] { get }
+}
+
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
-    public let ssm: MLXArray?
+    private let storedSSM: MLXArray?
+    public let deferredSSM: (any CBv2DeferredRecurrentSSM)?
+    public var ssm: MLXArray? { deferredSSM?.materializedSSM ?? storedSSM }
+    public var evaluationRoots: [MLXArray] {
+        (conv.map { [$0] } ?? [])
+            + (deferredSSM?.evaluationRoots ?? (storedSSM.map { [$0] } ?? []))
+    }
 
     public init(conv: MLXArray?, ssm: MLXArray?) {
         self.conv = conv
-        self.ssm = ssm
+        self.storedSSM = ssm
+        self.deferredSSM = nil
+    }
+
+    public init(conv: MLXArray?, deferredSSM: any CBv2DeferredRecurrentSSM) {
+        self.conv = conv
+        self.storedSSM = nil
+        self.deferredSSM = deferredSSM
     }
 }
 
@@ -398,7 +423,9 @@ public final class CBv2RecurrentRequestState {
                         + "\(layer.ssmShape)/\(layer.ssmDType) "
                         + "at layer \(layer.modelLayerIndex)")
             }
-            adopted[layer.modelLayerIndex] = state
+            // Imported state starts with canonical tensors, never another
+            // request's model-specific replay representation.
+            adopted[layer.modelLayerIndex] = CBv2RecurrentLayerState(conv: conv, ssm: ssm)
         }
         guard adopted.count == spec.layers.count else {
             throw CBv2RecurrentStateError.invalidSpec(
@@ -428,7 +455,9 @@ public final class CBv2RecurrentRequestState {
     public func confirmedStateSnapshot() -> [Int: CBv2RecurrentLayerState]? {
         guard !isReleased else { return nil }
         let layers = resolvedCommitted()
-        return layers.isEmpty ? nil : layers
+        return layers.isEmpty ? nil : layers.mapValues { state in
+            state.deferredSSM == nil ? state : CBv2RecurrentLayerState(conv: state.conv, ssm: state.ssm)
+        }
     }
 
     /// `committed` with any deferred strict-prefix replays built (the same
@@ -673,7 +702,7 @@ public final class CBv2RecurrentStateEvaluation {
     public func stagedEvaluationRoots(in layers: Range<Int>) -> [MLXArray] {
         guard !evaluated, !isCaptured else { return [] }
         return staged.keys.sorted().filter { layers.contains($0) }.flatMap { index in
-            [staged[index]!.conv, staged[index]!.ssm].compactMap { $0 }
+            staged[index]!.evaluationRoots
         }
     }
 
@@ -793,7 +822,7 @@ public final class CBv2RecurrentStateEvaluation {
             prefixReplay: replayMode ? stagedPrefixReplay : nil)
         evaluated = true
         var roots = stagedLayers.keys.sorted().flatMap { index in
-            [stagedLayers[index]!.conv, stagedLayers[index]!.ssm].compactMap { $0 }
+            stagedLayers[index]!.evaluationRoots
         }
         for index in stagedPrefixReplay.keys.sorted() {
             roots.append(contentsOf: stagedPrefixReplay[index]!.evaluationRoots)
