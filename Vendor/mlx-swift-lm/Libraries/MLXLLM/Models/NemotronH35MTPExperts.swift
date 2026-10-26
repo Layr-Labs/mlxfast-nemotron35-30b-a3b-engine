@@ -623,10 +623,6 @@ private final class NemotronMoELeaderKernel: Sendable {
     /// Production-only copy with the constant 8-value tail (nmlTail8Source);
     /// `kernel` stays the reference the self-tests compare against.
     let tail8: MLXFast.MLXFastKernel?
-    /// `kernel` and `tail8` reading (scale, bias) through the draft head's
-    /// routed FC1 pair dictionary (`NemotronSBDict.draftDict`), or nil.
-    let kernelDict: MLXFast.MLXFastKernel?
-    let tail8Dict: MLXFast.MLXFastKernel?
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_qmv_affine4_gs64",
@@ -637,22 +633,6 @@ private final class NemotronMoELeaderKernel: Sendable {
         tail8 = nmlTail8Source(nemotronMoELeaderSource).map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_qmv_tail8_affine4_gs64",
-                inputNames: ["w", "scales", "biases", "x", "inds"],
-                outputNames: ["y"],
-                source: $0,
-                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
-        }
-        kernelDict = nemotronSBDictSource(nemotronMoELeaderSource).map {
-            MLXFast.metalKernel(
-                name: "nemotron_moe_leader_qmv_affine4_gs64_sbd",
-                inputNames: ["w", "scales", "biases", "x", "inds"],
-                outputNames: ["y"],
-                source: $0,
-                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
-        }
-        tail8Dict = nmlTail8Source(nemotronMoELeaderSource).flatMap(nemotronSBDictSource).map {
-            MLXFast.metalKernel(
-                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_sbd",
                 inputNames: ["w", "scales", "biases", "x", "inds"],
                 outputNames: ["y"],
                 source: $0,
@@ -1013,11 +993,9 @@ enum NemotronMoELeader {
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
     /// Returns [R * topK, N].
     /// tail8: production calls only (the self-test references keep false).
-    /// dict: the draft head's routed FC1 pair dictionary (one row only).
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
-                      prepared: MLXArray? = nil, tail8: Bool = false,
-                      dict: NemotronSBDict.Dict? = nil) -> MLXArray {
+                      prepared: MLXArray? = nil, tail8: Bool = false) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
@@ -1034,23 +1012,8 @@ enum NemotronMoELeader {
                 outputShapes: [[rows * topK, bank.n]],
                 outputDTypes: [x.dtype])[0]
         }
-        let kernels = NemotronMoELeaderKernel.shared
-        let kernel = (tail8 ? kernels.tail8 : nil) ?? kernels.kernel
-        // `dict`: the selected kernel's twin, reading the bank's pair indices
-        // (addressed from their base like the scales) and its FP32 pair table.
-        if let dict, rows == 1,
-           let twin = tail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict {
-            return twin(
-                [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index),
-                 dict.table, x, inds],
-                template: [("T", x.dtype), ("R", rows), ("TOPK", topK),
-                           ("K", bank.k), ("N", bank.n), ("XSLOT", perSlot),
-                           ("RELU2", relu2), ("RPS", rps)],
-                grid: (32, bank.n / rps, rows * topK),
-                threadGroup: (32, 2, 1),
-                outputShapes: [[rows * topK, bank.n]],
-                outputDTypes: [x.dtype])[0]
-        }
+        let kernel = (tail8 ? NemotronMoELeaderKernel.shared.tail8 : nil)
+            ?? NemotronMoELeaderKernel.shared.kernel
         return kernel(
             [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
              NemotronBankBinding.bind(bank.biases), x, inds],
@@ -1097,12 +1060,6 @@ enum NemotronMoELeader {
         let kernels = NemotronMoELeaderPreparedKernels.shared
         return tripleGateUp && (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
             ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
-    }
-    /// The dictionary twin of the R = 1 leader `apply` selects with
-    /// `tail8: leaderTail8` (the draft tail's FC1), if built.
-    static var draftDictFC1Available: Bool {
-        let kernels = NemotronMoELeaderKernel.shared
-        return (leaderTail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict) != nil
     }
 
     static func applyWithBalancePlan(
@@ -1237,8 +1194,6 @@ enum NemotronMoELeader {
         let xr = x.reshaped(rows, 2688)
         let act: MLXArray
         let balancePlan: MLXArray?
-        // One row (the draft tail): the draft head bank's admitted pair dictionary, if any.
-        let draftDict = rows == 1 ? NemotronSBDict.draftDict(mlp.fc1) : nil
         if fuseRelu2 {
             let dict = rows == 3 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
             if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
@@ -1252,12 +1207,12 @@ enum NemotronMoELeader {
                 balancePlan = fused.plan
             } else {
                 act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                    relu2: true, prepared: prepared, tail8: leaderTail8, dict: draftDict)
+                    relu2: true, prepared: prepared, tail8: leaderTail8)
                 balancePlan = nil
             }
         } else {
             let h = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
-                prepared: prepared, tail8: leaderTail8, dict: draftDict)
+                prepared: prepared, tail8: leaderTail8)
             let a = maximum(h, MLXArray(0))
             act = a * a
             balancePlan = nil
@@ -2464,9 +2419,7 @@ enum NemotronZSkip {
             return
         }
         lock.withLock { draftCopies = built }
-        let dicts = built.values.filter(\.dict).count
-        FileHandle.standardError.write(
-            Data("nemotron draft zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+        FileHandle.standardError.write(Data("nemotron draft zskip on: \(built.count) MoE layers\n".utf8))
     }
 
     /// Seeded one-row cases against the production R = 1 kernel: sparse rows
@@ -3495,145 +3448,5 @@ enum NemotronSBDict {
         if inProj { shapes.append([2688, 10304, 1]) }
         if sharedUp { shapes.append([2688, 3712, 1]) }
         return (same.item(Bool.self), fc1, shapes)
-    }
-
-    // MARK: Draft head (one row per draft step)
-    //
-    // The MTP head's own 4-bit tensors (eh_proj, Q/K/V, o_proj, shared up and
-    // down, the routed FC1 bank) get pair dictionaries of their own, read only
-    // by the head's R = 1 draft-step launches: the one-row QMV (eh_proj,
-    // o_proj, shared up and down), the fused Q/K/V launch and the routed FC1
-    // leader. Same tables and decode check as above, kept apart from the
-    // target's: a target tensor never finds a dictionary here, and the head's
-    // multi-row launches keep the loaded arrays. The routed FC2 reads its own
-    // copy (`NemotronZSkip.prepareDraft`, with the bank's pair dictionary). A
-    // tensor keeps its dictionary only if every R = 1 dictionary kernel that
-    // reads it equals its record kernel bit for bit on the real weights.
-    // NEMOTRON_MTP_DRAFT_SBDICT=0 (or NEMOTRON_MTP_SB_DICT=0) keeps the record kernels.
-    static let draftEnabled = enabled
-        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SBDICT"] != "0"
-    nonisolated(unsafe) private static var draftDicts: [ObjectIdentifier: Dict] = [:]
-
-    /// The admitted draft-head dictionary of `owner`'s scales and biases, if any.
-    static func draftDict(_ owner: AnyObject) -> Dict? {
-        lock.withLock { draftDicts[ObjectIdentifier(owner)] }
-    }
-
-    /// Every admitted draft-head index and table (decode-only backing for the head's residency set).
-    static var draftArrays: [MLXArray] {
-        lock.withLock { draftDicts.values.flatMap { [$0.index, $0.table] } }
-    }
-
-    /// The admitted routed-bank indices (for `NemotronBankBinding.warm`: addressed from their base).
-    static var draftBankIndexArrays: [MLXArray] {
-        lock.withLock { draftDicts.values.compactMap { $0.index.ndim == 3 ? $0.index : nil } }
-    }
-
-    /// Load time, before any draft graph is traced or warmed: a dictionary for
-    /// the head's routed FC1 bank and every 4-bit head projection, then each
-    /// R = 1 dictionary kernel against its record kernel (`checkDraftKernels`).
-    /// The head's weights are untouched; a tensor whose check differs (or that
-    /// no dictionary kernel reads) keeps its record kernels.
-    static func prepareDraft(_ head: Module) {
-        guard draftEnabled, Device.defaultDevice().deviceType == .gpu else { return }
-        var built: [ObjectIdentifier: Dict] = [:]
-        var names: [ObjectIdentifier: String] = [:]
-        for (name, module) in head.namedModules() {
-            if let moe = module as? NemotronHMoE {
-                guard type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
-                      let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
-                      up.weight.shape == [128, 1856, 336],
-                      let d = make(scales: up.scales, biases: up.biases) else { continue }
-                built[ObjectIdentifier(moe.switchMLP.fc1)] = d
-                names[ObjectIdentifier(moe.switchMLP.fc1)] = name + ".switch_mlp.fc1"
-            } else if let q = module as? QuantizedLinear, q.mode == .affine, q.bits == 4,
-                      q.groupSize == 64, q.bias == nil, q.weight.dtype == .uint32, q.weight.ndim == 2,
-                      let biases = q.biases, let d = make(scales: q.scales, biases: biases) {
-                built[ObjectIdentifier(q)] = d
-                names[ObjectIdentifier(q)] = name
-            }
-        }
-        lock.withLock { draftDicts = built }
-        let kept = checkDraftKernels(head)
-        lock.withLock { draftDicts = built.filter { kept.contains($0.key) } }
-        let on = built.keys.filter { kept.contains($0) }.compactMap { names[$0] }.sorted()
-        let off = built.keys.filter { !kept.contains($0) }.compactMap { names[$0] }.sorted()
-        guard !on.isEmpty else {
-            FileHandle.standardError.write(Data(
-                "nemotron draft sb dict off: no R = 1 dictionary kernel equals its record kernel \(off)\n".utf8))
-            return
-        }
-        let groups = built.filter { kept.contains($0.key) }.values.reduce(0) { $0 + $1.index.size }
-        let rest = off.isEmpty ? "" : "; record kernels kept for \(off)"
-        FileHandle.standardError.write(Data(
-            "nemotron draft sb dict on: \(on.count) tensors \(on), \(groups) groups, R = 1 kernels bitwise equal\(rest)\n".utf8))
-    }
-
-    /// Each draft dictionary's R = 1 kernels against their record kernels, bit
-    /// for bit, on the head's real weights and seeded rows: the one-row QMV on
-    /// every projection (ReLU2 off and on), the fused Q/K/V launch on Q, K and
-    /// V together, and the routed FC1 leader on route sets covering all 128
-    /// experts (ReLU2 off and on). Also JITs every R = 1 twin pipeline outside
-    /// any timed window. Returns the owners every check of which ran and
-    /// matched; a dictionary no kernel reads is not kept.
-    private static func checkDraftKernels(_ head: Module) -> Set<ObjectIdentifier> {
-        let keys = MLXRandom.split(key: MLXRandom.key(0x5bd2), into: 3)
-        var same: [ObjectIdentifier: MLXArray] = [:]
-        func record(_ owner: AnyObject, _ ok: MLXArray) {
-            let id = ObjectIdentifier(owner)
-            same[id] = logicalAnd(same[id] ?? MLXArray(true), ok)
-        }
-        func equal(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
-            (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
-        }
-        var failed = Set<ObjectIdentifier>()
-        for module in head.modules() {
-            if let q = module as? QuantizedLinear, draftDict(q) != nil,
-               NemotronMultiRowQMV.draftDictAvailable {
-                let x = (MLXRandom.normal([1, q.weight.dim(1) * 8], key: keys[0]) * 0.5).asType(.bfloat16)
-                for relu2 in [false, true] {
-                    guard let a = NemotronMultiRowQMV.apply(x, q, relu2: relu2, sbDict: false),
-                          let b = NemotronMultiRowQMV.apply(x, q, relu2: relu2) else { continue }
-                    record(q, equal(a, b))
-                }
-            }
-            if let attention = module as? NemotronHAttention, NemotronTargetQKV.draftDictAvailable,
-               draftDict(attention.wq) != nil, draftDict(attention.wk) != nil,
-               draftDict(attention.wv) != nil {
-                let x = (MLXRandom.normal([1, 1, 2688], key: keys[1]) * 0.5).asType(.bfloat16)
-                let owners: [AnyObject] = [attention.wq, attention.wk, attention.wv]
-                if let a = NemotronTargetQKV.apply(
-                       x, query: attention.wq, key: attention.wk, value: attention.wv,
-                       captureMTP: false, sbDict: false),
-                   let b = NemotronTargetQKV.apply(
-                       x, query: attention.wq, key: attention.wk, value: attention.wv,
-                       captureMTP: false) {
-                    let ok = logicalAnd(equal(a.0, b.0), logicalAnd(equal(a.1, b.1), equal(a.2, b.2)))
-                    for owner in owners { record(owner, ok) }
-                } else {
-                    // The launch did not run: Q, K and V share it, so none keeps a dictionary.
-                    for owner in owners { failed.insert(ObjectIdentifier(owner)) }
-                }
-            }
-            if let moe = module as? NemotronHMoE, let d = draftDict(moe.switchMLP.fc1),
-               NemotronMoELeader.draftDictFC1Available,
-               let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16) {
-                // 22 sets of six distinct experts cover all 128 (one row each).
-                let rows = (MLXRandom.normal([22, 2688], key: keys[2]) * 0.5).asType(.bfloat16)
-                for route in 0 ..< 22 {
-                    let inds = MLXArray((0 ..< 6).map { UInt32((route * 6 + $0) % 128) })
-                    let x = rows[route ..< route + 1]
-                    for relu2 in [false, true] {
-                        let a = NemotronMoELeader.apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
-                            relu2: relu2, tail8: NemotronMoELeader.leaderTail8)
-                        let b = NemotronMoELeader.apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
-                            relu2: relu2, tail8: NemotronMoELeader.leaderTail8, dict: d)
-                        record(moe.switchMLP.fc1, equal(a, b))
-                    }
-                }
-            }
-        }
-        eval(Array(same.values))
-        return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
     }
 }
