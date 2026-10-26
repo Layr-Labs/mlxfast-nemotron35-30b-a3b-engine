@@ -595,6 +595,28 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         guard count > 0 else {
             return pool.gather(group: groupKey, pages: [], firstSlot: 0, count: 0)
         }
+        return pool.gather(
+            group: groupKey, pages: gatherPages(start: start, count: count),
+            firstSlot: start % pool.config.pageSize, count: count)
+    }
+
+    /// `snapshot()` as one direct read with `extraRows` spare rows per head
+    /// after the attendable ones (`PagedKVPool.gatherDirect`): `combined` is
+    /// [2, 1, kvHeads, count + extraRows, headDim], keys then values, and the
+    /// spare rows are the caller's to store. nil when that read does not apply.
+    public func snapshotCombined(extraRows: Int) -> (combined: MLXArray, count: Int, offset: Int)? {
+        let count = retainedCount
+        guard count > 0 else { return nil }
+        let start = absoluteOffset - count
+        guard let combined = pool.gatherDirect(
+            group: groupKey, pages: gatherPages(start: start, count: count),
+            firstSlot: start % pool.config.pageSize, count: count, extraRows: extraRows)
+        else { return nil }
+        return (combined, count, absoluteOffset)
+    }
+
+    /// The page ids `gatherRange` reads, oldest first (count > 0).
+    private func gatherPages(start: Int, count: Int) -> [Int32] {
         precondition(start >= baseOffset && start + count <= absoluteOffset)
         precondition(
             start >= oldestValidPosition,
@@ -611,8 +633,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             let idx = ringPages.map { lp % $0 } ?? lp
             pages.append(table[idx])
         }
-        return pool.gather(
-            group: groupKey, pages: pages, firstSlot: start % s, count: count)
+        return pages
     }
 
     /// NEMOTRON_KERNEL_SELFTEST=1 with CBV2_PAGED_STRIDED_WRITE: read the
