@@ -456,17 +456,44 @@ func nemotronSBDictSource(_ source: String) -> String? {
         s = s.replacingOccurrences(of: from, with: to)
     }
     // The hoisted and next-block register loads of the prepared load forms.
-    for (from, to) in [
-        ("sv[row] = sc[row * in_vec_size_g];", "sv[row] = sbt[sc[row * in_vec_size_g]].x;"),
-        ("bv[row] = bs[row * in_vec_size_g];", "bv[row] = sbt[bs[row * in_vec_size_g]].y;"),
-        ("sn[row] = sc[block_size / group_size + row * in_vec_size_g];",
-         "sn[row] = sbt[sc[block_size / group_size + row * in_vec_size_g]].x;"),
-        ("bn[row] = bs[block_size / group_size + row * in_vec_size_g];",
-         "bn[row] = sbt[bs[block_size / group_size + row * in_vec_size_g]].y;"),
+    // `sc` and `bs` address the SAME index stream here (one uint16 index per
+    // group, `biases` is the pair table), so the two statements of a hoist
+    // read one and the same table entry: its low half is the group's scale and
+    // its high half its bias. One pair load serves both registers, where the
+    // record form issued a u16 index load and a table load for `sv` and the
+    // same two again for `bv`; the extracted halves are the two values those
+    // four loads produced (`NemotronSBDict.wideSelfCheck`).
+    // NEMOTRON_MTP_IDXWIDE=0 keeps the record's two separate reads.
+    let wide = NemotronSBDict.wide
+    for (groupOffset, scaleReg, biasReg, pairName) in [
+        ("row * in_vec_size_g", "sv", "bv", "svp"),
+        ("block_size / group_size + row * in_vec_size_g", "sn", "bn", "snp"),
     ] {
-        s = s.replacingOccurrences(of: from, with: to)
+        for indent in ["      ", "        "] {
+            let record = indent + "\(scaleReg)[row] = sc[\(groupOffset)];\n"
+                + indent + "\(biasReg)[row] = bs[\(groupOffset)];\n"
+            let separate = indent + "\(scaleReg)[row] = sbt[sc[\(groupOffset)]].x;\n"
+                + indent + "\(biasReg)[row] = sbt[bs[\(groupOffset)]].y;\n"
+            if wide {
+                let paired = indent + "const float2 \(pairName) = sbt[sc[\(groupOffset)]];\n"
+                    + indent + "\(scaleReg)[row] = \(pairName).x;\n"
+                    + indent + "\(biasReg)[row] = \(pairName).y;\n"
+                if s.components(separatedBy: record).count > 1 {
+                    NemotronSBDict.widePairs += s.components(separatedBy: record).count - 1
+                }
+                s = s.replacingOccurrences(of: record, with: paired)
+            } else {
+                s = s.replacingOccurrences(of: record, with: separate)
+            }
+        }
     }
     let rest = s.replacingOccurrences(of: "sbt[sc[", with: "").replacingOccurrences(of: "sbt[bs[", with: "")
+    if wide {
+        // The pair rewrite must have landed on every hoist statement it applies
+        // to; a miss returns nil so the record's kernels serve the launch.
+        guard !s.contains("sv[row] = sc["), !s.contains("bv[row] = bs["),
+              !s.contains("sn[row] = sc["), !s.contains("bn[row] = bs[") else { return nil }
+    }
     guard !rest.contains("sc["), !rest.contains("bs["), !s.contains("const device T* sc"),
           !s.contains("const device T* bs"), !s.contains("const device T* sl"),
           !s.contains("const device T* bl"), !s.contains("bl[0]"),
@@ -3279,6 +3306,14 @@ enum NemotronSBDict {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var dicts: [ObjectIdentifier: Dict] = [:]
 
+    /// One pair load per group instead of a scale load and a bias load
+    /// (`nemotronSBDictSource`): the dict form's index stream is shared by
+    /// `sc` and `bs`, so a group's scale and bias are the two 32-bit halves of
+    /// one table entry. NEMOTRON_MTP_IDXWIDE=0 keeps the record's two reads.
+    static let wide = ProcessInfo.processInfo.environment["NEMOTRON_MTP_IDXWIDE"] != "0"
+    /// Pair-hoist rewrites that landed (load-time evidence the wide read runs).
+    nonisolated(unsafe) static var widePairs = 0
+
     /// The verified dictionary of `owner`'s scales and biases, if any.
     static func dict(_ owner: AnyObject) -> Dict? {
         lock.withLock { dicts[ObjectIdentifier(owner)] }
@@ -3293,6 +3328,70 @@ enum NemotronSBDict {
     /// Every built dictionary's index and table (decode-only backing for the residency lease).
     static var allArrays: [MLXArray] {
         lock.withLock { dicts.values.flatMap { [$0.index, $0.table] } }
+    }
+
+    /// The wide reader's extraction for one group: entry `e` of the pair table,
+    /// low 32 bits the group's scale, high 32 its bias — the two values the
+    /// record read as `scales[i]` and `biases[i]`.
+    private static func pairOf(_ table: UnsafePointer<UInt32>, _ e: UInt16) -> (UInt32, UInt32) {
+        (table[2 * Int(e)], table[2 * Int(e) + 1])
+    }
+
+    /// The one-load pair against the record's elementwise u16 reads, over every
+    /// group of one served tensor.
+    static func wideSame(_ s: [UInt16], _ b: [UInt16], _ index: [UInt16],
+                         _ words: [UInt32]) -> Bool {
+        guard s.count == b.count, s.count == index.count, !words.isEmpty else { return false }
+        return s.withUnsafeBufferPointer { sp in b.withUnsafeBufferPointer { bp in
+        index.withUnsafeBufferPointer { ip in words.withUnsafeBufferPointer { tp in
+            for i in 0 ..< ip.count {
+                let (lo, hi) = pairOf(tp.baseAddress!, ip[i])
+                if lo != UInt32(sp[i]) << 16 || hi != UInt32(bp[i]) << 16 { return false }
+            }
+            return true
+        } } } }
+    }
+
+    /// Synthetic banks of every group-count class (below, at and above a row of
+    /// 42 and of 29 groups, odd and even, with both signs' zero, the smallest
+    /// subnormal and a NaN payload), each built by the same pair dictionary and
+    /// read by the same wide extraction. Any miss keeps the record path.
+    static func wideSelfCheck() -> Bool {
+        var seed: UInt32 = 0x9e3779b9
+        func next() -> UInt32 {
+            seed = seed &* 1664525 &+ 1013904223
+            return seed >> 8
+        }
+        for count in [1, 2, 3, 29, 41, 42, 43, 58, 63, 64, 65, 127, 128, 129, 1000] {
+            var s = [UInt16](repeating: 0, count: count)
+            var b = [UInt16](repeating: 0, count: count)
+            for i in 0 ..< count {
+                switch i % 5 {
+                case 0: s[i] = 0x0000; b[i] = 0x8000
+                case 1: s[i] = 0x3f80; b[i] = 0xbf80
+                case 2: s[i] = 0x0001; b[i] = 0x8001
+                case 3: s[i] = UInt16(next() & 0x7fff); b[i] = UInt16(next() & 0x7fff)
+                default: s[i] = 0x7f7f; b[i] = 0x007f
+                }
+            }
+            var slot: [Int64: Int32] = [:]
+            var words: [UInt32] = []
+            var index = [UInt16](repeating: 0, count: count)
+            for i in 0 ..< count {
+                let key = Int64(s[i]) << 16 | Int64(b[i])
+                if let p = slot[key] {
+                    index[i] = UInt16(p)
+                } else {
+                    let p = Int32(words.count / 2)
+                    slot[key] = p
+                    index[i] = UInt16(p)
+                    words.append(UInt32(s[i]) << 16)
+                    words.append(UInt32(b[i]) << 16)
+                }
+            }
+            guard wideSame(s, b, index, words) else { return false }
+        }
+        return true
     }
 
     /// One tensor's pair dictionary, or nil when its pairs need more than 16
@@ -3344,6 +3443,20 @@ enum NemotronSBDict {
             [scales.reshaped(-1).asType(.float32), biases.reshaped(-1).asType(.float32)], axis: 1)
         guard (decoded.view(dtype: .uint32) .== widened.view(dtype: .uint32)).all().item(Bool.self)
         else { return nil }
+        // The wide pair read: for every group of this tensor the one table load
+        // must carry the two u16 values the record read elementwise, and the
+        // synthetic banks of every group-count class must extract exactly too.
+        // Any miss drops the wide path for every kernel (the record's two
+        // reads stay), so a dictionary is never served by a reader that has not
+        // reproduced every group on this device.
+        if wide {
+            // The wide pair read: for every group of this tensor the one table
+            // load must carry the two u16 values the record read elementwise,
+            // and the synthetic banks of every group-count class must extract
+            // exactly too. Any miss drops the dictionary, so no kernel is ever
+            // served by a reader that has not reproduced every group.
+            guard wideSelfCheck(), wideSame(s, b, index, words) else { return nil }
+        }
         eval(indexArray, table)
         return Dict(index: indexArray, table: table)
     }
@@ -3373,11 +3486,11 @@ enum NemotronSBDict {
         guard same else {
             lock.withLock { dicts = [:] }
             FileHandle.standardError.write(
-                Data("nemotron sb dict off: a dictionary kernel differs from its record kernel\n".utf8))
+                Data("nemotron sb dict off: a dictionary kernel differs from its record kernel (idxwide \(wide ? "on" : "off") \(widePairs) pair hoists)\n".utf8))
             return
         }
         FileHandle.standardError.write(Data(
-            "nemotron sb dict on: \(built.count) tensors, \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
+            "nemotron sb dict on: \(built.count) tensors (idxwide \(wide ? "on" : "off") \(widePairs) pair hoists), \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
     }
 
     private static func checkKernels(_ model: Module) -> (Bool, Int, [[Int]]) {
