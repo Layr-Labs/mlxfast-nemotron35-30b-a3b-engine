@@ -14,6 +14,7 @@ enum NemotronMTPDraftTail {
     }
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
+    static let oneLaunchRouter = enabled("NEMOTRON_MTP_DRAFT_ROUTER_FUSED")
 }
 
 enum NemotronMTPFrontNorms {
@@ -475,7 +476,11 @@ final class NemotronH35MTPExpertBlock: Module {
 
     fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
         let h = normalized ?? norm(x)
-        let (indices, scores) = mixer.gate(h)
+        let gate = mixer.gate
+        let fused = NemotronMTPDraftTail.oneLaunchRouter && gate.topK == 6 && gate.nGroup == 1
+            && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
+            ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
+        let (indices, scores) = fused ?? gate(h)
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
                 h, indices, scores, mixer.switchMLP, products: true)
