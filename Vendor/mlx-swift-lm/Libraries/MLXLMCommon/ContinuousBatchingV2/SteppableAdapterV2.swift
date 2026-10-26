@@ -406,12 +406,6 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MTPPolicyTopTwoProviding {
         }
         return provider.cbv2MTPTopTwo(logits)
     }
-
-    public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
-        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
-    {
-        (model as? any CBv2MTPPolicyTopTwoProviding)?.cbv2MTPTopTwoPacket(logits, window: window)
-    }
 }
 
 extension CBv2SteppableLanguageModelAdapter:
@@ -473,5 +467,22 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
         (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
+    }
+}
+
+
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPTopTwoSteppableModel {
+    public var supportsTopTwoCaptured: Bool {
+        (model as? any CBv2RecurrentCaptureMTPTopTwoForwardable)?.cbv2SupportsTopTwoCaptured == true
+    }
+    public func forwardWithTopTwoCaptured(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> CBv2CapturedTopTwoOutput {
+        guard let target = model as? any CBv2RecurrentCaptureMTPTopTwoForwardable else {
+            preconditionFailure("CBv2 captured top-two called without target capability")
+        }
+        return target.cbv2ForwardWithTopTwoCaptured(tokens, caches: asKVCaches(caches),
+            recurrentState: recurrentState, positionIds: positionIds)
     }
 }

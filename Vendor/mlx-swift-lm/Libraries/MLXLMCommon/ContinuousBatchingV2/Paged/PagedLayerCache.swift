@@ -53,7 +53,6 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     var attentionMetadata: CBv2AttentionMetadataForward?
     var attentionPacket: CBv2AttentionPacketForward?
 
-    /// Set only on the embedded assistant's private request-owned cache.
     public var nemotronDraftAttention = false
     public let layerIndex: Int
     public let kind: CBv2LayerKind
@@ -192,18 +191,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// the tokens about to be processed (snapshot semantics). KV-shared
     /// layers own no rows, so their own value is empty (they reuse the
     /// source layer's pre-update capture).
-    public var positionOffsets: MLXArray {
-        if positionOffsetsDeferred { rebuildPositionOffsets() }
-        return cachedPositionOffsets
-    }
-
-    /// The Nemotron draft head has no RoPE and never reads its offsets, so
-    /// its cache skips the per-call device `+ L` (one dispatch in each
-    /// draft root set) and rebuilds from the host frontier if one is read.
-    private var positionOffsetsDeferred = false
+    public var positionOffsets: MLXArray { cachedPositionOffsets }
 
     private func rebuildPositionOffsets() {
-        positionOffsetsDeferred = false
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
         cachedPositionOffsets = MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
@@ -222,13 +212,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var roots: [MLXArray] = []
         roots.reserveCapacity(pagedRows.count * 2)
         for (index, row) in pagedRows.enumerated() {
-            // CBV2_PAGED_STRIDED_WRITE: a slice view (no launch) instead of
-            // an Int subscript (an MLX `take`, one gather launch per array);
-            // the strided segment write reads the same elements.
-            let k = CBv2CriticalPathCuts.stridedSegmentWrite
-                ? keys[index ..< (index + 1)].squeezed(axis: 0) : keys[index]
-            let v = CBv2CriticalPathCuts.stridedSegmentWrite
-                ? values[index ..< (index + 1)].squeezed(axis: 0) : values[index]
+            let k = keys[index]
+            let v = values[index]
             row.write(keys: k, values: v)
             roots.append(k)
             roots.append(v)
@@ -241,21 +226,6 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // generation ordering as updateAndAttend.
         roots.append(contentsOf: innerState())
         return roots
-    }
-
-    /// `appendTrusted` of `n` rows the single row's storage already holds
-    /// just past its frontier (`PagedSequenceKV.readvanceRetained`): the same
-    /// frontier, offsets and fence roots, without the write dispatch. nil,
-    /// with no change, when they cannot be re-exposed (including any write
-    /// after `generation`, the row's `writeGeneration` seen right after the
-    /// write that stored them); append them instead.
-    public func readvanceTrusted(_ n: Int, writtenAt generation: UInt64) -> [MLXArray]? {
-        guard !pool.writeValidation.isFaulted, kind.sharesKVWithLayer == nil,
-            pagedRows.count == 1, pagedRows[0].readvanceRetained(n, writtenAt: generation)
-        else { return nil }
-        rebuildPositionOffsets()
-        retainedPrefillKV = []
-        return innerState()
     }
 
     public func updateAndAttend(
@@ -363,11 +333,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // is [B,chunk] with one common chunk length) — the rows just
         // advanced their absolute counters by exactly L, so the cached
         // device array tracks them without a per-step host rebuild.
-        if nemotronDraftAttention && NemotronMTPDraftChainCleanup.hostPositionOffsets {
-            positionOffsetsDeferred = true
-        } else {
-            cachedPositionOffsets = cachedPositionOffsets + Int32(l)
-        }
+        cachedPositionOffsets = cachedPositionOffsets + Int32(l)
         return output
     }
 

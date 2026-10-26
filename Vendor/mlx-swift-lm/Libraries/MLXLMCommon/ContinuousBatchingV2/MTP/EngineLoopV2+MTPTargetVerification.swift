@@ -33,7 +33,6 @@ extension EngineLoopV2 {
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
-        packet: MLXArray?,
         cacheInnerState: [MLXArray],
         diagnostics: [CBv2LogitDiagnosticPacket],
         recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
@@ -44,10 +43,6 @@ extension EngineLoopV2 {
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
-        // The acceptance packet written by the top-2 finalize itself
-        // (`CBv2MTPTopTwoPacket`); the engine uses it only for the plain
-        // argmax packet layout it reproduces.
-        var packet: MLXArray?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         var capturedInnerState: [MLXArray] = []
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
@@ -234,7 +229,8 @@ extension EngineLoopV2 {
                 }
             }
             let tokens = concatenated(columns, axis: 1)
-            let output: (logits: MLXArray, lastHidden: MLXArray)
+            var output: (logits: MLXArray, lastHidden: MLXArray)?
+            var compactOutput: CBv2CapturedTopTwoOutput?
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
                 // window; the model stages [1+k, ...] captured stacks per
@@ -255,9 +251,20 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                if !useTargetPrefix, diagnosticOffsets == nil, mtp.usesRequestStatefulDrafter,
+                   rows.allSatisfy({ $0.rec.request.sampling.temperature < LogitsPipelineV2.greedyEpsilon }),
+                   (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?.draftShortlistSize == nil,
+                   let compact = recurrentModel as? any CBv2RecurrentMTPTopTwoSteppableModel,
+                   compact.supportsTopTwoCaptured {
+                    compactOutput = try checkedModelForward(phase: .mtpVerification) {
+                        compact.forwardWithTopTwoCaptured(tokens: tokens, caches: caches,
+                            recurrentState: evaluations, positionIds: positionIds)
+                    }
+                } else {
+                    output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
+                        tokens: tokens, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds) }
+                }
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,
@@ -273,52 +280,53 @@ extension EngineLoopV2 {
             } else {
                 output = try checkedModelForward(phase: .mtpVerification) { mtp.model.forwardWithHidden(tokens: tokens, caches: caches) }
             }
-            if mtp.usesRequestStatefulDrafter {
-                guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
-                    preconditionFailure(
-                        "CBv2 request-stateful rectangular MTP target lacks top-two provider")
-                }
-                let batch = output.logits.dim(0)
-                let width = output.logits.dim(1)
-                let vocabulary = output.logits.dim(2)
-                let flat = output.logits.reshaped([1, batch * width, vocabulary])
-                let topTwo: (ids: MLXArray, values: MLXArray)
-                if !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
-                    let folded = provider.cbv2MTPTopTwoPacket(flat, window: tokens)
-                {
-                    topTwo = (folded.ids, folded.values)
-                    packet = folded.packet
-                } else {
-                    topTwo = provider.cbv2MTPTopTwo(flat)
-                }
-                policyTopTwo = (
-                    topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32))
-            }
-            if useTargetPrefix {
-                scores = scoreColumns(output.logits, columnOffset: 0)
-            } else if let policyTopTwo {
-                scores = policyTopTwo.ids[0..., 0..., 0]
+            if let compactOutput {
+                policyTopTwo = (compactOutput.ids.asType(.int32), compactOutput.values.asType(.float32))
+                scores = compactOutput.ids[0..., 0..., 0].asType(.int32)
+                hidden = compactOutput.lastHidden
             } else {
-                scores = argMax(output.logits, axis: -1).asType(.int32)
-            }
-            captureDiagnostics(
-                output.logits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
-            hidden = output.lastHidden
-            // Draft-head shortlist (rectangular only; the serial oracle stays
-            // byte-identical to the shipped path): each verify position's
-            // target top-K ids feed the NEXT round's shortlisted draft, and
-            // the captured probability mass rides the acceptance packet so
-            // finalize can gate coverage without an extra host sync.
-            if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
-                .draftShortlistSize
-            {
-                shortlist = Self.mtpDraftShortlist(logits: output.logits, size: size)
+                guard let output else {
+                    preconditionFailure("CBv2 captured verification produced no output")
+                }
+                if mtp.usesRequestStatefulDrafter {
+                    guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
+                        preconditionFailure(
+                            "CBv2 request-stateful rectangular MTP target lacks top-two provider")
+                    }
+                    let batch = output.logits.dim(0)
+                    let width = output.logits.dim(1)
+                    let vocabulary = output.logits.dim(2)
+                    let flat = output.logits.reshaped([1, batch * width, vocabulary])
+                    let topTwo = provider.cbv2MTPTopTwo(flat)
+                    policyTopTwo = (
+                        topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
+                        topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+                }
+                if useTargetPrefix {
+                    scores = scoreColumns(output.logits, columnOffset: 0)
+                } else if let policyTopTwo {
+                    scores = policyTopTwo.ids[0..., 0..., 0]
+                } else {
+                    scores = argMax(output.logits, axis: -1).asType(.int32)
+                }
+                captureDiagnostics(
+                    output.logits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
+                hidden = output.lastHidden
+                // Draft-head shortlist (rectangular only; the serial oracle stays
+                // byte-identical to the shipped path): each verify position's
+                // target top-K ids feed the NEXT round's shortlisted draft, and
+                // the captured probability mass rides the acceptance packet so
+                // finalize can gate coverage without an extra host sync.
+                if let size = (mtp.drafter as? any CBv2MTPRequestStatefulDrafter)?
+                    .draftShortlistSize
+                {
+                    shortlist = Self.mtpDraftShortlist(logits: output.logits, size: size)
+                }
             }
         }
 
         return (
-            scores, hidden, shortlist, policyTopTwo, packet,
+            scores, hidden, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent)
     }
 
