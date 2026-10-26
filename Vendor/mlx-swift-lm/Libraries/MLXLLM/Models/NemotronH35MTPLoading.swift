@@ -84,6 +84,9 @@ extension NemotronH35MTPAssistant {
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
+        let draftMixer = (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer
+        NemotronTargetQKV.qualifyDraftRowWrite(
+            query: draftMixer.wq, key: draftMixer.wk, value: draftMixer.wv)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
@@ -576,4 +579,4 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Measurement entry 2 of this tree.
 
-// Measurement entry 3 of this tree.
+// Measurement 3 of the t90 tree.

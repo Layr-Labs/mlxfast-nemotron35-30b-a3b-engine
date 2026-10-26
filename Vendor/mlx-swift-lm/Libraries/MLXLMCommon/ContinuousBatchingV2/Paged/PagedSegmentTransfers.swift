@@ -68,6 +68,8 @@ enum PagedSegmentTransfers {
     /// one segment, storing into a real kernel output. The grid's depth is the
     /// record count, which is then the token count: every (token, head, lane)
     /// of both planes is stored once, so nothing needs a fill beforehand.
+    /// X spare rows per head follow the gathered ones (`gatherDirect`); this
+    /// launch never stores them.
     private static let readOutputBody = """
         const int h = int(thread_position_in_grid.y);
         const int d = int(thread_position_in_grid.x);
@@ -75,7 +77,7 @@ enum PagedSegmentTransfers {
         const int token = records[r * 3];
         const int page = records[r * 3 + 1];
         const int slot = records[r * 3 + 2];
-        const int count = int(threads_per_grid.z);
+        const int count = int(threads_per_grid.z) + X;
         const size_t source = (((size_t)page * H + h) * S + slot) * D + d;
         const size_t target = ((size_t)h * count + token) * D + d;
         output[target] = storage[source];
@@ -211,6 +213,20 @@ enum PagedSegmentTransfers {
                  publishReadFence: publishReadFence, stream: stream).output
     }
 
+    /// The direct single-segment read with `extraRows` spare rows per head after
+    /// the `count` gathered ones: [2, 1, H, count + extraRows, D]. The read
+    /// never stores the spare rows; the caller owns them. nil (nothing built)
+    /// unless the records name one segment under CBV2_PAGED_READ_OUTPUT.
+    static func gatherDirect(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
+                             extraRows: Int) -> MLXArray?
+    {
+        guard CBv2CriticalPathCuts.segmentReadOutput, count > 0, extraRows >= 0 else { return nil }
+        let transfers = segmentTransfers(group: group, pages: pages, firstSlot: firstSlot, count: count)
+        guard transfers.count == 1 else { return nil }
+        return directRead(group: group, transfers: transfers, count: count, extraRows: extraRows,
+                          publishReadFence: true, stream: .default)
+    }
+
     /// `direct`: the output is the single-segment read launch's own output
     /// (CBV2_PAGED_READ_OUTPUT), not an alias of an in-place destination.
     private static func combined(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
@@ -221,6 +237,18 @@ enum PagedSegmentTransfers {
         guard count > 0 else {
             return (MLXArray.zeros([2, 1, h, 0, d], dtype: group.dtype, stream: stream), false)
         }
+        let transfers = segmentTransfers(group: group, pages: pages, firstSlot: firstSlot, count: count)
+        guard CBv2CriticalPathCuts.segmentReadOutput, transfers.count == 1 else {
+            return (inPlaceGather(group: group, transfers: transfers, count: count,
+                                  publishReadFence: publishReadFence, stream: stream), false)
+        }
+        return (directRead(group: group, transfers: transfers, count: count, extraRows: 0,
+                           publishReadFence: publishReadFence, stream: stream), true)
+    }
+
+    private static func segmentTransfers(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int)
+        -> [(PagedKVSegment, [Int32])]
+    {
         precondition(firstSlot >= 0 && firstSlot < group.pageSize)
         precondition(pages.count * group.pageSize >= firstSlot + count)
         let slots = (0 ..< count).map { token -> Int32 in
@@ -228,28 +256,32 @@ enum PagedSegmentTransfers {
             return pages[offset / group.pageSize] * Int32(group.pageSize)
                 + Int32(offset % group.pageSize)
         }
-        let transfers = buckets(group: group, slots: slots)
-        guard CBv2CriticalPathCuts.segmentReadOutput, transfers.count == 1 else {
-            return (inPlaceGather(group: group, transfers: transfers, count: count,
-                                  publishReadFence: publishReadFence, stream: stream), false)
-        }
+        return buckets(group: group, slots: slots)
+    }
+
+    private static func directRead(
+        group: PagedKVGroup, transfers: [(PagedKVSegment, [Int32])], count: Int, extraRows: Int,
+        publishReadFence: Bool, stream: StreamOrDevice
+    ) -> MLXArray {
+        let h = group.key.kvHeads, d = group.key.headDim
         let (segment, triples) = transfers[0]
-        precondition(triples.count == 3 * count)
+        precondition(transfers.count == 1 && triples.count == 3 * count)
         let read = readOutputKernel(dtype: group.dtype)(
             [segment.storage, records(triples), group.writeFence],
             template: [("T", group.dtype), ("H", h), ("D", d),
-                       ("S", group.pageSize), ("VBASE", segment.valueOffset)],
+                       ("S", group.pageSize), ("VBASE", segment.valueOffset), ("X", extraRows)],
             grid: (d, h, count), threadGroup: (min(256, d), 1, 1),
-            outputShapes: [[2, 1, h, count, d], [1]], outputDTypes: [group.dtype, .int32],
-            stream: stream)
+            outputShapes: [[2, 1, h, count + extraRows, d], [1]],
+            outputDTypes: [group.dtype, .int32], stream: stream)
         if CBv2CriticalPathCuts.selfTest {
-            selfTestRead(read[0], reference: inPlaceGather(
+            let gathered = extraRows == 0 ? read[0] : read[0][0..., 0..., 0..., 0 ..< count, 0...]
+            selfTestRead(gathered, reference: inPlaceGather(
                 group: group, transfers: transfers, count: count, publishReadFence: false,
                 stream: stream))
         }
         // The read's own fence orders every later write of the group after it.
         if publishReadFence { group.writeFence = read[1] }
-        return (read[0], true)
+        return read[0]
     }
 
     /// NEMOTRON_KERNEL_SELFTEST=1 with CBV2_PAGED_READ_OUTPUT: the direct read

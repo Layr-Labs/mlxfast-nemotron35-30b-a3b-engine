@@ -1438,6 +1438,14 @@ enum NemotronPrefillScanExp {
 /// (the join every other layer already uses) instead of the stock add and
 /// rms launches. `qualify` checks the join against the stock pair with the
 /// target's own norm weights. NEMOTRON_PREFILL_BOUNDARY_JOIN=0 keeps the pair.
+/// Seed only: the request prefill's last block joins norm_f like every other
+/// block joins its next norm (`NemotronHResidualRMSNorm.apply`, or the MoE
+/// join when the last block is an MoE block), one launch fewer. Requires
+/// `NemotronPrefillBoundaryJoin`, whose check covers norm_f among the 2688-wide
+/// norms. NEMOTRON_PREFILL_FINAL_NORM_JOIN=0 keeps the add and norm_f launches.
+let nemotronPrefillFinalNormJoin =
+    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FINAL_NORM_JOIN"] != "0"
+
 enum NemotronPrefillBoundaryJoin {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_BOUNDARY_JOIN"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -4587,6 +4595,24 @@ class NemotronHAttention: Module, NemotronHMixer {
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
     }
 
+    /// `cbv2Projections` of one draft row (`targetQKV`) through the launch that
+    /// also stores the row's K/V into `kCache` / `vCache` ([1, 2, capacity,
+    /// 128] planes) at token `row`; nil (nothing built) when that launch does
+    /// not apply.
+    func cbv2ProjectionsWritingRow(
+        _ x: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+              let outputs = NemotronTargetQKV.applyWritingRow(
+                  x, query: wq, key: wk, value: wv, kCache: kCache, vCache: vCache,
+                  row: row, capacity: capacity)
+        else { return nil }
+        return NemotronMoELeader.selfTest
+            ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+               nemotronBitwiseOrNaN(outputs.2, wv(x)))
+            : outputs
+    }
+
     /// `projections`, when given, are `cbv2Projections` of this same `x`
     /// computed earlier (the MTP draft head queues them before its cache is final).
     func cbv2Forward(
@@ -5121,6 +5147,7 @@ private final class NemotronHPrefillKernels: Sendable {
     let inversePermutation: MLXFast.MLXFastKernel
     let countingSort: MLXFast.MLXFastKernel
     let countingSortChunked: MLXFast.MLXFastKernel
+    let relu2v4: MLXFast.MLXFastKernel
     let relu2: MLXFast.MLXFastKernel
     let combine: MLXFast.MLXFastKernel
     let combineAdd: MLXFast.MLXFastKernel
@@ -5365,6 +5392,23 @@ private final class NemotronHPrefillKernels: Sendable {
             source: """
                 uint p = thread_position_in_grid.x;
                 inv[order[p]] = static_cast<T>(p);
+            """)
+        // relu2 with four consecutive elements per thread (vector load and
+        // store); the per-element statements are relu2's.
+        relu2v4 = MLXFast.metalKernel(
+            name: "nemotron_relu2_v4",
+            inputNames: ["x"], outputNames: ["out"],
+            source: """
+                uint i = thread_position_in_grid.x * 4;
+                const vec<T, 4> v4 = *((const device vec<T, 4>*)(x + i));
+                vec<T, 4> o4;
+                for (int j = 0; j < 4; ++j) {
+                    T v = v4[j];
+                    T zero = static_cast<T>(0);
+                    T m = metal::isnan(v) ? v : (v > zero ? v : zero);
+                    o4[j] = m * m;
+                }
+                *((device vec<T, 4>*)(out + i)) = o4;
             """)
         // Stock relu2: Maximum(x, 0) (NaN-propagating) then Multiply(m, m), in T.
         relu2 = MLXFast.metalKernel(
@@ -5652,6 +5696,15 @@ enum NemotronPrefillSharedRelu2 {
               up.dtype == .bfloat16 || up.dtype == .float16,
               MLX.maximum(up, MLXArray(0)).dtype == up.dtype
         else { return nil }
+        // Four elements per thread when the size allows (`relu2v4`, the same
+        // per-element statements). NEMOTRON_PREFILL_SHARED_RELU2_VEC=0 keeps
+        // one element per thread.
+        if up.size % 4 == 0, ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_RELU2_VEC"] != "0" {
+            return NemotronHPrefillKernels.shared.relu2v4(
+                [up], template: [("T", up.dtype)],
+                grid: (up.size / 4, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [up.shape], outputDTypes: [up.dtype])[0]
+        }
         return NemotronHPrefillKernels.shared.relu2(
             [up], template: [("T", up.dtype)],
             grid: (up.size, 1, 1), threadGroup: (256, 1, 1),
@@ -7716,6 +7769,8 @@ private class NemotronHBackbone: Module {
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
         let prefillChunks = inputs.dim(1) > 1 && !captureMTP
+        let finalNormJoin = prefillChunks && nemotronPrefillFinalNormJoin
+            && NemotronPrefillBoundaryJoin.verified && NemotronHPrefillX5.active
         let earlyEvalInterval = prefillChunks ? nemotronPrefillEvalInterval : nemotronEarlyEvalInterval
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -7740,8 +7795,11 @@ private class NemotronHBackbone: Module {
                 && !(prefillChunks && NemotronPrefillBoundaryJoin.verified && NemotronHPrefillX5.active)
             let submitsEarly = earlyEvalInterval > 0 && next < layers.count
                 && next % earlyEvalInterval == 0
+            // Seed request prefill: the last block's residual add and norm_f
+            // also take the join launch (`nemotronPrefillFinalNormJoin`).
             let nextNorm = next < layers.count && !suppressedNorm
-                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm
+                : (finalNormJoin && next == layers.count ? normF : nil)
             let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
@@ -7788,6 +7846,8 @@ private class NemotronHBackbone: Module {
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
+        // The last block's join already applied norm_f.
+        if finalNormJoin, let preparedNorm { return preparedNorm }
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
     }
 
