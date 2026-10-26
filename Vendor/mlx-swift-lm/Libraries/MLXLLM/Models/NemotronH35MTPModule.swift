@@ -298,16 +298,6 @@ final class NemotronH35MTPAttentionBlock: Module {
         return fused + nemotronR1Linear(merged, mixer.wo)
     }
 
-    func maskedRowParts(
-        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> (MLXArray, MLXArray) {
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries.asType(keys.dtype), keys: keys, values: values,
-            scale: mixer.scale, mask: .array(mask))
-        let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
-        return (fused, nemotronR1Linear(merged, mixer.wo))
-    }
-
     /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
     func draftKeyValues(inputs: [MLXArray]) -> (keys: MLXArray, values: MLXArray) {
         (inputs[3].reshaped(1, 1, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3),
@@ -661,23 +651,6 @@ final class NemotronH35MTPModule: Module {
     func finishPagedAttentionRow(_ attention: MLXArray) -> MLXArray {
         precondition(attention.ndim == 3 && attention.dim(0) == 1 && attention.dim(1) == 1)
         return (layers[1] as! NemotronH35MTPExpertBlock)(attention)
-    }
-
-    static let deviceDraftJoin =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_DRAFT_JOIN"] != "0"
-
-    func finishMaskedRow(
-        fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> MLXArray {
-        let block = layers[0] as! NemotronH35MTPAttentionBlock
-        guard Self.deviceDraftJoin else {
-            return finishPagedAttentionRow(block.maskedRowOutput(
-                fused: fused, queries: queries, keys: keys, values: values, mask: mask))
-        }
-        let (residual, attention) = block.maskedRowParts(
-            fused: fused, queries: queries, keys: keys, values: values, mask: mask)
-        precondition(residual.ndim == 3 && residual.dim(0) == 1 && residual.dim(1) == 1)
-        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: residual, attention: attention)
     }
 
     func pagedForwardRows(
