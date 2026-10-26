@@ -114,11 +114,11 @@ enum NemotronMTPFrontNorms {
         outputNames: ["out", "prepared"],
         source: preparedSource(), ensureRowContiguous: true)
 
-    /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
+    /// Post-verify rows (R = 2...3): (joined norms, eh_proj's prepared input).
     static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
         -> (MLXArray, MLXArray)?
     {
-        guard NemotronMTPDraftJoins.enabled, embedding.ndim == 3, embedding.dim(1) == 3,
+        guard NemotronMTPDraftJoins.enabled, embedding.ndim == 3, (2...3).contains(embedding.dim(1)),
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               let reference = eligible(embedding: embedding, hidden: hidden, enorm: enorm, hnorm: hnorm)
         else { return nil }
@@ -272,7 +272,7 @@ final class NemotronH35MTPAttentionBlock: Module {
            let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: norm) {
             (x, xPrepared) = pair
             if NemotronMTPDraftJoins.negativeNorm {
-                xPrepared = NemotronHeadPreparedActivation.pack(fused.reshaped(3, 2688))
+                xPrepared = NemotronHeadPreparedActivation.pack(fused.reshaped(fused.dim(1), 2688))
             }
         }
         let batch = x.dim(0), length = x.dim(1)
