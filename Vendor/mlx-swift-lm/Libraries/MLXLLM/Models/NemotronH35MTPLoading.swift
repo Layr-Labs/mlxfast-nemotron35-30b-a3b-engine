@@ -81,6 +81,7 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
+        target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
@@ -522,3 +523,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Second measurement of ff544a18.
 
 // Second measurement entry of this tree.
+
+// Sixth measurement entry of this tree.

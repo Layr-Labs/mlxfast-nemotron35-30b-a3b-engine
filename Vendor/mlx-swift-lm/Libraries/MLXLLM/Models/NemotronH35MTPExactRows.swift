@@ -1079,12 +1079,22 @@ enum NemotronSharedUpPacking {
 
     /// Load check of the dictionary twin on `q`: both outputs of both
     /// kernels on the same rows, bit for bit (nil when either cannot run).
+    /// The packed output is compared on the chunks the kernel writes and the
+    /// prepared QMV reads: [3, tiles, 9, 32] holds chunk t * 32 + lane at
+    /// [r, t, i, lane], and only chunks < N / 8 exist. The last tile's lanes
+    /// past N / 8 are never stored (their bytes are whatever the allocator
+    /// handed out) and never loaded (the reader's `remaining` is 0 there).
     static func dictMatches(_ x: MLXArray, _ q: QuantizedLinear) -> MLXArray? {
         guard dictKernel != nil, NemotronSBDict.dict(q) != nil,
               let a = dispatch(x, q, prepared: nil, sbDict: false),
               let b = dispatch(x, q, prepared: nil) else { return nil }
+        let chunks = q.weight.dim(0) / 8, tiles = (chunks + 31) / 32
+        func written(_ p: MLXArray) -> MLXArray {
+            p.view(dtype: .uint32).reshaped(3, tiles, 9, 32).transposed(0, 1, 3, 2)
+                .reshaped(3, tiles * 32, 9)[0..., ..<chunks, 0...]
+        }
         return logicalAnd((a.0.view(dtype: .uint16) .== b.0.view(dtype: .uint16)).all(),
-                          (a.1.view(dtype: .uint32) .== b.1.view(dtype: .uint32)).all())
+                          (written(a.1) .== written(b.1)).all())
     }
 
     private static func dispatch(_ x: MLXArray, _ q: QuantizedLinear,
@@ -2200,6 +2210,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
     /// order do not depend on which rows share a threadgroup, so the gates,
@@ -2220,10 +2231,11 @@ enum NemotronMTPRouterRowsSelect {
     /// x: [1, R, 2688] bf16 (R = 1...4), weight: a row-major [128, 2688] bf16
     /// router, bias: [128] fp32. Returns (indices [1, R, 6] uint32,
     /// weights [1, R, 6] fp32), or nil outside the qualified shapes.
-    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false)
+    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false,
+                    draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter,
+        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2257,6 +2269,9 @@ enum NemotronMTPRouterRowsSelect {
         let zero = MLXArray.zeros([1], dtype: .uint32)
         eval(zero)
         counter = zero
+        let draftZero = MLXArray.zeros([1], dtype: .uint32)
+        eval(draftZero)
+        draftCounter = draftZero
         var ok = MLXArray(true)
         do {
             let matched = try withError { () -> Bool in
