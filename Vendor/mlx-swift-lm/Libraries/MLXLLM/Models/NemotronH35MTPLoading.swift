@@ -448,12 +448,23 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
     }
+    /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
+    /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
+    /// set keeps its own queue.
     func begin() -> Lease {
-        for set in targetSets + extraSets {
-            targetQueue.async { set.requestResidency() }
-        }
         NemotronZSkip.beginCopyReadiness(owners)
-        request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+        guard !targetSets.isEmpty else {
+            for set in extraSets { targetQueue.async { set.requestResidency() } }
+            request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+            return Lease(self)
+        }
+        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        let head = seedSet, ready = Array(owners.prefix(cut))
+        targetQueue.async {
+            head.requestResidency()
+            NemotronZSkip.markCopyReady(ready)
+        }
+        for set in extraSets { targetQueue.async { set.requestResidency() } }
         return Lease(self)
     }
 }

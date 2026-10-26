@@ -1185,7 +1185,9 @@ private final class NemotronHScanKernels: Sendable {
                 const int t1 = min(t0 + TC, n);
                 const device float* sp = state + bb * state_strides[0] + hh * state_strides[1];
                 float st[RB][4];
-                for (int r = 0; r < RB; ++r) {
+                // ZS: the fresh request's zero-stride +0.0 state view, identical
+                // in every row, so only row 0 is loaded (see the loop below).
+                for (int r = 0; r < (ZS ? 1 : RB); ++r) {
                     for (int tn = 0; tn < 4; ++tn) {
                         st[r][tn] = sp[(i0 + r) * state_strides[2] + (k0 + tn) * state_strides[3]];
                     }
@@ -1202,12 +1204,25 @@ private final class NemotronHScanKernels: Sendable {
                         for (int tn = 0; tn < 4; ++tn) {
                             cv[tn] = static_cast<float>(cp[t * C_strides[1] + (k0 + tn) * C_strides[3]]);
                         }
-                        for (int r = 0; r < RB; ++r) {
+                        if (ZS) {
+                            // Every row's operands are the same +0.0 state values
+                            // and the same cv, in the same order: row 0's partial
+                            // is each row's partial, bit for bit.
                             float acc = 0.0f;
                             for (int tn = 0; tn < 4; ++tn) {
-                                acc += st[r][tn] * cv[tn];
+                                acc += st[0][tn] * cv[tn];
                             }
-                            pp[r * TB + j][lane] = acc;
+                            for (int r = 0; r < RB; ++r) {
+                                pp[r * TB + j][lane] = acc;
+                            }
+                        } else {
+                            for (int r = 0; r < RB; ++r) {
+                                float acc = 0.0f;
+                                for (int tn = 0; tn < 4; ++tn) {
+                                    acc += st[r][tn] * cv[tn];
+                                }
+                                pp[r * TB + j][lane] = acc;
+                            }
                         }
                     }
                     simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -1445,6 +1460,11 @@ func nemotronSSMAttn(
         let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
         let lastDecay = expDtACumsum[0..., -1, 0..., .newAxis, .newAxis]
         let previousState: MLXArray
+        // The fused epilogue's zero-state row reuse applies to the fresh
+        // request's broadcast +0.0 view only (never a materialized state).
+        // NEMOTRON_PREFILL_ZERO_STATE_ROWS=0 keeps the per-row loop.
+        let zeroStateRows = currentState == nil && NemotronMambaZeroState.enabled
+            && ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_ZERO_STATE_ROWS"] != "0"
         if let currentState {
             previousState = currentState
             if NemotronHPrefillX5.ssmStateUpdate, NemotronHPrefillX5.active, nextState.dtype == .float32,
@@ -1478,7 +1498,8 @@ func nemotronSSMAttn(
             let fused = NemotronHScanKernels.shared.windowOutFinal(
                 [previousState, stepC, yWindow, expDtACumsum, n, x, D, prior, copied, start],
                 template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
-                           ("DH", dh), ("TC", 32), ("LT", last ? l : n), ("COPY", copied > 0)],
+                           ("DH", dh), ("TC", 32), ("LT", last ? l : n), ("COPY", copied > 0),
+                           ("ZS", zeroStateRows)],
                 grid: (dh / 32 * 128, (n + 31) / 32 + copyBlocks, b * h), threadGroup: (128, 1, 1),
                 outputShapes: [[b, last ? l : n, h, dh]], outputDTypes: [x.dtype])[0]
             if last {
