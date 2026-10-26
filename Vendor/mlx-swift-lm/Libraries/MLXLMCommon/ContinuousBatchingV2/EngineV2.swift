@@ -112,6 +112,11 @@ final class CBv2EngineGauges: @unchecked Sendable {
 /// (lock + queue hop), resident-prefix preflight (index lock, advisory only),
 /// `cancel` (lock), `capacity()` (lock), and `shutdown()`
 /// (queue-synchronized drain).
+/// Request-independent work a model library starts when an engine is built (installed once at load).
+public enum CBv2EngineInitHooks {
+    nonisolated(unsafe) public static var onInit: (() -> Void)?
+}
+
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// See `init`: commit one trivial operation when an engine is built.
     static let wakeOnInit = ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_WAKE"] != "0"
@@ -224,6 +229,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // overlaps this setup and the first prefill chunk's graph build.
         // NEMOTRON_ENGINE_WAKE=0 skips it.
         if Self.wakeOnInit { asyncEval(MLXArray(Int32(1)) + MLXArray(Int32(1))) }
+        CBv2EngineInitHooks.onInit?()
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
