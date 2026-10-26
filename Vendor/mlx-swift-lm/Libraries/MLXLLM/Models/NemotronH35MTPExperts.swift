@@ -2743,10 +2743,11 @@ enum NemotronSharedDownZSkip {
 // The captured verify's routed FC2 slot kernel (18 slot rows of 21 tiles) and the shared-expert down zero-skip
 // kernel (3 rows of 21 tiles) are data independent: FC2 reads the routed relu2 rows and shared down the shared
 // relu2 rows, and only the layer's join reads both results. One launch of 21 rows runs both: a threadgroup picks
-// its body by `threadgroup_position_in_grid.y`, and each body is the separate kernel's source text, unchanged
-// except that its threadgroup arrays are views of one maximal set and its slot index is the row minus the other
-// body's rows. Every thread therefore runs the same loads, partials, order, closing simd_sum and store as in its
-// own kernel, so `prod` and `shared_y` carry the same bits. `prepare` re-checks every layer against the two
+// its body by `threadgroup_position_in_grid.y`. Each body retains the separate kernel's arithmetic, but holds
+// its virtual-lane partials in thread-local storage until all activation/mask reads finish. A uniform barrier
+// then permits the staging allocation to become the original FP32 partial plane. The slot index is the row
+// minus the other body's rows; the closing simd_sum and output stores are unchanged. `prepare` re-checks
+// every layer against the two
 // separate kernels (which keep their own record checks) and leaves the separate launches on any miss.
 // The shared rows (twice the K of a slot row) come first. NEMOTRON_MTP_COLAUNCH=0 keeps the separate launches;
 // NEMOTRON_MTP_COLAUNCH_SD_FIRST=0 puts the shared rows last.
@@ -2783,24 +2784,64 @@ enum NemotronFC2SharedColaunch {
         return pair.0
     }
 
-    /// `fc2`: the routed slot kernel's source (plain or dictionary); `shared`: `NemotronSharedDownZSkip.source`.
+    /// Retain every virtual lane's partials until activation reads finish, then
+    /// reuse the activation/mask storage for the original partial transpose.
+    /// Arithmetic and the final lane-order reduction remain unchanged.
+    private static func reuseStaging(_ source: String) -> String? {
+        let begin = "  for (int ll = 0; ll < LPS; ll++) {\n"
+        let finish = """
+            for (int o = 0; o < 4; o++) {
+              part[l * PS + 4 * lid + o] = p[o];
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int q = 0; q < OT / SGS; q++) {
+        """
+        let retained = """
+            for (int o = 0; o < 4; o++) {
+              retained[ll][o] = p[o];
+            }
+          }
+          // Every group member finishes all activation/mask reads before
+          // any member overwrites their storage with reduction partials.
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int ll = 0; ll < LPS; ll++) {
+            const int l = sg + SGS * ll;
+            for (int o = 0; o < 4; o++) {
+              part[l * PS + 4 * lid + o] = retained[ll][o];
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int q = 0; q < OT / SGS; q++) {
+        """
+        guard source.components(separatedBy: begin).count == 2,
+              source.components(separatedBy: finish).count == 2 else { return nil }
+        return source.replacingOccurrences(of: begin, with: "  thread U retained[LPS][4];\n" + begin)
+            .replacingOccurrences(of: finish, with: retained)
+    }
+
+    /// Both bodies share one allocation across two barrier-separated phases:
+    /// activation/mask staging first, then the original FP32 partial plane.
     private static func source(fc2: String, shared: String) -> String? {
         let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
-        let views = "  threadgroup float* part = nmc_part;\n  threadgroup T* xsh = nmc_xsh;\n"
-            + "  threadgroup uchar* cmask = nmc_cmask;\n"
+        let views = "  threadgroup float* part = nmc_part;\n"
+            + "  threadgroup T* xsh = reinterpret_cast<threadgroup T*>(nmc_part);\n"
+            + "  threadgroup uchar* cmask = reinterpret_cast<threadgroup uchar*>(nmc_part) + NMC_MAX_K * sizeof(T);\n"
         let slot = "  const int slot = int(threadgroup_position_in_grid.y);\n"
         guard fc2.components(separatedBy: arrays).count == 2, fc2.components(separatedBy: slot).count == 2,
               shared.components(separatedBy: arrays).count == 2, shared.components(separatedBy: slot).count == 2,
-              fc2.contains("constexpr int OT = 128;"), shared.contains("constexpr int OT = 128;")
+              fc2.contains("constexpr int OT = 128;"), shared.contains("constexpr int OT = 128;"),
+              let stagedFC2 = reuseStaging(fc2), let stagedShared = reuseStaging(shared)
         else { return nil }
-        let routed = fc2.replacingOccurrences(of: arrays, with: views)
+        let routed = stagedFC2.replacingOccurrences(of: arrays, with: views)
             .replacingOccurrences(of: slot, with: "  const int slot = nmc_row - (SDFIRST ? SROWS : 0);\n")
-        let down = shared.replacingOccurrences(of: arrays, with: views)
+        let down = stagedShared.replacingOccurrences(of: arrays, with: views)
             .replacingOccurrences(of: slot, with: "  const int slot = nmc_row - (SDFIRST ? 0 : SLOTS);\n")
         return """
+          constexpr int NMC_MAX_K = KS > KF ? KS : KF;
+          static_assert(NMC_MAX_K * sizeof(T) + NMC_MAX_K / 8 <= sizeof(float) * 32 * (128 + 1),
+                        "co-launch staging must fit the partial plane");
           threadgroup float nmc_part[32 * (128 + 1)];
-          threadgroup T nmc_xsh[KS > KF ? KS : KF];
-          threadgroup uchar nmc_cmask[(KS > KF ? KS : KF) / 8];
           const int nmc_row = int(threadgroup_position_in_grid.y);
           if (SDFIRST ? nmc_row >= SROWS : nmc_row < SLOTS) {
             constexpr int K = KF;
@@ -2826,9 +2867,9 @@ enum NemotronFC2SharedColaunch {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    private static let plainKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast",
+    private static let plainKernel = make("nemotron_zskip_fc2_shared_down_tiled_reuse_fast",
                                           fc2: nemotronZSkipTiledFastSource)
-    private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd",
+    private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_reuse_fast_sbd",
                                          fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
 
     private static let lock = NSLock()
