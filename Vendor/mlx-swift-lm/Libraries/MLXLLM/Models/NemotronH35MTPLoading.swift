@@ -91,6 +91,7 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
+        NemotronMTPDraftRouterQualification.run(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -101,6 +102,8 @@ extension NemotronH35MTPAssistant {
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
         NemotronPrefillCombineAdd.qualify()
+        NemotronPrefillScanExp.qualify()
+        NemotronPrefillBoundaryJoin.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
