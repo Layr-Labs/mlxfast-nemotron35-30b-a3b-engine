@@ -2205,6 +2205,7 @@ enum NemotronMTPRouterRows {
     // warm(), before any compile trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
     static func isRowMajor(_ weight: MLXArray) -> Bool { rowMajor.contains(ObjectIdentifier(weight)) }
+    static func unregister(_ weight: MLXArray) { rowMajor.remove(ObjectIdentifier(weight)) }
 
     /// Record row-major router weights, then compile every pipeline the
     /// verify window can request (R = 1...4) at load.
@@ -2399,6 +2400,49 @@ enum NemotronMTPRouterRowsSelect {
             verified = false
         }
         report(verified ? "on (bitwise equal at R = 1...4)" : "off (differs or failed)")
+    }
+}
+
+/// The MTP head's router (the draft tail's one-launch selection,
+/// `NemotronMTPDraftTail.oneLaunchRouter`): its row-major weight is recorded
+/// like the target's (`NemotronMTPRouterRows.warm`), then the one-row launch on
+/// the draft counter is compared bit for bit with the head gate's own call
+/// (stock gemv and selection) on seeded rows; any miss unregisters the weight,
+/// which keeps the draft tail on the gate's own launches.
+enum NemotronMTPDraftRouterQualification {
+    static func run(_ head: Module) {
+        guard NemotronMTPRouterRowsSelect.enabled, NemotronMTPRouterRowsSelect.verified else { return }
+        let gates = head.modules().compactMap { $0 as? NemotronHMoEGate }
+        NemotronMTPRouterRows.warm(head)
+        var admitted = 0
+        for gate in gates where NemotronMTPRouterRows.isRowMajor(gate.weight) {
+            var ok = gate.topK == 6 && gate.nGroup == 1 && gate.topkGroup == 1 && gate.normTopkProb
+                && gate.routedScalingFactor == 2.5 && gate.eSCB.shape == [128] && gate.eSCB.dtype == .float32
+            if ok {
+                do {
+                    ok = try withError { () -> Bool in
+                        for seed in 0 ..< 4 {
+                            let x = MLXRandom.normal([1, 1, 2688], key: MLXRandom.key(UInt64(0xd7a + seed)))
+                                .asType(.bfloat16)
+                            guard let fused = NemotronMTPRouterRowsSelect.run(
+                                x, gate.weight, bias: gate.eSCB, draft: true) else { return false }
+                            let reference = gate(x)
+                            let same = MLX.logicalAnd(
+                                (fused.0 .== reference.0.asType(fused.0.dtype)).all(),
+                                (fused.1.view(dtype: .uint32) .== reference.1.asType(.float32).view(dtype: .uint32)).all())
+                            eval(same)
+                            guard same.item(Bool.self) else { return false }
+                        }
+                        return true
+                    }
+                } catch {
+                    ok = false
+                }
+            }
+            if ok { admitted += 1 } else { NemotronMTPRouterRows.unregister(gate.weight) }
+        }
+        FileHandle.standardError.write(Data(
+            "nemotron mtp draft router one-launch: \(admitted) of \(gates.count) head routers bitwise equal\n".utf8))
     }
 }
 
