@@ -75,6 +75,7 @@ extension NemotronH35MTPAssistant {
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
+        NemotronMTPDraftRowPick.qualify()
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
@@ -83,6 +84,9 @@ extension NemotronH35MTPAssistant {
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
+        let draftMixer = (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer
+        NemotronTargetQKV.qualifyDraftRowWrite(
+            query: draftMixer.wq, key: draftMixer.wk, value: draftMixer.wv)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
@@ -91,16 +95,20 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
+        NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
+        NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
         NemotronPrefillCombineAdd.qualify()
+        NemotronPrefillScanExp.qualify()
+        NemotronPrefillBoundaryJoin.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -499,7 +507,29 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
     /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
     /// set keeps its own queue.
+    /// The lease this process built at load, for `earlyBegin` from an engine's initializer.
+    nonisolated(unsafe) static weak var current: NemotronDecodeResidency?
+    /// NEMOTRON_RESIDENCY_EARLY=0 skips it: the target groups' residency requests are enqueued (in the same
+    /// backbone order, on the same serial queue) when a request's engine is built, before the engine is
+    /// assembled; the lease's `begin` that follows within `earlyWindow` then enqueues only the head set, the
+    /// extras and the copies after them, so the serial order is the base's.
+    static let earlyEnabled = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_EARLY"] != "0"
+    private static let earlyWindow: TimeInterval = 5
+    private let earlyLock = NSLock()
+    private var earlyIssuedAt: Date?
+
+    func earlyBegin() {
+        guard Self.earlyEnabled, !targetSets.isEmpty else { return }
+        earlyLock.withLock { earlyIssuedAt = Date() }
+        for set in targetSets { targetQueue.async { set.requestResidency() } }
+    }
+
     func begin() -> Lease {
+        let early = earlyLock.withLock { () -> Bool in
+            defer { earlyIssuedAt = nil }
+            guard let at = earlyIssuedAt else { return false }
+            return Date().timeIntervalSince(at) < Self.earlyWindow
+        }
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
         guard !targetSets.isEmpty else {
@@ -507,7 +537,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
-        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        if !early { for set in targetSets { targetQueue.async { set.requestResidency() } } }
         let head = seedSet, ready = Array(owners.prefix(cut))
         targetQueue.async {
             head.requestResidency()
@@ -534,3 +564,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Second measurement of 208838c4.
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
+
+// Measurement entry 2 of this tree.
+
+// Second measurement of 81b97a6c.
