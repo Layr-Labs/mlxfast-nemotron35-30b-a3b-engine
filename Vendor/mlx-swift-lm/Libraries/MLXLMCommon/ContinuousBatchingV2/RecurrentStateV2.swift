@@ -233,6 +233,11 @@ public struct CBv2RecurrentPrefixReplayStage {
     /// rejectable exact-tail copies out of the verify graph.
     fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
     fileprivate let replay: (Int) -> CBv2RecurrentLayerState
+    /// Optional model-defined form of the same strict-prefix state that a
+    /// later forward can consume without `replay` ever being built (the
+    /// model replays the kept steps inside a launch it already runs). Nil
+    /// for a keep the model cannot fold.
+    fileprivate let fold: ((Int) -> AnyObject?)?
 
     public init(
         positions: Int,
@@ -245,6 +250,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        fold: ((Int) -> AnyObject?)? = nil,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard positions >= 2 else {
@@ -267,6 +273,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         self.fullAcceptanceRetainedByteCount = fullAcceptanceRetainedByteCount
         self.fullAcceptanceRetainedRoots = fullAcceptanceRetainedRoots
         self.fullAcceptance = fullAcceptance
+        self.fold = fold
         self.replay = replay
     }
 }
@@ -286,10 +293,21 @@ fileprivate final class CBv2DeferredPrefixReplay {
     /// Unbuilt layers. A closure retains its tape until it is consumed.
     private var replays: [Int: (Int) -> CBv2RecurrentLayerState]
     private var built: [Int: CBv2RecurrentLayerState] = [:]
+    /// The stages' folded forms of the same states (see
+    /// `CBv2RecurrentPrefixReplayStage.fold`). Reading one builds nothing.
+    private let folds: [Int: (Int) -> AnyObject?]
 
-    init(keep: Int, replays: [Int: (Int) -> CBv2RecurrentLayerState]) {
+    init(
+        keep: Int, replays: [Int: (Int) -> CBv2RecurrentLayerState],
+        folds: [Int: (Int) -> AnyObject?] = [:]
+    ) {
         self.keep = keep
         self.replays = replays
+        self.folds = folds
+    }
+
+    func fold(_ modelLayerIndex: Int) -> AnyObject? {
+        folds[modelLayerIndex]?(keep)
     }
 
     func layer(_ modelLayerIndex: Int) -> CBv2RecurrentLayerState? {
@@ -550,7 +568,8 @@ public final class CBv2RecurrentRequestState {
                 // the built graphs would retain, not the full-window finals.
                 committed = [:]
                 deferredCommitted = CBv2DeferredPrefixReplay(
-                    keep: keep, replays: replay.mapValues { $0.replay })
+                    keep: keep, replays: replay.mapValues { $0.replay },
+                    folds: replay.compactMapValues { $0.fold })
             } else {
                 committed = replay.mapValues { $0.replay(keep) }
             }
@@ -668,6 +687,13 @@ public final class CBv2RecurrentStateEvaluation {
         input[modelLayerIndex] ?? deferredInput?.layer(modelLayerIndex)
     }
 
+    /// The model-defined folded form of a deferred strict-prefix input, or
+    /// nil. Unlike `inputState`, it never builds that layer's replay, so a
+    /// forward that consumes it leaves the replay unsubmitted.
+    public func inputFold(modelLayerIndex: Int) -> AnyObject? {
+        input[modelLayerIndex] == nil ? deferredInput?.fold(modelLayerIndex) : nil
+    }
+
     /// Already-built roots only: schedule their identical graphs at an existing
     /// within-request submission boundary. Ownership and commit order stay here.
     public func stagedEvaluationRoots(in layers: Range<Int>) -> [MLXArray] {
@@ -744,6 +770,7 @@ public final class CBv2RecurrentStateEvaluation {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        fold: ((Int) -> AnyObject?)? = nil,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard !evaluated, stagedCapturedPositions == nil, staged.isEmpty else {
@@ -773,6 +800,7 @@ public final class CBv2RecurrentStateEvaluation {
             fullAcceptanceRetainedByteCount: fullAcceptanceRetainedByteCount,
             fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
             fullAcceptance: fullAcceptance,
+            fold: fold,
             replay: replay)
     }
 

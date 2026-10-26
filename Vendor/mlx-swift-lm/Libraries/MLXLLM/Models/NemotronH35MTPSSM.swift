@@ -359,3 +359,231 @@ final class NemotronMTPReplayGroup {
             steps: keep, writeOutput: false).finalState)
     }
 }
+
+// MARK: - Strict-prefix replay folded into the next window
+
+/// One Mamba layer's committed state after strict-prefix rounds, unbuilt:
+/// `root` (a state some launch already wrote) advanced, link by link, by
+/// `keep` steps of that round's window tape. The next verify window replays
+/// the links itself (`NemotronHCompactSSMGated.foldKernel`), so the grouped
+/// replay launches of those rounds are never built.
+final class NemotronMTPFoldChain {
+    struct Link {
+        /// The window's activated conv rows `[1, 3, convDim]` and FP32 dt `[1, 3, heads]`.
+        let convolution: MLXArray, dt: MLXArray
+        let keep: Int
+    }
+
+    let root: MLXArray
+    let links: [Link]
+    /// The conv history after the last link: its window's padded rows
+    /// `keep ..< keep + history`, the view the replay closure stages.
+    let conv: MLXArray
+
+    init(root: MLXArray, links: [Link], conv: MLXArray) {
+        precondition((1 ... NemotronMTPFold.maxLinks).contains(links.count))
+        self.root = root
+        self.links = links
+        self.conv = conv
+    }
+
+    var arrays: [MLXArray] { [root] + links.flatMap { [$0.convolution, $0.dt] } }
+
+    /// The same state built for a reader that needs it as an array: one
+    /// compact replay per link (the per-layer twin of the grouped replay).
+    func materialize(
+        ALog: MLXArray, D: MLXArray, heads: Int, headDim: Int, groups: Int, stateDim: Int
+    ) -> MLXArray {
+        NemotronMTPFold.materialized += 1
+        return links.reduce(root) { state, link in
+            nemotronMTPSSMCompact(
+                convolution: link.convolution, ALog: ALog, D: D, dt: link.dt, state: state,
+                heads: heads, headDim: headDim, groups: groups, stateDim: stateDim,
+                steps: link.keep, writeOutput: false).finalState
+        }
+    }
+}
+
+/// The fold launch's link operands. Every chain fills all `maxLinks` slots
+/// (spare slots repeat link 0 with keep 0 and run no step), so one kernel
+/// instantiation and one compiled graph per pre-state flag serve every chain.
+struct NemotronMTPFoldInputs {
+    static let count = 2 * NemotronMTPFold.maxLinks + 1
+
+    let convolutions: [MLXArray]
+    let dts: [MLXArray]
+    /// int32 `[maxLinks]`, host-built.
+    let keeps: MLXArray
+    /// The chain is full: the launch also stores the state after its links,
+    /// the root of the next chain.
+    let writePre: Bool
+
+    init(_ chain: NemotronMTPFoldChain) {
+        let spare = NemotronMTPFold.maxLinks - chain.links.count
+        convolutions = chain.links.map(\.convolution)
+            + Array(repeating: chain.links[0].convolution, count: spare)
+        dts = chain.links.map(\.dt) + Array(repeating: chain.links[0].dt, count: spare)
+        keeps = NemotronMTPFold.keeps(chain.links.map(\.keep))
+        writePre = chain.links.count == NemotronMTPFold.maxLinks
+    }
+
+    /// From a compiled graph's argument list (`arrays` order).
+    init(_ arrays: ArraySlice<MLXArray>, writePre: Bool) {
+        precondition(arrays.count == Self.count)
+        let values = Array(arrays)
+        let links = NemotronMTPFold.maxLinks
+        convolutions = Array(values[0 ..< links])
+        dts = Array(values[links ..< 2 * links])
+        keeps = values[2 * links]
+        self.writePre = writePre
+    }
+
+    var arrays: [MLXArray] { convolutions + dts + [keeps] }
+
+    /// Every link tape has the window's own shape and type.
+    func accepts(convolution: MLXArray, dt: MLXArray) -> Bool {
+        convolutions.allSatisfy { $0.shape == convolution.shape && $0.dtype == convolution.dtype }
+            && dts.allSatisfy { $0.shape == dt.shape && $0.dtype == dt.dtype }
+            && keeps.shape == [NemotronMTPFold.maxLinks] && keeps.dtype == .int32
+    }
+}
+
+/// NEMOTRON_MTP_RFOLD: after a verify round that keeps a strict prefix, the
+/// next round's fused SSM window launch replays the kept steps (see
+/// `NemotronMTPFoldChain`) instead of the commit's grouped replay launches,
+/// which then are never built. Consecutive strict rounds extend the chain up
+/// to `maxLinks` links; a window that reads a full chain also stores the
+/// state after it, and a strict commit of that window starts a new chain
+/// there. On only after `qualify` finds the fold launch bitwise equal to the
+/// record's replay-then-window path at load.
+enum NemotronMTPFold {
+    static let maxLinks = 4
+    nonisolated(unsafe) static var enabled = false
+    /// Evidence counters per layer window since the load warm-up, printed at
+    /// exit: folded windows, chains re-rooted at a stored end state, chains
+    /// a non-folding reader built with compact replays.
+    nonisolated(unsafe) static var folded = 0
+    nonisolated(unsafe) static var rerooted = 0
+    nonisolated(unsafe) static var materialized = 0
+    nonisolated(unsafe) private static var warmUp = (folded: 0, rerooted: 0, materialized: 0)
+    nonisolated(unsafe) private static var mambaLayers = 0
+
+    static func endWarmUp() {
+        warmUp = (folded, rerooted, materialized)
+        (folded, rerooted, materialized) = (0, 0, 0)
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var keepArrays: [[Int]: MLXArray] = [:]
+
+    /// One shared host-built int32 array per keep list (zero-padded).
+    static func keeps(_ values: [Int]) -> MLXArray {
+        lock.withLock {
+            if let cached = keepArrays[values] { return cached }
+            let padded = values + Array(repeating: 0, count: maxLinks - values.count)
+            let array = MLXArray(padded.map(Int32.init))
+            keepArrays[values] = array
+            return array
+        }
+    }
+
+    /// Load time: on seeded random banks at the real shapes, with the
+    /// layer's own A_log, D and norm, every chain of one to `maxLinks` links
+    /// below is folded and compared with the record's path (the grouped
+    /// replay link by link, as a six-layer launch, then the fused window),
+    /// and with the per-layer compact replay: the normalized rows, the
+    /// prepared activation, the final state and, for a full chain, the
+    /// stored pre-window state, bit for bit. Any difference keeps it off.
+    static func qualify(_ mixer: NemotronHMamba2Mixer, mambaLayers: Int) {
+        enabled = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron rfold: \(message)\n".utf8))
+        }
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_RFOLD"] != "0" else {
+            report("off: NEMOTRON_MTP_RFOLD=0")
+            return
+        }
+        guard nemotronMTPCompactSSM else {
+            report("off: compact SSM verify is off")
+            return
+        }
+        let (heads, dim, groups, stateDim) =
+            (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        let convDim = mixer.convDim, width = 3
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5246_4f4c), into: 4 + 2 * maxLinks)
+        func tape(_ index: Int) -> (MLXArray, MLXArray) {
+            (MLXRandom.normal([1, width, convDim], key: keys[index]).asType(.bfloat16),
+             MLXRandom.uniform(
+                low: Float(0.001), high: Float(0.1), [1, width, heads], key: keys[index + 1]))
+        }
+        let root = MLXRandom.normal([1, heads, dim, stateDim], key: keys[0])
+        let projected = MLXRandom.normal(
+            [1, width, mixer.intermediateSize + convDim + heads], key: keys[1]).asType(.bfloat16)
+        let window = tape(2)
+        let tapes = (0 ..< maxLinks).map { tape(4 + 2 * $0) }
+        func equal(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            a.shape == b.shape && a.dtype == b.dtype
+                ? (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all() : MLXArray(false)
+        }
+        var ok = MLXArray(true)
+        let chains = [[1], [2], [2, 1], [1, 2, 2], [2, 1, 2, 1], [1, 1, 2, 2]]
+        for keeps in chains {
+            var grouped = root, single = root
+            for (link, keep) in keeps.enumerated() {
+                let member = NemotronMTPReplayGroup.Member(
+                    convolution: tapes[link].0, dt: tapes[link].1, aLog: mixer.aLog, D: mixer.D,
+                    state: grouped, heads: heads, headDim: dim, groups: groups, stateDim: stateDim)
+                grouped = NemotronMTPReplayGroupKernel.replay(
+                    Array(repeating: member, count: NemotronMTPReplayGroupKernel.maxLayers),
+                    keep: keep)[0]
+                single = nemotronMTPSSMCompact(
+                    convolution: tapes[link].0, ALog: mixer.aLog, D: mixer.D, dt: tapes[link].1,
+                    state: single, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                    steps: keep, writeOutput: false).finalState
+            }
+            let chain = NemotronMTPFoldChain(
+                root: root,
+                links: keeps.enumerated().map {
+                    .init(convolution: tapes[$0.offset].0, dt: tapes[$0.offset].1, keep: $0.element)
+                },
+                conv: window.0)
+            let inputs = NemotronMTPFoldInputs(chain)
+            guard let reference = mixer.norm.compactSSMPreparedRows(
+                    convolution: window.0, ALog: mixer.aLog, D: mixer.D, dt: window.1,
+                    state: grouped, projected: projected, heads: heads, headDim: dim,
+                    groups: groups, stateDim: stateDim),
+                  let folded = mixer.norm.compactSSMPreparedRowsFolded(
+                    convolution: window.0, ALog: mixer.aLog, D: mixer.D, dt: window.1,
+                    root: root, projected: projected, heads: heads, headDim: dim,
+                    groups: groups, stateDim: stateDim, fold: inputs)
+            else {
+                report("off: the fused SSM window launch is not available")
+                return
+            }
+            var checks = [equal(grouped, single), equal(folded.0, reference.0),
+                          equal(folded.1, reference.1), equal(folded.2, reference.2)]
+            if inputs.writePre {
+                checks.append(folded.3.map { equal($0, grouped) } ?? MLXArray(false))
+            }
+            for check in checks { ok = MLX.logicalAnd(ok, check) }
+        }
+        enabled = ok.item(Bool.self)
+        guard enabled else {
+            report("off: a fold output differs from the replay-then-window path")
+            return
+        }
+        self.mambaLayers = mambaLayers
+        report("on (\(chains.count) chains of 1...\(maxLinks) links bitwise equal to the grouped "
+            + "replay then the fused window, pre-window state included)")
+        atexit { NemotronMTPFold.reportCounts() }
+    }
+
+    private static func reportCounts() {
+        let layers = max(1, mambaLayers)
+        FileHandle.standardError.write(Data((
+            "nemotron rfold folded rounds: \(folded / layers) after load (\(folded) layer windows, "
+            + "\(rerooted / layers) re-rooted, \(materialized) layer chains materialized); "
+            + "load warm-up \(warmUp.folded / layers) rounds, \(warmUp.rerooted / layers) re-rooted, "
+            + "\(warmUp.materialized) materialized\n").utf8))
+    }
+}

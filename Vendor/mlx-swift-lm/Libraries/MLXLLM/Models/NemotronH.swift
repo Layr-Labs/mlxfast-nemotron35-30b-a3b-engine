@@ -776,7 +776,9 @@ enum NemotronHCompactSSMGated {
         inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
-        source: """
+        source: source, mutableInputs: ["counter"])
+
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -898,7 +900,7 @@ enum NemotronHCompactSSMGated {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            """, mutableInputs: ["counter"])
+            """
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -912,9 +914,87 @@ enum NemotronHCompactSSMGated {
         eval(c)
         counter = c
     }
+
+    /// NEMOTRON_MTP_RFOLD (see `NemotronMTPFold`): the same launch, whose
+    /// thread first advances its state from `state_in` through up to four
+    /// strict-prefix links of earlier windows, `rkeep[k]` steps of link k's
+    /// tape (`rconv<k>`: x | B | C rows, `rdt<k>`: dt rows), before the
+    /// window. A link step is the compact kernel's step with the C product
+    /// and output dropped (dead in the replay launches too): the same loads,
+    /// dA, dB_by_x and state statements in the same order, the state kept in
+    /// FP32 registers where the replay stored and reloaded it as FP32. A
+    /// slot with keep 0 runs no step. WP also stores the state after the
+    /// links (`state_pre`). Everything from the window loop on is `source`.
+    static let foldKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_gated_prepared_fold",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter", "rconv0", "rconv1", "rconv2", "rconv3",
+                     "rdt0", "rdt1", "rdt2", "rdt3", "rkeep"],
+        outputNames: ["out", "state_out", "normed", "prepared", "state_pre"],
+        source: foldSource, mutableInputs: ["counter"])
+
+    static let foldLinks = """
+        {
+            const device T* fold_conv_[4] = {rconv0, rconv1, rconv2, rconv3};
+            const device float* fold_dt_[4] = {rdt0, rdt1, rdt2, rdt3};
+            for (int k = 0; k < 4; ++k) {
+                const int fold_keep_ = rkeep[k];
+                const device T* fold_tape_ = fold_conv_[k];
+                const device float* fold_dts_ = fold_dt_[k];
+                for (int t = 0; t < fold_keep_; ++t) {
+                    auto x_ = static_cast<float>(fold_tape_[t * CD + n * Dh + d_idx]);
+                    auto B_ = fold_tape_ + t * CD + BO + g_idx * Ds;
+                    auto dt_ = static_cast<float>(fold_dts_[t * H + n]);
+                    auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                    auto dA = fast::exp(A * dt_);
+                    for (int i = 0; i < n_per_t; ++i) {
+                        auto s_idx = n_per_t * ds_idx + i;
+                        if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                        auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                        auto state = dA * prior[i] + dB_by_x;
+                        prior[i] = static_cast<U>(state);
+                    }
+                }
+            }
+            if constexpr (WP) {
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    state_pre[(n * Dh + d_idx) * Ds + s_idx] = prior[i];
+                }
+            }
+        }
+
+        """
+
+    static let foldSource: String = {
+        let window = "for (int t = 0; t < L; ++t) {"
+        precondition(source.components(separatedBy: window).count == 2, "rfold: window loop anchor")
+        return source.replacingOccurrences(of: window, with: foldLinks + window)
+    }()
 }
 
 extension NemotronHRMSNormGated {
+    /// The fused launch's guards, on the window operands' shapes and types.
+    func compactSSMGatedAccepts(
+        convolution: ([Int], DType), dt: ([Int], DType), state: ([Int], DType),
+        projected: ([Int], DType), heads: Int, headDim: Int, groups: Int, stateDim: Int
+    ) -> Bool {
+        NemotronHCompactSSMGated.enabled && NemotronMTPExecution.batchedNorm
+            && NemotronMultiRowQMV.enabled && NemotronMultiRowQMV.narrowEnabled
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && type(of: self) == NemotronHRMSNormGated.self
+            && groupSize == 512 && heads == 64 && headDim == 64 && groups == 8 && stateDim == 128
+            && convolution.0 == [1, 3, 6144] && convolution.1 == .bfloat16
+            && dt.1 == .float32 && dt.0 == [1, 3, 64]
+            && state.1 == .float32 && state.0 == [1, 64, 64, 128]
+            && projected.0 == [1, 3, 10304] && projected.1 == .bfloat16
+            && weight.shape == [4096] && weight.dtype == .bfloat16
+            // Created and evaluated at load (`prepareCounter`), never inside a
+            // compile trace; without it the two launches stay.
+            && NemotronHCompactSSMGated.counter != nil
+    }
+
     /// nemotronMTPSSMCompact(steps = writeOutput = 3) + preparedRows in one
     /// launch, under preparedRows' guards; returns (normalized, prepared, final
     /// SSM state) or nil to keep the two launches.
@@ -923,20 +1003,11 @@ extension NemotronHRMSNormGated {
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int
     ) -> (MLXArray, MLXArray, MLXArray)? {
-        guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
-              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
-              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              type(of: self) == NemotronHRMSNormGated.self,
-              groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
-              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
-              dt.dtype == .float32, dt.shape == [1, 3, 64],
-              state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
-              weight.shape == [4096], weight.dtype == .bfloat16
+        guard compactSSMGatedAccepts(
+            convolution: (convolution.shape, convolution.dtype), dt: (dt.shape, dt.dtype),
+            state: (state.shape, state.dtype), projected: (projected.shape, projected.dtype),
+            heads: heads, headDim: headDim, groups: groups, stateDim: stateDim)
         else { return nil }
-        // Created and evaluated at load (`prepareCounter`), never inside a
-        // compile trace; without it the two launches stay.
-        guard NemotronHCompactSSMGated.counter != nil else { return nil }
         let outputs = NemotronHCompactSSMGated.kernel(
             [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
              eps, NemotronHCompactSSMGated.counter!],
@@ -947,6 +1018,35 @@ extension NemotronHRMSNormGated {
             outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
         return (outputs[2], outputs[3], outputs[1])
+    }
+
+    /// `compactSSMPreparedRows` from `root` advanced through `fold`'s links
+    /// (the fold variant launch): returns (normalized, prepared, final SSM
+    /// state, the state after the links when `fold.writePre`), or nil when
+    /// the fused launch's guards fail.
+    func compactSSMPreparedRowsFolded(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        root: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
+        stateDim: Int, fold: NemotronMTPFoldInputs
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray?)? {
+        guard compactSSMGatedAccepts(
+            convolution: (convolution.shape, convolution.dtype), dt: (dt.shape, dt.dtype),
+            state: (root.shape, root.dtype), projected: (projected.shape, projected.dtype),
+            heads: heads, headDim: headDim, groups: groups, stateDim: stateDim),
+              fold.accepts(convolution: convolution, dt: dt)
+        else { return nil }
+        let outputs = NemotronHCompactSSMGated.foldKernel(
+            [convolution, ALog, D, dt, root, projected, weight, NemotronHGatedRMSKernel.identity,
+             eps, NemotronHCompactSSMGated.counter!] + fold.arrays,
+            template: [("T", DType.bfloat16), ("U", DType.float32),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304),
+                       ("WP", fold.writePre)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32],
+                           fold.writePre ? [1, 64, 64, 128] : [1]],
+            outputDTypes: [.bfloat16, .float32, .bfloat16, .float32, .float32])
+        return (outputs[2], outputs[3], outputs[1], fold.writePre ? outputs[4] : nil)
     }
 }
 

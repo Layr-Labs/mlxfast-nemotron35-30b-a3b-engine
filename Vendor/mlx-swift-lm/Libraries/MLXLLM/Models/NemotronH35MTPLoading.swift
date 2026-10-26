@@ -136,6 +136,7 @@ extension NemotronH35MTPAssistant {
             FileHandle.standardError.write(Data("nemotron mtp warm-up skipped: \(error)\n".utf8))
         }
         warmPostVerifySpeculation(skippingWidth: postVerifyWarmupWidth)
+        NemotronMTPFold.endWarmUp()
         Memory.clearCache()
     }
 
@@ -229,6 +230,13 @@ extension NemotronH35MTPAssistant {
         // acceptance (one-token accepted-history replay, every finalize
         // branch), then every shallower width.
         var rounds = [(depth, min(2, depth + 1)), (depth, depth + 1), (depth, 1)]
+        // NEMOTRON_MTP_RFOLD: strict rounds that grow a fold chain to full
+        // length, a strict round over the full chain (its end state stored,
+        // the chain re-rooted there) and a full round over the new chain, so
+        // every fold graph and launch the decode can reach compiles here.
+        if NemotronMTPFold.enabled, depth == 2 {
+            rounds += [(2, 2), (2, 1), (2, 2), (2, 1), (2, 3)]
+        }
         for k in (1..<depth).reversed() { rounds += [(k, k + 1), (k, 1)] }
         for (k, confirmed) in rounds {
             var tokens = seed, hidden = carry
