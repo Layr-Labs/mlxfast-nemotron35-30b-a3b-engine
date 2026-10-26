@@ -329,6 +329,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let owners: [ObjectIdentifier]
     let cut: Int
     let queue = DispatchQueue(label: "nemotron.decode.memory")
+    /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
+    /// requests are left standing between requests.
+    static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
 
     /// The target's own parameter buffers, one set per backbone group (embeddings, layers in order, then the
     /// rest), requested on their own serial queue when a request's lease begins and ended with the lease.
@@ -431,6 +434,12 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             finished = true
             let owner = owner
+            guard NemotronDecodeResidency.endsRequests else {
+                // The requests stay standing; the next lease requests the same sets again.
+                owner.targetQueue.sync {}
+                owner.queue.sync { NemotronZSkip.endCopyReadiness() }
+                return
+            }
             owner.targetQueue.sync {
                 for set in owner.targetSets + owner.extraSets { set.endResidency() }
             }
@@ -448,12 +457,25 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
     }
+    /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
+    /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
+    /// set keeps its own queue.
     func begin() -> Lease {
-        for set in targetSets + extraSets {
-            targetQueue.async { set.requestResidency() }
-        }
         NemotronZSkip.beginCopyReadiness(owners)
-        request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+        guard !targetSets.isEmpty else {
+            for set in extraSets { targetQueue.async { set.requestResidency() } }
+            request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+            return Lease(self)
+        }
+        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        let head = seedSet, ready = Array(owners.prefix(cut))
+        targetQueue.async {
+            head.requestResidency()
+            NemotronZSkip.markCopyReady(ready)
+        }
+        for set in extraSets { targetQueue.async { set.requestResidency() } }
         return Lease(self)
     }
 }
+
+// Second measurement of ff544a18.
