@@ -57,14 +57,16 @@ let nemotronVerifyFirstSubmit =
     ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_FIRST_SUBMIT"] != "0"
 
 /// Captured verify only: the layer counts after which it submits (evaluation
-/// order only). Two short chunks first, so the GPU has the verify's first
-/// layers while the host builds the next chunk. `NEMOTRON_MTP_VERIFY_SUBMITS`
-/// takes a comma list; setting `NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL` uses the
+/// order only). Short chunks first, so the GPU has the verify's first layers
+/// while the host builds the next chunk, then one submit every seven layers to
+/// the end, so the GPU never waits on the host for a long tail chunk.
+/// `NEMOTRON_MTP_VERIFY_SUBMITS` takes a comma list ("1,4,13,26" is the
+/// previous schedule); setting `NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL` uses the
 /// interval instead.
 let nemotronVerifySubmitLayers: Set<Int>? = {
     let env = ProcessInfo.processInfo.environment
     guard env["NEMOTRON_MTP_VERIFY_SUBMIT_INTERVAL"] == nil else { return nil }
-    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,13,26")
+    return Set((env["NEMOTRON_MTP_VERIFY_SUBMITS"] ?? "1,4,8,13,20,27,34,41,48")
         .split(separator: ",").compactMap { Int($0) })
 }()
 
