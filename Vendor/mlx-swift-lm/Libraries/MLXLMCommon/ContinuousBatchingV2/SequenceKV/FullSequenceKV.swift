@@ -82,6 +82,15 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     /// don't immediately grow the buffer.
     static let initialSlack = 256
 
+    /// Set by the Nemotron request prefill (the seed of the scored decode)
+    /// around its forward, only after its load-time raw-word check of
+    /// `seedFirstWriteCheck`: a sequence's first write then builds the
+    /// storage as the update followed by the zero slack in one concatenate,
+    /// instead of a zero storage that a slice update rewrites whole. Same
+    /// stored values, same shape; the storage stays fresh and row-contiguous.
+    nonisolated(unsafe) public static var seedFirstWrite = false
+    nonisolated(unsafe) private static var seedFirstWriteReported = false
+
     public private(set) var absoluteOffset: Int = 0
     public var retainedCount: Int { absoluteOffset }
 
@@ -149,6 +158,28 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             absoluteOffset + n <= maxLength,
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
+
+        if keys == nil, Self.seedFirstWrite, absoluteOffset == 0,
+           newKeys.ndim == 4, newValues.ndim == 4, newKeys.dim(0) == 1, newKeys.dim(1) == kvHeads,
+           newValues.dim(1) == kvHeads, newKeys.dtype.size == 2, newValues.dtype.size == 2
+        {
+            let first = min(maxLength, max(capacity, n))
+            if first > n {
+                if !Self.seedFirstWriteReported {
+                    Self.seedFirstWriteReported = true
+                    FileHandle.standardError.write(Data(
+                        "nemotron seedx kv: engaged (first write \(n) rows into \(first))\n".utf8))
+                }
+                capacity = first
+                keys = Self.firstWrite(newKeys, capacity: first)
+                values = Self.firstWrite(newValues, capacity: first)
+                absoluteOffset = n
+                return (
+                    keys![.ellipsis, ..<absoluteOffset, 0...],
+                    values![.ellipsis, ..<absoluteOffset, 0...]
+                )
+            }
+        }
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
@@ -274,6 +305,27 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             strides, strides.count, StreamOrDevice.default.ctx)
         precondition(rc == 0, "CBv2FullSequenceKV: mlx_slice_update failed with rc=\(rc)")
         return MLXArray(result)
+    }
+
+    /// `[update, zeros]` along the token axis as one concatenate: the update
+    /// rows are copied once and only the slack rows are written as zeros. The
+    /// slack is a host 16-bit zero word viewed as the K/V dtype and broadcast
+    /// (no buffer, no launch of its own; `MLXArray.zeros` would fill one), so
+    /// the concatenate's two copies are the only launches. 16-bit dtypes only.
+    private static func firstWrite(_ update: MLXArray, capacity: Int) -> MLXArray {
+        let slack = broadcast(
+            MLXArray(UInt16(0)).view(dtype: update.dtype),
+            to: [update.dim(0), update.dim(1), capacity - update.dim(2), update.dim(3)])
+        return concatenated([update, slack], axis: 2)
+    }
+
+    /// For the load-time check: the seed's first-write storage and the stock
+    /// one (a zero storage of `capacity` rows, then `write` at offset 0).
+    public static func seedFirstWriteCheck(_ update: MLXArray, capacity: Int) -> (MLXArray, MLXArray) {
+        let stock = write(
+            MLXArray.zeros([update.dim(0), update.dim(1), capacity, update.dim(3)], dtype: update.dtype),
+            update, at: 0)
+        return (firstWrite(update, capacity: capacity), stock)
     }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
