@@ -3170,3 +3170,32 @@ extern "C" void* nemotron_decode_backing(void* opaque) {
   if (!a.is_available() || !a.data_shared_ptr()) return nullptr;
   return a.buffer().ptr();
 }
+
+// Host-only: the GPU device's per-command-buffer byte rule. MLX commits a
+// command buffer once its new inputs pass `max_mb_per_buffer_` (50 MB on Max
+// parts), so each routed expert gather (> 300 MB of weights) ends its buffer.
+// The request prefill lifts the rule while it encodes; every other forward
+// keeps it. The generated Metal source above is unchanged.
+#include "mlx/backend/metal/device.h"
+namespace nemotron_commit_rule {
+struct MaxMBTag {};
+auto member(MaxMBTag);
+// Explicit instantiations may name private members ([temp.spec.general]).
+template <typename Tag, auto M>
+struct Access {
+  friend auto member(Tag) {
+    return M;
+  }
+};
+template struct Access<MaxMBTag, &mlx::core::metal::Device::max_mb_per_buffer_>;
+} // namespace nemotron_commit_rule
+
+// Sets the byte rule (in MB) and returns the previous value.
+extern "C" int nemotron_set_max_mb_per_buffer(int mb) {
+  using namespace nemotron_commit_rule;
+  auto& d = mlx::core::metal::device(mlx::core::Device::gpu);
+  int& value = d.*member(MaxMBTag{});
+  int old = value;
+  value = mb;
+  return old;
+}

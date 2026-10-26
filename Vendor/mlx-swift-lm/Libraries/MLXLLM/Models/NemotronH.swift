@@ -1292,6 +1292,60 @@ enum NemotronHPrefillX5 {
     static var active: Bool { !seedOnly || requestPrefill }
 }
 
+@_silgen_name("nemotron_set_max_mb_per_buffer")
+private func nemotronSetMaxMBPerBuffer(_ mb: Int32) -> Int32
+
+/// Seed-only (request prefill): MLX commits a command buffer as soon as its
+/// new inputs pass the device's byte rule (50 MB on Max parts), so each routed
+/// fc1/fc2 gather (> 300 MB of expert weights) ends its command buffer and the
+/// next one waits for it. `relax` lifts the byte rule when the request prefill
+/// starts to build (the op-count rule and the prefill's chunk evaluations
+/// still end buffers); `restore` puts the stock rule back at the lease's first
+/// decode round, at the lease's finish and when any other target forward
+/// starts to build, so the timed prefill and the decode keep the stock rule.
+/// Buffer boundaries only; every value is unchanged.
+/// NEMOTRON_PREFILL_RELAX_COMMIT=0 keeps the stock rule.
+enum NemotronPrefillRelaxCommit {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_RELAX_COMMIT"] != "0"
+    /// In MB; above any request's inputs.
+    static let relaxedMB: Int32 = 1 << 20
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var saved: Int32?
+
+    static var isRelaxed: Bool { lock.withLock { saved != nil } }
+
+    static func relax() {
+        guard enabled, Device.defaultDevice().deviceType == .gpu else { return }
+        lock.withLock {
+            guard saved == nil else { return }
+            saved = nemotronSetMaxMBPerBuffer(relaxedMB)
+        }
+    }
+
+    static func restore() {
+        lock.withLock {
+            guard let old = saved else { return }
+            _ = nemotronSetMaxMBPerBuffer(old)
+            saved = nil
+        }
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`) while the byte
+/// rule is lifted (`NemotronPrefillRelaxCommit`): each MoE block orders its
+/// shared expert by `depends` edges (encode order only) so that the up
+/// projection + relu2 is encoded right after the routed fc1 launch, in fc1's
+/// barrier interval, and the down projection next to the routed fc2 launch,
+/// in fc2's interval. The kernels and their inputs are the shared expert's
+/// own, so every value is unchanged. NEMOTRON_PREFILL_SHARED_OVERLAP=0 keeps
+/// the base order.
+enum NemotronPrefillSharedOverlap {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_OVERLAP"] != "0"
+    static var active: Bool {
+        enabled && NemotronHPrefillX5.active && NemotronPrefillRelaxCommit.isRelaxed
+    }
+}
+
 /// Seed-only: a fresh request's first scan window computes
 /// `next + lastDecay * (+0.0)` (a [b, h, 1, 1] multiply, then a broadcast
 /// add) through `stateUpdate` with the zero-stride +0.0 state, i.e. the same
@@ -4724,16 +4778,22 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             }
             return nemotronR1Linear(activated.reshaped(1, 1, 3712), downProj)
         }
+        return downProj(activation(x))
+    }
+
+    /// `relu2(upProj(x))` outside the one-row path above: the down projection's
+    /// input, as `callAsFunction` computes it.
+    func activation(_ x: MLXArray) -> MLXArray {
         // Request prefill: up projection and relu2 in one launch (`NemotronPrefillSharedUpGather`).
         if let activated = NemotronPrefillSharedUpGather.apply(x, upProj) {
-            return downProj(activated)
+            return activated
         }
         let up = upProj(x)
         // Request prefill: the stock relu2 in one launch (`NemotronPrefillSharedRelu2`).
         if let activated = NemotronPrefillSharedRelu2.apply(up) {
-            return downProj(activated)
+            return activated
         }
-        return downProj(relu2(up))
+        return relu2(up)
     }
 
     // Protocol conformance
@@ -5001,10 +5061,13 @@ class NemotronHSwitchMLP: Module {
     /// `fusedSortedCombine`, and with `addend` (the shared-expert output,
     /// same shape and dtype as the result) inside the request prefill, the
     /// MoE block's `y + addend` in the combine launch; `added` says whether it
-    /// was applied.
+    /// was applied. With `sharedOverlap` (`NemotronPrefillSharedOverlap`) the
+    /// shared expert's output is built here in the overlap order and used as
+    /// `addend`; `shared` returns it.
     func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, addend: MLXArray?,
-                            join: (residual: MLXArray, norm: RMSNorm)? = nil)
-        -> (out: MLXArray, added: Bool, normalized: MLXArray?)? {
+                            join: (residual: MLXArray, norm: RMSNorm)? = nil,
+                            sharedOverlap: NemotronHMLP? = nil)
+        -> (out: MLXArray, added: Bool, normalized: MLXArray?, shared: MLXArray?)? {
         let k = indices.dim(-1)
         guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
               scores.shape == indices.shape,
@@ -5042,17 +5105,31 @@ class NemotronHSwitchMLP: Module {
             }
             return lin(input, idx, sortedIndices: true)
         }
+        // Overlap order: the shared activation reads `x` only after the fc1
+        // launch, and what follows fc1 (relu2 where separate, fc2) follows that
+        // activation. The arrays share their inputs' buffers (encode order only).
+        // `depends` takes its stream from its first input's primitive (else the
+        // C++ default stream), so `fc1Out` comes first: `x` may already be
+        // evaluated by an earlier chunk. (Depends needs one dependency.)
+        var sharedActivation: MLXArray? = nil
+        func afterFC1(_ fc1Out: MLXArray) -> MLXArray {
+            guard let sharedOverlap else { return fc1Out }
+            let activation = sharedOverlap.activation(
+                depends(inputs: [fc1Out, x], dependencies: [fc1Out])[1])
+            sharedActivation = activation
+            return depends(input: fc1Out, dependencies: [activation])
+        }
         var y: MLXArray
         if let tiles = runTiles, let rowsK = orderK, let q = fc1 as? QuantizedSwitchLinear,
             let activated = NemotronPrefillDirectFC1.apply(
                 x.reshaped(tokens, 1, inputDims), q, rows: rowsK, tiles: tiles) {
             // Seed only: fc1 reads the token rows directly; `xs` stays lazy.
-            y = activated
+            y = afterFC1(activated)
         } else if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
             let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
-            y = activated
+            y = afterFC1(activated)
         } else {
-            y = gather(fc1, xs)
+            y = afterFC1(gather(fc1, xs))
             // Stock relu2 promotes against an int scalar; fuse only when that
             // keeps the activation dtype (graph metadata, never evaluated).
             if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
@@ -5064,30 +5141,35 @@ class NemotronHSwitchMLP: Module {
                 y = relu2(y)
             }
         }
+        // Overlap order: the shared down projection follows the routed
+        // activation, so it is encoded next to fc2.
+        let sharedOut = sharedActivation.map {
+            sharedOverlap!.downProj(depends(input: $0, dependencies: [y]))
+        }
         y = gather(fc2, y)
         guard y.dim(-1) == inputDims, y.size == indices.size * inputDims else { return nil }
         var outShape = indices.shape
         outShape[outShape.count - 1] = inputDims
-        if let addend, NemotronPrefillCombineAdd.verified, NemotronHPrefillX5.active,
+        if let addend = addend ?? sharedOut, NemotronPrefillCombineAdd.verified, NemotronHPrefillX5.active,
            addend.shape == outShape, addend.dtype == y.dtype {
             // terrapinelf's MoE join: the block's residual add and next norm in this launch.
             if let join, NemotronPrefillMoEJoin.verified,
                let joined = NemotronHResidualRMSNorm.applyMoEJoin(
                    join.residual, y: y, inverse: inverse, scores: scores, addend: addend, k: k,
                    norm: join.norm) {
-                return (joined.0, true, joined.1)
+                return (joined.0, true, joined.1, sharedOut)
             }
             return ((NemotronPrefillCombineAdd.vec4Verified ? kernels.combineAdd4 : kernels.combineAdd)(
                 [y, inverse, scores, inputDims, addend],
                 template: [("T", y.dtype), ("K", k)],
                 grid: (inputDims / 4, tokens, 1), threadGroup: (NemotronPrefillCombineAdd.vec4Verified ? 64 : 32, 1, 1),
-                outputShapes: [outShape], outputDTypes: [y.dtype])[0], true, nil)
+                outputShapes: [outShape], outputDTypes: [y.dtype])[0], true, nil, sharedOut)
         }
         return (kernels.combine(
             [y, inverse, scores, inputDims],
             template: [("T", y.dtype), ("K", k)],
             grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
-            outputShapes: [outShape], outputDTypes: [y.dtype])[0], false, nil)
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0], false, nil, sharedOut)
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -7396,21 +7478,26 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     {
         let (inds, scores) = gate(x)
         // Request prefill: the shared-expert add rides the combine launch.
-        let shared: MLXArray? = NemotronPrefillCombineAdd.verified && NemotronHPrefillX5.active
-            ? sharedExperts.map { $0(x) } : nil
+        let seedAdd = NemotronPrefillCombineAdd.verified && NemotronHPrefillX5.active
+        // With the byte rule lifted, the combine builds the shared expert in the overlap order.
+        let overlap = seedAdd && sharedExperts != nil && NemotronPrefillSharedOverlap.active
+        let shared: MLXArray? = seedAdd && !overlap ? sharedExperts.map { $0(x) } : nil
         var y: MLXArray
         var added = false
-        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared, join: join) {
+        var overlapShared: MLXArray? = nil
+        if let fused = switchMLP.fusedSortedCombine(
+            x, inds, scores, addend: shared, join: join, sharedOverlap: overlap ? sharedExperts : nil) {
             if let normalized = fused.normalized { return (fused.out, normalized) }
             y = fused.out
             added = fused.added
+            overlapShared = fused.shared
         } else {
             y = switchMLP(x, inds)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
 
         if let sharedExperts, !added {
-            y = y + (shared ?? sharedExperts(x))
+            y = y + (shared ?? overlapShared ?? sharedExperts(x))
         }
 
         return (y, nil)
@@ -7974,6 +8061,7 @@ public class NemotronHModel:
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        NemotronPrefillRelaxCommit.restore()
         var out = backbone(inputs, cache: cache)
         if let lmHead {
             out = lmHead(out)
@@ -8071,6 +8159,8 @@ public class NemotronHModel:
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false
     ) -> MLXArray {
+        // Every forward but the request prefill builds under the stock byte rule.
+        if !NemotronHPrefillX5.requestPrefill { NemotronPrefillRelaxCommit.restore() }
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
                 preconditionFailure("NemotronH CBv2 target received legacy KV cache")
@@ -8087,6 +8177,7 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> (hidden: MLXArray, prepared: MLXArray?)? {
+        NemotronPrefillRelaxCommit.restore()
         guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.shape == [1, 3] else { return nil }
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {

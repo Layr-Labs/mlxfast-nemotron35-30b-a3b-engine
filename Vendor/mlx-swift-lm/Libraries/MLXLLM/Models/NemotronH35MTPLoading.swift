@@ -477,6 +477,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         private var finished = false
         init(_ owner: NemotronDecodeResidency) { self.owner = owner }
         func beginDecode() {
+            // The request prefill is encoded: the stock byte rule from here on.
+            NemotronPrefillRelaxCommit.restore()
             guard !finished else { return }
             if !decoded {
                 decoded = true
@@ -487,6 +489,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             _ = NemotronZSkip.snapshotCopyReadiness()
         }
         func finish() {
+            NemotronPrefillRelaxCommit.restore()
             guard !finished else { return }
             finished = true
             let owner = owner
@@ -575,5 +578,3 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
 
 // Measurement entry 2 of this tree.
-
-// Measurement entry 3 of this tree.
