@@ -82,8 +82,10 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
+        NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
-        NemotronBankBinding.warm(assistant.module)
+        NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
+        target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
@@ -527,3 +529,4 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Second measurement entry of this tree.
 
 // Second measurement of 208838c4.
+// e-man07: second measurement of c28 (b550b079).
