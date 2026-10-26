@@ -345,6 +345,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// With target sets, the per-layer copy sets are requested on the target queue right after the extras, each
     /// marking its layer ready when its request returns, instead of at the first verify graph.
     static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
+    /// Submit the immutable ordered request list as one serial-queue job,
+    /// retaining each set's original request and readiness publication order.
+    static let batchRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_BATCH"] != "0"
     private(set) var copiesEnqueued = false
     /// The buffers of the residency sets are locked in memory (`mlock`) once at load, so a lease's request maps
     /// pages that stay wired between requests. NEMOTRON_MTP_MLOCK=targets locks only the target's groups;
@@ -493,6 +496,24 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     func begin() -> Lease {
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
+        if Self.batchRequests, !targetSets.isEmpty {
+            let targets = targetSets, head = seedSet, extras = extraSets
+            let headReady = Array(owners.prefix(cut))
+            let copies = Self.copiesAfterExtras ? decodeSets : []
+            let copyOwners = owners, copyCut = cut
+            copiesEnqueued = Self.copiesAfterExtras
+            targetQueue.async {
+                for set in targets { set.requestResidency() }
+                head.requestResidency()
+                NemotronZSkip.markCopyReady(headReady)
+                for set in extras { set.requestResidency() }
+                for (i, set) in copies.enumerated() {
+                    set.requestResidency()
+                    NemotronZSkip.markCopyReady([copyOwners[copyCut + i]])
+                }
+            }
+            return Lease(self)
+        }
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
