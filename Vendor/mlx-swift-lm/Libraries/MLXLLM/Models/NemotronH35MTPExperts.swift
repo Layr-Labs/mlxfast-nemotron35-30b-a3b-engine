@@ -1839,7 +1839,7 @@ private let nemotronZSkipTiledSeqSource = """
 // scale exactly when the BF16 magnitude is at least 2^-110 and finite. Smaller
 // or non-finite values retain the complete tiled arithmetic below, avoiding
 // flush-to-zero differences from cancelling a subnormal intermediate.
-private let nemotronZSkipTiledFastSource = """
+private let nemotronZSkipTiledFastBaseSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
   constexpr int chunks = K / 8;
@@ -2010,6 +2010,68 @@ private let nemotronZSkipTiledFastSource = """
     }
   }
 """
+
+// A chunk with exactly four nonzero inputs takes a short path like one with three. The record adds each half
+// (values 0-3, then 4-7) left to right and then adds the second half to the first, so two values in each half
+// associate as (a + b) + (c + d), one value in the first half as a + ((b + c) + d), and every other split as
+// ((a + b) + c) + d. Each product of a BF16 input and a 4-bit code is exact in FP32, so only the order of the
+// additions matters. NEMOTRON_ZSKIP_FAST4=0 keeps such chunks on the dense path.
+private let nemotronZSkipFast4Block = """
+      if (popcount(m) == 4) {
+        const int j1 = ctz(m);
+        const uint m2 = m & (m - 1);
+        const int j2 = ctz(m2);
+        const uint m3 = m2 & (m2 - 1);
+        const int j3 = ctz(m3);
+        const int j4 = ctz(m3 & (m3 - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const uint w3 = uint(wq[(8 * c + j3) * 32]);
+        const uint w4 = uint(wq[(8 * c + j4) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const T xv3 = xsh[8 * c + j3];
+        const T xv4 = xsh[8 * c + j4];
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
+        const U xt3 = U(xv3);
+        const U xt4 = U(xv4);
+        const uint low = popcount(m & 0xfu);
+        const bool pairs = low == 2;
+        const bool lead = low == 1;
+        const U sum4 = pairs ? (U(xv1) + U(xv2)) + (U(xv3) + U(xv4))
+            : lead ? U(xv1) + ((U(xv2) + U(xv3)) + U(xv4))
+            : ((U(xv1) + U(xv2)) + U(xv3)) + U(xv4);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
+          const U c3 = U(int(((w3 >> (4 * o)) & 0xfu)));
+          const U c4 = U(int(((w4 >> (4 * o)) & 0xfu)));
+          const U t1 = xt1 * c1;
+          const U t2 = xt2 * c2;
+          const U t3 = xt3 * c3;
+          const U t4 = xt4 * c4;
+          const U accum = pairs ? (t1 + t2) + (t3 + t4) : lead ? t1 + ((t2 + t3) + t4) : ((t1 + t2) + t3) + t4;
+          p[o] += as_type<float>(sv[o]) * accum + sum4 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
+
+"""
+
+private let nemotronZSkipTiledFastSource: String = {
+    let anchor = "      thread U xt[8];\n"
+    guard ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_FAST4"] != "0",
+          nemotronZSkipTiledFastBaseSource.components(separatedBy: anchor).count == 2
+    else { return nemotronZSkipTiledFastBaseSource }
+    return nemotronZSkipTiledFastBaseSource.replacingOccurrences(
+        of: anchor, with: nemotronZSkipFast4Block + anchor)
+}()
 
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
