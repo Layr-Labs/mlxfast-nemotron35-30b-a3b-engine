@@ -855,7 +855,8 @@ enum NemotronHeadPreparedActivation {
         let (kernel, hf) = projectKernel(rows: rows, fast: k % 512 == 0)
         guard rows == 3 else { return (kernel, hf, rps, 2) }
         let load = loadForm(k: k, n: n)
-        let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
+        let geometry = tunedGeometry(k: k, n: n)
+            ?? preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
@@ -867,7 +868,8 @@ enum NemotronHeadPreparedActivation {
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
-        let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
+        let geometry = tunedGeometry(k: k, n: n)
+            ?? preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
         guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
@@ -1015,6 +1017,170 @@ enum NemotronHeadPreparedActivation {
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+    }
+}
+
+// A process-local launch plan selected on throwaway, input-independent rows.
+// The numerical kernel body, weight representation and lane reductions are unchanged.
+extension NemotronHeadPreparedActivation {
+    private struct LaunchChoice: Equatable, Sendable {
+        let rps: Int
+        let nsg: Int
+    }
+    private static let tuneEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_PREPARED_LAUNCH_TUNE"] != "0"
+    private static let tuneLock = NSLock()
+    private static let geometryLock = NSLock()
+    nonisolated(unsafe) private static var tuningComplete = false
+    nonisolated(unsafe) private static var tuned: [[Int]: LaunchChoice] = [:]
+
+    private static func tunedGeometry(k: Int, n: Int) -> (rps: Int, nsg: Int)? {
+        guard tuneEnabled else { return nil }
+        return geometryLock.withLock {
+            tuned[[k, n]].map { (rps: $0.rps, nsg: $0.nsg) }
+        }
+    }
+
+    /// Same direct prepared-QMV call as apply, with an explicit row mapping.
+    /// Keep the original per-shape load/decode form and dictionary admission.
+    private static func tuneProjection(
+        _ q: QuantizedLinear, prepared: MLXArray, choice: LaunchChoice, relu2: Bool
+    ) -> MLXArray {
+        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
+        let load = loadForm(k: k, n: n)
+        let extra: [(String, any KernelTemplateArg)] = choice.nsg == 2 ? [] : [("NSG", choice.nsg)]
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let templates: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+            ("RELU2", relu2), ("RPS", choice.rps)]
+        let kernel: MLXFast.MLXFastKernel
+        let operands: [MLXArray]
+        if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
+           let dictionary = dictKernel(half: !hf.isEmpty, load: load, nsg: choice.nsg != 2) {
+            kernel = dictionary
+            operands = [q.weight, d.index, d.table, prepared, args.0, args.1]
+        } else {
+            kernel = variantKernel(half: !hf.isEmpty, load: load, nsg: choice.nsg != 2)
+            operands = [q.weight, q.scales, q.biases!, prepared, args.0, args.1]
+        }
+        return kernel(operands, template: templates + hf + extra,
+            grid: (32, n / choice.rps, 1), threadGroup: (32, choice.nsg, 1),
+            outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// Run before the model's compiled verify graphs are constructed. Nothing
+    /// is learned from a request, a golden, an official score or a runner ID.
+    /// Only the small immutable launch-choice table survives this call.
+    static func tune(_ target: NemotronH35Model) throws {
+        guard tuneEnabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu else { return }
+        tuneLock.lock(); defer { tuneLock.unlock() }
+        guard !tuningComplete else { return }
+        let shapes = [[4096, 2688], [2688, 3712], [2688, 131072]]
+        let proposals = [(2, 2), (2, 4), (2, 8), (4, 2), (4, 4), (4, 8)]
+            .map { LaunchChoice(rps: $0.0, nsg: $0.1) }
+        var selected: [[Int]: LaunchChoice] = [:]
+        for shape in shapes {
+            let k = shape[0], n = shape[1]
+            let layers = target.modules().compactMap { $0 as? QuantizedLinear }.filter {
+                type(of: $0) == QuantizedLinear.self && $0.mode == .affine
+                    && $0.bits == 4 && $0.groupSize == 64 && $0.bias == nil
+                    && $0.weight.shape == [n, k / 8] && $0.weight.dtype == .uint32
+                    && $0.scales.shape == [n, k / 64] && $0.scales.dtype == .bfloat16
+                    && $0.biases?.shape == [n, k / 64] && $0.biases?.dtype == .bfloat16
+            }
+            guard !layers.isEmpty else { continue }
+            let original = preparedGeometry[shape] ?? (rps: 2, nsg: 2)
+            let baseline = LaunchChoice(rps: original.rps, nsg: original.nsg)
+            let relu2 = shape == [2688, 3712]
+            var eligible = proposals.filter { $0 != baseline && n % ($0.rps * $0.nsg) == 0 }
+            // Complete loaded matrices, including every target layer of this
+            // shape. This also JITs both epilogues before any timing begins.
+            for fixture in 0..<3 {
+                let x: MLXArray
+                if fixture < 2 {
+                    x = MLXRandom.normal([3, k], key: MLXRandom.key(UInt64(47000 + k + fixture)))
+                        .asType(.bfloat16)
+                } else {
+                    let values: [Float] = (0..<(3 * k)).map { i in
+                        let col = i % k
+                        return col % 64 == 0 || col % 64 == 63
+                            ? Float((i / k + 1) * (col % 2 == 0 ? 1 : -1)) / 8 : 0
+                    }
+                    x = MLXArray(values).reshaped(3, k).asType(.bfloat16)
+                }
+                let packed = pack(x)
+                eval(packed)
+                for q in layers {
+                    try withError {
+                        let reference = concatenated((0..<3).map { row in
+                            q(x[row..<(row + 1), 0...])
+                        }, axis: 0)
+                        let original = tuneProjection(q, prepared: packed, choice: baseline, relu2: false)
+                        let baselineOK = (reference.view(dtype: .uint16) .== original.view(dtype: .uint16)).all()
+                        eval(baselineOK)
+                        guard baselineOK.item(Bool.self) else {
+                            throw NemotronH35MTPError.invalidArtifact("prepared launch baseline qualification")
+                        }
+                        let activated = tuneProjection(q, prepared: packed, choice: baseline, relu2: true)
+                        eval(activated)
+                        eligible = eligible.filter { choice in
+                            let plain = tuneProjection(q, prepared: packed, choice: choice, relu2: false)
+                            let gated = tuneProjection(q, prepared: packed, choice: choice, relu2: true)
+                            let equal = (plain.view(dtype: .uint16) .== original.view(dtype: .uint16)).all()
+                                .&& (gated.view(dtype: .uint16) .== activated.view(dtype: .uint16)).all()
+                            eval(equal)
+                            return equal.item(Bool.self)
+                        }
+                    }
+                }
+            }
+            guard !eligible.isEmpty else { continue }
+            let x = MLXRandom.normal([3, k], key: MLXRandom.key(UInt64(48000 + k))).asType(.bfloat16)
+            let packed = pack(x)
+            eval(packed)
+            // Sweep all real layers of a shape. Their distinct matrices avoid
+            // tuning the 23/29-layer paths on one tiny repeatedly cached weight.
+            // Each output is a new graph and is completed before advancing.
+            func measure(_ choice: LaunchChoice, reversed: Bool) throws -> Double {
+                var elapsed = 0.0
+                try withError {
+                    let start = ProcessInfo.processInfo.systemUptime
+                    for offset in layers.indices {
+                        let index = reversed ? layers.count - 1 - offset : offset
+                        let output = tuneProjection(layers[index], prepared: packed, choice: choice, relu2: relu2)
+                        eval(output)
+                    }
+                    elapsed = ProcessInfo.processInfo.systemUptime - start
+                }
+                return elapsed
+            }
+            var winner = baseline
+            var best = 0.92
+            for choice in eligible {
+                var ratios: [Double] = []
+                for pass in 0..<3 {
+                    let before = try measure(baseline, reversed: pass % 2 != 0)
+                    let candidate = try measure(choice, reversed: pass % 2 != 0)
+                    let after = try measure(baseline, reversed: pass % 2 != 0)
+                    let control = (before + after) * 0.5
+                    guard control.isFinite, candidate.isFinite, control > 0, candidate > 0 else {
+                        ratios.removeAll(); break
+                    }
+                    ratios.append(candidate / control)
+                }
+                // A modest single timing fluctuation cannot replace the base.
+                guard ratios.count == 3, ratios.allSatisfy({ $0 < 0.97 }) else { continue }
+                let median = ratios.sorted()[1]
+                if median < best { winner = choice; best = median }
+            }
+            if winner != baseline { selected[shape] = winner }
+            FileHandle.standardError.write(Data(
+                "nemotron prepared launch \(k)x\(n): RPS\(winner.rps) NSG\(winner.nsg), baseline retained=\(winner == baseline)\n".utf8))
+        }
+        geometryLock.withLock { tuned = selected }
+        tuningComplete = true
     }
 }
 
@@ -3084,106 +3250,6 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
-
-    /// Draft-only 2-bit screen records: each selected group's 64 head values
-    /// (dequantized from the head's own 4-bit codes) re-quantized on load to
-    /// 2 bits with their own minimum and step (round to nearest, clamped to
-    /// 0...3). Per row: 4 words of codes per selected group (value j of a
-    /// word at bits 2j), then one word per group holding the minimum (low
-    /// half) and the step (high half) as float16; 5 words per selected group
-    /// (rows from `rows` up: the upper group set). Only the screen's partial
-    /// pass reads them; the kept rows are rescored on the head itself.
-    static func packRecords2(
-        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
-        upperGroups: [Int]?
-    ) -> MLXArray {
-        let shifts = MLXArray((0..<16).map { UInt32(2 * $0) })
-        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
-            let columns = MLXArray(selected.flatMap { g in (0..<64).map { Int32(64 * g + $0) } })
-            var parts: [MLXArray] = []
-            for start in stride(from: range.lowerBound, to: range.upperBound, by: 8192) {
-                let r = start..<min(start + 8192, range.upperBound)
-                let values = take(
-                    dequantized(weight[r], scales: scales[r], biases: biases[r], groupSize: 64, bits: 4)
-                        .asType(.float32), columns, axis: 1
-                ).reshaped(r.count, selected.count, 64)
-                let low = values.min(axis: -1, keepDims: true)
-                let step = (values.max(axis: -1, keepDims: true) - low) / 3
-                let safe = which(step .== 0, MLXArray(Float(1)), step)
-                let codes = clip(round((values - low) / safe), min: 0, max: 3).asType(.uint32)
-                let words = (codes.reshaped(r.count, selected.count, 4, 16) << shifts).sum(axis: -1)
-                    .reshaped(r.count, selected.count * 4)
-                let lowBits = low.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let stepBits = step.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let part = concatenated([words.asType(.uint32), lowBits | (stepBits << 16)], axis: 1)
-                eval(part)
-                parts.append(part)
-            }
-            return concatenated(parts, axis: 0).reshaped(-1)
-        }
-        let lower = pack(0..<rows, groups)
-        guard let upperGroups else { return lower }
-        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
-    }
-
-    // The 2-bit record twin of the partial pass: lane l owns half-group l
-    // (32 values = two code words) of the selected groups; scores are
-    // step * sum(code * x) + minimum * sum(x) over the selected groups.
-    private static let record2PartialSource = """
-      constexpr int VPL = 32;
-      const int lane = int(thread_index_in_simdgroup);
-      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
-      const int row0 = sg * RPS;
-      const bool upper = row0 >= LO;
-      const int H = upper ? 2 * S2 : 2 * S;
-      const bool on = lane < H;
-      const int gi = lane >> 1;
-      const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
-      const int part = lane & 1;
-      const device T* xp = x + g * 64 + part * 32;
-      float xv[VPL];
-      float xs = 0.0f;
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < VPL; i += 8) {
-        _Pragma("clang loop unroll(full)")
-        for (int k = 0; k < 8; k++) {
-          const float xk = on ? float(xp[i + k]) : 0.0f;
-          xs += xk;
-          xv[i + k] = xk / float(1 << (2 * k));
-        }
-      }
-      _Pragma("clang loop unroll(full)")
-      for (int r = 0; r < RPS; r++) {
-        const int row = row0 + r;
-        float acc = 0.0f;
-        if (on) {
-          const device uint32_t* rp = rec + (upper
-              ? size_t(LO) * (5 * S) + size_t(row - LO) * (5 * S2) : size_t(row) * (5 * S));
-          const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);
-          const uint ld = rp[4 * (upper ? S2 : S) + gi];
-          const float lo = float(as_type<half>(ushort(ld & 0xffffu)));
-          const float d = float(as_type<half>(ushort(ld >> 16)));
-          float a = 0.0f;
-          _Pragma("clang loop unroll(full)")
-          for (int i = 0; i < VPL / 8; i++) {
-            const uint q = uint(ws[i]);
-            a += xv[8 * i] * float(q & 0x0003u) + xv[8 * i + 1] * float(q & 0x000cu)
-                + xv[8 * i + 2] * float(q & 0x0030u) + xv[8 * i + 3] * float(q & 0x00c0u)
-                + xv[8 * i + 4] * float(q & 0x0300u) + xv[8 * i + 5] * float(q & 0x0c00u)
-                + xv[8 * i + 6] * float(q & 0x3000u) + xv[8 * i + 7] * float(q & 0xc000u);
-          }
-          acc = d * a + lo * xs;
-        }
-        acc = simd_sum(acc);
-        if (lane == 0) {
-          scores[row] = acc;
-        }
-      }
-    """
-    private static let record2PartialKernel = MLXFast.metalKernel(
-        name: "nemotron_head_screen_partial_record2_affine2",
-        inputNames: ["rec", "x", "groups", "groups2"],
-        outputNames: ["scores"], source: record2PartialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3321,7 +3387,7 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
+        packed: MLXArray? = nil, records: MLXArray? = nil,
         counter: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
@@ -3332,12 +3398,7 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records2.map {
-            record2PartialKernel(
-                [$0, hidden, groups, upperGroups ?? groups], template: template,
-                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-                outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? records.map {
+        let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
