@@ -737,14 +737,10 @@ enum CBv2AttentionV1 {
     /// concatenate that `updateAndAttend` would apply. Same KV update, same
     /// per-query SDPA calls. Only the serialized, span-free, keep-mask-free
     /// configuration is served; the caller checks that before calling.
-    /// `attendRows`, on a full-attention layer without sinks or softcap, gets
-    /// the queries, the updated K/V `[1, kvHeads, history + L, headDim]` and
-    /// the scale, and returns those per-query outputs bit for bit or nil.
     static func updateAndAttendSerialQueryRows(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?,
-        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
+        scale: Float, sinks: MLXArray?, softcap: Float?
     ) -> [MLXArray] {
         precondition(
             queries.dim(0) == 1 && queries.dim(2) > 1,
@@ -753,40 +749,6 @@ enum CBv2AttentionV1 {
             sinks, kind: kind, queries: queries, softcap: softcap)
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        if let attendRows, window(of: kind) == nil, effectiveSinks == nil, softcap == nil,
-           let outputs = attendRows(queries, cachedKeys, cachedValues, scale) {
-            return outputs
-        }
-        return queryBlockOutputs(
-            queries: queries, keys: cachedKeys, values: cachedValues,
-            newTokenCount: L, window: window(of: kind), scale: scale,
-            sinks: effectiveSinks, softcap: softcap, blockSize: 1,
-            spanContext: nil, keepMask: nil)
-    }
-
-    /// `updateAndAttendSerialQueryRows` when a producer kernel already wrote
-    /// the L new tokens' K/V into `row`'s storage in place (the target from
-    /// `CBv2FullSequenceKV.inPlaceAppendTarget`; `written` is an output of
-    /// that kernel). The append is committed behind that write; the per-query
-    /// outputs come from `attendRows` under the same conditions as in
-    /// `updateAndAttendSerialQueryRows`, else from the per-query SDPA calls.
-    static func attendSerialQueryRowsWritten(
-        row: CBv2FullSequenceKV, kind: CBv2LayerKind,
-        queries: MLXArray, written: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?,
-        attendRows: ((MLXArray, MLXArray, MLXArray, Float) -> [MLXArray]?)? = nil
-    ) -> [MLXArray] {
-        precondition(
-            queries.dim(0) == 1 && queries.dim(2) > 1,
-            "CBv2AttentionV1: serial query rows serve one row with L > 1")
-        let effectiveSinks = dispatchSinks(
-            sinks, kind: kind, queries: queries, softcap: softcap)
-        let L = queries.dim(2)
-        let (cachedKeys, cachedValues) = row.commitInPlaceAppend(count: L, written: written)
-        if let attendRows, window(of: kind) == nil, effectiveSinks == nil, softcap == nil,
-           let outputs = attendRows(queries, cachedKeys, cachedValues, scale) {
-            return outputs
-        }
         return queryBlockOutputs(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,

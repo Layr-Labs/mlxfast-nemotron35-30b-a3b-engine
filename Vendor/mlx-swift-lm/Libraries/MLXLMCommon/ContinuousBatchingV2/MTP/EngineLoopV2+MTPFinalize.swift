@@ -280,7 +280,6 @@ extension EngineLoopV2 {
                     let fixed = mtp.config.fixedDraftTokens ?? 0
                     let depth = CBv2MTPFirstDraftPrestage.chained
                         && rec.request.maxTokens - rec.generatedTokenCount >= fixed ? fixed : 1
-                    CBv2MTPSubmitMerge.begin()
                     prestager.prestageDrafts(
                         token: kept[confirmed - 1], hidden: hidden, requestState: state,
                         depth: depth)
@@ -532,37 +531,6 @@ public enum CBv2MTPFirstDraftPrestage {
         && ProcessInfo.processInfo.environment["CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT"] != "0"
 }
 
-/// Head-chain submissions grouped into fewer `asyncEval` calls (evaluation
-/// order only): finalize's prestaged drafts and the round-build draft steps
-/// ride the verify's first submission, so the host reaches that submission
-public enum CBv2MTPSubmitMerge {
-    public static let enabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MERGE_SUBMITS"] != "0"
-    nonisolated(unsafe) private static var held: [MLXArray]? = nil
-
-    /// Start holding submissions (engine thread only).
-    public static func begin() {
-        if enabled && held == nil { held = [] }
-    }
-
-    /// `asyncEval(arrays)`, or hold them for the next `take`/`flush`.
-    public static func submit(_ arrays: [MLXArray]) {
-        if held != nil { held!.append(contentsOf: arrays) } else { asyncEval(arrays) }
-    }
-
-    /// The held arrays (empty when none); holding ends.
-    public static func take() -> [MLXArray] {
-        defer { held = nil }
-        return held ?? []
-    }
-
-    /// Submit the held arrays on their own; holding ends.
-    public static func flush() {
-        let arrays = take()
-        if !arrays.isEmpty { asyncEval(arrays) }
-    }
-}
-
 extension EngineLoopV2 {
     /// Queue the drafter's acceptance-independent work behind a submitted
     /// verify. It depends on the verify outputs, so it runs after them; it is
@@ -578,8 +546,6 @@ extension EngineLoopV2 {
         let draftCount = batch * verify.k
         let targets = verify.acceptancePacket[draftCount ..< (draftCount + batch * width)]
             .reshaped([batch, width])
-        CBv2MTPSubmitMerge.begin()
-        defer { CBv2MTPSubmitMerge.flush() }
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
             speculator.speculateAfterVerify(
@@ -602,73 +568,9 @@ extension EngineLoopV2 {
     static func mtpDeviceAcceptedDrafts(_ verify: CBv2MTPRoundInFlight.Verify, row: Int) -> MLXArray {
         let k = verify.k, width = k + 1, draftCount = verify.rows.count * k
         let packet = verify.acceptancePacket
-        func original() -> MLXArray {
-            let drafts = packet[(row * k) ..< (row * k + k)]
-            let targets = packet[(draftCount + row * width) ..< (draftCount + row * width + k)]
-            let matches = (targets .== drafts).asType(.int32)
-            return cumprod(matches, axis: 0).sum(axis: 0, keepDims: true).asType(.int32)
-        }
-        guard let walked = CBv2MTPDeviceAcceptWalk.apply(
-            packet, count: k, drafts: row * k, targets: draftCount + row * width)
-        else { return original() }
-        if CBv2CriticalPathCuts.selfTest {
-            let expected = original()
-            eval(walked, expected)
-            precondition(
-                walked.shape == expected.shape && walked.dtype == expected.dtype
-                    && walked.item(Int32.self) == expected.item(Int32.self),
-                "CBV2_MTP_ACCEPT_WALK: device walk differs from the stock ops")
-        }
-        return walked
-    }
-}
-
-/// CBV2_MTP_ACCEPT_WALK: the device accept walk of one row (the number of
-/// leading draft ids its targets confirm) as one launch instead of four
-/// (Equal, AsType, cumprod scan, sum). Integer-only: the count of leading
-/// `targets[a] == drafts[a]`, which is what the cumulative product of the
-/// 0/1 matches sums to, returned as the same [1] int32.
-public enum CBv2MTPDeviceAcceptWalk {
-    private static let kernel = MLXFast.metalKernel(
-        name: "cbv2_mtp_device_accept_walk",
-        inputNames: ["packet", "bounds"], outputNames: ["accepted"],
-        source: """
-            if (thread_position_in_grid.x == 0) {
-                int count = bounds[0];
-                int drafts = bounds[1];
-                int targets = bounds[2];
-                int a = 0;
-                while (a < count && packet[targets + a] == packet[drafts + a]) {
-                    ++a;
-                }
-                accepted[0] = a;
-            }
-            """)
-
-    /// nil (nothing built) when the switch is off or the packet is not the
-    /// 1-D int32 acceptance packet holding both ranges.
-    static func apply(_ packet: MLXArray, count: Int, drafts: Int, targets: Int) -> MLXArray? {
-        guard CBv2CriticalPathCuts.acceptWalkKernel, packet.ndim == 1, packet.dtype == .int32,
-              count > 0, drafts >= 0, targets >= 0,
-              drafts + count <= packet.dim(0), targets + count <= packet.dim(0)
-        else { return nil }
-        return kernel(
-            [packet, MLXArray([Int32(count), Int32(drafts), Int32(targets)])],
-            grid: (1, 1, 1), threadGroup: (1, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.int32])[0]
-    }
-
-    /// Compile the pipelines at load so no JIT lands in a timed window: one
-    /// packet under eight elements (constant argument space) and the depth-2
-    /// packet's eleven (device argument space).
-    public static func warm() {
-        guard CBv2CriticalPathCuts.acceptWalkKernel, CBv2MTPFirstDraftPrestage.deviceAccepted
-        else { return }
-        for size in [6, 11] {
-            if let walked = apply(MLXArray([Int32](repeating: 0, count: size)),
-                                  count: 2, drafts: 0, targets: 2) {
-                eval(walked)
-            }
-        }
+        let drafts = packet[(row * k) ..< (row * k + k)]
+        let targets = packet[(draftCount + row * width) ..< (draftCount + row * width + k)]
+        let matches = (targets .== drafts).asType(.int32)
+        return cumprod(matches, axis: 0).sum(axis: 0, keepDims: true).asType(.int32)
     }
 }

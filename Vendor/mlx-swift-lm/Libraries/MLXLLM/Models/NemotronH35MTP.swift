@@ -41,25 +41,9 @@ private final class NemotronMTPDraftHead {
         /// Packed selected scales/biases (`NemotronHeadScreen.packScalesBiases`),
         /// used once its partial scores matched the gathered ones bitwise.
         var packed: MLXArray? = nil
-        /// Full packed records (`NemotronHeadScreen.packRecords`), adopted the
-        /// same way; when set, `packed` is not built.
-        var records: MLXArray? = nil
-        /// Ticket counter of the fused select + final launch
-        /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
-        /// two-launch path bitwise.
-        var counter: MLXArray? = nil
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
-
-    /// Qualified immutable screen backing is outside the registered module
-    /// tree. Include it in the existing decode lease, but never the mutable
-    /// fused-selection ticket counter or any request tensor.
-    var decodeResidencyArrays: [MLXArray] {
-        guard let screen else { return [] }
-        return [screen.groups] + [screen.upperGroups, screen.packed, screen.records]
-            .compactMap { $0 }
-    }
 
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
@@ -72,9 +56,7 @@ private final class NemotronMTPDraftHead {
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
-            upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
-            records: screen.records,
-            counter: screen.counter)
+            upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -127,9 +109,9 @@ private final class NemotronMTPDraftHead {
             FileHandle.standardError.write(Data("nemotron mtp head screen: \(message)\n".utf8))
         }
         let environment = ProcessInfo.processInfo.environment
-        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 12
+        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 16
         let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? 1024
-        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? 16
+        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? 32
         let k = NemotronHeadScreen.width, rows = NemotronHeadScreen.rows
         guard (2...16).contains(groupCount), groupCount % 2 == 0,
               [512, 1024, 2048].contains(chunk), keep % 4 == 0, (4...min(chunk / 8, 64)).contains(keep),
@@ -144,6 +126,8 @@ private final class NemotronMTPDraftHead {
               let prefix, prefix.weight.dim(0) == rows,
               gamma.shape == [k]
         else { return report("off (head, shape or setting does not qualify)") }
+        NemotronHeadScreen.prepareHeapSelector(weight: head.weight, scales: head.scales,
+            biases: biases, chunk: chunk, keep: keep)
         // Weight-only importance per K-group: sum over the group's columns of
         // gamma[c]^2 * ||W[:, c]||^2 over the scored rows.
         let g = gamma.asType(.float32)
@@ -228,30 +212,22 @@ private final class NemotronMTPDraftHead {
         guard let chosen = qualified else {
             return report("off (rescore is not bitwise the stock head)")
         }
-        // Packed screen records: load-time copies of the head's own bytes for
-        // the screen's partial pass only (the target and the rescore read the
-        // head itself). The full record (selected words, scales and biases) is
-        // tried first, then scales/biases alone, else the gathered screen
-        // stays. Each is adopted only if its partial scores and picks equal
-        // the gathered kernel's bitwise on the same synthetic inputs, for the
-        // plan and (when it screens the upper half) its half-head variant.
+        // Packed scales/biases: a load-time copy of the head's own bytes for the
+        // screen's partial pass only (the target and the rescore read the head
+        // itself). Adopted only if its partial scores and picks equal the
+        // gathered kernel's bitwise on the same synthetic inputs.
         var plan = chosen.plan
-        var packedNotes: [String] = []
-        func screened(_ x: MLXArray, _ s: Screen, upper: Bool) -> NemotronHeadScreen.Result {
-            NemotronHeadScreen.run(
-                x, weight: s.weight, scales: s.scales, biases: s.biases,
-                groups: s.groups, groupCount: groupCount, chunk: chunk, keep: keep,
-                upperGroups: upper ? s.upperGroups : nil, upperGroupCount: upper ? s.upperGroupCount : 0,
-                packed: s.packed, records: s.records)
-        }
-        func adopt(_ name: String, _ build: (inout Screen) -> MLXArray) {
+        var packedNote = "off"
+        if NemotronHeadScreen.packedScalesBiases, (upper?.count ?? 0) <= groupCount {
             // MLX errors (a kernel that fails to build) throw here instead of
-            // stopping the load; the next layout down then stays in use.
-            var candidate = chosen.plan
+            // stopping the load; the gathered screen then stays in use.
+            let verified: MLXArray?
             do {
-                let verified = try withError { () -> MLXArray? in
-                    let copy = build(&candidate)
-                    eval(copy)
+                verified = try withError { () -> MLXArray? in
+                    let packed = NemotronHeadScreen.packScalesBiases(
+                        scales: head.scales, biases: biases, groups: selected,
+                        groupCount: groupCount, upperGroups: upper)
+                    eval(packed)
                     var state: UInt64 = 0x2545_F491_4F6C_DD1D
                     for _ in 0..<4 {
                         let t = (0..<k).map { _ -> Float in
@@ -259,141 +235,58 @@ private final class NemotronMTPDraftHead {
                             return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
                         }
                         let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
-                        for upper in chosen.plan.upperGroups == nil ? [false] : [true, false] {
-                            let a = screened(x, chosen.plan, upper: upper)
-                            let b = screened(x, candidate, upper: upper)
-                            let equal = MLX.logicalAnd(
-                                (a.scores.view(dtype: .uint32) .== b.scores.view(dtype: .uint32)).all(),
-                                MLX.logicalAnd(
-                                    (a.candidateIds .== b.candidateIds).all(), (a.id .== b.id).all()))
-                            if !equal.item(Bool.self) { return nil }
-                        }
+                        let a = NemotronHeadScreen.run(
+                            x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                            upperGroups: plan.upperGroups, upperGroupCount: plan.upperGroupCount)
+                        let b = NemotronHeadScreen.run(
+                            x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                            upperGroups: plan.upperGroups, upperGroupCount: plan.upperGroupCount,
+                            packed: packed)
+                        let equal = MLX.logicalAnd(
+                            (a.scores.view(dtype: .uint32) .== b.scores.view(dtype: .uint32)).all(),
+                            MLX.logicalAnd(
+                                (a.candidateIds .== b.candidateIds).all(), (a.id .== b.id).all()))
+                        if !equal.item(Bool.self) { return nil }
                     }
-                    return copy
-                }
-                if let verified {
-                    plan = candidate
-                    packedNotes.append("\(name) on (\(verified.nbytes >> 10) KiB, bitwise equal)")
-                } else {
-                    packedNotes.append("\(name) off (partial scores differ)")
-                }
-            } catch {
-                packedNotes.append("\(name) off (\(error))")
-            }
-        }
-        if NemotronHeadScreen.packedRecords {
-            adopt("full records") { candidate in
-                let records = NemotronHeadScreen.packRecords(
-                    weight: head.weight, scales: head.scales, biases: biases, groups: selected,
-                    upperGroups: upper)
-                candidate.records = records
-                return records
-            }
-        }
-        if plan.records == nil, NemotronHeadScreen.packedScalesBiases, (upper?.count ?? 0) <= groupCount {
-            adopt("scales/biases") { candidate in
-                let packed = NemotronHeadScreen.packScalesBiases(
-                    scales: head.scales, biases: biases, groups: selected,
-                    groupCount: groupCount, upperGroups: upper)
-                candidate.packed = packed
-                return packed
-            }
-        }
-        // Fused select + final: adopted only if, on synthetic inputs and for
-        // each half the plan screens, its id and candidates equal the
-        // two-launch path's bitwise, one launch at a time and again with all
-        // of them queued in one evaluation on the shared counter, which must
-        // read 0 afterwards.
-        var fusedNote = "off"
-        if NemotronHeadScreen.fusedFinal {
-            func same(_ a: NemotronHeadScreen.Result, _ b: NemotronHeadScreen.Result) -> Bool {
-                MLX.logicalAnd(
-                    (a.id .== b.id).all(),
-                    MLX.logicalAnd(
-                        (a.candidateIds .== b.candidateIds).all(),
-                        (a.candidateValues.view(dtype: .uint32)
-                            .== b.candidateValues.view(dtype: .uint32)).all())).item(Bool.self)
-            }
-            let verified: MLXArray?
-            do {
-                verified = try withError { () -> MLXArray? in
-                    let counter = NemotronHeadScreen.makeCounter()
-                    var state: UInt64 = 0x6A09_E667_F3BC_C909
-                    var expected: [NemotronHeadScreen.Result] = []
-                    var queued: [NemotronHeadScreen.Result] = []
-                    for _ in 0..<4 {
-                        let t = (0..<k).map { _ -> Float in
-                            state = state &* 6364136223846793005 &+ 1442695040888963407
-                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
-                        }
-                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
-                        for half in plan.upperGroups == nil ? [false] : [false, true] {
-                            func screened(_ counter: MLXArray?) -> NemotronHeadScreen.Result {
-                                NemotronHeadScreen.run(
-                                    x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
-                                    groups: plan.groups, groupCount: groupCount, chunk: chunk,
-                                    keep: keep, upperGroups: half ? plan.upperGroups : nil,
-                                    upperGroupCount: half ? plan.upperGroupCount : 0,
-                                    packed: plan.packed, records: plan.records, counter: counter)
-                            }
-                            let reference = screened(nil)
-                            if !same(reference, screened(counter)) { return nil }
-                            expected.append(reference)
-                            queued.append(screened(counter))
-                        }
-                    }
-                    eval(queued.flatMap { [$0.id, $0.candidateIds, $0.candidateValues] })
-                    for (a, b) in zip(expected, queued) where !same(a, b) { return nil }
-                    return counter.item(UInt32.self) == 0 ? counter : nil
+                    return packed
                 }
             } catch {
                 verified = nil
-                fusedNote = "off (\(error))"
+                packedNote = "off (\(error))"
             }
             if let verified {
-                plan.counter = verified
-                fusedNote = "on (bitwise equal)"
-            } else if fusedNote == "off" {
-                fusedNote = "off (fused id differs)"
+                plan.packed = verified
+                packedNote = "on (\(verified.nbytes >> 10) KiB, bitwise equal)"
+            } else if packedNote == "off" {
+                packedNote = "off (partial scores differ)"
             }
         }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
-        // the half-head variant (on the same packed and fused path) here as
-        // well, so neither builds inside a timed window.
+        // the half-head variant (on the same packed path) here as well, so
+        // neither builds inside a timed window.
         if plan.upperGroups != nil {
             let x = (MLXArray.ones([k]) * g).asType(.bfloat16).reshaped(1, 1, k)
             eval(NemotronHeadScreen.run(
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
-                packed: plan.packed, records: plan.records, counter: plan.counter).id)
+                packed: plan.packed).id)
         }
         report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
-            + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
+            + " packed scales/biases \(packedNote),"
             + " qualified (synthetic agreement \(chosen.agree)/4)")
     }
 
-    /// A request's drafts screen the upper vocabulary half while it committed
-    /// an upper-half id within this many committed tokens; separately per draft
-    /// position. Break-even per draft: one draft's upper screen costs ~0.4% of a
-    /// round with packed records (~0.01 tokens' worth at ~2.45 tokens per round;
-    /// both drafts' together measured ~0.8%). An upper-half hit is worth
-    /// ~h (1 + a2) ~ 1.08 accepted tokens for the first draft and ~h a1 ~ 0.48
-    /// for the second (h ~0.6, a1 ~0.8, a2 ~0.8), so the first pays above an
-    /// upper-id rate of ~0.9% (one per ~110 tokens) and the second above ~2.0%
-    /// (one per ~49). NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_FIRST / _LATER set
-    /// them; NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW sets both; 0 screens always.
-    private static func window(_ key: String, _ fallback: Int) -> Int {
-        let environment = ProcessInfo.processInfo.environment
-        return Int(environment[key] ?? "")
-            ?? Int(environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW"] ?? "") ?? fallback
-    }
-    static let upperWindowFirst = window("NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_FIRST", 110)
-    static let upperWindowLater = window("NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_LATER", 49)
-    static func usesUpper(tokensSinceUpper: Int, firstDraft: Bool) -> Bool {
-        let window = firstDraft ? upperWindowFirst : upperWindowLater
-        return window == 0 || tokensSinceUpper < window
+    /// Committed target tokens a request must have seen within this many
+    /// tokens for its drafts to screen the upper vocabulary half
+    /// (NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW; 0 screens it always).
+    static let upperWindow = Int(
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW"] ?? "") ?? 128
+    static func usesUpper(tokensSinceUpper: Int) -> Bool {
+        upperWindow == 0 || tokensSinceUpper < upperWindow
     }
 
     /// Multi-row twin for the post-verify head rows: the same prefix view
@@ -409,38 +302,17 @@ private final class NemotronMTPDraftHead {
 /// retains the ordinary one-token shape; the target verifies every proposal.
 /// Trusted shifted prompt history primes the assistant before its first
 /// proposal and is preserved by the durable prefix checkpoint codec.
-public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, CBv2MTPMemoryPreparing, @unchecked Sendable {
-    private var decodeResidency: AnyObject?
-    func prepareDecodeResidency() {
-        if #available(macOS 15.0, *) {
-            decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 }
-                    + draftHead.decodeResidencyArrays,
-                layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
-                target: NemotronDecodeResidency.targetGroups(target),
-                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays)
-        }
-    }
-    public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
-        if #available(macOS 15.0, *), let p = decodeResidency as? NemotronDecodeResidency {
-            return p.begin()
-        }
-        return nil
-    }
-
+public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
     let module: NemotronH35MTPModule
     let target: NemotronH35Model
     private let draftHead: NemotronMTPDraftHead
     private let kvOnlyHistory: Bool
     private let primePromptHistory: Bool
     private let draftLimit: Int
-    /// The head cache's K/V dtype, probed once from the loaded weights.
-    private let headKVDType = NemotronHLoadedMemo<DType>()
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
-    private static let captureVerify =
-        ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_CAPTURE_VERIFY"] != "0"
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
-        Self.captureVerify ? .rectangularExact : .serialTarget
+        ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_MTP_CAPTURE_VERIFY"] != "0"
+            ? .rectangularExact : .serialTarget
     }
     public var maximumDraftTokens: Int? { draftLimit }
     public var maximumSpeculativeBatch: Int? { 1 }
@@ -506,14 +378,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
-        /// Post-verify rows: fused residuals, queries and the K/V appended to
-        /// the head cache; the device-picked row's attention reads them.
-        var speculation: (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray,
-                          width: Int)?
-        /// The head row's `writeGeneration` right after `speculation`'s rows
-        /// were written; set only there, read only with a `nextFirstDraft`
-        /// that finalize built from that same speculation.
-        var speculationWriteGeneration: UInt64?
+        /// Post-verify attention/KV only; finalize selects the one expert row.
+        var speculation: (attention: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The next first draft queued behind the verify for the device-picked
@@ -523,23 +389,14 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// Committed tokens since the last one in the upper vocabulary half
         /// (prompt tail included); Int.max when none has been seen.
         var tokensSinceUpper = Int.max
-        /// Whether a round's first draft (`firstDraft`) or a later one screens
-        /// the upper vocabulary half.
-        func screensUpper(firstDraft: Bool) -> Bool {
-            NemotronMTPDraftHead.usesUpper(tokensSinceUpper: tokensSinceUpper, firstDraft: firstDraft)
+        var draftsScreenUpper: Bool {
+            NemotronMTPDraftHead.usesUpper(tokensSinceUpper: tokensSinceUpper)
         }
         /// The cache-free inputs of the second draft on `deviceFirstDraft`
         /// (`pagedDraftInputs`), queued with it, and the same inputs carried
         /// with `nextFirstDraft` once finalize adopts that first draft.
         var deviceSecondInputs: (inputs: [MLXArray], from: MLXArray)?
         var nextSecondInputs: (inputs: [MLXArray], from: MLXArray)?
-        /// The whole second draft on `deviceFirstDraft` (masked attention over
-        /// the head cache's rows as the device-picked count keeps them), with
-        /// its own K/V row; carried with `nextFirstDraft` once adopted.
-        var deviceSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
-                                from: MLXArray)?
-        var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
-                              from: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -675,10 +532,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             attention: .full, headDim: a.headDim ?? a.hiddenSize / a.numAttentionHeads,
             kvHeads: a.numKeyValueHeads, queryHeads: a.numAttentionHeads,
             modelLayerIndex: 0)
-        let dtype = headKVDType.value {
-            let hiddenDType = target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype
-            return module.projectedKVDType(hiddenDType: hiddenDType)
-        }
+        let hiddenDType = target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype
+        let dtype = module.projectedKVDType(hiddenDType: hiddenDType)
         s.paged = try PagedState(kind: kind, dtype: dtype, maximumSequenceLength: bound)
     }
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
@@ -690,7 +545,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         if s.prestagedResult != nil || s.prestagedSecond != nil {
             discardRound(requestState: requestState)
         }
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil
         precondition(s.stagedInputCount == 0)
         let n = observation.tokens.dim(1)
         precondition(observation.tokens.shape == [1, n] && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
@@ -730,7 +585,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             }
             discardRound(requestState: requestState)
         }
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil
         precondition(s.paged != nil, "Nemotron MTP state requires admitted sequence bound")
         precondition(s.stagedInputCount < draftLimit && tokens.shape == [1, 1] && hidden.shape == [1, 1, target.configuration.hiddenSize])
         let first = s.stagedInputCount == 0
@@ -779,7 +634,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.frontier = nil
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
-        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
+        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
         s.roots.append(contentsOf: [out, ids])
@@ -796,15 +651,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Only the first seed used authoritative target hidden. Discard every
         // chained KV row even on full acceptance, then replay accepted inputs
         // using the verifier's true hidden states before the next round.
+        let speculation = s.speculation.flatMap {
+            $0.attention.dim(1) == s.stagedInputCount + 1 && n < $0.attention.dim(1) ? $0 : nil
+        }
         // Adopt only when the host's accepted prefix is the device-selected row.
         let deviceFirstDraft = s.hostAcceptedDrafts == n ? s.deviceFirstDraft : nil
-        // The post-verify rows carry only the device-picked row's attention;
-        // any other count takes the ordinary replay path below.
-        let speculation = s.speculation.flatMap {
-            $0.width == s.stagedInputCount + 1 && n < $0.width && deviceFirstDraft != nil ? $0 : nil
-        }
         let deviceSecondInputs = deviceFirstDraft == nil ? nil : s.deviceSecondInputs
-        let deviceSecondDraft = deviceFirstDraft == nil ? nil : s.deviceSecondDraft
         if speculation != nil {
             // Post-verify speculation already appended rows (target token r,
             // target hidden r) after the trusted seed row. Exact-greedy
@@ -829,8 +681,15 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // Build the ordinary one-token tail lazily. The existing prestage
         // submits it only when the engine has a continuing carry.
         s.nextSecondInputs = speculation == nil ? nil : deviceSecondInputs
-        s.nextSecondDraft = speculation == nil ? nil : deviceSecondDraft
-        s.nextFirstDraft = speculation == nil ? nil : deviceFirstDraft
+        s.nextFirstDraft = speculation.map { spec in
+            if let deviceFirstDraft { return deviceFirstDraft }
+            let out = module.finishPagedAttentionRow(
+                spec.attention[0..., n ..< (n + 1), 0...])
+            let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
+            return (ids: ids, out: out,
+                    keys: spec.keys[0..., 0..., n ..< (n + 1), 0...],
+                    values: spec.values[0..., 0..., n ..< (n + 1), 0...])
+        }
     }
     public func discardRound(requestState: any CBv2MTPRequestState) {
         let s = state(requestState)
@@ -848,12 +707,11 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
         s.deviceFirstDraft = nil; s.hostAcceptedDrafts = nil; s.deviceSecondInputs = nil
-        s.deviceSecondDraft = nil
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
         clearRound(s)
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil
         s.paged?.release(); s.paged = nil
         s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil
         s.committedInputCount = 0; s.released = true
@@ -872,7 +730,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     ) {
         let s = state(requestState)
         let next = s.nextFirstDraft
-        s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
+        s.nextFirstDraft = nil; s.nextSecondInputs = nil
         guard s.canPrestageFirstDraft, s.started, s.stagedInputCount == 0,
               s.prestagedResult == nil, s.paged != nil,
               hidden.shape == [1, 1, target.configuration.hiddenSize]
@@ -885,20 +743,11 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             s.paged!.row.beginSpeculativeWrite()
             s.savedTokens = []; s.savedHidden = []; s.savedFrontier = s.frontier
             s.frontier = nil
-            // `next` exists only from finalize's speculation branch, whose
-            // rollback stopped exactly at this row: `speculateAfterVerify`
-            // appended every post-verify row, so row n's K/V (`next.keys`,
-            // `next.values`) are the bytes here, and any cache write since
-            // moves the row's write generation. Step over them unless the
-            // rollback released their page.
-            let retained = NemotronMTPDraftChainCleanup.retainedSeedRow
-                ? s.speculationWriteGeneration.flatMap { s.cache.readvanceTrusted(1, writtenAt: $0) }
-                : nil
-            s.roots = (retained ?? s.cache.appendTrusted(keys: next.keys, values: next.values))
+            s.roots = s.cache.appendTrusted(keys: next.keys, values: next.values)
                 + [next.ids, next.out]
             s.stagedInputCount = 1
             s.trustedOffset = s.cacheOffset
-            CBv2MTPSubmitMerge.submit(s.roots)
+            asyncEval(s.roots)
             s.prestagedHidden = hidden
             s.prestagedResult = (tokens: next.ids, hidden: next.out)
             return
@@ -906,7 +755,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let result = draftStep(
             tokens: MLXArray([Int32(token)]).reshaped([1, 1]), hidden: hidden,
             shortlist: nil, requestState: requestState)
-        CBv2MTPSubmitMerge.submit([result.tokens, result.hidden] + s.arrays)
+        asyncEval([result.tokens, result.hidden] + s.arrays)
         s.prestagedHidden = hidden
         s.prestagedResult = result
     }
@@ -918,35 +767,25 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
     ) {
         let secondInputs = state(requestState).nextSecondInputs
-        let secondDraft = state(requestState).nextSecondDraft
         prestageFirstDraft(token: token, hidden: hidden, requestState: requestState)
         let s = state(requestState)
         guard depth >= 2, draftLimit >= 2, let first = s.prestagedResult,
               s.prestagedSecond == nil, s.stagedInputCount == 1
         else { return }
-        let out: MLXArray, ids: MLXArray
-        if let secondDraft, secondDraft.from === first.hidden {
-            // The whole second draft already ran behind the verify for this
-            // row (`speculateNextFirstDraft`); only its K/V row is appended, at
-            // the position the round-build step would write it.
-            s.roots += s.cache.appendTrusted(keys: secondDraft.keys, values: secondDraft.values)
-            out = secondDraft.out
-            ids = secondDraft.ids
+        // On the adopted device-picked first draft, its cache-free part is
+        // already queued (`speculateNextFirstDraft`): same inputs, same ops.
+        let out: MLXArray
+        if let secondInputs, secondInputs.from === first.hidden {
+            out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
         } else {
-            // On the adopted device-picked first draft, its cache-free part is
-            // already queued (`speculateNextFirstDraft`): same inputs, same ops.
-            if let secondInputs, secondInputs.from === first.hidden {
-                out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
-            } else {
-                out = module.pagedForward(
-                    hidden: first.hidden,
-                    embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
-            }
-            ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: false))
+            out = module.pagedForward(
+                hidden: first.hidden,
+                embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
         }
+        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         s.stagedInputCount += 1
         s.roots.append(contentsOf: [out, ids])
-        CBv2MTPSubmitMerge.submit([ids, out] + s.arrays)
+        asyncEval([ids, out] + s.arrays)
         s.prestagedSecond = (tokens: ids, hidden: out, parent: first.hidden)
     }
 
@@ -966,17 +805,25 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         else { return }
         // Chained draft rows are never trusted; drop them before appending.
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
-        // Every row's K/V goes to the head cache; only the row the device
-        // picks is attended (`speculateNextFirstDraft`).
-        let rows = module.frontRows(
-            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens))
-        let written = s.cache.appendTrusted(keys: rows.keys, values: rows.values)
-        s.speculation = (fused: rows.fused, queries: rows.queries, keys: rows.keys,
-                         values: rows.values, width: width)
-        s.speculationWriteGeneration = s.paged!.row.writeGeneration
-        let roots = [rows.fused, rows.queries] + written + s.cache.innerState()
+        // Attend the rows one query column at a time through the decode
+        // kernel the one-token draft already uses (the verify column path):
+        // each row is then bitwise a one-token draft step, and the kernel
+        // choice does not depend on the KV length.
+        let cache = s.cache
+        if NemotronH35MTPSpeculation.columnAttention {
+            cache.mtpSerializesRectangularAttention = true
+            cache.mtpBatchesRectangularAttention = prefersBatchedRectangularAttention
+        }
+        defer {
+            cache.mtpSerializesRectangularAttention = false
+            cache.mtpBatchesRectangularAttention = false
+        }
+        let rows = module.pagedAttentionRows(
+            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
+        s.speculation = (attention: rows.output, keys: rows.keys, values: rows.values)
+        let roots = [rows.output] + s.cache.innerState()
         s.roots += roots
-        CBv2MTPSubmitMerge.submit(roots)
+        asyncEval(roots)
     }
 }
 
@@ -990,74 +837,23 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     ) {
         let s = state(requestState)
         guard let spec = s.speculation, acceptedDrafts.shape == [1],
-              spec.width == s.stagedInputCount + 1, let paged = s.paged
+              spec.attention.dim(1) == s.stagedInputCount + 1
         else { return }
         let row = acceptedDrafts.asType(.int32)
-        // The picked row attends the trusted prefix and post-verify rows 0...row.
-        let rowHistory = paged.row.snapshot()
-        let rowLength = rowHistory.keys.dim(2)
-        let rowFirst = rowLength - spec.width
-        let fusedMasks = NemotronMTPDraftMasks.masks(
-            row: row, firstSpeculated: rowFirst, length: rowLength, dtype: rowHistory.keys.dtype)
-        let rowMask: MLXArray
-        if let fusedMasks {
-            rowMask = fusedMasks.0
-        } else {
-            let rowKeep = MLXArray(Int32(0) ..< Int32(rowLength)) .<= (row + Int32(rowFirst))
-            rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
-                .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
-        }
-        let attended = module.maskedRowOutput(
-            fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
-            keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
-        let out = module.finishPagedAttentionRow(attended)
-        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
+        let out = module.finishPagedAttentionRow(take(spec.attention, row, axis: 1))
+        let ids = draftHead.greedy(out, upper: s.draftsScreenUpper)
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
         guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
-            CBv2MTPSubmitMerge.submit([ids, out, keys, values])
+            asyncEval([ids, out, keys, values])
             return
         }
         let inputs = module.pagedDraftInputs(
             hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        var roots = [ids, out, keys, values] + inputs
-        // The rest of the second draft too: its attention reads the head cache,
-        // which still holds every post-verify row (they sit last). Attend over
-        // the trusted prefix, post-verify rows 0...n for the device-picked n,
-        // and the draft's own row; mask out the rows past n.
-        if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged {
-            // Nothing is appended to the head cache since `rowHistory` was
-            // gathered, so its views are this snapshot; gather again only if
-            // the row moved.
-            let history = paged.row.absoluteOffset == rowHistory.offset
-                && NemotronMTPDraftMasks.reuseSnapshot ? rowHistory : paged.row.snapshot()
-            let length = history.keys.dim(2)
-            let firstSpeculated = length - spec.width
-            let own = module.draftKeyValues(inputs: inputs)
-            let ownKeys = own.keys.asType(history.keys.dtype)
-            let ownValues = own.values.asType(history.values.dtype)
-            let mask: MLXArray
-            if let fusedMasks, length == rowLength, firstSpeculated == rowFirst,
-               history.keys.dtype == rowHistory.keys.dtype {
-                mask = fusedMasks.1
-            } else {
-                let position = MLXArray(Int32(0) ..< Int32(length + 1))
-                let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
-                mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
-                    .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
-            }
-            let out2 = module.maskedSecondDraft(
-                inputs: inputs,
-                keys: concatenated([history.keys, ownKeys], axis: 2),
-                values: concatenated([history.values, ownValues], axis: 2), mask: mask)
-            let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
-            s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
-            roots += [ids2, out2, ownKeys, ownValues]
-        }
-        CBv2MTPSubmitMerge.submit(roots)
+        asyncEval([ids, out, keys, values] + inputs)
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {
@@ -1084,58 +880,6 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 
 /// NEMOTRON_MTP_DEVICE_SECOND_FRONT=0 builds the whole second draft after
 /// the readback again.
-/// NEMOTRON_MTP_DEVICE_SECOND_DRAFT=0 keeps the second draft's attention and
-/// tail after the readback.
-enum NemotronH35MTPDeviceSecondDraft {
-    static let enabled = NemotronH35MTPDeviceSecondFront.enabled
-        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
-}
-
-/// The two additive masks of `speculateNextFirstDraft` from one launch:
-/// `first[i]` keeps `i <= row + firstSpeculated` over the snapshot's `length`
-/// keys, `second[i]` the same over `length + 1` keys plus the draft's own
-/// row `i == length`. Kept entries are +0 and the others -inf in the history
-/// dtype, the values the integer compare, `which(keep, 0, -inf)` (FP32) and
-/// the cast produce. NEMOTRON_MTP_DRAFT_MASKS=0 builds them with those ops.
-enum NemotronMTPDraftMasks {
-    static let enabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_MASKS"] != "0"
-    /// NEMOTRON_MTP_DRAFT_SNAPSHOT_REUSE=0 gathers the head cache again for
-    /// the second draft.
-    static let reuseSnapshot =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SNAPSHOT_REUSE"] != "0"
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_draft_masks",
-        inputNames: ["row", "params"], outputNames: ["first", "second"],
-        source: """
-            const int i = int(thread_position_in_grid.x);
-            const int last = row[0] + params[0];
-            const int n = params[1];
-            if (i < n) {
-                first[i] = i <= last ? T(0.0f) : T(-INFINITY);
-            }
-            if (i <= n) {
-                second[i] = (i <= last || i == n) ? T(0.0f) : T(-INFINITY);
-            }
-            """)
-
-    /// row: [1] int32 on the device. Returns ([1, 1, 1, length], [1, 1, 1, length + 1]).
-    static func masks(row: MLXArray, firstSpeculated: Int, length: Int, dtype: DType)
-        -> (MLXArray, MLXArray)?
-    {
-        guard enabled, row.shape == [1], row.dtype == .int32, length > 0,
-              dtype == .bfloat16 || dtype == .float16 || dtype == .float32 else { return nil }
-        let params = MLXArray([Int32(firstSpeculated), Int32(length)])
-        let threads = ((length + 1 + 255) / 256) * 256
-        let out = kernel(
-            [row, params], template: [("T", dtype)],
-            grid: (threads, 1, 1), threadGroup: (256, 1, 1),
-            outputShapes: [[1, 1, 1, length], [1, 1, 1, length + 1]],
-            outputDTypes: [dtype, dtype])
-        return (out[0], out[1])
-    }
-}
-
 enum NemotronH35MTPDeviceSecondFront {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_FRONT"] != "0"

@@ -7,7 +7,6 @@
 // a batch never touches this object (batch membership is just list membership
 // in `CBv2LayerCache.rows`).
 
-import Cmlx
 import Foundation
 import MLX
 
@@ -152,55 +151,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
-        keys = Self.write(keys!, newKeys, at: absoluteOffset)
-        values = Self.write(values!, newValues, at: absoluteOffset)
+        keys![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newKeys
+        values![.ellipsis, absoluteOffset ..< (absoluteOffset + n), 0...] = newValues
         absoluteOffset += n
 
         return (
             keys![.ellipsis, ..<absoluteOffset, 0...],
             values![.ellipsis, ..<absoluteOffset, 0...]
-        )
-    }
-
-    /// CBV2_KV_IN_PLACE_APPEND: the storage a producer kernel may write the
-    /// next `n` tokens' K/V into directly (`[1, kvHeads, capacity, headDim]`,
-    /// row-contiguous), with the append position and capacity. nil unless
-    /// the buffers exist, are evaluated, are this row's only owners of their
-    /// bytes (no view or snapshot can observe the write), match `dtype` and
-    /// `headDim`, and the append fits without growth. Nothing changes until
-    /// `commitInPlaceAppend`.
-    func inPlaceAppendTarget(count n: Int, dtype: DType, headDim d: Int)
-        -> (keys: MLXArray, values: MLXArray, offset: Int, capacity: Int)?
-    {
-        guard CBv2CriticalPathCuts.kvInPlaceAppend, n > 0, let keys, let values,
-            d == headDim, keys.dtype == dtype, values.dtype == dtype,
-            keys.shape == [1, kvHeads, capacity, headDim], values.shape == keys.shape,
-            absoluteOffset + n <= capacity, absoluteOffset + n <= maxLength
-        else { return nil }
-        // Exclusive, materialized, row-contiguous storage only: an in-place
-        // write is then visible to nothing that predates it.
-        guard let kInfo = try? keys.evaluatedBufferInfo(), kInfo.isUnique, kInfo.isRowContiguous,
-            let vInfo = try? values.evaluatedBufferInfo(), vInfo.isUnique, vInfo.isRowContiguous
-        else { return nil }
-        return (keys, values, absoluteOffset, capacity)
-    }
-
-    /// After a kernel wrote tokens `[offset, offset + n)` into the buffers
-    /// `inPlaceAppendTarget` returned (`written` is any output of that
-    /// kernel): advance exactly as `update` advances and return the same
-    /// views, each ordered after the write by a dependency edge on `written`.
-    /// The Depends nodes are built on the views (Slice primitives on the
-    /// caller's stream), so the edge stays on that stream. Later rounds read
-    /// the buffers only after this round's readback.
-    func commitInPlaceAppend(count n: Int, written: MLXArray) -> (MLXArray, MLXArray) {
-        precondition(keys != nil && values != nil && absoluteOffset + n <= capacity,
-            "CBv2FullSequenceKV: in-place append without a target")
-        absoluteOffset += n
-        let k = keys![.ellipsis, ..<absoluteOffset, 0...]
-        let v = values![.ellipsis, ..<absoluteOffset, 0...]
-        return (
-            depends(input: k, dependencies: [written]),
-            depends(input: v, dependencies: [written])
         )
     }
 
@@ -243,38 +200,6 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     // MARK: - Private
-
-    /// `storage[..., offset ..< offset + n, :] = update` as one slice update
-    /// of the 4-D update as given. The subscript form drops the update's
-    /// leading singleton and reshapes it back, which copies a strided update
-    /// (the transposed K/V projection views) before the slice write; here the
-    /// slice write reads the strided view directly. The stored values are the
-    /// same. `NEMOTRON_KV_DIRECT_WRITE=0` keeps the subscript form.
-    static let directWrite =
-        ProcessInfo.processInfo.environment["NEMOTRON_KV_DIRECT_WRITE"] != "0"
-
-    private static func write(_ storage: MLXArray, _ update: MLXArray, at offset: Int) -> MLXArray {
-        guard directWrite, storage.ndim == 4, update.ndim == 4,
-              update.dim(0) == storage.dim(0), update.dim(1) == storage.dim(1),
-              update.dim(3) == storage.dim(3), update.dtype == storage.dtype
-        else {
-            var result = storage
-            result[.ellipsis, offset ..< (offset + update.dim(2)), 0...] = update
-            return result
-        }
-        let starts: [Int32] = [0, 0, Int32(offset), 0]
-        let stops: [Int32] = [
-            Int32(storage.dim(0)), Int32(storage.dim(1)), Int32(offset + update.dim(2)),
-            Int32(storage.dim(3)),
-        ]
-        let strides: [Int32] = [1, 1, 1, 1]
-        var result = mlx_array_new()
-        let rc = mlx_slice_update(
-            &result, storage.ctx, update.ctx, starts, starts.count, stops, stops.count,
-            strides, strides.count, StreamOrDevice.default.ctx)
-        precondition(rc == 0, "CBv2FullSequenceKV: mlx_slice_update failed with rc=\(rc)")
-        return MLXArray(result)
-    }
 
     private func ensureCapacity(_ needed: Int, keyTemplate: MLXArray, valueTemplate: MLXArray) {
         if keys == nil {

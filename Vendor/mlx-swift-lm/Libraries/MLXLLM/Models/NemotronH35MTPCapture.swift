@@ -129,11 +129,6 @@ extension NemotronHMamba2Mixer {
         let history = convKernelSize - 1
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
-        // NEMOTRON_MTP_SSM_REPLAY_GROUP: replay with this forward's other
-        // Mamba layers in grouped launches (same per-layer statements).
-        let grouped = NemotronMTPReplayGroup.join(evaluation, .init(
-            convolution: convolution, dt: dt, aLog: logA, D: skip, state: initialSSM,
-            heads: heads, headDim: dim, groups: groups, stateDim: state))
         do {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
@@ -146,8 +141,7 @@ extension NemotronHMamba2Mixer {
                 replay: { keep in
                     CBv2RecurrentLayerState(
                         conv: padded[0..., keep ..< (keep + history), 0...],
-                        ssm: grouped.map { $0.group.finalState(slot: $0.slot, keep: keep) }
-                            ?? nemotronMTPSSMCompact(
+                        ssm: nemotronMTPSSMCompact(
                             convolution: convolution, ALog: logA, D: skip, dt: dt,
                             state: initialSSM, heads: heads, headDim: dim, groups: groups,
                             stateDim: state, steps: keep, writeOutput: false).finalState)
@@ -167,72 +161,16 @@ extension NemotronHMamba2Mixer {
         prepared inputPrepared: MLXArray? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
-        // The window's conv, padded history and timestep come from in_proj's
-        // own epilogue when the shapes allow it (same values, one launch fewer).
-        var fusedWindow: (MLXArray, MLXArray, MLXArray)? = nil
-        let projected: MLXArray
-        if batch == 1, hiddenStates.ndim == 3, convKernelSize == 4, conv1d.groups == convDim,
-           conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
-           let convBias = conv1d.bias, let q = inProj as? QuantizedLinear,
-           type(of: q) == QuantizedLinear.self,
-           let fused = NemotronMambaInProjConvDt.apply(
-               hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: inputPrepared,
-               oldState: convState, convWeight: conv1d.weight, convBias: convBias,
-               dtBias: dtBias, timeStepLimit: timeStepLimit,
-               convStart: intermediateSize, convDim: convDim, heads: numHeads) {
-            projected = fused.projected.reshaped(batch, length, -1)
-            fusedWindow = (fused.convolution, fused.padded, fused.dt)
-        } else {
-            projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
-        }
+        let projected = nemotronMTPLinearRows(hiddenStates, inProj, prepared: inputPrepared)
         let parts = split(projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
         let gate = parts[0], input = parts[1]
         let rawDt = parts[2].reshaped(batch, length, numHeads)
-        func separateWindow() -> (MLXArray, MLXArray, MLXArray) {
-            packedConvDt(convState, input, rawDt) ?? {
-                let (convolution, padded) = packedConv(convState, input)
-                return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
-            }()
-        }
-        var (convolution, padded, dt) = fusedWindow ?? separateWindow()
-        if fusedWindow != nil, NemotronMambaInProjConvDt.check {
-            let reference = separateWindow()
-            convolution = nemotronBitwiseOrNaN(convolution, reference.0)
-            padded = nemotronBitwiseOrNaN(padded, reference.1)
-            dt = nemotronBitwiseOrNaN(dt, reference.2)
-        }
+        let (convolution, padded, dt) = packedConvDt(convState, input, rawDt) ?? {
+            let (convolution, padded) = packedConv(convState, input)
+            return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
+        }()
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
-        // NEMOTRON_SSM_GATED_FUSED: the compact SSM window, the gated RMS norm
-        // and out_proj's prepared activation in one launch (see
-        // NemotronHCompactSSMGated); the same normed rows, prepared activation
-        // and final state as the two launches below.
-        if length == 3, NemotronMTPExecution.batchedNorm,
-           let q = outProj as? QuantizedLinear, q.mode == .affine,
-           q.bits == 4, q.groupSize == 64, q.bias == nil,
-           q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
-           q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
-           q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
-           var fused = norm.compactSSMPreparedRows(
-               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-               projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state) {
-            if NemotronMoELeader.selfTest {
-                // Reference: the two launches (compact SSM, then the gated
-                // norm with the prepared output) on the same operands.
-                let reference = nemotronMTPSSMCompact(
-                    convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-                    heads: heads, headDim: dim, groups: groups, stateDim: state,
-                    steps: length, writeOutput: true)
-                if let pair = norm.preparedRows(
-                    reference.output.reshaped(batch, length, heads * dim), gate: gate) {
-                    fused = (nemotronBitwiseOrNaN(fused.0, pair.0),
-                             nemotronBitwiseOrNaN(fused.1, pair.1),
-                             nemotronBitwiseOrNaN(fused.2, reference.finalState))
-                }
-            }
-            return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
-                    padded, convolution, dt, fused.2]
-        }
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
@@ -363,20 +301,6 @@ extension NemotronH35Model {
             (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
         let normInput = MLXArray.zeros([1, 1, heads * dim], dtype: activationDType)
         var roots: [MLXArray] = [mixer.norm(normInput, gate: normInput)]
-        // NEMOTRON_SSM_GATED_FUSED: the zeroed arrival counters and the
-        // fused launch's pipeline, here at load (zero operands leave the
-        // counters at zero).
-        NemotronHCompactSSMGated.prepareCounter()
-        if let fused = mixer.norm.compactSSMPreparedRows(
-            convolution: MLXArray.zeros([1, 3, mixer.convDim], dtype: .bfloat16),
-            ALog: mixer.aLog, D: mixer.D,
-            dt: MLXArray.zeros([1, 3, heads], dtype: .float32),
-            state: MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32),
-            projected: MLXArray.zeros(
-                [1, 3, mixer.intermediateSize + mixer.convDim + heads], dtype: .bfloat16),
-            heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
-            eval(fused.0, fused.1, fused.2)
-        }
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = silu(mixer.conv1d(padded))
@@ -405,15 +329,6 @@ extension NemotronH35Model {
                     timeStepLimit: mixer.timeStepLimit)
                 roots += [window.output, window.capturedStates]
             }
-        }
-        if nemotronMTPCompactSSM {
-            let mambaLayers = modules().lazy.filter { $0 is NemotronHMamba2Mixer }.count
-            roots += NemotronMTPReplayGroupKernel.warm(
-                layerCount: mambaLayers,
-                convolution: silu(mixer.conv1d(
-                    MLXArray.zeros([1, history + 8, mixer.convDim], dtype: activationDType))),
-                aLog: mixer.aLog, D: mixer.D,
-                heads: heads, headDim: dim, groups: groups, stateDim: stateDim)
         }
         let packed = mixer.packedConv(
             MLXArray.zeros([1, history, mixer.convDim], dtype: activationDType),
