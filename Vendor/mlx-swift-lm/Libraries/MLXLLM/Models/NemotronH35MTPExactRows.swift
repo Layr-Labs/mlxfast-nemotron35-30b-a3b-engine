@@ -751,6 +751,10 @@ enum NemotronMambaInProjConvDt {
 }
 
 enum NemotronHeadPreparedActivation {
+    /// The prepared-QMV body the shared up's R = 3 launch runs (crown form: no HF twin,
+    /// load form 0, two SIMD groups). Read by `NemotronMoEUpFC1CoLaunch`, which runs it
+    /// beside the routed FC1 in one grid.
+    static let preparedBodySource = nemotronHeadPreparedQMVSource
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
         outputNames: ["prepared"], source: nemotronHeadPrepareSource,
@@ -1131,14 +1135,39 @@ enum NemotronSharedUpPacking {
 
     /// The shared relu2 rows [3, N] that `apply` hands the zero-skip shared down on its unpacked route, or nil
     /// when `apply` would take another route (`NemotronFC2SharedColaunch` then keeps the separate launches).
+    /// True when `apply` takes the unpacked route for this call: the shared up's own
+    /// prepared QMV, no pack output. `NemotronMoEUpFC1CoLaunch` composes that same launch,
+    /// so it requires this and keeps the separate launches otherwise.
+    static func coversUnpacked(_ x: MLXArray, up: Linear, down: Linear,
+                               prepared: MLXArray?) -> Bool {
+        guard x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3 else { return false }
+        return unpackedOwner(up, down: down)
+    }
+
+    /// The same route's owner conditions, without a call's shape.
+    static func unpackedOwner(_ up: Linear, down: Linear) -> Bool {
+        guard verified, !NemotronMoELeader.selfTest, let q = up as? QuantizedLinear,
+              unpackedEnabled, NemotronSharedDownZSkip.covers(down),
+              unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) })
+        else { return false }
+        return true
+    }
+
     static func unpackedActivation(_ x: MLXArray, up: Linear, down: Linear,
                                    prepared: MLXArray?) -> MLXArray? {
-        guard verified, !NemotronMoELeader.selfTest, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
-              let q = up as? QuantizedLinear, unpackedEnabled, NemotronSharedDownZSkip.covers(down),
-              unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) })
-        else { return nil }
+        guard coversUnpacked(x, up: up, down: down, prepared: prepared),
+              let q = up as? QuantizedLinear else { return nil }
         return NemotronHeadPreparedActivation.apply(x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2,
                                                     prepared: prepared)
+    }
+
+    /// `apply`'s tail after the unpacked up rows: the shared down on `activated`
+    /// ([3, N] relu2 rows). Nil for a non-quantized shared up.
+    static func downRows(_ activated: MLXArray, up: Linear, down: Linear) -> MLXArray? {
+        guard let q = up as? QuantizedLinear else { return nil }
+        if let y = NemotronSharedDownZSkip.run(activated, owner: down) { return y }
+        return nemotronMTPLinearRows(
+            activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: nil)
     }
 
     static func apply(_ x: MLXArray, up: Linear, down: Linear,
