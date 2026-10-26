@@ -70,7 +70,7 @@ final class NemotronH35MTPGraphCache {
         return withExtendedLifetime(retired) { current.function(prepared.map { [x, $0] } ?? [x]) }
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
+    static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -2018,6 +2018,15 @@ enum NemotronZSkip {
     }
     static func needsOriginal(_ owner: SwitchLinear) -> Bool {
         lock.withLock { roundOriginal.contains(ObjectIdentifier(owner)) }
+    }
+    static func originalBankMask(_ owners: [SwitchLinear]) -> Int {
+        lock.withLock {
+            var mask = 0
+            for (index, owner) in owners.enumerated() {
+                if roundOriginal.contains(ObjectIdentifier(owner)) { mask |= 1 << index }
+            }
+            return mask
+        }
     }
     static func decodeCopyOwners(_ model: Module) -> [ObjectIdentifier] {
         let supported = lock.withLock { Set(copies.keys) }

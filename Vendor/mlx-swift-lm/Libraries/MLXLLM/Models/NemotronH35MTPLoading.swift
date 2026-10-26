@@ -71,6 +71,7 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        let terminalGraphLoad = NemotronHModel.beginMTPTerminalGraphLoad()
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
@@ -96,6 +97,7 @@ extension NemotronH35MTPAssistant {
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
         try NemotronDraftAttentionGeometry.warm()
+        target.admitMTPTerminalGraph(loadTicket: terminalGraphLoad)
         assistant.warmUpExactShapes()
         assistant.prepareDecodeResidency()
         return assistant

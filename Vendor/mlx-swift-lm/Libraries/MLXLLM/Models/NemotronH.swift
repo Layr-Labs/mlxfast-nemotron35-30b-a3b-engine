@@ -777,6 +777,7 @@ enum NemotronHCompactSSMGated {
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
         source: """
+            coherent(device) device T* published_y = (coherent(device) device T*)out;
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -810,7 +811,7 @@ enum NemotronHCompactSSMGated {
                 }
                 acc = simd_sum(acc);
                 if (thread_index_in_simdgroup == 0) {
-                    out[(t * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+                    published_y[(t * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
                 }
             }
 
@@ -849,7 +850,7 @@ enum NemotronHCompactSSMGated {
                         auto y = 1 / (1 + metal::exp(metal::abs(g)));
                         T sig = g < 0 ? y : 1 - y;
                         T activated = g * sig;
-                        T gated = out[int64_t(row) * (H * Dh) + f] * activated;
+                        T gated = published_y[int64_t(row) * (H * Dh) + f] * activated;
                         thread_x[i] = gated;
                         acc += thread_x[i] * thread_x[i];
                     }
@@ -4266,8 +4267,210 @@ private class NemotronHBlock: Module {
 
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
 
+/// The attention-free R=3 tail. Only numerical arrays enter its compiled body.
+private final class NemotronH35MTPTerminalGraphCache {
+    private static let loadLock = NSLock()
+    nonisolated(unsafe) private static var loadTicket = 0
+    static func beginLoad() -> Int {
+        loadLock.withLock { loadTicket += 1; return loadTicket }
+    }
+
+    private struct Layer {
+        let modules: [Module]
+        var block: NemotronHBlock { modules[0] as! NemotronHBlock }
+        var norm: RMSNorm { modules[1] as! RMSNorm }
+
+        init?(_ block: NemotronHBlock) {
+            guard type(of: block) == NemotronHBlock.self,
+                  type(of: block.norm) == RMSNorm.self, Self.validNorm(block.norm)
+            else { return nil }
+            if block.blockType == .mamba, let m = block.mixer as? NemotronHMamba2Mixer,
+               NemotronH35MTPCompactGraphCache.nativeIdentity(m) != nil {
+                modules = [block, block.norm, m, m.inProj, m.conv1d, m.norm, m.outProj]
+            } else if block.blockType == .moe, let m = block.mixer as? NemotronHMoE,
+                      NemotronH35MTPGraphCache.nativeIdentity(m) != nil,
+                      let shared = m.sharedExperts {
+                modules = [block, block.norm, m, m.gate, m.switchMLP,
+                           m.switchMLP.fc1, m.switchMLP.fc2, shared, shared.upProj, shared.downProj]
+            } else { return nil }
+        }
+
+        static func validNorm(_ norm: RMSNorm) -> Bool {
+            norm.weight.shape == [2688] && norm.weight.dtype == .bfloat16
+        }
+
+        func matches(_ current: NemotronHBlock) -> Bool {
+            guard block === current, norm === current.norm, modules[2] === current.mixer,
+                  Self.validNorm(current.norm) else { return false }
+            if let m = current.mixer as? NemotronHMamba2Mixer {
+                return modules[3] === m.inProj && modules[4] === m.conv1d
+                    && modules[5] === m.norm && modules[6] === m.outProj
+            }
+            let m = current.mixer as! NemotronHMoE
+            guard let shared = m.sharedExperts else { return false }
+            return modules[3] === m.gate && modules[4] === m.switchMLP
+                && modules[5] === m.switchMLP.fc1 && modules[6] === m.switchMLP.fc2
+                && modules[7] === shared && modules[8] === shared.upProj && modules[9] === shared.downProj
+        }
+    }
+
+    private final class Layout {
+        let layers: [Layer]
+        let normF: RMSNorm
+        let mambas: [NemotronHMamba2Mixer]
+        let bankOwners: [SwitchLinear]
+        let state: [MLXArray]
+
+        init?(_ owner: NemotronHBackbone) {
+            guard owner.layers.count == 52, type(of: owner.normF) == RMSNorm.self,
+                  Layer.validNorm(owner.normF), (44..<52).allSatisfy({ next in
+                      !(nemotronVerifySubmitLayers.map { $0.contains(next) }
+                        ?? (nemotronVerifySubmitInterval > 0 && next % nemotronVerifySubmitInterval == 0))
+                  }) else { return nil }
+            var layers: [Layer] = []
+            var mambas: [NemotronHMamba2Mixer] = []
+            var banks: [SwitchLinear] = []
+            for index in 43..<52 {
+                let block = owner.layers[index]
+                guard block.blockType == (index % 2 == 0 ? .mamba : .moe),
+                      let layer = Layer(block) else { return nil }
+                layers.append(layer)
+                if let m = block.mixer as? NemotronHMamba2Mixer { mambas.append(m) }
+                else { banks.append((block.mixer as! NemotronHMoE).switchMLP.fc2) }
+            }
+            self.layers = layers
+            normF = owner.normF
+            self.mambas = mambas
+            bankOwners = banks
+            state = layers.flatMap { $0.block.innerState() } + owner.normF.innerState()
+        }
+
+        func matches(_ owner: NemotronHBackbone) -> Bool {
+            guard owner.layers.count == 52, normF === owner.normF, Layer.validNorm(normF)
+            else { return false }
+            for index in layers.indices {
+                if !layers[index].matches(owner.layers[43 + index]) { return false }
+            }
+            return true
+        }
+
+        func arrays(_ inputs: [MLXArray]) -> [MLXArray] {
+            var residual = inputs[0], normalized = inputs[1], prepared = inputs[2]
+            var tapes: [MLXArray] = []
+            var mambaIndex = 0
+            for index in layers.indices {
+                let output: MLXArray
+                let shared: MLXArray?
+                if let m = layers[index].block.mixer as? NemotronHMamba2Mixer {
+                    let result = m.mtpCompactArrays(normalized, convState: inputs[3 + 2 * mambaIndex],
+                        initialSSM: inputs[4 + 2 * mambaIndex], prepared: prepared)
+                    output = result[0]
+                    shared = nil
+                    tapes.append(contentsOf: result.dropFirst())
+                    mambaIndex += 1
+                } else {
+                    let m = layers[index].block.mixer as! NemotronHMoE
+                    let result = m.mtpForwardRowsUncompiledOutputs(normalized, prepared: prepared, parts: true)
+                    output = result[0]
+                    shared = result[1]
+                }
+                guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
+                    residual, output, shared: shared,
+                    norm: index + 1 < layers.count ? layers[index + 1].norm : normF)
+                else { return [] }
+                (residual, normalized, prepared) = joined
+            }
+            return [normalized, prepared] + tapes
+        }
+    }
+
+    private struct Entry {
+        let layout: Layout
+        let bankMask: Int
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var admittedTicket: Int?
+    private var entry: Entry?
+    private var generations = 0
+    private var calls = 0
+    var generationCount: Int { lock.withLock { generations } }
+    var callCount: Int { lock.withLock { calls } }
+    var lastBankMask: Int? { lock.withLock { entry?.bankMask } }
+
+    func admit(loadTicket: Int) {
+        var retired: Entry?
+        lock.withLock {
+            admittedTicket = loadTicket
+            retired = entry
+            entry = nil
+        }
+        withExtendedLifetime(retired) {}
+    }
+
+    func callAsFunction(
+        _ residual: MLXArray, normalized: MLXArray?, prepared: MLXArray?,
+        owner: NemotronHBackbone, recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> (MLXArray, MLXArray)? {
+        guard NemotronHResidualRMSNorm.plumbingAvailable, nemotronMTPCompactSSM,
+              NemotronMTPExecution.compiledMoE, NemotronH35MTPCompactGraphCache.enabled,
+              !NemotronMoELeader.selfTest, owner.layers.count == 52, recurrentState.count == 1,
+              residual.shape == [1, 3, 2688], residual.dtype == .bfloat16,
+              let normalized, normalized.shape == residual.shape, normalized.dtype == .bfloat16,
+              let prepared, prepared.shape == [3, 11, 288], prepared.dtype == .float32
+        else { return nil }
+        let evaluation = recurrentState[0]
+        var inputs = [residual, normalized, prepared]
+        for index in 0..<4 {
+            let initial = evaluation.inputState(modelLayerIndex: 44 + 2 * index)
+            let conv = initial?.conv ?? MLXArray.zeros([1, 3, 6144], dtype: .bfloat16)
+            let ssm = initial?.ssm ?? MLXArray.zeros([1, 64, 64, 128], dtype: .float32)
+            guard conv.shape == [1, 3, 6144], conv.dtype == .bfloat16,
+                  ssm.shape == [1, 64, 64, 128], ssm.dtype == .float32 else { return nil }
+            inputs.append(contentsOf: [conv, ssm])
+        }
+        let ticket = Self.loadLock.withLock { Self.loadTicket }
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry? in
+            guard admittedTicket == ticket else { return nil }
+            let layout: Layout
+            if let entry, entry.layout.matches(owner) { layout = entry.layout }
+            else {
+                guard let replacement = Layout(owner) else { return nil }
+                layout = replacement
+            }
+            let mask = NemotronZSkip.originalBankMask(layout.bankOwners)
+            if let entry, entry.layout === layout, entry.bankMask == mask {
+                calls += 1
+                return entry
+            }
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [layout.state]) {
+                [weak owner, layout] arrays in
+                guard owner != nil else { preconditionFailure("Released Nemotron MTP terminal owner") }
+                return layout.arrays(arrays)
+            }
+            let replacement = Entry(layout: layout, bankMask: mask, function: function)
+            retired = entry
+            entry = replacement
+            generations += 1
+            calls += 1
+            return replacement
+        }
+        guard let current else { return nil }
+        let outputs = withExtendedLifetime(retired) { current.function(inputs) }
+        guard outputs.count == 18 else { return nil }
+        for index in current.layout.mambas.indices {
+            current.layout.mambas[index].mtpStageCompactArrays(
+                Array(outputs[(2 + 4 * index)..<(6 + 4 * index)]), length: 3,
+                modelLayerIndex: 44 + 2 * index, evaluation: evaluation, initialSSM: inputs[4 + 2 * index])
+        }
+        return (outputs[0], outputs[1])
+    }
+}
+
 private class NemotronHBackbone: Module {
     let args: NemotronHConfiguration
+    let mtpTerminalGraphCache = NemotronH35MTPTerminalGraphCache()
 
     @ModuleInfo(key: "embeddings") var embeddings: Embedding
     @ModuleInfo(key: "layers") var layers: [NemotronHBlock]
@@ -4481,6 +4684,13 @@ private class NemotronHBackbone: Module {
         var preparedActivation: MLXArray? = entry?.1
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
+            if modelLayerIndex == 43, let terminal = mtpTerminalGraphCache(
+                hidden, normalized: preparedNorm, prepared: preparedActivation,
+                owner: self, recurrentState: recurrentState) {
+                precondition(attentionIndex == caches.count,
+                    "NemotronH CBv2 attention cache count is too large")
+                return (terminal.0, terminal.1)
+            }
             let cache: (any CBv2AttendingLayerCache)?
             if layer.blockType == .attention {
                 guard attentionIndex < caches.count else {
@@ -4569,6 +4779,9 @@ public class NemotronHModel:
     private let recurrentActivationDTypes = NemotronHActivationDTypeMemo()
     private let layerKindsMemo = NemotronHLoadedMemo<[CBv2LayerKind]>()
     private let recurrentStateSpecMemo = NemotronHLoadedMemo<CBv2RecurrentStateSpec>()
+
+    static func beginMTPTerminalGraphLoad() -> Int { NemotronH35MTPTerminalGraphCache.beginLoad() }
+    func admitMTPTerminalGraph(loadTicket: Int) { backbone.mtpTerminalGraphCache.admit(loadTicket: loadTicket) }
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 

@@ -14,7 +14,7 @@ final class NemotronH35MTPCompactGraphCache {
         let identity: [ObjectIdentifier]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
-    private static let enabled =
+    static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
     private let lock = NSLock()
     /// [plain, consuming a prepared in_proj activation]: separate graphs.
@@ -67,7 +67,7 @@ final class NemotronH35MTPCompactGraphCache {
         return zip(result, expected).map { nemotronBitwiseOrNaN($0.0, $0.1) }
     }
 
-    private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
+    static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
         func linear(_ value: Linear) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
@@ -123,7 +123,17 @@ extension NemotronHMamba2Mixer {
         let arrays = mtpCompactGraphCache(
             hiddenStates, convState: convState, initialSSM: initialSSM, prepared: prepared,
             owner: self)
-        let (padded, convolution, dt, finalSSM) = (arrays[1], arrays[2], arrays[3], arrays[4])
+        mtpStageCompactArrays(Array(arrays.dropFirst()), length: length,
+            modelLayerIndex: modelLayerIndex, evaluation: evaluation, initialSSM: initialSSM)
+        return arrays[0]
+    }
+
+    /// Register this call's replay tape after numerical graph construction.
+    func mtpStageCompactArrays(
+        _ arrays: [MLXArray], length: Int, modelLayerIndex: Int,
+        evaluation: CBv2RecurrentStateEvaluation, initialSSM: MLXArray
+    ) {
+        let (padded, convolution, dt, finalSSM) = (arrays[0], arrays[1], arrays[2], arrays[3])
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
@@ -155,7 +165,6 @@ extension NemotronHMamba2Mixer {
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
         }
-        return arrays[0]
     }
 
     /// Original numerical graph, with request state supplied as dynamic arrays.
