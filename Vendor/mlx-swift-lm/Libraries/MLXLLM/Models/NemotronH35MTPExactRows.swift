@@ -3084,106 +3084,6 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
-
-    /// Draft-only 2-bit screen records: each selected group's 64 head values
-    /// (dequantized from the head's own 4-bit codes) re-quantized on load to
-    /// 2 bits with their own minimum and step (round to nearest, clamped to
-    /// 0...3). Per row: 4 words of codes per selected group (value j of a
-    /// word at bits 2j), then one word per group holding the minimum (low
-    /// half) and the step (high half) as float16; 5 words per selected group
-    /// (rows from `rows` up: the upper group set). Only the screen's partial
-    /// pass reads them; the kept rows are rescored on the head itself.
-    static func packRecords2(
-        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
-        upperGroups: [Int]?
-    ) -> MLXArray {
-        let shifts = MLXArray((0..<16).map { UInt32(2 * $0) })
-        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
-            let columns = MLXArray(selected.flatMap { g in (0..<64).map { Int32(64 * g + $0) } })
-            var parts: [MLXArray] = []
-            for start in stride(from: range.lowerBound, to: range.upperBound, by: 8192) {
-                let r = start..<min(start + 8192, range.upperBound)
-                let values = take(
-                    dequantized(weight[r], scales: scales[r], biases: biases[r], groupSize: 64, bits: 4)
-                        .asType(.float32), columns, axis: 1
-                ).reshaped(r.count, selected.count, 64)
-                let low = values.min(axis: -1, keepDims: true)
-                let step = (values.max(axis: -1, keepDims: true) - low) / 3
-                let safe = which(step .== 0, MLXArray(Float(1)), step)
-                let codes = clip(round((values - low) / safe), min: 0, max: 3).asType(.uint32)
-                let words = (codes.reshaped(r.count, selected.count, 4, 16) << shifts).sum(axis: -1)
-                    .reshaped(r.count, selected.count * 4)
-                let lowBits = low.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let stepBits = step.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let part = concatenated([words.asType(.uint32), lowBits | (stepBits << 16)], axis: 1)
-                eval(part)
-                parts.append(part)
-            }
-            return concatenated(parts, axis: 0).reshaped(-1)
-        }
-        let lower = pack(0..<rows, groups)
-        guard let upperGroups else { return lower }
-        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
-    }
-
-    // The 2-bit record twin of the partial pass: lane l owns half-group l
-    // (32 values = two code words) of the selected groups; scores are
-    // step * sum(code * x) + minimum * sum(x) over the selected groups.
-    private static let record2PartialSource = """
-      constexpr int VPL = 32;
-      const int lane = int(thread_index_in_simdgroup);
-      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
-      const int row0 = sg * RPS;
-      const bool upper = row0 >= LO;
-      const int H = upper ? 2 * S2 : 2 * S;
-      const bool on = lane < H;
-      const int gi = lane >> 1;
-      const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
-      const int part = lane & 1;
-      const device T* xp = x + g * 64 + part * 32;
-      float xv[VPL];
-      float xs = 0.0f;
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < VPL; i += 8) {
-        _Pragma("clang loop unroll(full)")
-        for (int k = 0; k < 8; k++) {
-          const float xk = on ? float(xp[i + k]) : 0.0f;
-          xs += xk;
-          xv[i + k] = xk / float(1 << (2 * k));
-        }
-      }
-      _Pragma("clang loop unroll(full)")
-      for (int r = 0; r < RPS; r++) {
-        const int row = row0 + r;
-        float acc = 0.0f;
-        if (on) {
-          const device uint32_t* rp = rec + (upper
-              ? size_t(LO) * (5 * S) + size_t(row - LO) * (5 * S2) : size_t(row) * (5 * S));
-          const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);
-          const uint ld = rp[4 * (upper ? S2 : S) + gi];
-          const float lo = float(as_type<half>(ushort(ld & 0xffffu)));
-          const float d = float(as_type<half>(ushort(ld >> 16)));
-          float a = 0.0f;
-          _Pragma("clang loop unroll(full)")
-          for (int i = 0; i < VPL / 8; i++) {
-            const uint q = uint(ws[i]);
-            a += xv[8 * i] * float(q & 0x0003u) + xv[8 * i + 1] * float(q & 0x000cu)
-                + xv[8 * i + 2] * float(q & 0x0030u) + xv[8 * i + 3] * float(q & 0x00c0u)
-                + xv[8 * i + 4] * float(q & 0x0300u) + xv[8 * i + 5] * float(q & 0x0c00u)
-                + xv[8 * i + 6] * float(q & 0x3000u) + xv[8 * i + 7] * float(q & 0xc000u);
-          }
-          acc = d * a + lo * xs;
-        }
-        acc = simd_sum(acc);
-        if (lane == 0) {
-          scores[row] = acc;
-        }
-      }
-    """
-    private static let record2PartialKernel = MLXFast.metalKernel(
-        name: "nemotron_head_screen_partial_record2_affine2",
-        inputNames: ["rec", "x", "groups", "groups2"],
-        outputNames: ["scores"], source: record2PartialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3321,7 +3221,7 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
+        packed: MLXArray? = nil, records: MLXArray? = nil,
         counter: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
@@ -3332,12 +3232,7 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records2.map {
-            record2PartialKernel(
-                [$0, hidden, groups, upperGroups ?? groups], template: template,
-                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-                outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? records.map {
+        let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
@@ -3376,5 +3271,269 @@ enum NemotronHeadScreen {
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+    }
+}
+
+// The original prepared QMV body remains intact except for its final store.
+// Its 672 groups each publish exactly one original RMS lane's four-value sum.
+private let nemotronOutJoinEpilogue = """
+  const uint jf = simd_gid * 32 + simd_lid;
+  const uint jt = tid.y;
+  const uint jg = jt / 32;
+  threadgroup uint joinLast;
+  threadgroup float joinInverse;
+  threadgroup float joinTotal[3];
+  coherent(device) device float* jp = (coherent(device) device float*)partials;
+  coherent(device) device float* js = (coherent(device) device float*)subtotals;
+  coherent(device) device T* jr = (coherent(device) device T*)residual;
+
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  if (jf == 0) {
+    for (int r = 0; r < 3; ++r) {
+      float acc = 0;
+      for (int i = 0; i < 4; ++i) {
+        float value = joinLocal[r * 4 + i];
+        acc += value * value;
+      }
+      jp[r * 672 + jt] = acc;
+    }
+  }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  if (jf == 0) {
+    uint before = atomic_fetch_add_explicit((device atomic_uint*)(counter + jg),
+      1u, memory_order_relaxed);
+    joinLast = before == 31u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!joinLast) return;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+
+  // The last producer in each set of 32 QMV groups computes exactly one
+  // of the original RMS kernel's 21 SIMD reductions, for all three rows.
+  if (simd_gid == 0) {
+    for (int r = 0; r < 3; ++r) {
+      float sum = simd_sum(jp[r * 672 + jg * 32 + simd_lid]);
+      if (simd_lid == 0) js[r * 21 + jg] = sum;
+    }
+  }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+  if (jf == 0) {
+    atomic_store_explicit((device atomic_uint*)(counter + jg), 0u, memory_order_relaxed);
+    uint before = atomic_fetch_add_explicit((device atomic_uint*)(counter + 21),
+      1u, memory_order_relaxed);
+    joinLast = before == 20u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!joinLast) return;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+
+  // The last of those 21 groups finishes the original 32-lane sum (11 zero
+  // lanes), then normalizes independent features and prepares K=2688 rows.
+  if (simd_gid == 0) {
+    for (int r = 0; r < 3; ++r) {
+      float value = simd_lid < 21 ? js[r * 21 + simd_lid] : 0.0f;
+      float sum = simd_sum(value);
+      if (simd_lid == 0) joinTotal[r] = sum;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int r = 0; r < 3; ++r) {
+    if (jf == 0) joinInverse = metal::precise::rsqrt(joinTotal[r] / N + joinEps);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int chunk = int(jf); chunk < 336; chunk += 64) {
+      T rounded[8];
+      for (int i = 0; i < 8; ++i) {
+        int feature = chunk * 8 + i;
+        T value = normWeight[feature]
+          * static_cast<T>(float(jr[r * 2688 + feature]) * joinInverse);
+        normalized[r * 2688 + feature] = value;
+        rounded[i] = value;
+      }
+      float values[8];
+      float total = 0;
+      for (int i = 0; i < 8; i += 4) {
+        total += float(rounded[i]) + float(rounded[i + 1])
+          + float(rounded[i + 2]) + float(rounded[i + 3]);
+        values[i] = rounded[i];
+        values[i + 1] = rounded[i + 1] / 16.0f;
+        values[i + 2] = rounded[i + 2] / 256.0f;
+        values[i + 3] = rounded[i + 3] / 4096.0f;
+      }
+      const int base = (r * 11 + chunk / 32) * 9 * 32 + chunk % 32;
+      for (int i = 0; i < 8; ++i) nextPrepared[base + i * 32] = values[i];
+      nextPrepared[base + 8 * 32] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (jf == 0) atomic_store_explicit((device atomic_uint*)(counter + 21), 0u, memory_order_relaxed);
+"""
+
+extension NemotronHeadPreparedActivation {
+    private static func outJoinKernel(dict: Bool) -> MLXFast.MLXFastKernel? {
+        let half = decodeForm(rows: 3, fast: true) != nil
+        let load = loadForm(k: 4096, n: 2688)
+        let original = nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: false)
+        let store = "yp[r * out_vec_size + row] = h;"
+        guard original.components(separatedBy: store).count == 2 else { return nil }
+        var source = "threadgroup T joinLocal[12];\n"
+            + "coherent(device) device T* joinResidual = (coherent(device) device T*)residual;\n"
+            + original.replacingOccurrences(
+            of: store, with: """
+                yp[r * out_vec_size + row] = h;
+                T joined = lhs[r * out_vec_size + out_row + row] + h;
+                joinResidual[r * out_vec_size + out_row + row] = joined;
+                joinLocal[r * 4 + simd_gid * 2 + row] = joined;
+                """) + nemotronOutJoinEpilogue
+        if dict {
+            guard let converted = nemotronSBDictSource(source) else { return nil }
+            source = converted
+        }
+        return MLXFast.metalKernel(
+            name: "nemotron_mamba_out_join" + (dict ? "_sbd" : ""),
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N", "lhs", "normWeight", "joinEps", "counter"],
+            outputNames: ["y", "residual", "normalized", "nextPrepared", "partials", "subtotals"],
+            source: source, header: variantHeader(half: half, load: load), mutableInputs: ["counter"])
+    }
+
+    private static let outJoined = outJoinKernel(dict: false)
+    private static let outJoinedDict = outJoinKernel(dict: true)
+
+    static func outJoinedRaw(
+        _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?, residual: MLXArray,
+        norm: RMSNorm, counter: MLXArray
+    ) -> [MLXArray]? {
+        let geometry = preparedGeometry[[4096, 2688]] ?? (rps: 2, nsg: 2)
+        guard geometry.rps == 2, geometry.nsg == 2,
+              x.shape == [1, 3, 4096], x.dtype == .bfloat16,
+              residual.shape == [1, 3, 2688], residual.dtype == .bfloat16,
+              type(of: q) == QuantizedLinear.self, q.mode == .affine,
+              q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
+              type(of: norm) == RMSNorm.self, norm.weight.shape == [2688], norm.weight.dtype == .bfloat16,
+              let ordinary = outJoined else { return nil }
+        let packed = compatible(prepared, rows: 3, k: 4096)
+            ?? prepareContiguousRows(x.reshaped(3, 4096), pv: 16)
+        let scalars = NemotronMultiRowQMV.scalarPair(4096, 2688)
+        var kernel = ordinary
+        var scales = q.scales, biases = q.biases!
+        if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q), let twin = outJoinedDict {
+            kernel = twin
+            scales = d.index
+            biases = d.table
+        }
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("R", 3), ("FAST", true), ("RELU2", false), ("RPS", 2)]
+        if let half = decodeForm(rows: 3, fast: true) { template.append(("HF", half)) }
+        return kernel([q.weight, scales, biases, packed, scalars.0, scalars.1,
+                       residual, norm.weight, MLXArray(norm.eps), counter],
+            template: template, grid: (32, 1344, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, 2688], [1, 3, 2688], [1, 3, 2688], [3, 11, 288], [3, 672], [3, 21]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32, .float32, .float32])
+    }
+}
+
+enum NemotronMambaOutJoin {
+    private static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MAMBA_OUT_JOIN"] != "0"
+    nonisolated(unsafe) private static var counter: MLXArray?
+    nonisolated(unsafe) private static var owners: Set<ObjectIdentifier> = []
+
+    static func covers(_ linear: Linear) -> Bool {
+        enabled && counter != nil && owners.contains(ObjectIdentifier(linear))
+    }
+
+    static func apply(
+        _ x: MLXArray, _ linear: Linear, prepared: MLXArray?, residual: MLXArray, norm: RMSNorm
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard covers(linear), let q = linear as? QuantizedLinear, let counter,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              let result = NemotronHeadPreparedActivation.outJoinedRaw(
+                x, q, prepared: prepared, residual: residual, norm: norm, counter: counter),
+              result.count == 6 else { return nil }
+        return (result[1], result[2], result[3])
+    }
+
+    private static func samePrepared(_ lhs: MLXArray, _ rhs: MLXArray) -> MLXArray {
+        let a = lhs.reshaped(3, 11, 9, 32).view(dtype: .uint32)
+        let b = rhs.reshaped(3, 11, 9, 32).view(dtype: .uint32)
+        return MLX.logicalAnd(
+            (a[0..., 0..<10, 0..., 0...] .== b[0..., 0..<10, 0..., 0...]).all(),
+            (a[0..., 10, 0..., 0..<16] .== b[0..., 10, 0..., 0..<16]).all())
+    }
+
+    /// Representative changed-input checks run on the official worker at
+    /// load, before any compiled verify captures this choice. Any error or
+    /// mismatch retains the ordinary projection followed by the ordinary join.
+    static func qualify(_ model: Module) {
+        owners = []
+        counter = nil
+        guard enabled, NemotronHResidualRMSNorm.plumbingAvailable,
+              let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+                  type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+              }) else { return }
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        let ticket = MLXArray.zeros([22], dtype: .uint32)
+        do {
+            let admitted = try withError { () -> Set<ObjectIdentifier> in
+                eval(ticket)
+                var admitted: Set<ObjectIdentifier> = []
+                func check(_ q: QuantizedLinear, seed: UInt64) -> MLXArray? {
+                    let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 2)
+                    let x = seed % 4 == 0
+                        ? MLXArray.zeros([1, 3, 4096], dtype: .bfloat16)
+                        : MLXRandom.normal([1, 3, 4096], key: keys[0]).asType(.bfloat16)
+                    let residual = seed % 4 == 1
+                        ? -MLXArray.zeros([1, 3, 2688], dtype: .bfloat16)
+                        : MLXRandom.normal([1, 3, 2688], key: keys[1]).asType(.bfloat16)
+                    guard let got = NemotronHeadPreparedActivation.outJoinedRaw(
+                        x, q, prepared: nil, residual: residual, norm: norm, counter: ticket),
+                          got.count == 6 else { return nil }
+                    let projected = nemotronMTPLinearRows(x, q)
+                    guard let expected = NemotronHResidualRMSNorm.applyPreparedRows(
+                        residual, projected, norm: norm) else { return nil }
+                    var same = (got[0].view(dtype: .uint16) .== projected.view(dtype: .uint16)).all()
+                    same = MLX.logicalAnd(same,
+                        (got[1].view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all())
+                    same = MLX.logicalAnd(same,
+                        (got[2].view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all())
+                    return MLX.logicalAnd(same, samePrepared(got[3], expected.2))
+                }
+                for (index, mixer) in mixers.enumerated() {
+                    guard let q = mixer.outProj as? QuantizedLinear else { continue }
+                    var checks: [MLXArray] = []
+                    for trial in 0..<4 {
+                        guard let same = check(q, seed: UInt64(0x7a00 + index * 4 + trial)) else { return [] }
+                        checks.append(same)
+                    }
+                    eval(checks)
+                    guard checks.allSatisfy({ $0.item(Bool.self) }),
+                          ticket.sum().item(UInt32.self) == 0 else { return [] }
+                    admitted.insert(ObjectIdentifier(q))
+                }
+                // Different activation buffers queued before any result is
+                // read expose stale cross-group reads and counter-reset bugs.
+                if let q = mixers.first?.outProj as? QuantizedLinear {
+                    var checks: [MLXArray] = []
+                    for trial in 0..<32 {
+                        guard let same = check(q, seed: UInt64(0x8b00 + trial)) else { return [] }
+                        checks.append(same)
+                    }
+                    eval(checks)
+                    guard checks.allSatisfy({ $0.item(Bool.self) }),
+                          ticket.sum().item(UInt32.self) == 0 else { return [] }
+                }
+                return admitted
+            }
+            if !admitted.isEmpty { counter = ticket; owners = admitted }
+        } catch {
+            owners = []
+            counter = nil
+        }
+        FileHandle.standardError.write(Data("nemotron Mamba out join: \(owners.count) qualified projections\n".utf8))
     }
 }
