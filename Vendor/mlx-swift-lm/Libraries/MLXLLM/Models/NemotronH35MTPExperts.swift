@@ -362,6 +362,15 @@ inline T nml_store(float v) {
 }
 """
 
+private let nemotronPairMaskHeader = """
+template <typename T>
+inline uint nml_pair_mask(T value, int bit) {
+  const uint ab = uint(as_type<uint16_t>(value)) & 0x7fffu;
+  return (ab != 0 ? (1u << bit) : 0u)
+      | (ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 4u : 0u);
+}
+"""
+
 private let nemotronMoELeaderPreparedHeader = """
 template <typename U, int values_per_thread>
 inline U nml_prepared_vector(const device float* p, thread U* x_thread) {
@@ -649,6 +658,10 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    let tripleGateUpPairMasks: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8PairMasks: MLXFast.MLXFastKernel?
+    let tripleGateUpPairMasksDict: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8PairMasksDict: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -713,6 +726,36 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
+        }
+        let masks = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .flatMap(nmlFC1PairMaskSource)
+        let tailMasks = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nmlFC1PairMaskSource)
+        let maskHeader = header + nemotronMoETripleDecodeHeader + nemotronPairMaskHeader
+        tripleGateUpPairMasks = masks.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_pair_masks",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "pairMasks"], source: $0, header: maskHeader)
+        }
+        tripleGateUpTail8PairMasks = tailMasks.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_pair_masks",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "pairMasks"], source: $0, header: maskHeader)
+        }
+        tripleGateUpPairMasksDict = masks.flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_pair_masks_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "pairMasks"], source: $0, header: maskHeader)
+        }
+        tripleGateUpTail8PairMasksDict = tailMasks.flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_pair_masks_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "pairMasks"], source: $0, header: maskHeader)
         }
     }
 }
@@ -1060,6 +1103,46 @@ enum NemotronMoELeader {
             which(ok, result[1], referencePlan))
     }
 
+    fileprivate static var pairMasksAvailable: Bool {
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        let plain = fc1Tail8 ? kernels.tripleGateUpTail8PairMasks : kernels.tripleGateUpPairMasks
+        let twin = fc1Tail8 ? kernels.tripleGateUpTail8PairMasksDict : kernels.tripleGateUpPairMasksDict
+        return plain != nil && (!NemotronSBDict.enabled || twin != nil)
+    }
+
+    /// The admitted copied-FC2 route needs activations and masks, but no plan.
+    fileprivate static func applyWithPairMasks(
+        _ x: MLXArray, _ inds: MLXArray, bank: Bank,
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+    ) -> (activation: MLXArray, pairMasks: MLXArray)? {
+        guard fuseRelu2, tripleGateUp, fuseBalancePlan, preparedGateUp, pairMasksAvailable,
+              leaderResultsPerSimdgroup(rows: 3) == 2,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
+        else { return nil }
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        let plain = fc1Tail8 ? kernels.tripleGateUpTail8PairMasks : kernels.tripleGateUpPairMasks
+        let twin = fc1Tail8 ? kernels.tripleGateUpTail8PairMasksDict : kernels.tripleGateUpPairMasksDict
+        guard let selected = dict == nil ? plain : twin else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let result = selected(
+            dict.map { [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind($0.index),
+                        $0.table, packed, inds] }
+                ?? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                    NemotronBankBinding.bind(bank.biases), packed, inds],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6), ("K", bank.k), ("N", bank.n),
+                       ("XSLOT", false), ("RELU2", true), ("RPS", 2)],
+            grid: (32, bank.n / 2, 18), threadGroup: (32, 2, 1),
+            outputShapes: [[18, bank.n], [18, bank.n / 2]], outputDTypes: [x.dtype, .uint8])
+        guard selfTest else { return (result[0], result[1]) }
+        let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
+                             perSlot: false, relu2: true, prepared: packed)
+        let same = (result[0].view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+        return (which(same, result[0], MLXArray(Float.nan).asType(x.dtype)), result[1])
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -1106,7 +1189,15 @@ enum NemotronMoELeader {
         let xr = x.reshaped(rows, 2688)
         let act: MLXArray
         let balancePlan: MLXArray?
-        if fuseRelu2 {
+        var pairMasks: MLXArray? = nil
+        if rows == 3, NemotronZSkip.usesPreparedMasks(mlp.fc2),
+           let fused = applyWithPairMasks(
+               xr, flat, bank: up, prepared: prepared,
+               dict: NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil) {
+            act = fused.activation
+            balancePlan = nil
+            pairMasks = fused.pairMasks
+        } else if fuseRelu2 {
             if rows == 3, let fused = applyWithBalancePlan(
                 xr, flat, bank: up, relu2: true, prepared: prepared,
                 dict: NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil) {
@@ -1129,7 +1220,7 @@ enum NemotronMoELeader {
         // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
         // itself (same expressions and order).
         if products, let prod = rows == 3
-            ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
+            ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2, pairMasks: pairMasks)
             : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
@@ -1139,7 +1230,7 @@ enum NemotronMoELeader {
                 .== expected.view(dtype: .uint16)).all()
             return which(ok, prod, MLXArray(Float.nan))
         }
-        var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
+        var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2, pairMasks: pairMasks)
             ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: NemotronZSkip.needsOriginal(mlp.fc2) ? nil : balancePlan,
                 tail8: leaderTail8)
         if selfTest {
@@ -1367,6 +1458,42 @@ private final class NMLBalanceWeighted: Sendable {
     }
 }
 
+
+// Keep each final BF16 store and classify its two-result SIMD pair locally.
+// Bits 0/1 mark nonzero values; bit 2 marks any tiny or nonfinite value.
+private func nmlFC1PairMaskSource(_ source: String) -> String? {
+    let marker = "  constexpr int results_per_simdgroup = RPS;\n"
+    guard source.components(separatedBy: marker).count == 2 else { return nil }
+    var s = source.replacingOccurrences(of: marker, with:
+        marker + "  static_assert(RPS == 2, \"pair masks require two results\");\n")
+    for (results, slots) in [
+        (["result"], ["slot"]),
+        (["result0", "result1"], ["slot", "partner"]),
+        (["result0", "result1", "result2"], ["slot", "partner", "third"]),
+    ] {
+        let reductions = results.map { "      \($0)[r] = simd_sum(\($0)[r]);\n" }.joined()
+        let oldStores = results.enumerated().map {
+            "        y\($0.offset)[r] = nml_store<T, RELU2>(\($0.element)[r]);\n"
+        }.joined()
+        let newStores = results.enumerated().map {
+            "        const T h\($0.offset) = nml_store<T, RELU2>(\($0.element)[r]);\n"
+                + "        y\($0.offset)[r] = h\($0.offset);\n"
+                + "        pm[\($0.offset)] |= nml_pair_mask<T>(h\($0.offset), r);\n"
+        }.joined()
+        let writes = slots.enumerated().map {
+            "      pairMasks[\($0.element) * (N / 2) + out_row / 2] = uchar(pm[\($0.offset)]);\n"
+        }.joined()
+        let from = "    for (int r = 0; r < results_per_simdgroup; r++) {\n"
+            + reductions + "      if (simd_lid == 0) {\n" + oldStores + "      }\n    }\n"
+        let to = "    uint pm[\(results.count)] = {0};\n"
+            + "    for (int r = 0; r < results_per_simdgroup; r++) {\n"
+            + reductions + "      if (simd_lid == 0) {\n" + newStores + "      }\n    }\n"
+            + "    if (simd_lid == 0) {\n" + writes + "    }\n"
+        guard s.components(separatedBy: from).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    return s
+}
 
 /// Reuse the entire accepted prepared FC1 body verbatim. The extra work runs
 /// in exactly one complete 64-thread TG: row-zero/slot-zero is always a leader,
@@ -1879,6 +2006,38 @@ private let nemotronZSkipTiledFastSource = """
   }
 """
 
+// Replace only the tiled-fast activation-mask staging. Four current FC1 pair
+// bytes reconstruct the same effective eight-value mask; all arithmetic stays.
+private func nemotronZSkipPairMaskSource(_ source: String) -> String? {
+    let from = """
+    const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+    uint m = 0, unsafe = 0;
+    for (int i = 0; i < 8; i++) {
+      const uint ab = uint(xb[i]) & 0x7fffu;
+      m |= ab != 0 ? (1u << i) : 0u;
+      unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+      xsh[8 * c + i] = xs[8 * c + i];
+    }
+    // A full-mask sentinel sends tiny/nonfinite chunks to the unchanged dense
+    // arithmetic, without a second shared array or per-output exponent tests.
+    cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
+"""
+    let to = """
+    for (int i = 0; i < 8; i++) {
+      xsh[8 * c + i] = xs[8 * c + i];
+    }
+    uint m = 0, unsafe = 0;
+    for (int i = 0; i < 4; i++) {
+      const uint p = pairMasks[slot * (K / 2) + 4 * c + i];
+      m |= (p & 3u) << (2 * i);
+      unsafe |= p & 4u;
+    }
+    cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
+"""
+    guard source.components(separatedBy: from).count == 2 else { return nil }
+    return source.replacingOccurrences(of: from, with: to)
+}
+
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
 // tile-major uint16 pair index (one per group and output) and `bk` the bank's
@@ -1986,6 +2145,8 @@ enum NemotronZSkip {
         /// The tile-major biases, or with `dict` the bank's FP32 pair table.
         let biases: MLXArray
         var dict = false
+        // Set only on a local copy during build, before publication/graphs.
+        fileprivate var preparedMasks = false
     }
 
     private static let lock = NSLock()
@@ -2072,6 +2233,14 @@ enum NemotronZSkip {
         outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
+    private static let pairMaskSlotKernel = nemotronZSkipPairMaskSource(nemotronZSkipTiledFastSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_fast_pair_masks",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "pairMasks"],
+            outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
     private static let tiledDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledSeqSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_fc2_slots_tiled_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
@@ -2082,6 +2251,15 @@ enum NemotronZSkip {
     private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static let pairMaskDictSlotKernel = nemotronZSkipPairMaskSource(nemotronZSkipTiledFastSource)
+        .flatMap(nemotronZSkipDictSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_fast_pair_masks_sbd",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "pairMasks"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
@@ -2152,13 +2330,17 @@ enum NemotronZSkip {
     /// Returns [1, rows, 2688]. Every slot is its own threadgroup column, so
     /// the slot kernel is the same for any row count.
     static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy,
-                    rows: Int = 3) -> MLXArray {
-        reduceProducts(products(x, inds, scores, copy: copy, rows: rows), rows: rows)
+                    rows: Int = 3, pairMasks: MLXArray? = nil) -> MLXArray {
+        reduceProducts(products(x, inds, scores, copy: copy, rows: rows, pairMasks: pairMasks), rows: rows)
     }
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     private static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, pairMasks: MLXArray? = nil) -> MLXArray {
+        if pairMaskKernelSelected(x, inds, scores, copy: copy, rows: rows, pairMasks: pairMasks),
+           let pairMasks, let result = pairMaskProducts(x, inds, scores, copy: copy, pairMasks: pairMasks) {
+            return result
+        }
         let slots = rows * 6
         let threads = 32 * sgs
         return (copy.dict ? dictKernel! : kernel)(
@@ -2167,6 +2349,45 @@ enum NemotronZSkip {
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+    }
+
+    private static var preparedMaskSettings: Bool {
+        enabled && tiled && fast && sgs == 16 && NemotronMoELeader.preparedGateUp
+            && NemotronMoELeader.fuseBalancePlan && NemotronMoELeader.fuseRelu2
+            && NemotronMoELeader.tripleGateUp && NemotronMoELeader.leaderResultsPerSimdgroup(rows: 3) == 2
+            && NemotronMoELeader.pairMasksAvailable && pairMaskSlotKernel != nil
+            && (!sbDict || pairMaskDictSlotKernel != nil)
+    }
+
+    fileprivate static func usesPreparedMasks(_ owner: SwitchLinear) -> Bool {
+        guard preparedMaskSettings, !needsOriginal(owner) else { return false }
+        return lock.withLock { copies[ObjectIdentifier(owner)]?.preparedMasks == true }
+    }
+
+    private static func pairMaskKernelSelected(
+        _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+        copy: Copy, rows: Int, pairMasks: MLXArray?
+    ) -> Bool {
+        guard preparedMaskSettings, copy.preparedMasks, rows == 3,
+              x.shape == [18, 1856], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              scores.shape == [18], scores.dtype == .float32,
+              let pairMasks, pairMasks.shape == [18, 928], pairMasks.dtype == .uint8
+        else { return false }
+        return (copy.dict ? pairMaskDictSlotKernel : pairMaskSlotKernel) != nil
+    }
+
+    private static func pairMaskProducts(
+        _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+        copy: Copy, pairMasks: MLXArray
+    ) -> MLXArray? {
+        guard let selected = copy.dict ? pairMaskDictSlotKernel : pairMaskSlotKernel else { return nil }
+        return selected(
+            [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores, pairMasks],
+            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+            grid: (32 * sgs * (2688 / 128), 18, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[18 * 2688]], outputDTypes: [.float32])[0]
     }
 
     /// The record's top-six reduce of `products` output: [1, rows, 2688] BF16.
@@ -2190,21 +2411,21 @@ enum NemotronZSkip {
     /// The R = 3 weighted slot products of a target layer ([18 * 2688] FP32,
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 owner: SwitchLinear) -> MLXArray? {
+                                 owner: SwitchLinear, pairMasks: MLXArray? = nil) -> MLXArray? {
         guard !needsOriginal(owner), joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
               x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+        return products(x, inds, scores, copy: copy, rows: 3, pairMasks: pairMasks)
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
-                         owner: SwitchLinear) -> MLXArray? {
+                         owner: SwitchLinear, pairMasks: MLXArray? = nil) -> MLXArray? {
         guard !needsOriginal(owner), rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        return run(x, inds, scores, copy: copy, pairMasks: pairMasks)
     }
 
     // MARK: Draft head (one row per draft step)
@@ -2349,8 +2570,9 @@ enum NemotronZSkip {
         case .built(let built):
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
+            let masks = built.values.filter(\.preparedMasks).count
             FileHandle.standardError.write(
-                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, \(masks) with prepared masks\n".utf8))
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
@@ -2376,10 +2598,19 @@ enum NemotronZSkip {
                   let down = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
                   down.weight.shape == [128, 2688, 232], down.scales.shape == [128, 2688, 29],
                   down.biases.shape == down.scales.shape else { continue }
-            let copy = makeCopy(down)
+            var copy = makeCopy(down)
             eval(copy.codes, copy.scales, copy.biases)
             guard finite(down) else { return .nonFinite(built.count) }
             guard matches(down, copy, seed: built.count) else { return .kernelMiss(built.count) }
+            if preparedMaskSettings,
+               let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+               up.weight.shape == [128, 1856, 336] {
+                copy.preparedMasks = matchesPreparedMasks(up, copy, seed: built.count)
+                if !copy.preparedMasks {
+                    FileHandle.standardError.write(Data(
+                        "nemotron prepared masks off: layer \(built.count) differs from the original kernels\n".utf8))
+                }
+            }
             built[ObjectIdentifier(moe.switchMLP.fc2)] = copy
         }
         return .built(built)
@@ -2388,6 +2619,36 @@ enum NemotronZSkip {
     private static func finite(_ bank: NemotronMoELeader.Bank) -> Bool {
         let limit = MLXArray(Float.infinity).asType(.bfloat16)
         return logicalAnd((abs(bank.scales) .< limit).all(), (abs(bank.biases) .< limit).all()).item(Bool.self)
+    }
+
+    private static func matchesPreparedMasks(
+        _ up: NemotronMoELeader.Bank, _ copy: Copy, seed: Int
+    ) -> Bool {
+        let inds = MLXArray([3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127] as [UInt32])
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x2ac0 + seed)), into: 2)
+        let x = (MLXRandom.normal([3, 2688], key: keys[0]) * 0.5).asType(.bfloat16)
+        guard let original = NemotronMoELeader.applyWithBalancePlan(
+                  x, inds, bank: up, relu2: true, prepared: nil),
+              let got = NemotronMoELeader.applyWithPairMasks(x, inds, bank: up, prepared: nil)
+        else { return false }
+        let values = original.activation.view(dtype: .uint16).asArray(UInt16.self)
+        var bytes = [UInt8](repeating: 0, count: values.count / 2)
+        for i in values.indices {
+            let ab = values[i] & 0x7fff
+            if ab != 0 {
+                bytes[i / 2] |= UInt8(1 << (i % 2))
+                if ab < 0x0880 || ab >= 0x7f80 { bytes[i / 2] |= 4 }
+            }
+        }
+        let expectedMasks = MLXArray(bytes, [18, 928])
+        let scores = MLXRandom.uniform(Float(0) ..< 1, [18], key: keys[1])
+        let expected = products(original.activation, inds, scores, copy: copy, rows: 3)
+        guard let prod = pairMaskProducts(got.activation, inds, scores, copy: copy, pairMasks: got.pairMasks)
+        else { return false }
+        var same = (original.activation.view(dtype: .uint16) .== got.activation.view(dtype: .uint16)).all()
+        same = logicalAnd(same, (expectedMasks .== got.pairMasks).all())
+        same = logicalAnd(same, (expected.view(dtype: .uint32) .== prod.view(dtype: .uint32)).all())
+        return same.item(Bool.self)
     }
 
     private static func matches(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
@@ -2864,6 +3125,14 @@ enum NemotronSBDict {
                 same = logicalAnd(same, logicalAnd(
                     (a.activation.view(dtype: .uint16) .== b.activation.view(dtype: .uint16)).all(),
                     (a.plan .== b.plan).all()))
+                if NemotronZSkip.usesPreparedMasks(moe.switchMLP.fc2) {
+                    guard let ma = NemotronMoELeader.applyWithPairMasks(x, inds, bank: up, prepared: nil),
+                          let mb = NemotronMoELeader.applyWithPairMasks(x, inds, bank: up, prepared: nil, dict: d)
+                    else { return (false, fc1, shapes) }
+                    same = logicalAnd(same, (a.activation.view(dtype: .uint16) .== ma.activation.view(dtype: .uint16)).all())
+                    same = logicalAnd(same, (b.activation.view(dtype: .uint16) .== mb.activation.view(dtype: .uint16)).all())
+                    same = logicalAnd(same, (ma.pairMasks .== mb.pairMasks).all())
+                }
                 fc1 += 1
             } else if let q = module as? QuantizedLinear, dict(q) != nil {
                 let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
