@@ -2,6 +2,9 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+#if canImport(Metal)
+import Metal
+#endif
 
 enum NemotronMTPExecution {
     private static func enabledByDefault(_ key: String) -> Bool {
@@ -25,6 +28,9 @@ func nemotronMTPHeadRows(_ x: MLXArray, _ linear: Linear,
           q.groupSize == 64, q.bits == 4, q.mode == .affine,
           q.scales.dtype == x.dtype, q.biases?.dtype == x.dtype
     else { return nemotronMTPLinearRows(x, linear) }
+    if let tensor = NemotronR3GroupwiseTensorHead.apply(x.reshaped(x.dim(1), x.dim(2)), q) {
+        return tensor.reshaped(1, 3, 131072)
+    }
     if let rows = NemotronMultiRowQMV.apply(x.reshaped(x.dim(1), x.dim(2)), q,
                                             prepared: prepared) {
         var result = rows.reshaped(1, x.dim(1), q.weight.dim(0))
@@ -41,6 +47,123 @@ func nemotronMTPHeadRows(_ x: MLXArray, _ linear: Linear,
         .transposed(1, 0, 2, 3).reshaped(1, count, q.weight.dim(0))
     if let bias = q.bias { result = result + bias }
     return result
+}
+
+
+// Prototype only. Each group keeps all 64 raw codes and its original metadata.
+enum NemotronR3GroupwiseTensorHead {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R3_GROUPWISE_TENSOR_HEAD"] != "0"
+
+    static var apiAvailable: Bool {
+        if #available(macOS 26.3, iOS 26.3, tvOS 26.3, visionOS 26.3, *) { return true }
+        return false
+    }
+
+    static let neuralHardware: Bool = {
+        #if canImport(Metal)
+        guard #available(macOS 26.3, iOS 26.3, tvOS 26.3, visionOS 26.3, *) else { return false }
+        #if os(macOS)
+        let device = MTLCopyAllDevices().first ?? MTLCreateSystemDefaultDevice()
+        #else
+        let device = MTLCreateSystemDefaultDevice()
+        #endif
+        return device?.supportsFamily(.apple10) == true
+        #else
+        return false
+        #endif
+    }()
+
+    static func apply(_ x: MLXArray, _ q: QuantizedLinear) -> MLXArray? {
+        guard enabled, apiAvailable, x.shape == [3, 2688], q.weight.shape == [131072, 336],
+              neuralHardware else { return nil }
+        return direct(x, q)
+    }
+
+    // Test entry: the same MPP primitive can use its older-GPU shader path.
+    // Small N multiples of 32 permit exact controlled cases without a full head.
+    static func direct(_ x: MLXArray, _ q: QuantizedLinear) -> MLXArray? {
+        guard apiAvailable, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.ndim == 2, q.weight.dtype == .uint32, q.weight.dim(1) == 336,
+              q.weight.dim(0) > 0, q.weight.dim(0) % 32 == 0,
+              q.scales.shape == [q.weight.dim(0), 42], q.scales.dtype == .bfloat16,
+              let biases = q.biases, biases.shape == q.scales.shape, biases.dtype == .bfloat16
+        else { return nil }
+        let n = q.weight.dim(0)
+        return kernel([q.weight, q.scales, biases, x], template: [("N", n)],
+            grid: (32 * (n / 32), 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_r3_head_group64_tensor_strict", inputNames: ["w", "scales", "biases", "x"],
+        outputNames: ["y"], source: source, header: """
+#include <metal_tensor>
+#include <metal_cooperative_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+
+""")
+
+    static let source = """
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, 32, 32, false, true, false,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto a = op.get_left_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto b = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+  auto p = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>,
+      metal::remove_addrspace_t<decltype(b)>, float>();
+  auto total = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(a)>,
+      metal::remove_addrspace_t<decltype(b)>, float>();
+  const int tile = int(threadgroup_position_in_grid.x) * 32;
+  const int lane = int(thread_index_in_simdgroup);
+  for (ushort i = 0; i < total.get_capacity(); i++) {
+    if (total.is_valid_element(i)) { total[i] = 0.0f; }
+  }
+  for (int g = 0; g < 42; g++) {
+    for (ushort i = 0; i < p.get_capacity(); i++) {
+      if (p.is_valid_element(i)) { p[i] = 0.0f; }
+    }
+    for (int part = 0; part < 2; part++) {
+      for (ushort i = 0; i < a.get_capacity(); i++) {
+        if (a.is_valid_element(i)) {
+          const auto c = a.get_multidimensional_index(i);
+          a[i] = c[1] < 3 ? bfloat(x[c[1] * 2688 + g * 64 + part * 32 + c[0]])
+                          : bfloat(0.0f);
+        }
+      }
+      for (ushort i = 0; i < b.get_capacity(); i++) {
+        if (b.is_valid_element(i)) {
+          const auto c = b.get_multidimensional_index(i);
+          const uint word = w[(tile + c[1]) * 336 + g * 8 + part * 4 + c[0] / 8];
+          b[i] = bfloat((word >> (4 * (c[0] % 8))) & 15u);
+        }
+      }
+      op.run(a, b, p);
+    }
+    float sums[3];
+    for (int row = 0; row < 3; row++) {
+      const int base = row * 2688 + g * 64;
+      sums[row] = simd_sum(float(x[base + lane]) + float(x[base + lane + 32]));
+    }
+    for (ushort i = 0; i < p.get_capacity(); i++) {
+      if (p.is_valid_element(i) && total.is_valid_element(i)) {
+        const auto c = p.get_multidimensional_index(i);
+        if (c[1] < 3) {
+          const int sb = (tile + c[0]) * 42 + g;
+          total[i] += float(scales[sb]) * p[i] + float(biases[sb]) * sums[c[1]];
+        }
+      }
+    }
+  }
+  for (ushort i = 0; i < total.get_capacity(); i++) {
+    if (total.is_valid_element(i)) {
+      const auto c = total.get_multidimensional_index(i);
+      if (c[1] < 3) { y[c[1] * N + tile + c[0]] = bfloat16_t(total[i]); }
+    }
+  }
+"""
 }
 
 /// Norm reductions are row-local. Keep this independently gated while checking
