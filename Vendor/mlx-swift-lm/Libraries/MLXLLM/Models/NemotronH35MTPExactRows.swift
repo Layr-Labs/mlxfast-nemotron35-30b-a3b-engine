@@ -683,18 +683,23 @@ enum NemotronMambaInProjConvDt {
     static let check =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV_CHECK"] == "1"
 
+    /// SIMD groups per threadgroup of the launch (NEMOTRON_MTP_INPROJ_NSG; 2 restores the crown's): each
+    /// SIMD group keeps its own output rows, lane split, K order, qdot, simd_sum, store and epilogue rows.
+    static let simdgroups = max(1, Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_NSG"] ?? "") ?? 1)
+    private static let body = simdgroups == 2 ? nemotronHeadPreparedQMVSource
+        : nemotronPreparedVariantSource(nemotronHeadPreparedQMVSource, load: 0, nsg: true)
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mamba_in_proj_conv_dt",
+        name: simdgroups == 2 ? "nemotron_mamba_in_proj_conv_dt" : "nemotron_mamba_in_proj_conv_dt_nsg",
         inputNames: ["w", "scales", "biases", "prepared", "K", "N",
                      "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
         outputNames: ["y", "conv", "padded", "dt"],
-        source: nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
+        source: body + nemotronMambaInProjConvDtEpilogue,
         header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
     /// The same launch reading (scale, bias) through `NemotronSBDict`.
     private static let dictKernel = nemotronSBDictSource(
-        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue).map {
+        body + nemotronMambaInProjConvDtEpilogue).map {
         MLXFast.metalKernel(
-            name: "nemotron_mamba_in_proj_conv_dt_sbd",
+            name: simdgroups == 2 ? "nemotron_mamba_in_proj_conv_dt_sbd" : "nemotron_mamba_in_proj_conv_dt_nsg_sbd",
             inputNames: ["w", "scales", "biases", "prepared", "K", "N",
                          "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
             outputNames: ["y", "conv", "padded", "dt"],
@@ -736,8 +741,9 @@ enum NemotronMambaInProjConvDt {
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", 2), ("CS", convStart), ("CC", convDim),
-                       ("DS", convStart + convDim), ("NH", heads)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                       ("DS", convStart + convDim), ("NH", heads)]
+                + (simdgroups == 2 ? [] : [("NSG", simdgroups)] as [(String, any KernelTemplateArg)]),
+            grid: (32, n / 2, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
@@ -804,7 +810,18 @@ enum NemotronHeadPreparedActivation {
     static let fastLoadForm = 0
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
-    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
+    /// NEMOTRON_MTP_PREPARED_NSG1=0 keeps the crown's two SIMD groups per threadgroup for the shared
+    /// expert's up projection [2688, 3712] and the Mamba out / attention output projections [4096, 2688].
+    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = {
+        let env = ProcessInfo.processInfo.environment
+        let headNSG = Int(env["NEMOTRON_MTP_HEAD_NSG"] ?? "") ?? 8
+        var table: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: headNSG)]
+        if ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREPARED_NSG1"] != "0" {
+            table[[2688, 3712]] = (rps: 2, nsg: 1)
+            table[[4096, 2688]] = (rps: 2, nsg: 1)
+        }
+        return table
+    }()
     static func loadForm(k: Int, n: Int) -> Int {
         loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
     }
@@ -2205,6 +2222,7 @@ enum NemotronMTPRouterRows {
     // warm(), before any compile trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
     static func isRowMajor(_ weight: MLXArray) -> Bool { rowMajor.contains(ObjectIdentifier(weight)) }
+    static func unregister(_ weight: MLXArray) { rowMajor.remove(ObjectIdentifier(weight)) }
 
     /// Record row-major router weights, then compile every pipeline the
     /// verify window can request (R = 1...4) at load.
@@ -2399,6 +2417,49 @@ enum NemotronMTPRouterRowsSelect {
             verified = false
         }
         report(verified ? "on (bitwise equal at R = 1...4)" : "off (differs or failed)")
+    }
+}
+
+/// The MTP head's router (the draft tail's one-launch selection,
+/// `NemotronMTPDraftTail.oneLaunchRouter`): its row-major weight is recorded
+/// like the target's (`NemotronMTPRouterRows.warm`), then the one-row launch on
+/// the draft counter is compared bit for bit with the head gate's own call
+/// (stock gemv and selection) on seeded rows; any miss unregisters the weight,
+/// which keeps the draft tail on the gate's own launches.
+enum NemotronMTPDraftRouterQualification {
+    static func run(_ head: Module) {
+        guard NemotronMTPRouterRowsSelect.enabled, NemotronMTPRouterRowsSelect.verified else { return }
+        let gates = head.modules().compactMap { $0 as? NemotronHMoEGate }
+        NemotronMTPRouterRows.warm(head)
+        var admitted = 0
+        for gate in gates where NemotronMTPRouterRows.isRowMajor(gate.weight) {
+            var ok = gate.topK == 6 && gate.nGroup == 1 && gate.topkGroup == 1 && gate.normTopkProb
+                && gate.routedScalingFactor == 2.5 && gate.eSCB.shape == [128] && gate.eSCB.dtype == .float32
+            if ok {
+                do {
+                    ok = try withError { () -> Bool in
+                        for seed in 0 ..< 4 {
+                            let x = MLXRandom.normal([1, 1, 2688], key: MLXRandom.key(UInt64(0xd7a + seed)))
+                                .asType(.bfloat16)
+                            guard let fused = NemotronMTPRouterRowsSelect.run(
+                                x, gate.weight, bias: gate.eSCB, draft: true) else { return false }
+                            let reference = gate(x)
+                            let same = MLX.logicalAnd(
+                                (fused.0 .== reference.0.asType(fused.0.dtype)).all(),
+                                (fused.1.view(dtype: .uint32) .== reference.1.asType(.float32).view(dtype: .uint32)).all())
+                            eval(same)
+                            guard same.item(Bool.self) else { return false }
+                        }
+                        return true
+                    }
+                } catch {
+                    ok = false
+                }
+            }
+            if ok { admitted += 1 } else { NemotronMTPRouterRows.unregister(gate.weight) }
+        }
+        FileHandle.standardError.write(Data(
+            "nemotron mtp draft router one-launch: \(admitted) of \(gates.count) head routers bitwise equal\n".utf8))
     }
 }
 
