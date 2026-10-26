@@ -87,6 +87,8 @@ extension NemotronH35MTPAssistant {
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        // The new sidecar's consumer A/B requires the original products-join gate first.
+        NemotronFC1ProducerMask.prepare(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
@@ -530,3 +532,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Second measurement of 208838c4.
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
+
+// Measurement entry 2 of this tree.
