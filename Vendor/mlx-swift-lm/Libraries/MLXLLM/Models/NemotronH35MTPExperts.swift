@@ -649,6 +649,10 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    let tripleGateUp: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8: MLXFast.MLXFastKernel?
+    let tripleGateUpDict: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8Dict: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -712,6 +716,38 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUp = nmlPreparedSource(tripleSource, pointers: triplePointers).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8 = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpDict = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8Dict = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
     }
@@ -1060,6 +1096,47 @@ enum NemotronMoELeader {
             which(ok, result[1], referencePlan))
     }
 
+    static let elideUnreadPlan =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_PLAN_ELIDE"] != "0"
+
+    static func applyTripleWithoutPlan(
+        _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+    ) -> MLXArray? {
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
+        else { return nil }
+        let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+        guard tail8 || kernels.tripleGateUpAndPlan != nil else { return nil }
+        let useDict = dict != nil
+            && (tail8 ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
+        guard let kernel = useDict
+            ? (tail8 ? kernels.tripleGateUpTail8Dict : kernels.tripleGateUpDict)
+            : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let rps = leaderResultsPerSimdgroup(rows: 3)
+        let activation = kernel(
+            useDict
+                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+                : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                   NemotronBankBinding.bind(bank.biases), packed, inds],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+            outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+        guard selfTest else { return activation }
+        let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
+            perSlot: false, relu2: relu2, prepared: packed)
+        let ok = (activation.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+        return which(ok, activation, MLXArray(Float.nan).asType(x.dtype))
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -1107,9 +1184,14 @@ enum NemotronMoELeader {
         let act: MLXArray
         let balancePlan: MLXArray?
         if fuseRelu2 {
-            if rows == 3, let fused = applyWithBalancePlan(
-                xr, flat, bank: up, relu2: true, prepared: prepared,
-                dict: NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil) {
+            let dict = rows == 3 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
+            if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
+               let activation = applyTripleWithoutPlan(
+                   xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
+                act = activation
+                balancePlan = nil
+            } else if rows == 3, let fused = applyWithBalancePlan(
+                xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
                 act = fused.activation
                 balancePlan = fused.plan
             } else {
@@ -1834,6 +1916,83 @@ private let nemotronZSkipTiledFastSource = """
         }
         continue;
       }
+      if (popcount(m) == 3) {
+        const int j1 = ctz(m);
+        const uint m2 = m & (m - 1);
+        const int j2 = ctz(m2);
+        const int j3 = ctz(m2 & (m2 - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const uint w3 = uint(wq[(8 * c + j3) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const T xv3 = xsh[8 * c + j3];
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
+        const U xt3 = U(xv3);
+        // The record adds each half (values 0-3, then 4-7) left to right before adding the second half to
+        // the first, so one value in the first half and two in the second associate as a + (b + c).
+        const bool split = j1 < 4 && j2 >= 4;
+        const U sum3 = split ? U(xv1) + (U(xv2) + U(xv3)) : (U(xv1) + U(xv2)) + U(xv3);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
+          const U c3 = U(int(((w3 >> (4 * o)) & 0xfu)));
+          const U t1 = xt1 * c1;
+          const U t2 = xt2 * c2;
+          const U t3 = xt3 * c3;
+          const U accum = split ? t1 + (t2 + t3) : (t1 + t2) + t3;
+          p[o] += as_type<float>(sv[o]) * accum + sum3 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
+      if (popcount(m) == 4) {
+        const int j1 = ctz(m);
+        const uint m2 = m & (m - 1);
+        const int j2 = ctz(m2);
+        const uint m3 = m2 & (m2 - 1);
+        const int j3 = ctz(m3);
+        const int j4 = ctz(m3 & (m3 - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const uint w3 = uint(wq[(8 * c + j3) * 32]);
+        const uint w4 = uint(wq[(8 * c + j4) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const T xv3 = xsh[8 * c + j3];
+        const T xv4 = xsh[8 * c + j4];
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
+        const U xt3 = U(xv3);
+        const U xt4 = U(xv4);
+        // The record adds each half left to right, then the second half to the first: with n0 values in the
+        // first half that is a + ((b + c) + d) for n0 = 1, (a + b) + (c + d) for n0 = 2, else ((a + b) + c) + d.
+        const int n0 = popcount(m & 0xfu);
+        const U sum4 = n0 == 1 ? U(xv1) + ((U(xv2) + U(xv3)) + U(xv4))
+            : n0 == 2 ? (U(xv1) + U(xv2)) + (U(xv3) + U(xv4))
+            : ((U(xv1) + U(xv2)) + U(xv3)) + U(xv4);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U t1 = xt1 * U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U t2 = xt2 * U(int(((w2 >> (4 * o)) & 0xfu)));
+          const U t3 = xt3 * U(int(((w3 >> (4 * o)) & 0xfu)));
+          const U t4 = xt4 * U(int(((w4 >> (4 * o)) & 0xfu)));
+          const U accum = n0 == 1 ? t1 + ((t2 + t3) + t4)
+              : n0 == 2 ? (t1 + t2) + (t3 + t4)
+              : ((t1 + t2) + t3) + t4;
+          p[o] += as_type<float>(sv[o]) * accum + sum4 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
       thread U xt[8];
       U sum = 0;
       const threadgroup T* xv = xsh + 8 * c;
@@ -2030,6 +2189,10 @@ enum NemotronZSkip {
         }.sorted { $0.0 < $1.0 }.map { $0.1 }
     }
 
+    /// A dictionary copy's FP32 pair table is read by every decode slot launch, so it joins its layer's
+    /// residency set unless NEMOTRON_MTP_RESID=0.
+    static let residentTables = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESID"] != "0"
+
     /// Numeric backbone order, independent of dictionary iteration order.
     static func decodeCopyLayers(_ model: Module) -> [[MLXArray]] {
         let layers = model.namedModules().compactMap { name, module -> (Int, NemotronHMoE)? in
@@ -2041,7 +2204,7 @@ enum NemotronZSkip {
         return lock.withLock {
             layers.compactMap { _, moe in
                 guard let c = copies[ObjectIdentifier(moe.switchMLP.fc2)] else { return nil }
-                return c.dict ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
+                return c.dict && !residentTables ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
             }
         }
     }
@@ -2223,6 +2386,22 @@ enum NemotronZSkip {
     /// The draft copies' arrays (decode-only backing for the residency lease).
     static var draftCopyArrays: [MLXArray] {
         lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+    /// `module`'s parameters except the original banks of switch linears whose draft copy is verified: the draft
+    /// rounds read the copy, so those banks are not decode backing. NEMOTRON_MTP_DRAFT_BANK_RESIDENCY=1 keeps them.
+    static func withoutCopiedDraftBanks(_ module: Module) -> [MLXArray] {
+        let all = module.parameters().flattened().map { $0.1 }
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_RESIDENCY"] != "1" else { return all }
+        let copied = lock.withLock { Set(draftCopies.keys) }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, copied.contains(ObjectIdentifier(linear)) else { continue }
+            for (_, a) in linear.parameters().flattened() { skip.insert(ObjectIdentifier(a)) }
+        }
+        let kept = all.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(kept.count) arrays, \(all.count - kept.count) copied draft-bank arrays left out\n".utf8))
+        return kept
     }
 
     static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
