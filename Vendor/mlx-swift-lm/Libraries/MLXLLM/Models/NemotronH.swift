@@ -771,12 +771,7 @@ class NemotronHRMSNormGated: Module {
 enum NemotronHCompactSSMGated {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_SSM_GATED_FUSED"] != "0"
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_ssm_compact_gated_prepared",
-        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
-                     "eps", "counter"],
-        outputNames: ["out", "state_out", "normed", "prepared"],
-        source: """
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -898,7 +893,31 @@ enum NemotronHCompactSSMGated {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            """, mutableInputs: ["counter"])
+            """
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_gated_prepared",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: source, mutableInputs: ["counter"])
+
+    /// The current-window body and gated norm are literally the existing
+    /// source. Replay only delays state stores; it does not rearrange outputs.
+    static let replayKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_lazy_checkpoint_gated_prepared",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                     "eps", "counter"] + NemotronMTPDeferredSSMKernel.inputNames,
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: source.replacingOccurrences(of: "for (int t = 0; t < L; ++t) {",
+            with: NemotronMTPDeferredSSMKernel.body + """
+                if constexpr (!WS) {
+                    if (n == 0 && d_idx == 0 && ds_idx == 0) state_out[0] = static_cast<U>(0);
+                }
+                for (int t = 0; t < L; ++t) {
+                """)
+            .replacingOccurrences(of: "if (t == L - 1) {", with: "if (WS && t == L - 1) {"),
+        mutableInputs: ["counter"])
+
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -921,7 +940,8 @@ extension NemotronHRMSNormGated {
     func compactSSMPreparedRows(
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
-        stateDim: Int
+        stateDim: Int, replayInputs: [MLXArray]? = nil,
+        deferSSM: Bool = false, writeDeferredState: Bool = false
     ) -> (MLXArray, MLXArray, MLXArray)? {
         guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -937,14 +957,26 @@ extension NemotronHRMSNormGated {
         // Created and evaluated at load (`prepareCounter`), never inside a
         // compile trace; without it the two launches stay.
         guard NemotronHCompactSSMGated.counter != nil else { return nil }
-        let outputs = NemotronHCompactSSMGated.kernel(
-            [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
-             eps, NemotronHCompactSSMGated.counter!],
+        let kernel = deferSSM ? NemotronHCompactSSMGated.replayKernel : NemotronHCompactSSMGated.kernel
+        var operands: [any ScalarOrArray] = [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
+             eps, NemotronHCompactSSMGated.counter!]
+        if deferSSM {
+            guard let replayInputs, replayInputs.count == 13,
+                  replayInputs[12].shape == [6], replayInputs[12].dtype == .int32 else { return nil }
+            for i in 0..<6 {
+                guard replayInputs[i].shape == [1, 3, 6144], replayInputs[i].dtype == .bfloat16,
+                      replayInputs[i + 6].shape == [1, 3, 64], replayInputs[i + 6].dtype == .float32
+                else { return nil }
+            }
+            operands += replayInputs
+        }
+        let outputs = kernel(
+            operands,
             template: [("T", DType.bfloat16), ("U", DType.float32),
                        ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
-                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)],
+                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304), ("WS", writeDeferredState)],
             grid: (32, 64, 64), threadGroup: (32, 8, 1),
-            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
+            outputShapes: [[1, 3, 64, 64], deferSSM && !writeDeferredState ? [1] : [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
         return (outputs[2], outputs[3], outputs[1])
     }
