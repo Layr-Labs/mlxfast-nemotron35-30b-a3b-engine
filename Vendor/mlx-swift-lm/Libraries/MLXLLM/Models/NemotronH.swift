@@ -205,6 +205,99 @@ enum NemotronHResidualRMSNorm {
         return (outputs[0], outputs[1], outputs[2])
     }
 
+    private static let draftPreparedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_RMS_PREPARED"] != "0"
+    private static let draftPreparedLock = NSLock()
+    nonisolated(unsafe) private static var draftPreparedNorms: Set<ObjectIdentifier> = []
+
+    /// The existing prepared residual/RMS body is row-independent. Its one-row
+    /// launch preserves the BF16 residual and weighted RMS rounding, then packs
+    /// those rounded values without another launch or normalized-row read.
+    private static func dispatchPreparedDraft(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray, MLXArray)?
+    {
+        guard preparedMoEEnabled, NemotronMoELeader.enabled, NemotronMoELeader.preparedGateUp,
+            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            lhs.shape == [1, 1, 2688], rhs.shape == lhs.shape,
+            lhs.dtype == .bfloat16, rhs.dtype == .bfloat16,
+            type(of: norm) == RMSNorm.self,
+            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let outputs = preparedKernel([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape, [1, 11, 9 * 32]],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    static func applyPreparedDraft(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm,
+                                   consumer: SwitchLinear) -> (MLXArray, MLXArray, MLXArray)? {
+        guard draftPreparedEnabled, NemotronMoELeader.draftFC1Covers(consumer),
+            draftPreparedLock.withLock({ draftPreparedNorms.contains(ObjectIdentifier(norm)) })
+        else { return nil }
+        return dispatchPreparedDraft(lhs, rhs, norm: norm)
+    }
+
+    /// Executed only by the official worker at load, before graph warm-up.
+    /// Compare the actual native norm and every written word of its prepared
+    /// layout; the last tile's 16 unwritten lanes are never read by FC1.
+    static func prepareDraftPrepared(_ head: Module) {
+        draftPreparedLock.withLock { draftPreparedNorms = [] }
+        guard draftPreparedEnabled, preparedMoEEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return }
+        var built: Set<ObjectIdentifier> = []
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in head.modules() {
+                    guard let block = module as? NemotronH35MTPExpertBlock else { continue }
+                    guard NemotronMoELeader.draftFC1Covers(block.mixer.switchMLP.fc1)
+                    else { return false }
+                    let dense = MLXArray((0..<2688).map { Float(($0 * 37 + 11) % 257 - 128) / 64 })
+                        .asType(.bfloat16).reshaped(1, 1, 2688)
+                    let rhs = MLXArray((0..<2688).map { Float(($0 * 13 + 3) % 251 - 125) / 128 })
+                        .asType(.bfloat16).reshaped(1, 1, 2688)
+                    let sparse = MLXArray((0..<2688).map {
+                        $0 % 17 == 0 ? Float(($0 % 31) - 15) / 8 : Float(-0.0)
+                    }).asType(.bfloat16).reshaped(1, 1, 2688)
+                    let tail = MLXArray((0..<2688).map {
+                        $0 >= 2560 ? Float(($0 % 19) - 9) / 4 : Float(0)
+                    }).asType(.bfloat16).reshaped(1, 1, 2688)
+                    let zero = MLXArray.zeros([1, 1, 2688], dtype: .bfloat16)
+                    let trials = [(dense, rhs), (dense, -dense), (sparse, tail),
+                                  (tail, sparse), (zero, zero),
+                                  ((dense * MLXArray(Float(4))).asType(.bfloat16), rhs)]
+                    func written(_ x: MLXArray) -> MLXArray {
+                        x.view(dtype: .uint32).reshaped(1, 11, 9, 32).transposed(0, 1, 3, 2)
+                            .reshaped(1, 352, 9)[0..., ..<336, 0...]
+                    }
+                    for (a, b) in trials {
+                        guard let actual = dispatchPreparedDraft(a, b, norm: block.norm),
+                              let expected = apply(a, b, norm: block.norm) else { return false }
+                        let packed = NemotronHeadPreparedActivation.prepareContiguousRows(
+                            expected.1.reshaped(1, 2688), pv: 8)
+                        let residual = (actual.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all()
+                        let normalized = (actual.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()
+                        let layout = (written(actual.2) .== written(packed)).all()
+                        let finite = (abs(actual.1).asType(.float32) .< MLXArray(Float.infinity)).all()
+                        guard logicalAnd(logicalAnd(residual, normalized), logicalAnd(layout, finite))
+                            .item(Bool.self) else { return false }
+                    }
+                    built.insert(ObjectIdentifier(block.norm))
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        draftPreparedLock.withLock { draftPreparedNorms = accepted ? built : [] }
+        FileHandle.standardError.write(Data((accepted
+            ? "nemotron draft fused norm pack on: \(built.count) norms\n"
+            : "nemotron draft fused norm pack off: compiler or private word check refused\n").utf8))
+    }
+
     // MARK: Captured-verify plumbing (one launch per layer join)
 
     /// NEMOTRON_MTP_FUSED_PLUMBING=0 restores the original captured verify
