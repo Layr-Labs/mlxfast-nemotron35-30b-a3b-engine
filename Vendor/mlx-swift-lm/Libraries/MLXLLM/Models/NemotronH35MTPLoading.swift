@@ -78,7 +78,9 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
+        NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
+        NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
@@ -342,6 +344,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
+    static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
+    private(set) var copiesEnqueued = false
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
@@ -424,7 +428,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             if !decoded {
                 decoded = true
-                for (i, set) in owner.decodeSets.enumerated() {
+                for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
             }
@@ -445,7 +449,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             }
             owner.queue.sync {
                 owner.seedSet.endResidency()
-                if decoded { for set in owner.decodeSets { set.endResidency() } }
+                if decoded || owner.copiesEnqueued { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
         }
@@ -462,6 +466,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// set keeps its own queue.
     func begin() -> Lease {
         NemotronZSkip.beginCopyReadiness(owners)
+        copiesEnqueued = false
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
@@ -474,8 +479,21 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
         for set in extraSets { targetQueue.async { set.requestResidency() } }
+        if Self.copiesAfterExtras {
+            copiesEnqueued = true
+            for (i, set) in decodeSets.enumerated() {
+                let ready = [owners[cut + i]]
+                targetQueue.async {
+                    set.requestResidency()
+                    NemotronZSkip.markCopyReady(ready)
+                }
+            }
+        }
         return Lease(self)
     }
 }
 
 // Second measurement of ff544a18.
+
+
+// Second measurement of d7be4a2c.
