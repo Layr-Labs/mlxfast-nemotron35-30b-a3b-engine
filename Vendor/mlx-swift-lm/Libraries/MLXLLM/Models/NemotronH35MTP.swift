@@ -1099,13 +1099,13 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
         guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
-            CBv2MTPSubmitMerge.submit([ids, out, keys, values])
+            CBv2MTPSubmitMerge.submit([ids, out])
             return
         }
         let inputs = module.pagedDraftInputs(
             hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        var roots = [ids, out, keys, values] + inputs
+        var roots = [ids, out] + inputs
         // The rest of the second draft too: its attention reads the head cache,
         // which still holds every post-verify row (they sit last). Attend over
         // the trusted prefix, post-verify rows 0...n for the device-picked n,
