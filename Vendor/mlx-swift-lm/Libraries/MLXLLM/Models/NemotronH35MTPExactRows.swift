@@ -2200,6 +2200,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
     /// order do not depend on which rows share a threadgroup, so the gates,
@@ -2220,10 +2221,11 @@ enum NemotronMTPRouterRowsSelect {
     /// x: [1, R, 2688] bf16 (R = 1...4), weight: a row-major [128, 2688] bf16
     /// router, bias: [128] fp32. Returns (indices [1, R, 6] uint32,
     /// weights [1, R, 6] fp32), or nil outside the qualified shapes.
-    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false)
+    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false,
+                    draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter,
+        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2257,6 +2259,9 @@ enum NemotronMTPRouterRowsSelect {
         let zero = MLXArray.zeros([1], dtype: .uint32)
         eval(zero)
         counter = zero
+        let draftZero = MLXArray.zeros([1], dtype: .uint32)
+        eval(draftZero)
+        draftCounter = draftZero
         var ok = MLXArray(true)
         do {
             let matched = try withError { () -> Bool in
@@ -2669,6 +2674,9 @@ enum NemotronHeadScreen {
     // simdgroups rescore 4 kept rows each with the stock non-fast qmv per-row
     // body (K = 2688: ten 256-blocks plus a 128-value tail), as
     // nemotronMultiRowQMVSource does for R = 1, and round to T.
+    // Chunk XC is rescored whole: its threadgroup and the NCH - NSC
+    // threadgroups after the NSC screened chunks each take C consecutive rows
+    // of it (CH / C in all) instead of a partial-score selection.
     private static let selectCrownSource = """
       constexpr int P1 = CH / 32;
       constexpr int RPSG = 4;
@@ -2685,9 +2693,14 @@ enum NemotronHeadScreen {
       const int base = chunk * CH;
       threadgroup int cand[C];
       threadgroup float cval[C];
+      const bool exact = chunk == XC || chunk >= NSC;
+      if (exact) {
+        const int first = XC * CH + (chunk == XC ? 0 : chunk - NSC + 1) * C;
+        for (int s = sgid * 32 + lane; s < C; s += NSG * 32) cand[s] = first + s;
+      }
       // Simdgroup 0 keeps the chunk's top C partial scores (larger score,
       // then lower id); lane l holds the P1 contiguous rows l * P1 + i.
-      if (sgid == 0) {
+      if (sgid == 0 && !exact) {
         float v[P1];
         const device float* sp = scores + base + lane * P1;
         for (int i = 0; i < P1; i++) v[i] = sp[i];
@@ -3049,6 +3062,11 @@ enum NemotronHeadScreen {
         return counter
     }
 
+    /// NEMOTRON_MTP_HEAD_SCREEN_EXACT_CHUNK: the CH-row chunk whose rows are all rescored instead of
+    /// selected by partial score (default 1, head rows 1024..<2048 at CH 1024); a negative value keeps
+    /// every chunk on the partial-score selection.
+    static let exactChunk = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_EXACT_CHUNK"] ?? "") ?? 1
+
     struct Result {
         let id: MLXArray
         let scores: MLXArray
@@ -3093,27 +3111,34 @@ enum NemotronHeadScreen {
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
+        // The whole-chunk rescore (`exactChunk`): CH / C threadgroups of C consecutive rows each.
+        // XC = chunks (no such chunk) keeps every chunk on the selection.
+        let exactChunk = Self.exactChunk >= 0 && Self.exactChunk < chunks && chunk % keep == 0
+            ? Self.exactChunk : chunks
+        let groupsTotal = chunks + (exactChunk < chunks ? chunk / keep - 1 : 0)
         let selectGroups = 8
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
             let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
                 [scores, weight, scales, biases, hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
-                           ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
-                grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
-                outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks], [1]],
+                           ("NCH", groupsTotal), ("NSC", chunks), ("XC", exactChunk)]
+                    + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
+                grid: (32, selectGroups * groupsTotal, 1), threadGroup: (32, selectGroups, 1),
+                outputShapes: [[groupsTotal * keep], [groupsTotal * keep], [groupsTotal], [groupsTotal], [1]],
                 outputDTypes: [.int32, .float32, .float32, .int32, .int32])
             return Result(id: picked[4], scores: scores, candidateIds: picked[0], candidateValues: picked[1])
         }
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
             [scores, weight, scales, biases, hidden],
-            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
+            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
+                       ("NSC", chunks), ("XC", exactChunk)]
                 + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
-            grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
-            outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks]],
+            grid: (32, selectGroups * groupsTotal, 1), threadGroup: (32, selectGroups, 1),
+            outputShapes: [[groupsTotal * keep], [groupsTotal * keep], [groupsTotal], [groupsTotal]],
             outputDTypes: [.int32, .float32, .float32, .int32])
         let id = finalKernel(
-            [picked[2], picked[3]], template: [("NCH", chunks)],
+            [picked[2], picked[3]], template: [("NCH", groupsTotal)],
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
