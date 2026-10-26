@@ -91,6 +91,7 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
+        NemotronMTPDraftRouterQualification.run(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -406,9 +407,41 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         return sets
     }
 
+    /// NEMOTRON_GPU_WAKE=0 skips it: `begin` first commits one one-thread compute launch on its own queue
+    /// (not waited on), so the GPU leaves its idle state while the host builds and encodes the seed's first
+    /// chunk instead of after the first chunk is committed. The launch writes one word of its own buffer.
+    static let wakeEnabled = ProcessInfo.processInfo.environment["NEMOTRON_GPU_WAKE"] != "0"
+    private var wake: (queue: any MTLCommandQueue, pipeline: any MTLComputePipelineState, buffer: any MTLBuffer)?
+
+    private static func makeWake(_ device: any MTLDevice)
+        -> (queue: any MTLCommandQueue, pipeline: any MTLComputePipelineState, buffer: any MTLBuffer)?
+    {
+        guard wakeEnabled, let queue = device.makeCommandQueue(),
+              let library = try? device.makeLibrary(source: """
+                  kernel void nemotron_gpu_wake(device uint* word [[buffer(0)]]) { word[0] = 1u; }
+                  """, options: nil),
+              let function = library.makeFunction(name: "nemotron_gpu_wake"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let buffer = device.makeBuffer(length: 16, options: .storageModeShared)
+        else { return nil }
+        return (queue, pipeline, buffer)
+    }
+
+    private func wakeGPU() {
+        guard let wake, let commands = wake.queue.makeCommandBuffer(),
+              let encoder = commands.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(wake.pipeline)
+        encoder.setBuffer(wake.buffer, offset: 0, index: 0)
+        encoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
+        commands.commit()
+    }
+
     init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier], target: [[MLXArray]],
           extras: [MLXArray]) {
         guard Self.enabled, let device = MTLCreateSystemDefaultDevice() else { return nil }
+        self.wake = Self.makeWake(device)
         let targetSets = Self.targetEnabled ? Self.makeTargetSets(device, target) : []
         let extraSets = Self.extrasEnabled && !extras.isEmpty ? Self.makeTargetSets(device, [extras]) : []
         FileHandle.standardError.write(Data(
@@ -496,6 +529,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
     /// set keeps its own queue.
     func begin() -> Lease {
+        wakeGPU()
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
         guard !targetSets.isEmpty else {
