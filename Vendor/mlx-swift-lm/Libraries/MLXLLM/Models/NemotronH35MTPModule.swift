@@ -285,16 +285,14 @@ final class NemotronH35MTPAttentionBlock: Module {
         return (fused, queries, keys, values)
     }
 
-    /// One row's attention-block output (residual + projected attention) from
-    /// its query [1, heads, 1, headDim] over explicit K/V with an additive mask.
-    func maskedRowOutput(
+    func maskedRowParts(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
-    ) -> MLXArray {
+    ) -> (residual: MLXArray, attention: MLXArray) {
         let output = MLXFast.scaledDotProductAttention(
             queries: queries.asType(keys.dtype), keys: keys, values: values,
             scale: mixer.scale, mask: .array(mask))
         let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
-        return fused + nemotronR1Linear(merged, mixer.wo)
+        return (fused, nemotronR1Linear(merged, mixer.wo))
     }
 
     /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
@@ -605,11 +603,13 @@ final class NemotronH35MTPModule: Module {
     {
         (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding)
     }
-    func maskedRowOutput(
+    func finishMaskedRow(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
-        (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowOutput(
+        let parts = (layers[0] as! NemotronH35MTPAttentionBlock).maskedRowParts(
             fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(
+            residual: parts.residual, attention: parts.attention)
     }
     /// The one-token draft step from `pagedDraftInputs` with its attention over
     /// explicit, masked K/V instead of the paged head cache.
