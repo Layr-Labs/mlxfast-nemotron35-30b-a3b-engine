@@ -804,7 +804,7 @@ enum NemotronHeadPreparedActivation {
     static let fastLoadForm = 0
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
-    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
+    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 4)]
     static func loadForm(k: Int, n: Int) -> Int {
         loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
     }
@@ -2200,6 +2200,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
     /// order do not depend on which rows share a threadgroup, so the gates,
@@ -2220,10 +2221,11 @@ enum NemotronMTPRouterRowsSelect {
     /// x: [1, R, 2688] bf16 (R = 1...4), weight: a row-major [128, 2688] bf16
     /// router, bias: [128] fp32. Returns (indices [1, R, 6] uint32,
     /// weights [1, R, 6] fp32), or nil outside the qualified shapes.
-    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false)
+    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false,
+                    draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter,
+        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2257,6 +2259,9 @@ enum NemotronMTPRouterRowsSelect {
         let zero = MLXArray.zeros([1], dtype: .uint32)
         eval(zero)
         counter = zero
+        let draftZero = MLXArray.zeros([1], dtype: .uint32)
+        eval(draftZero)
+        draftCounter = draftZero
         var ok = MLXArray(true)
         do {
             let matched = try withError { () -> Bool in
