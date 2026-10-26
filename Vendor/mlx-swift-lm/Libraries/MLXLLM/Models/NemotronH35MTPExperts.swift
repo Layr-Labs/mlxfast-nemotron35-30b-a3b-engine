@@ -649,6 +649,10 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    let tripleGateUp: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8: MLXFast.MLXFastKernel?
+    let tripleGateUpDict: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8Dict: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -712,6 +716,38 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUp = nmlPreparedSource(tripleSource, pointers: triplePointers).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8 = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpDict = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8Dict = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
     }
@@ -1060,6 +1096,47 @@ enum NemotronMoELeader {
             which(ok, result[1], referencePlan))
     }
 
+    static let elideUnreadPlan =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_PLAN_ELIDE"] != "0"
+
+    static func applyTripleWithoutPlan(
+        _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+    ) -> MLXArray? {
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
+              x.shape == [3, 2688], x.dtype == .bfloat16,
+              inds.shape == [18], inds.dtype == .uint32,
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
+        else { return nil }
+        let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+        guard tail8 || kernels.tripleGateUpAndPlan != nil else { return nil }
+        let useDict = dict != nil
+            && (tail8 ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
+        guard let kernel = useDict
+            ? (tail8 ? kernels.tripleGateUpTail8Dict : kernels.tripleGateUpDict)
+            : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let rps = leaderResultsPerSimdgroup(rows: 3)
+        let activation = kernel(
+            useDict
+                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+                : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                   NemotronBankBinding.bind(bank.biases), packed, inds],
+            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
+                       ("RELU2", relu2), ("RPS", rps)],
+            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
+            outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+        guard selfTest else { return activation }
+        let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
+            perSlot: false, relu2: relu2, prepared: packed)
+        let ok = (activation.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
+        return which(ok, activation, MLXArray(Float.nan).asType(x.dtype))
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -1107,9 +1184,14 @@ enum NemotronMoELeader {
         let act: MLXArray
         let balancePlan: MLXArray?
         if fuseRelu2 {
-            if rows == 3, let fused = applyWithBalancePlan(
-                xr, flat, bank: up, relu2: true, prepared: prepared,
-                dict: NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil) {
+            let dict = rows == 3 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
+            if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
+               let activation = applyTripleWithoutPlan(
+                   xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
+                act = activation
+                balancePlan = nil
+            } else if rows == 3, let fused = applyWithBalancePlan(
+                xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
                 act = fused.activation
                 balancePlan = fused.plan
             } else {
