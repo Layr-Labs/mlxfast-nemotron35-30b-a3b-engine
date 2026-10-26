@@ -3084,106 +3084,6 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
-
-    /// Draft-only 2-bit screen records: each selected group's 64 head values
-    /// (dequantized from the head's own 4-bit codes) re-quantized on load to
-    /// 2 bits with their own minimum and step (round to nearest, clamped to
-    /// 0...3). Per row: 4 words of codes per selected group (value j of a
-    /// word at bits 2j), then one word per group holding the minimum (low
-    /// half) and the step (high half) as float16; 5 words per selected group
-    /// (rows from `rows` up: the upper group set). Only the screen's partial
-    /// pass reads them; the kept rows are rescored on the head itself.
-    static func packRecords2(
-        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
-        upperGroups: [Int]?
-    ) -> MLXArray {
-        let shifts = MLXArray((0..<16).map { UInt32(2 * $0) })
-        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
-            let columns = MLXArray(selected.flatMap { g in (0..<64).map { Int32(64 * g + $0) } })
-            var parts: [MLXArray] = []
-            for start in stride(from: range.lowerBound, to: range.upperBound, by: 8192) {
-                let r = start..<min(start + 8192, range.upperBound)
-                let values = take(
-                    dequantized(weight[r], scales: scales[r], biases: biases[r], groupSize: 64, bits: 4)
-                        .asType(.float32), columns, axis: 1
-                ).reshaped(r.count, selected.count, 64)
-                let low = values.min(axis: -1, keepDims: true)
-                let step = (values.max(axis: -1, keepDims: true) - low) / 3
-                let safe = which(step .== 0, MLXArray(Float(1)), step)
-                let codes = clip(round((values - low) / safe), min: 0, max: 3).asType(.uint32)
-                let words = (codes.reshaped(r.count, selected.count, 4, 16) << shifts).sum(axis: -1)
-                    .reshaped(r.count, selected.count * 4)
-                let lowBits = low.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let stepBits = step.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
-                let part = concatenated([words.asType(.uint32), lowBits | (stepBits << 16)], axis: 1)
-                eval(part)
-                parts.append(part)
-            }
-            return concatenated(parts, axis: 0).reshaped(-1)
-        }
-        let lower = pack(0..<rows, groups)
-        guard let upperGroups else { return lower }
-        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
-    }
-
-    // The 2-bit record twin of the partial pass: lane l owns half-group l
-    // (32 values = two code words) of the selected groups; scores are
-    // step * sum(code * x) + minimum * sum(x) over the selected groups.
-    private static let record2PartialSource = """
-      constexpr int VPL = 32;
-      const int lane = int(thread_index_in_simdgroup);
-      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
-      const int row0 = sg * RPS;
-      const bool upper = row0 >= LO;
-      const int H = upper ? 2 * S2 : 2 * S;
-      const bool on = lane < H;
-      const int gi = lane >> 1;
-      const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
-      const int part = lane & 1;
-      const device T* xp = x + g * 64 + part * 32;
-      float xv[VPL];
-      float xs = 0.0f;
-      _Pragma("clang loop unroll(full)")
-      for (int i = 0; i < VPL; i += 8) {
-        _Pragma("clang loop unroll(full)")
-        for (int k = 0; k < 8; k++) {
-          const float xk = on ? float(xp[i + k]) : 0.0f;
-          xs += xk;
-          xv[i + k] = xk / float(1 << (2 * k));
-        }
-      }
-      _Pragma("clang loop unroll(full)")
-      for (int r = 0; r < RPS; r++) {
-        const int row = row0 + r;
-        float acc = 0.0f;
-        if (on) {
-          const device uint32_t* rp = rec + (upper
-              ? size_t(LO) * (5 * S) + size_t(row - LO) * (5 * S2) : size_t(row) * (5 * S));
-          const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);
-          const uint ld = rp[4 * (upper ? S2 : S) + gi];
-          const float lo = float(as_type<half>(ushort(ld & 0xffffu)));
-          const float d = float(as_type<half>(ushort(ld >> 16)));
-          float a = 0.0f;
-          _Pragma("clang loop unroll(full)")
-          for (int i = 0; i < VPL / 8; i++) {
-            const uint q = uint(ws[i]);
-            a += xv[8 * i] * float(q & 0x0003u) + xv[8 * i + 1] * float(q & 0x000cu)
-                + xv[8 * i + 2] * float(q & 0x0030u) + xv[8 * i + 3] * float(q & 0x00c0u)
-                + xv[8 * i + 4] * float(q & 0x0300u) + xv[8 * i + 5] * float(q & 0x0c00u)
-                + xv[8 * i + 6] * float(q & 0x3000u) + xv[8 * i + 7] * float(q & 0xc000u);
-          }
-          acc = d * a + lo * xs;
-        }
-        acc = simd_sum(acc);
-        if (lane == 0) {
-          scores[row] = acc;
-        }
-      }
-    """
-    private static let record2PartialKernel = MLXFast.metalKernel(
-        name: "nemotron_head_screen_partial_record2_affine2",
-        inputNames: ["rec", "x", "groups", "groups2"],
-        outputNames: ["scores"], source: record2PartialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3321,8 +3221,8 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
-        counter: MLXArray? = nil,
+        packed: MLXArray? = nil, records: MLXArray? = nil,
+        counter: MLXArray? = nil, suppliedScores: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
@@ -3332,12 +3232,7 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records2.map {
-            record2PartialKernel(
-                [$0, hidden, groups, upperGroups ?? groups], template: template,
-                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
-                outputShapes: [[rows]], outputDTypes: [.float32])
-        } ?? records.map {
+        let scores = suppliedScores ?? (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
@@ -3376,5 +3271,144 @@ enum NemotronHeadScreen {
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+    }
+}
+
+// Activation-aware draft-only screen; exact shortlist rescoring stays unchanged.
+private let nemotronDynamicScreenPickerSource = """
+  const int lane = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const bool upper = threadgroup_position_in_grid.y != 0;
+  const int pairs = upper ? PU / 2 : PL / 2;
+  const int keep = upper ? SU / 2 : SL / 2;
+  const bool live = sg < pairs;
+  const int firstGroup = live ? int(upper ? poolUpper[2 * sg] : poolLower[2 * sg]) : 0;
+  const device float* energy = upper ? energyUpper : energyLower;
+  threadgroup float pairScore[8];
+  threadgroup int chosen[8];
+  float score = 0;
+  if (live) {
+    const int start = firstGroup * 64 + lane * 4;
+    for (int i = 0; i < 4; ++i) {
+      const float value = float(x[start + i]);
+      score += value * value * energy[start + i];
+    }
+  }
+  score = simd_sum(score);
+  if (lane == 0) pairScore[sg] = metal::isnan(score) ? -INFINITY : score;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) {
+    int rank = 0;
+    if (live) {
+      for (int i = 0; i < pairs; ++i) {
+        rank += pairScore[i] > pairScore[sg]
+          || (pairScore[i] == pairScore[sg] && i < sg);
+      }
+    }
+    chosen[sg] = live && rank < keep;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0 && chosen[sg]) {
+    int slot = 0;
+    for (int i = 0; i < sg; ++i) slot += chosen[i];
+    if (upper) {
+      groupsUpper[2 * slot] = uint(firstGroup);
+      groupsUpper[2 * slot + 1] = uint(firstGroup + 1);
+      slotsUpper[2 * slot] = uint(2 * sg);
+      slotsUpper[2 * slot + 1] = uint(2 * sg + 1);
+    } else {
+      groupsLower[2 * slot] = uint(firstGroup);
+      groupsLower[2 * slot + 1] = uint(firstGroup + 1);
+      slotsLower[2 * slot] = uint(2 * sg);
+      slotsLower[2 * slot + 1] = uint(2 * sg + 1);
+    }
+  }
+"""
+
+
+extension NemotronHeadScreen {
+    static func dynamicRecordKernel() -> MLXFast.MLXFastKernel? {
+        guard partialHalfDecodeForm == 0 else { return nil }
+        let substitutions: [(String, String)] = [
+            ("const device uint32_t* rp = rec + (upper",
+             "const int slot = int(upper ? slots2[lane >> 1] : slots[lane >> 1]);\n"
+                + "const device uint32_t* rp = rec + (upper"),
+            ("size_t(LO) * (9 * S)", "size_t(LO) * (9 * PL)"),
+            ("size_t(row - LO) * (9 * S2)", "size_t(row - LO) * (9 * PU)"),
+            ("size_t(row) * (9 * S)", "size_t(row) * (9 * PL)"),
+            ("rp + (lane >> 1) * 8 + part * 4", "rp + slot * 8 + part * 4"),
+            ("rp + 8 * (upper ? S2 : S)", "rp + 8 * (upper ? PU : PL)"),
+            ("float(sb[(lane >> 1)])", "float(sb[slot])"),
+            ("float(sb[(upper ? S2 : S) + (lane >> 1)])",
+             "float(sb[(upper ? PU : PL) + slot])"),
+        ]
+        var source = recordPartialSource
+        for (from, to) in substitutions {
+            guard source.components(separatedBy: from).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: from, with: to)
+        }
+        return MLXFast.metalKernel(name: "nemotron_head_dynamic_record_partial",
+            inputNames: ["rec", "x", "groups", "groups2", "slots", "slots2"],
+            outputNames: ["scores"], source: source)
+    }
+}
+
+
+extension NemotronHeadScreen {
+    struct DynamicPlan {
+        let records: MLXArray
+        let poolLower: MLXArray, poolUpper: MLXArray
+        let energyLower: MLXArray, energyUpper: MLXArray
+        let partial: MLXFast.MLXFastKernel
+        var arrays: [MLXArray] { [records, poolLower, poolUpper, energyLower, energyUpper] }
+
+        func pick(_ hidden: MLXArray) -> [MLXArray] {
+            NemotronHeadScreen.dynamicPicker(
+                [hidden, poolLower, poolUpper, energyLower, energyUpper],
+                template: [("T", DType.bfloat16), ("PL", 16), ("PU", 12), ("SL", 12), ("SU", 8)],
+                grid: (32, 16, 1), threadGroup: (32, 8, 1),
+                outputShapes: [[12], [8], [12], [8]],
+                outputDTypes: [.uint32, .uint32, .uint32, .uint32])
+        }
+
+        func scores(_ hidden: MLXArray, picked: [MLXArray], upper: Bool) -> MLXArray? {
+            guard picked.count == 4 else { return nil }
+            let rows = upper ? NemotronHeadScreen.headRows : NemotronHeadScreen.rows
+            return partial([records, hidden, picked[0], upper ? picked[1] : picked[0],
+                            picked[2], upper ? picked[3] : picked[2]],
+                template: [("T", DType.bfloat16), ("PL", 16), ("PU", 12),
+                           ("S", 12), ("S2", upper ? 8 : 12), ("RPS", 8), ("NSG", 2),
+                           ("LO", NemotronHeadScreen.rows)],
+                grid: (32, rows / 8, 1), threadGroup: (32, 2, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32]).first
+        }
+    }
+
+    private static let dynamicPicker = MLXFast.metalKernel(
+        name: "nemotron_head_dynamic_group_picker",
+        inputNames: ["x", "poolLower", "poolUpper", "energyLower", "energyUpper"],
+        outputNames: ["groupsLower", "groupsUpper", "slotsLower", "slotsUpper"],
+        source: nemotronDynamicScreenPickerSource)
+
+    static func makeDynamicPlan(
+        head: QuantizedLinear, lower: [Int], upper: [Int],
+        energyLower: MLXArray, energyUpper: MLXArray
+    ) -> DynamicPlan? {
+        func valid(_ groups: [Int], count: Int) -> Bool {
+            groups.count == count && Set(groups).count == count && groups == groups.sorted()
+                && stride(from: 0, to: count, by: 2).allSatisfy {
+                    groups[$0] >= 0 && groups[$0] % 2 == 0 && groups[$0 + 1] == groups[$0] + 1
+                        && groups[$0 + 1] < groupsPerRow
+                }
+        }
+        guard valid(lower, count: 16), valid(upper, count: 12),
+              energyLower.shape == [width], energyUpper.shape == [width],
+              energyLower.dtype == .float32, energyUpper.dtype == .float32,
+              let biases = head.biases, let kernel = dynamicRecordKernel() else { return nil }
+        let records = packRecords(weight: head.weight, scales: head.scales, biases: biases,
+                                  groups: lower, upperGroups: upper)
+        return DynamicPlan(records: records,
+            poolLower: MLXArray(lower.map { UInt32($0) }), poolUpper: MLXArray(upper.map { UInt32($0) }),
+            energyLower: energyLower, energyUpper: energyUpper, partial: kernel)
     }
 }
