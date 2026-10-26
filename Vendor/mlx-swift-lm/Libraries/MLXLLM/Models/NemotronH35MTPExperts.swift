@@ -133,11 +133,23 @@ extension NemotronHMoE {
         } else {
             packed = nil
         }
+        var y: MLXArray
+        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
+        let colaunch = products && NemotronFC2SharedColaunch.enabled
+            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         // Router matmul retains M=1. Gathered experts already have M=1 per
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
         let scores: MLXArray
-        if NemotronMTPExecution.batchedRouter {
+        if NemotronMTPExecution.batchedRouter, let colaunch, let packed,
+           NemotronSharedUpPacking.unpackedApplies(colaunch.x, up: colaunch.mlp.upProj, down: colaunch.mlp.downProj),
+           let fused = NemotronRouterSharedUpColaunch.run(x, gate: gate, up: colaunch.mlp.upProj, prepared: packed) {
+            // The router and the shared up in one launch; the shared up rows
+            // feed the routed FC2 / shared down launch below.
+            indices = fused.indices
+            scores = fused.weights
+            colaunch.up = fused.up
+        } else if NemotronMTPExecution.batchedRouter {
             let routed = gate.mtpForwardRows(x)
             indices = routed.0
             scores = routed.1
@@ -146,10 +158,6 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
-        var y: MLXArray
-        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
-        let colaunch = products && NemotronFC2SharedColaunch.enabled
-            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
             y = reduced
@@ -1026,13 +1034,6 @@ enum NemotronMoELeader {
             outputDTypes: [x.dtype])[0]
     }
 
-    /// Geometry of the plan-free triple FC1: one SIMD group per threadgroup
-    /// with four outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
-    /// 2 and the leader's narrow two restore the base's threadgroups). Only
-    /// the output-to-SIMD-group map moves: every output keeps its lane split,
-    /// K order, qdot and closing simd_sum.
-    static let fc1SimdGroups = max(1, Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_NSG"] ?? "") ?? 1)
-    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 4
     static let preparedGateUp = true
     static let fuseBalancePlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
@@ -1128,8 +1129,7 @@ enum NemotronMoELeader {
         else { return nil }
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
-        let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
-        let nsg = (bank.n / rps) % fc1SimdGroups == 0 ? fc1SimdGroups : 2
+        let rps = leaderResultsPerSimdgroup(rows: 3)
         let activation = kernel(
             useDict
                 ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
@@ -1138,7 +1138,7 @@ enum NemotronMoELeader {
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", false),
                        ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, bank.n / rps, 18), threadGroup: (32, nsg, 1),
+            grid: (32, bank.n / rps, 18), threadGroup: (32, 2, 1),
             outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
         guard selfTest else { return activation }
         let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
@@ -1839,7 +1839,7 @@ private let nemotronZSkipTiledSeqSource = """
 // scale exactly when the BF16 magnitude is at least 2^-110 and finite. Smaller
 // or non-finite values retain the complete tiled arithmetic below, avoiding
 // flush-to-zero differences from cancelling a subnormal intermediate.
-private let nemotronZSkipTiledFastSource = """
+private let nemotronZSkipTiledFastBaseSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
   constexpr int chunks = K / 8;
@@ -2010,6 +2010,68 @@ private let nemotronZSkipTiledFastSource = """
     }
   }
 """
+
+// A chunk with exactly four nonzero inputs takes a short path like one with three. The record adds each half
+// (values 0-3, then 4-7) left to right and then adds the second half to the first, so two values in each half
+// associate as (a + b) + (c + d), one value in the first half as a + ((b + c) + d), and every other split as
+// ((a + b) + c) + d. Each product of a BF16 input and a 4-bit code is exact in FP32, so only the order of the
+// additions matters. NEMOTRON_ZSKIP_FAST4=0 keeps such chunks on the dense path.
+private let nemotronZSkipFast4Block = """
+      if (popcount(m) == 4) {
+        const int j1 = ctz(m);
+        const uint m2 = m & (m - 1);
+        const int j2 = ctz(m2);
+        const uint m3 = m2 & (m2 - 1);
+        const int j3 = ctz(m3);
+        const int j4 = ctz(m3 & (m3 - 1));
+        const uint w1 = uint(wq[(8 * c + j1) * 32]);
+        const uint w2 = uint(wq[(8 * c + j2) * 32]);
+        const uint w3 = uint(wq[(8 * c + j3) * 32]);
+        const uint w4 = uint(wq[(8 * c + j4) * 32]);
+        const T xv1 = xsh[8 * c + j1];
+        const T xv2 = xsh[8 * c + j2];
+        const T xv3 = xsh[8 * c + j3];
+        const T xv4 = xsh[8 * c + j4];
+        const U xt1 = U(xv1);
+        const U xt2 = U(xv2);
+        const U xt3 = U(xv3);
+        const U xt4 = U(xv4);
+        const uint low = popcount(m & 0xfu);
+        const bool pairs = low == 2;
+        const bool lead = low == 1;
+        const U sum4 = pairs ? (U(xv1) + U(xv2)) + (U(xv3) + U(xv4))
+            : lead ? U(xv1) + ((U(xv2) + U(xv3)) + U(xv4))
+            : ((U(xv1) + U(xv2)) + U(xv3)) + U(xv4);
+        const int gi = c / 8;
+        const uint2 sr = *((const device uint2*)(sq + gi * OT));
+        const uint2 br = *((const device uint2*)(bq + gi * OT));
+        const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};
+        const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};
+        for (int o = 0; o < 4; o++) {
+          const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+          const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
+          const U c3 = U(int(((w3 >> (4 * o)) & 0xfu)));
+          const U c4 = U(int(((w4 >> (4 * o)) & 0xfu)));
+          const U t1 = xt1 * c1;
+          const U t2 = xt2 * c2;
+          const U t3 = xt3 * c3;
+          const U t4 = xt4 * c4;
+          const U accum = pairs ? (t1 + t2) + (t3 + t4) : lead ? t1 + ((t2 + t3) + t4) : ((t1 + t2) + t3) + t4;
+          p[o] += as_type<float>(sv[o]) * accum + sum4 * as_type<float>(bv[o]);
+        }
+        continue;
+      }
+
+"""
+
+private let nemotronZSkipTiledFastSource: String = {
+    let anchor = "      thread U xt[8];\n"
+    guard ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_FAST4"] != "0",
+          nemotronZSkipTiledFastBaseSource.components(separatedBy: anchor).count == 2
+    else { return nemotronZSkipTiledFastBaseSource }
+    return nemotronZSkipTiledFastBaseSource.replacingOccurrences(
+        of: anchor, with: nemotronZSkipFast4Block + anchor)
+}()
 
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
@@ -2764,6 +2826,8 @@ enum NemotronFC2SharedColaunch {
         let x: MLXArray
         let prepared: MLXArray?
         var rows: MLXArray? = nil
+        /// The shared up ReLU² rows when `NemotronRouterSharedUpColaunch` already produced them.
+        var up: MLXArray? = nil
         init(mlp: NemotronHMLP, x: MLXArray, prepared: MLXArray?) {
             self.mlp = mlp
             self.x = x
@@ -2776,7 +2840,7 @@ enum NemotronFC2SharedColaunch {
                     shared: Shared) -> MLXArray? {
         let down = shared.mlp.downProj
         guard covers(fc2: fc2, down: down),
-              let sx = NemotronSharedUpPacking.unpackedActivation(
+              let sx = shared.up ?? NemotronSharedUpPacking.unpackedActivation(
                   shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared),
               let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
         shared.rows = pair.1
@@ -3023,7 +3087,7 @@ private let nemotronMoETripleGateUpSource = """
     }
   }
 
-  const int out_row = tid.y * (int(threads_per_threadgroup.y) * results_per_simdgroup) + simd_gid * results_per_simdgroup;
+  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;
   const device uint8_t* ws = (const device uint8_t*)w +
       (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +
       simd_lid * 4;
