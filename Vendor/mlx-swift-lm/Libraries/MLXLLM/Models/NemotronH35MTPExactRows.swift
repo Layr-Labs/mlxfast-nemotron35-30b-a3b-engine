@@ -2201,8 +2201,9 @@ enum NemotronMTPRouterRows {
     // Router weights whose loaded layout is row-major [128, 2688]: there the
     // reference matmul(row, weight.T) takes the non-transposed gemv this kernel
     // repeats. Another layout makes MLX pick gemv_t, whose order differs, so
-    // only weights verified here at load take the fast path. Filled once by
-    // warm(), before any compile trace, from the frozen loaded weights.
+    // only weights verified here at load take the fast path. Filled by warm()
+    // (the target's routers, then the draft head's), before any compile
+    // trace, from the frozen loaded weights.
     nonisolated(unsafe) private static var rowMajor = Set<ObjectIdentifier>()
     static func isRowMajor(_ weight: MLXArray) -> Bool { rowMajor.contains(ObjectIdentifier(weight)) }
 
@@ -2306,10 +2307,13 @@ private let nemotronMTPRouterRowsSelectEpilogue = """
 /// `NemotronHRouterSelection`'s top-six selection (see the epilogue above).
 /// Used only after `qualify` found indices, weights and gates bitwise equal to
 /// the two launches. NEMOTRON_MTP_ROUTER_SELECT_FUSED=0 keeps the two launches.
+/// The draft head's one-row router (`exactOneTokenTail`) takes the same launch
+/// on its own counter once `qualifyDraft` matched it on the head's gate.
 enum NemotronMTPRouterRowsSelect {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
+    nonisolated(unsafe) static var draftVerified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
     nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
@@ -2336,7 +2340,15 @@ enum NemotronMTPRouterRowsSelect {
                     draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
+        launch(x, weight, bias: bias, force: force, draft: draft).map { ($0[1], $0[2]) }
+    }
+
+    /// `run`'s launch: [gates, indices, weights].
+    private static func launch(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool,
+                               draft: Bool) -> [MLXArray]?
+    {
+        guard enabled, force || (draft ? draftVerified : verified),
+              let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2346,12 +2358,11 @@ enum NemotronMTPRouterRowsSelect {
         else { return nil }
         let rows = x.dim(1)
         let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(2688, 128)
-        let out = kernel([weight, x, kArray, nArray, bias, counter],
+        return kernel([weight, x, kArray, nArray, bias, counter],
             template: [("T", x.dtype), ("R", rows)],
             grid: (32 * (128 / rowsPerThreadgroup), 8, 1), threadGroup: (32, 8, 1),
             outputShapes: [[1, rows, 128], [1, rows, 6], [1, rows, 6]],
             outputDTypes: [x.dtype, .uint32, .float32])
-        return (out[1], out[2])
     }
 
     /// Load time: the fused launch against the gemv + selection pair, bit for
@@ -2399,6 +2410,64 @@ enum NemotronMTPRouterRowsSelect {
             verified = false
         }
         report(verified ? "on (bitwise equal at R = 1...4)" : "off (differs or failed)")
+    }
+
+    /// Load time, after `qualify` and before any draft graph is traced: the
+    /// head's router (`exactOneTokenTail`, one row per draft step). Records the
+    /// head's row-major gate (`NemotronMTPRouterRows.warm`), then compares the
+    /// R = 1 launch on the draft counter with the two launches the draft takes
+    /// without it, the head gate's stock gemv `matmul(row, weight.T)` and
+    /// `NemotronHRouterSelection`: gates, indices and weights bit for bit on
+    /// seeded rows (each launched twice, so the counter reset is exercised).
+    /// Engages only if all match. NEMOTRON_MTP_DRAFT_ROUTER_FUSED=0 (or
+    /// NEMOTRON_MTP_DRAFT_FUSED=0) keeps the two launches.
+    static func qualifyDraft(_ head: Module) {
+        draftVerified = false
+        guard enabled, NemotronMTPDraftTail.oneLaunchRouter else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft router select fused: \(message)\n".utf8))
+        }
+        NemotronMTPRouterRows.warm(head)
+        let routers = head.modules().compactMap { $0 as? NemotronHMoEGate }
+        guard routers.count == 1, let gate = routers.first,
+              NemotronMTPRouterRows.isRowMajor(gate.weight),
+              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32,
+              gate.topK == 6, gate.nGroup == 1, gate.topkGroup == 1, gate.normTopkProb,
+              gate.routedScalingFactor == 2.5
+        else { return report("off (no row-major head router)") }
+        if draftCounter == nil {
+            let zero = MLXArray.zeros([1], dtype: .uint32)
+            eval(zero)
+            draftCounter = zero
+        }
+        var ok = MLXArray(true)
+        do {
+            let matched = try withError { () -> Bool in
+                for seed in 0 ..< 8 {
+                    let key = MLXRandom.key(UInt64(0xd7a5e1 + seed))
+                    let x = (MLXRandom.normal([1, 1, 2688], key: key) * Float(1 + seed % 4))
+                        .asType(.bfloat16)
+                    let gates = MLX.matmul(x, gate.weight.transposed())
+                    let reference = gate(x)
+                    for _ in 0 ..< 2 {
+                        guard let fused = launch(x, gate.weight, bias: gate.eSCB, force: true, draft: true)
+                        else { return false }
+                        ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                            (fused[0].view(dtype: .uint16) .== gates.view(dtype: .uint16)).all(),
+                            MLX.logicalAnd(
+                                (fused[1] .== reference.0).all(),
+                                (fused[2].view(dtype: .uint32) .== reference.1.view(dtype: .uint32)).all())))
+                        eval(ok, fused[0], fused[1], fused[2])
+                    }
+                }
+                return ok.item(Bool.self) && (draftCounter!.item(UInt32.self) == 0)
+            }
+            draftVerified = matched
+        } catch {
+            draftVerified = false
+        }
+        report(draftVerified ? "on (bitwise equal to the head's gemv + selection at R = 1)"
+            : "off (differs or failed)")
     }
 }
 
@@ -2541,6 +2610,23 @@ enum NemotronTargetQKV {
     static var draftDictAvailable: Bool {
         (r1HalfDecodeForm != 0 ? kernelHalfDict : kernelDict) != nil
     }
+    // NEMOTRON_MTP_SECOND_DRAFT_KV_ROW: `kernelHalfDict` (the R = 1 launch of a
+    // draft row) whose K and V tiles also store each BF16 result into a
+    // [1, 2, cap, 128] plane pair at token kvpos[0] (kvpos = [row, cap]): the
+    // storeLine -> storeAndCache swap of the cache-writing prepared launch.
+    private static let kernelHalfDictWritingRow = nemotronSBDictSource(
+        nemotronSwapped(nemotronMultiRowQMVSource, nemotronMultiRowHalfSwaps)).map {
+        MLXFast.metalKernel(
+            name: "nemotron_target_qkv_affine4_gs64_hf_sbd_kv",
+            inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K",
+                         "kcache", "vcache", "kvpos"],
+            outputNames: ["qy", "ky", "vy"],
+            source: dictTilePrefix + nemotronSwapped($0, [(storeLine, storeAndCache, 1)]) + "\n}",
+            header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader,
+            mutableInputs: ["kcache", "vcache"])
+    }
+    /// Set by `qualifyDraftRowWrite` once the launch above matched `apply`.
+    nonisolated(unsafe) static var draftRowWriteVerified = false
     private static let preparedKernelHalf = MLXFast.metalKernel(
         name: "nemotron_target_qkv_prepared_affine4_gs64_hf",
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
@@ -2682,6 +2768,104 @@ enum NemotronTargetQKV {
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
         }
         return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// `apply` for one draft row on its dictionary launch, also storing the
+    /// row's K and V into `kCache` / `vCache` ([1, 2, capacity, 128] planes)
+    /// at token `row` (mutable inputs; the caller orders later reads after
+    /// this launch). Returns the usual (q, k, v), or nil (nothing launched)
+    /// unless `apply` would take that launch and `qualifyDraftRowWrite` passed.
+    static func applyWritingRow(
+        _ x: MLXArray, query: Linear, key: Linear, value: Linear,
+        kCache: MLXArray, vCache: MLXArray, row: Int, capacity: Int, force: Bool = false
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard force || draftRowWriteVerified, r1HalfDecodeForm != 0,
+              let launch = kernelHalfDictWritingRow,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              kCache.dtype == .bfloat16, vCache.dtype == .bfloat16,
+              kCache.shape == [1, 2, capacity, 128], vCache.shape == kCache.shape,
+              row >= 0, row < capacity,
+              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
+              let v = buffers(value, rows: 256)
+        else { return nil }
+        let dicts = [query, key, value].compactMap { NemotronSBDict.draftDict($0) }
+        guard dicts.count == 3 else { return nil }
+        let weights = q + k + v
+        let bound = (0 ..< 3).flatMap { [weights[3 * $0], dicts[$0].index, dicts[$0].table] }
+        let outputs = launch(
+            bound + [x, NemotronMultiRowQMV.scalarPair(2688, 4096).0, kCache, vCache,
+                     MLXArray([Int32(row), Int32(capacity)])],
+            template: [("T", x.dtype), ("R", 1), ("FAST", false), ("RELU2", false), ("RPS", 4)]
+                + nemotronHalfTemplate(true, r1HalfDecodeForm),
+            grid: (32, 4608 / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, 4096], [1, 1, 256], [1, 1, 256]],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// Load time, on the draft head's own Q/K/V: `applyWritingRow` against
+    /// `apply` of the same seeded rows, bit for bit, for q, k, v and for the
+    /// K/V rows it stores into a [2, 1, 2, cap, 128] plane pair (the layout of
+    /// the head's direct snapshot); every other stored row must stay as it
+    /// was. Engages only if all match (also compiles the launch).
+    static func qualifyDraftRowWrite(query: Linear, key: Linear, value: Linear) {
+        draftRowWriteVerified = false
+        guard NemotronMTPSecondDraftRow.enabled else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp second draft kv row: \(message)\n".utf8))
+        }
+        func bits(_ a: MLXArray) -> MLXArray { a.view(dtype: .uint16) }
+        let capacity = 6
+        do {
+            let matched = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                for (seed, row) in [(0, capacity - 1), (1, 2)] {
+                    let x = MLXRandom.normal([1, 1, 2688], key: MLXRandom.key(UInt64(0x6b76_726f + seed)))
+                        .asType(.bfloat16)
+                    let planes = MLXRandom.normal(
+                        [2, 1, 2, capacity, 128], key: MLXRandom.key(UInt64(0x706c_6e73 + seed)))
+                        .asType(.bfloat16)
+                    eval(planes)
+                    let before = planes * 1
+                    eval(before)
+                    guard let written = applyWritingRow(
+                            x, query: query, key: key, value: value,
+                            kCache: planes[0 ..< 1].squeezed(axis: 0),
+                            vCache: planes[1 ..< 2].squeezed(axis: 0),
+                            row: row, capacity: capacity, force: true),
+                          let reference = apply(x, query: query, key: key, value: value,
+                                                captureMTP: false)
+                    else { return false }
+                    let stored = depends(input: planes, dependencies: [written.0])
+                    let expected = [reference.1, reference.2].map {
+                        $0.reshaped(1, 2, 1, 128)
+                    }
+                    for (a, b) in zip([written.0, written.1, written.2],
+                                      [reference.0, reference.1, reference.2]) {
+                        ok = MLX.logicalAnd(ok, all(bits(a) .== bits(b)))
+                    }
+                    for plane in 0 ..< 2 {
+                        let rows = stored[plane]
+                        ok = MLX.logicalAnd(ok, all(
+                            bits(rows[0..., 0..., row ..< (row + 1), 0...]) .== bits(expected[plane])))
+                        // Every other row keeps its bytes.
+                        let kept = before[plane]
+                        for other in 0 ..< capacity where other != row {
+                            ok = MLX.logicalAnd(ok, all(
+                                bits(rows[0..., 0..., other ..< (other + 1), 0...])
+                                    .== bits(kept[0..., 0..., other ..< (other + 1), 0...])))
+                        }
+                    }
+                    eval(ok)
+                }
+                return ok.item(Bool.self)
+            }
+            draftRowWriteVerified = matched
+        } catch {
+            draftRowWriteVerified = false
+        }
+        report(draftRowWriteVerified ? "on (bitwise equal q/k/v and stored rows)" : "off (differs or failed)")
     }
 
     /// Load-time JIT of the cache-writing launch (scratch caches only).
