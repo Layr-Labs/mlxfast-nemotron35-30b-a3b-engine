@@ -78,7 +78,10 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
+        NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
+        NemotronSharedUpPacking.prepareUnpacked(target)
+        NemotronFC2SharedColaunch.prepare(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
@@ -188,7 +191,16 @@ extension NemotronH35MTPAssistant {
             backend.release(rows)
             try? recurrent.release()
         }
-        try configureRequestState(draftState, maximumSequenceLength: maxLength)
+        // The live request configures the head's paged state for prompt + the
+        // worker's decode budget (4096), a 512-page size class whose value
+        // offset is a template constant of the segment write/read kernels. A
+        // short bound picks a smaller class, leaving both kernels to compile in
+        // the first decode window. NEMOTRON_MTP_WARM_DECODE_BUDGET=0 restores
+        // the short bound.
+        let liveBudget = max(0, Int(ProcessInfo.processInfo.environment[
+            "NEMOTRON_MTP_WARM_DECODE_BUDGET"] ?? "") ?? 4096)
+        try configureRequestState(
+            draftState, maximumSequenceLength: max(maxLength, promptLength + liveBudget))
         let storageRows = rows.compactMap { $0 }
         let vocabulary = target.configuration.vocabSize
         func cacheState() -> [MLXArray] { layerCaches.flatMap { $0.innerState() } }
@@ -522,3 +534,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Second measurement of ff544a18.
 
 // Second measurement entry of this tree.
+
+// Second measurement of 208838c4.
+
+// Measurement 3 of 701d9655 (1b6dc60).
