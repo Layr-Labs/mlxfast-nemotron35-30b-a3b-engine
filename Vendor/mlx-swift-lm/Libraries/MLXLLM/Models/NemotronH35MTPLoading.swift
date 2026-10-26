@@ -530,3 +530,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Second measurement of 208838c4.
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
+
+// Measurement entry 2 of this tree.
