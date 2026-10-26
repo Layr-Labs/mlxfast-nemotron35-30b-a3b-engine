@@ -414,7 +414,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
             decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 }
+                head: NemotronZSkip.withoutCopiedDraftBanks(module)
                     + draftHead.decodeResidencyArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
@@ -1220,3 +1220,4 @@ extension NemotronH35MTPAssistant {
         }
     }
 }
+private let gauntletRedraw_253c2798_20261026T025946Z: Int = 0
