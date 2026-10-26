@@ -52,6 +52,10 @@ private final class NemotronMTPDraftHead {
         /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
         /// two-launch path bitwise.
         var counter: MLXArray? = nil
+        /// The target's embedding table (`mtpEmbeddingTable`) whose picked
+        /// row that launch also stores, set once ids and rows matched the
+        /// fused launch and `mtpEmbedding` bitwise (NEMOTRON_MTP_EMBED_FOLD).
+        var embedding: QuantizedEmbedding? = nil
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -83,6 +87,27 @@ private final class NemotronMTPDraftHead {
             checkAgainstStock(hidden, result, screen)
         }
         return result.id
+    }
+
+    /// `greedy` with the picked id's `mtpEmbedding` row: stored by the fused
+    /// select launch itself once that qualified at load, else nil (the caller
+    /// embeds the id).
+    func greedyEmbedding(_ hidden: MLXArray, upper: Bool = false) -> (id: MLXArray, embedding: MLXArray?) {
+        guard let screen, let table = screen.embedding, screen.counter != nil,
+              hidden.shape == [1, 1, NemotronHeadScreen.width],
+              hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu,
+              !NemotronHeadScreen.check
+        else { return (greedy(hidden, upper: upper), nil) }
+        let result = NemotronHeadScreen.run(
+            hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
+            groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
+            keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
+            upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
+            records: screen.records, records2: screen.records2,
+            counter: screen.counter, embedding: table)
+        guard let row = result.embedding else { return (result.id, nil) }
+        guard NemotronMoELeader.selfTest else { return (result.id, row) }
+        return (result.id, nemotronBitwiseOrNaN(row, target.mtpEmbedding(result.id.reshaped([1, 1]))))
     }
 
     /// NEMOTRON_MTP_HEAD_SCREEN_CHECK=1 only: synchronous comparison with the
@@ -425,6 +450,71 @@ private final class NemotronMTPDraftHead {
             } else if fusedNote == "off" {
                 fusedNote = "off (fused id differs)"
             }
+        }
+        // The fused select storing the picked id's embedding row
+        // (NEMOTRON_MTP_EMBED_FOLD): adopted only if, on synthetic inputs and
+        // for each half the plan screens, its id and candidates equal the
+        // fused launch's and its row equals `mtpEmbedding` of that id bitwise,
+        // one launch at a time and again with all of them queued in one
+        // evaluation on the shared counter, which must read 0 afterwards.
+        if NemotronMTPFrontNorms.embedFold {
+            var embedNote = "off (no fused select or embedding table)"
+            if let counter = plan.counter, let table = target.mtpEmbeddingTable {
+                do {
+                    let cases = try withError { () -> Int? in
+                        var state: UInt64 = 0xBB67_AE85_84CA_A73B
+                        var expected: [(NemotronHeadScreen.Result, MLXArray)] = []
+                        var queued: [NemotronHeadScreen.Result] = []
+                        func screened(_ x: MLXArray, half: Bool, rows: QuantizedEmbedding?)
+                            -> NemotronHeadScreen.Result {
+                            NemotronHeadScreen.run(
+                                x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                groups: plan.groups, groupCount: groupCount, chunk: chunk,
+                                keep: keep, upperGroups: half ? plan.upperGroups : nil,
+                                upperGroupCount: half ? plan.upperGroupCount : 0,
+                                packed: plan.packed, records: plan.records, records2: plan.records2,
+                                counter: counter, embedding: rows)
+                        }
+                        func same(_ a: NemotronHeadScreen.Result, _ b: NemotronHeadScreen.Result,
+                                  _ row: MLXArray) -> Bool {
+                            guard let emitted = b.embedding else { return false }
+                            return MLX.logicalAnd(
+                                MLX.logicalAnd((a.id .== b.id).all(), (a.candidateIds .== b.candidateIds).all()),
+                                MLX.logicalAnd(
+                                    (a.candidateValues.view(dtype: .uint32)
+                                        .== b.candidateValues.view(dtype: .uint32)).all(),
+                                    (emitted.view(dtype: .uint16) .== row.view(dtype: .uint16)).all())
+                            ).item(Bool.self)
+                        }
+                        for _ in 0..<16 {
+                            let t = (0..<k).map { _ -> Float in
+                                state = state &* 6364136223846793005 &+ 1442695040888963407
+                                return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                            }
+                            let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                            for half in plan.upperGroups == nil ? [false] : [false, true] {
+                                let reference = screened(x, half: half, rows: nil)
+                                let row = target.mtpEmbedding(reference.id.reshaped([1, 1]))
+                                if !same(reference, screened(x, half: half, rows: table), row) { return nil }
+                                expected.append((reference, row))
+                                queued.append(screened(x, half: half, rows: table))
+                            }
+                        }
+                        eval(queued.flatMap { [$0.id, $0.candidateIds, $0.candidateValues, $0.embedding!] })
+                        for ((a, row), b) in zip(expected, queued) where !same(a, b, row) { return nil }
+                        return counter.item(UInt32.self) == 0 ? expected.count : nil
+                    }
+                    if let cases {
+                        plan.embedding = table
+                        embedNote = "on (ids, candidates and rows bitwise equal in \(cases) cases)"
+                    } else {
+                        embedNote = "off (id or row differs)"
+                    }
+                } catch {
+                    embedNote = "off (\(error))"
+                }
+            }
+            FileHandle.standardError.write(Data("nemotron mtp draft embedding row: \(embedNote)\n".utf8))
         }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
@@ -1052,7 +1142,8 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         // Every row's K/V goes to the head cache; only the row the device
         // picks is attended (`speculateNextFirstDraft`).
         let rows = module.frontRows(
-            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens))
+            hidden: targetHidden, tokens: targetTokens, table: target.mtpEmbeddingTable,
+            embed: target.mtpEmbedding)
         let written = s.cache.appendTrusted(keys: rows.keys, values: rows.values)
         s.speculation = (fused: rows.fused, queries: rows.queries, keys: rows.keys,
                          values: rows.values, width: width)
@@ -1071,16 +1162,49 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     public func speculateNextFirstDraft(
         acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState
     ) {
+        queueNextFirstDraft(acceptedDrafts: acceptedDrafts, walk: nil, requestState: requestState)
+    }
+
+    /// With the walk's operands one launch walks the packet and yields the
+    /// masks and the picked row (`NemotronMTPDraftRowPick`); `acceptedDrafts`
+    /// then stays unlaunched.
+    public func speculateNextFirstDraft(
+        acceptedDrafts: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands,
+        requestState: any CBv2MTPRequestState
+    ) {
+        queueNextFirstDraft(acceptedDrafts: acceptedDrafts, walk: walk, requestState: requestState)
+    }
+
+    private func queueNextFirstDraft(
+        acceptedDrafts: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands?,
+        requestState: any CBv2MTPRequestState
+    ) {
         let s = state(requestState)
         guard let spec = s.speculation, acceptedDrafts.shape == [1],
               spec.width == s.stagedInputCount + 1, let paged = s.paged
         else { return }
         let row = acceptedDrafts.asType(.int32)
         // The picked row attends the trusted prefix and post-verify rows 0...row.
-        let rowHistory = paged.row.snapshot()
+        // NEMOTRON_MTP_SECOND_DRAFT_KV_ROW: the snapshot carries one spare row
+        // per head, which the second draft's Q/K/V launch fills with that
+        // draft's own K/V; this row attends views of the gathered rows only.
+        let spare = NemotronMTPSecondDraftRow.enabled && draftLimit >= 2
+            && NemotronMTPDraftMasks.reuseSnapshot && NemotronTargetQKV.draftRowWriteVerified
+            ? paged.row.snapshotCombined(extraRows: 1) : nil
+        let rowHistory = spare.map {
+            (keys: $0.combined[0 ..< 1, 0..., 0..., 0 ..< $0.count].squeezed(axis: 0),
+             values: $0.combined[1 ..< 2, 0..., 0..., 0 ..< $0.count].squeezed(axis: 0),
+             offset: $0.offset)
+        } ?? paged.row.snapshot()
         let rowLength = rowHistory.keys.dim(2)
         let rowFirst = rowLength - spec.width
-        let fusedMasks = NemotronMTPDraftMasks.masks(
+        let picked = walk.flatMap {
+            NemotronMTPDraftRowPick.pick(
+                walk: $0, fused: spec.fused, queries: spec.queries, keys: spec.keys,
+                values: spec.values, firstSpeculated: rowFirst, length: rowLength,
+                dtype: rowHistory.keys.dtype)
+        }
+        let fusedMasks = picked.map { ($0.first, $0.second) } ?? NemotronMTPDraftMasks.masks(
             row: row, firstSpeculated: rowFirst, length: rowLength, dtype: rowHistory.keys.dtype)
         let rowMask: MLXArray
         if let fusedMasks {
@@ -1091,21 +1215,42 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
                 .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
         }
         let out = module.finishMaskedRow(
-            fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
+            fused: picked?.fused ?? take(spec.fused, row, axis: 1),
+            queries: picked?.queries ?? take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
-        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
-        let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
+        let secondFront = NemotronH35MTPDeviceSecondFront.enabled && draftLimit >= 2
+        // With the second draft's front queued below, the head's fused select
+        // also stores the picked id's embedding row (NEMOTRON_MTP_EMBED_FOLD).
+        let drafted = secondFront
+            ? draftHead.greedyEmbedding(out, upper: s.screensUpper(firstDraft: true))
+            : (id: draftHead.greedy(out, upper: s.screensUpper(firstDraft: true)), embedding: nil)
+        let ids = drafted.id
+        let keys = picked?.keys ?? take(spec.keys, row, axis: 2)
+        let values = picked?.values ?? take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        // The seed K/V gathers stay lazy: `prestageFirstDraft` reads them only
+        // when `readvanceTrusted` cannot re-expose the stored row.
+        let seedKV = NemotronMTPLazySeedKV.enabled ? [] : [keys, values]
         // The second draft's cache-free part on this first draft, so after the
         // readback only its attention and tail remain to build.
-        guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
-            CBv2MTPSubmitMerge.submit([ids, out, keys, values])
+        guard secondFront else {
+            CBv2MTPSubmitMerge.submit([ids, out] + seedKV)
             return
         }
-        let inputs = module.pagedDraftInputs(
-            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
+        let embedding = drafted.embedding ?? target.mtpEmbedding(ids.reshaped([1, 1]))
+        let inputs: [MLXArray]
+        var wroteRow = false
+        if let spare {
+            (inputs, wroteRow) = module.pagedDraftInputs(
+                hidden: out, embedding: embedding,
+                kCache: spare.combined[0 ..< 1].squeezed(axis: 0),
+                vCache: spare.combined[1 ..< 2].squeezed(axis: 0),
+                row: spare.count, capacity: spare.count + 1)
+        } else {
+            inputs = module.pagedDraftInputs(hidden: out, embedding: embedding)
+        }
         s.deviceSecondInputs = (inputs: inputs, from: out)
-        var roots = [ids, out, keys, values] + inputs
+        var roots = [ids, out] + seedKV + inputs
         // The rest of the second draft too: its attention reads the head cache,
         // which still holds every post-verify row (they sit last). Attend over
         // the trusted prefix, post-verify rows 0...n for the device-picked n,
@@ -1114,8 +1259,9 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             // Nothing is appended to the head cache since `rowHistory` was
             // gathered, so its views are this snapshot; gather again only if
             // the row moved.
-            let history = paged.row.absoluteOffset == rowHistory.offset
-                && NemotronMTPDraftMasks.reuseSnapshot ? rowHistory : paged.row.snapshot()
+            let reused = paged.row.absoluteOffset == rowHistory.offset
+                && NemotronMTPDraftMasks.reuseSnapshot
+            let history = reused ? rowHistory : paged.row.snapshot()
             let length = history.keys.dim(2)
             let firstSpeculated = length - spec.width
             let own = module.draftKeyValues(inputs: inputs)
@@ -1131,10 +1277,19 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
                 mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
                     .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
             }
+            let attended: (keys: MLXArray, values: MLXArray)
+            if let spare, wroteRow, reused {
+                // The Q/K/V launch stored ownKeys / ownValues in the spare row:
+                // the whole snapshot, read behind that launch, is the
+                // concatenation below.
+                let written = depends(input: spare.combined, dependencies: [inputs[3]])
+                attended = (written[0 ..< 1].squeezed(axis: 0), written[1 ..< 2].squeezed(axis: 0))
+            } else {
+                attended = (concatenated([history.keys, ownKeys], axis: 2),
+                            concatenated([history.values, ownValues], axis: 2))
+            }
             let out2 = module.maskedSecondDraft(
-                inputs: inputs,
-                keys: concatenated([history.keys, ownKeys], axis: 2),
-                values: concatenated([history.values, ownValues], axis: 2), mask: mask)
+                inputs: inputs, keys: attended.keys, values: attended.values, mask: mask)
             let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
             s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
             roots += [ids2, out2, ownKeys, ownValues]
@@ -1164,6 +1319,12 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
     }
 }
 
+/// NEMOTRON_MTP_LAZY_SEED_KV=0 submits the device-picked first draft's seed
+/// K/V gathers with its ids and hidden again.
+enum NemotronMTPLazySeedKV {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_LAZY_SEED_KV"] != "0"
+}
+
 /// NEMOTRON_MTP_DEVICE_SECOND_FRONT=0 builds the whole second draft after
 /// the readback again.
 /// NEMOTRON_MTP_DEVICE_SECOND_DRAFT=0 keeps the second draft's attention and
@@ -1171,6 +1332,17 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 enum NemotronH35MTPDeviceSecondDraft {
     static let enabled = NemotronH35MTPDeviceSecondFront.enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
+}
+
+/// The device second draft attends the head snapshot gathered with one spare
+/// row per head, which its own Q/K/V launch fills with the draft's K/V row
+/// (`NemotronTargetQKV.applyWritingRow`), instead of a concatenation of the
+/// snapshot and that row (two copies per plane). Same rows, same attention.
+/// Needs the direct paged read (CBV2_PAGED_READ_OUTPUT) and the launch's
+/// load-time qualification. NEMOTRON_MTP_SECOND_DRAFT_KV_ROW=0 concatenates.
+enum NemotronMTPSecondDraftRow {
+    static let enabled = NemotronH35MTPDeviceSecondDraft.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_SECOND_DRAFT_KV_ROW"] != "0"
 }
 
 /// The two additive masks of `speculateNextFirstDraft` from one launch:
@@ -1215,6 +1387,160 @@ enum NemotronMTPDraftMasks {
             outputShapes: [[1, 1, 1, length], [1, 1, 1, length + 1]],
             outputDTypes: [dtype, dtype])
         return (out[0], out[1])
+    }
+}
+
+/// The device accept walk, both masks of `NemotronMTPDraftMasks` and the
+/// walked row of the post-verify fused residuals, queries, keys and values
+/// from one launch, instead of the walk launch, the masks launch and four
+/// `take` gathers. The walk is the engine's integer loop on the same packet
+/// (`CBv2MTPDeviceAcceptWalk`), the masks are the masks kernel's statements
+/// and every row element is a copy. Engaged only once `qualify` matched the
+/// separate launches bit for bit. NEMOTRON_MTP_DRAFT_ROW_PICK=0 keeps them.
+enum NemotronMTPDraftRowPick {
+    static let enabled = NemotronMTPDraftMasks.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ROW_PICK"] != "0"
+    nonisolated(unsafe) static var verified = false
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_draft_row_pick",
+        inputNames: ["packet", "params", "fused", "queries", "keys", "values"],
+        outputNames: ["first", "second", "fused_row", "query_row", "key_row", "value_row"],
+        source: """
+            const int i = int(thread_position_in_grid.x);
+            const int count = params[0];
+            const int drafts = params[1];
+            const int targets = params[2];
+            const int64_t step = packet_strides[0];
+            int a = 0;
+            while (a < count && packet[(targets + a) * step] == packet[(drafts + a) * step]) {
+                ++a;
+            }
+            const int last = a + params[3];
+            const int n = params[4];
+            if (i < n) {
+                first[i] = i <= last ? T(0.0f) : T(-INFINITY);
+            }
+            if (i <= n) {
+                second[i] = (i <= last || i == n) ? T(0.0f) : T(-INFINITY);
+            }
+            if (i < FW) {
+                fused_row[i] = fused[a * fused_strides[1] + i * fused_strides[2]];
+            }
+            if (i < QH * HD) {
+                query_row[i] = queries[(i / HD) * queries_strides[1] + a * queries_strides[2]
+                    + (i % HD) * queries_strides[3]];
+            }
+            if (i < KH * HD) {
+                key_row[i] = keys[(i / HD) * keys_strides[1] + a * keys_strides[2]
+                    + (i % HD) * keys_strides[3]];
+                value_row[i] = values[(i / HD) * values_strides[1] + a * values_strides[2]
+                    + (i % HD) * values_strides[3]];
+            }
+            """,
+        ensureRowContiguous: false)
+
+    /// For the row `walk` selects: (first mask [1, 1, 1, length], second mask
+    /// [1, 1, 1, length + 1] as `NemotronMTPDraftMasks.masks`, fused [1, 1, F],
+    /// queries [1, QH, 1, D], keys and values [1, KH, 1, D] as `take` along
+    /// the row axis). fused [1, W, F], queries [1, QH, W, D] and keys / values
+    /// [1, KH, W, D] are read through their strides; nil outside the shapes.
+    static func pick(
+        walk: CBv2MTPDeviceAcceptWalk.Operands, fused: MLXArray, queries: MLXArray,
+        keys: MLXArray, values: MLXArray, firstSpeculated: Int, length: Int, dtype: DType,
+        force: Bool = false
+    ) -> (first: MLXArray, second: MLXArray, fused: MLXArray, queries: MLXArray,
+          keys: MLXArray, values: MLXArray)?
+    {
+        guard enabled, force || verified, length > 0,
+              dtype == .bfloat16 || dtype == .float16 || dtype == .float32,
+              walk.packet.ndim == 1, walk.packet.dtype == .int32,
+              fused.ndim == 3, fused.dim(0) == 1, walk.count < fused.dim(1),
+              queries.ndim == 4, queries.dim(0) == 1, queries.dim(2) == fused.dim(1),
+              keys.ndim == 4, keys.dim(0) == 1, keys.dim(2) == fused.dim(1),
+              values.shape == keys.shape, queries.dim(3) == keys.dim(3)
+        else { return nil }
+        let headDim = keys.dim(3)
+        let params = MLXArray([Int32(walk.count), Int32(walk.drafts), Int32(walk.targets),
+                               Int32(firstSpeculated), Int32(length)])
+        let widest = max(length + 1, fused.dim(2), queries.dim(1) * headDim, keys.dim(1) * headDim)
+        let out = kernel(
+            [walk.packet, params, fused, queries, keys, values],
+            template: [("T", dtype), ("FW", fused.dim(2)), ("QH", queries.dim(1)),
+                       ("KH", keys.dim(1)), ("HD", headDim)],
+            grid: ((widest + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, 1, 1, length], [1, 1, 1, length + 1], [1, 1, fused.dim(2)],
+                           [1, queries.dim(1), 1, headDim], [1, keys.dim(1), 1, headDim],
+                           [1, keys.dim(1), 1, headDim]],
+            outputDTypes: [dtype, dtype, fused.dtype, queries.dtype, keys.dtype, values.dtype])
+        return (out[0], out[1], out[2], out[3], out[4], out[5])
+    }
+
+    /// Load time: the launch against the masks launch and the four `take`
+    /// gathers of the row it walks to, bit for bit, for every accept count of
+    /// a depth-2 packet in both argument spaces (6 elements: constant, 11:
+    /// device), on seeded rows in the post-verify layouts (Q/K/V transposed
+    /// views). Engages only if all match; also compiles both pipelines.
+    static func qualify() {
+        verified = false
+        guard enabled else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft row pick: \(message)\n".utf8))
+        }
+        func bits(_ a: MLXArray) -> MLXArray {
+            a.view(dtype: a.itemSize == 2 ? .uint16 : (a.itemSize == 4 ? .uint32 : .uint8))
+        }
+        func seeded(_ shape: [Int], _ seed: UInt64) -> MLXArray {
+            MLXRandom.normal(shape, key: MLXRandom.key(seed)).asType(.bfloat16)
+        }
+        let width = 3, length = 600
+        let fused = seeded([1, width, 2688], 0x7069_636b)
+        let queries = seeded([1, width, 4096], 0x7069_636c)
+            .reshaped(1, width, 32, 128).transposed(0, 2, 1, 3)
+        let keys = seeded([1, width, 256], 0x7069_636d)
+            .reshaped(1, width, 2, 128).transposed(0, 2, 1, 3)
+        let values = seeded([1, width, 256], 0x7069_636e)
+            .reshaped(1, width, 2, 128).transposed(0, 2, 1, 3)
+        do {
+            let matched = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                for size in [6, 11] {
+                    for accepted in 0 ... 2 {
+                        // drafts at 0..<2, targets at 2..<5; the rest is filler.
+                        var host = [Int32](repeating: 7, count: size)
+                        host[0] = 11; host[1] = 12
+                        host[2] = accepted >= 1 ? 11 : 21
+                        host[3] = accepted >= 2 ? 12 : 22
+                        host[4] = 13
+                        let walk = CBv2MTPDeviceAcceptWalk.Operands(
+                            packet: MLXArray(host), count: 2, drafts: 0, targets: 2)
+                        let row = MLXArray([Int32(accepted)])
+                        guard let picked = pick(
+                                walk: walk, fused: fused, queries: queries, keys: keys,
+                                values: values, firstSpeculated: length - width, length: length,
+                                dtype: .bfloat16, force: true),
+                              let masks = NemotronMTPDraftMasks.masks(
+                                row: row, firstSpeculated: length - width, length: length,
+                                dtype: .bfloat16)
+                        else { return false }
+                        let expected = [masks.0, masks.1, take(fused, row, axis: 1),
+                                        take(queries, row, axis: 2), take(keys, row, axis: 2),
+                                        take(values, row, axis: 2)]
+                        let produced = [picked.first, picked.second, picked.fused, picked.queries,
+                                        picked.keys, picked.values]
+                        for (a, b) in zip(produced, expected) {
+                            guard a.shape == b.shape, a.dtype == b.dtype else { return false }
+                            ok = MLX.logicalAnd(ok, all(bits(a) .== bits(b)))
+                        }
+                        eval([ok] + produced)
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+            verified = matched
+        } catch {
+            verified = false
+        }
+        report(verified ? "on (bitwise equal, accept counts 0...2)" : "off (differs or failed)")
     }
 }
 
