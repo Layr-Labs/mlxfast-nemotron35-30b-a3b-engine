@@ -75,6 +75,7 @@ extension NemotronH35MTPAssistant {
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
+        NemotronMTPDraftRowPick.qualify()
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
@@ -91,16 +92,25 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
+        NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
+        NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
+        NemotronPrefillDecayA.prepare(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
         NemotronPrefillCombineAdd.qualify()
+        NemotronPrefillSharedRelu2.qualify(target)
+        NemotronPrefillBoundaryNorm.qualify(target)
+        NemotronPrefillMoEJoin.qualify(target)
+        NemotronPrefillScanInputs.qualify(target)
+        NemotronPrefillDecayDtx.qualify(target)
+        NemotronPrefillFreshWindowOut.qualify()
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -327,6 +337,17 @@ import Metal
 @_silgen_name("nemotron_decode_backing")
 private func nemotronDecodeBacking(_ opaque: UnsafeMutableRawPointer) -> UnsafeMutableRawPointer?
 
+@_silgen_name("nemotron_cache_snapshot")
+private func nemotronCacheSnapshot(_ minLength: Int64) -> Int64
+@_silgen_name("nemotron_cache_snapshot_count")
+private func nemotronCacheSnapshotCount() -> Int64
+@_silgen_name("nemotron_cache_prefault")
+private func nemotronCachePrefault() -> Int64
+@_silgen_name("nemotron_cache_prefault_request")
+private func nemotronCachePrefaultRequest()
+@_silgen_name("nemotron_cache_prefault_release")
+private func nemotronCachePrefaultRelease()
+
 @available(macOS 15.0, *)
 final class NemotronDecodeResidency: @unchecked Sendable {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_RESIDENCY"] != "0"
@@ -472,6 +493,14 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         func finish() {
             guard !finished else { return }
             finished = true
+            if NemotronDecodeResidency.cachePrefault {
+                nemotronCachePrefaultRelease()
+                let bytes = nemotronCacheSnapshot(NemotronDecodeResidency.cachePrefaultMin)
+                if NemotronDecodeResidency.cacheTrace {
+                    FileHandle.standardError.write(Data(
+                        "nemotron cache snapshot: \(bytes >> 20) MiB in \(nemotronCacheSnapshotCount()) buffers\n".utf8))
+                }
+            }
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
                 // The requests stay standing; the next lease requests the same sets again.
@@ -499,7 +528,50 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
     /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
     /// set keeps its own queue.
+    /// The lease this process built at load, for `earlyBegin` from an engine's initializer.
+    nonisolated(unsafe) static weak var current: NemotronDecodeResidency?
+    /// NEMOTRON_RESIDENCY_EARLY=0 skips it: the target groups' residency requests are enqueued (in the same
+    /// backbone order, on the same serial queue) when a request's engine is built, before the engine is
+    /// assembled; the lease's `begin` that follows within `earlyWindow` then enqueues only the head set, the
+    /// extras and the copies after them, so the serial order is the base's.
+    static let earlyEnabled = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_EARLY"] != "0"
+    private static let earlyWindow: TimeInterval = 5
+    private let earlyLock = NSLock()
+    private var earlyIssuedAt: Date?
+
+    /// NEMOTRON_CACHE_PREFAULT=0 skips it: the allocator's cache is empty when a request starts (the worker
+    /// drains it at every phase close), so the prefill's first layers allocate their intermediates fresh. A
+    /// finished lease records the lengths the cache then holds (the request's intermediates); the next request's
+    /// engine allocates buffers of those lengths before it builds its prefill, hands them to the
+    /// cache (where the prefill's allocations take them back) and requests their residency ahead of the target's
+    /// groups, so their pages are bound while the GPU wakes.
+    static let cachePrefault = ProcessInfo.processInfo.environment["NEMOTRON_CACHE_PREFAULT"] != "0"
+    /// Only cached buffers of at least this many bytes are recorded (`NEMOTRON_CACHE_PREFAULT_MIN`, default 1 MiB).
+    static let cachePrefaultMin = Int64(ProcessInfo.processInfo.environment["NEMOTRON_CACHE_PREFAULT_MIN"] ?? "")
+        ?? (1 << 20)
+
+    func earlyBegin() {
+        guard Self.earlyEnabled, !targetSets.isEmpty else { return }
+        earlyLock.withLock { earlyIssuedAt = Date() }
+        if Self.cachePrefault {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let bytes = nemotronCachePrefault()
+            if bytes > 0 { targetQueue.async { nemotronCachePrefaultRequest() } }
+            if Self.cacheTrace {
+                FileHandle.standardError.write(Data(String(format: "nemotron cache prefault: %lld MiB in %.3f ms\n",
+                    bytes >> 20, (CFAbsoluteTimeGetCurrent() - t0) * 1e3).utf8))
+            }
+        }
+        for set in targetSets { targetQueue.async { set.requestResidency() } }
+    }
+    static let cacheTrace = ProcessInfo.processInfo.environment["NEMOTRON_CACHE_PREFAULT_TRACE"] == "1"
+
     func begin() -> Lease {
+        let early = earlyLock.withLock { () -> Bool in
+            defer { earlyIssuedAt = nil }
+            guard let at = earlyIssuedAt else { return false }
+            return Date().timeIntervalSince(at) < Self.earlyWindow
+        }
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
         guard !targetSets.isEmpty else {
@@ -507,7 +579,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
-        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        if !early { for set in targetSets { targetQueue.async { set.requestResidency() } } }
         let head = seedSet, ready = Array(owners.prefix(cut))
         targetQueue.async {
             head.requestResidency()

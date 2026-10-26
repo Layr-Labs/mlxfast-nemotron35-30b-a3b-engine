@@ -3170,3 +3170,144 @@ extern "C" void* nemotron_decode_backing(void* opaque) {
   if (!a.is_available() || !a.data_shared_ptr()) return nullptr;
   return a.buffer().ptr();
 }
+
+// Host-only: the allocator's free-buffer cache is empty when a request starts
+// (the worker drains it at every phase close), so a request's first layers
+// allocate every intermediate fresh. `nemotron_cache_snapshot` records the
+// lengths of the buffers the cache holds after a request's prefill;
+// `nemotron_cache_prefault` allocates buffers of those lengths at the next
+// request's start, hands them to the cache (where that request's allocations
+// take them back) and requests their residency, so their pages are bound while
+// the GPU wakes. The generated Metal source above is unchanged.
+#include <mutex>
+#include <vector>
+#include "mlx/backend/metal/allocator.h"
+#include "mlx/backend/metal/device.h"
+namespace nemotron_cache_residency {
+struct CacheTag {};
+struct MutexTag {};
+struct PoolTag {};
+auto member(CacheTag);
+auto member(MutexTag);
+auto member(PoolTag);
+// Explicit instantiations may name private members ([temp.spec.general]).
+template <typename Tag, auto M>
+struct Access {
+  friend auto member(Tag) {
+    return M;
+  }
+};
+template struct Access<CacheTag, &mlx::core::metal::MetalAllocator::buffer_cache_>;
+template struct Access<MutexTag, &mlx::core::metal::MetalAllocator::mutex_>;
+template struct Access<PoolTag, &mlx::core::BufferCache<MTL::Buffer>::buffer_pool_>;
+std::mutex lock;
+std::vector<size_t> lengths;
+MTL::ResidencySet* set = nullptr;
+std::vector<MTL::Buffer*> held;
+
+// Ends the set's residency request first, so the next commit of new
+// allocations does not make them resident inside `commit()` itself.
+void release_held_locked() {
+  if (set) {
+    set->endResidency();
+    set->removeAllAllocations();
+    set->commit();
+  }
+  for (auto* b : held) {
+    b->release();
+  }
+  held.clear();
+}
+} // namespace nemotron_cache_residency
+
+// Records only buffers of at least `min_length` bytes.
+extern "C" long long nemotron_cache_snapshot(long long min_length) {
+  using namespace nemotron_cache_residency;
+  std::lock_guard<std::mutex> guard(lock);
+  auto& alloc = mlx::core::metal::allocator();
+  std::lock_guard<std::mutex> lk(alloc.*member(MutexTag{}));
+  lengths.clear();
+  long long bytes = 0;
+  for (auto& entry : (alloc.*member(CacheTag{})).*member(PoolTag{})) {
+    if (static_cast<long long>(entry.first) < min_length) {
+      continue;
+    }
+    lengths.push_back(entry.first);
+    bytes += static_cast<long long>(entry.first);
+  }
+  return bytes;
+}
+
+extern "C" long long nemotron_cache_snapshot_count(void) {
+  using namespace nemotron_cache_residency;
+  std::lock_guard<std::mutex> guard(lock);
+  return static_cast<long long>(lengths.size());
+}
+
+// Allocates the recorded lengths, puts them in this file's residency set and
+// hands them back to the cache. Returns the bytes, or -1 without a set.
+extern "C" long long nemotron_cache_prefault(void) {
+  using namespace nemotron_cache_residency;
+  if (__builtin_available(macOS 15, iOS 18, *)) {
+    std::lock_guard<std::mutex> guard(lock);
+    auto pool = mlx::core::metal::new_scoped_memory_pool();
+    auto& alloc = mlx::core::metal::allocator();
+    release_held_locked();
+    if (lengths.empty()) {
+      return 0;
+    }
+    if (!set) {
+      auto* desc = MTL::ResidencySetDescriptor::alloc()->init();
+      NS::Error* error = nullptr;
+      set = mlx::core::metal::device(mlx::core::Device::gpu)
+                .mtl_device()
+                ->newResidencySet(desc, &error);
+      desc->release();
+      if (!set) {
+        return -1;
+      }
+    }
+    std::vector<mlx::core::allocator::Buffer> buffers;
+    buffers.reserve(lengths.size());
+    for (size_t n : lengths) {
+      auto b = alloc.malloc(n);
+      if (b.ptr()) {
+        buffers.push_back(b);
+      }
+    }
+    long long bytes = 0;
+    for (auto& b : buffers) {
+      auto* mb = static_cast<MTL::Buffer*>(b.ptr());
+      mb->retain();
+      held.push_back(mb);
+      set->addAllocation(mb);
+      bytes += static_cast<long long>(mb->length());
+    }
+    for (auto& b : buffers) {
+      alloc.free(b);
+    }
+    set->commit();
+    return bytes;
+  }
+  return -1;
+}
+
+// Requests residency for the buffers `nemotron_cache_prefault` handed back
+// (returns once resident).
+extern "C" void nemotron_cache_prefault_request(void) {
+  using namespace nemotron_cache_residency;
+  if (__builtin_available(macOS 15, iOS 18, *)) {
+    std::lock_guard<std::mutex> guard(lock);
+    if (set && !held.empty()) {
+      set->requestResidency();
+    }
+  }
+}
+
+// Drops this file's references (the cache keeps its own until it is drained).
+extern "C" void nemotron_cache_prefault_release(void) {
+  using namespace nemotron_cache_residency;
+  std::lock_guard<std::mutex> guard(lock);
+  auto pool = mlx::core::metal::new_scoped_memory_pool();
+  release_held_locked();
+}
