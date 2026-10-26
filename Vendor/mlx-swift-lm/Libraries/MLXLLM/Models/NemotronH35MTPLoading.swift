@@ -322,6 +322,12 @@ private func nemotronDecodeBacking(_ opaque: UnsafeMutableRawPointer) -> UnsafeM
 final class NemotronDecodeResidency: @unchecked Sendable {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_RESIDENCY"] != "0"
     static let seedLayers = 0
+    /// The head's set is requested with the decode sets at the first verify
+    /// instead of inside `begin()`, so its residency request does not run
+    /// beside the seed prefill. NEMOTRON_MTP_HEAD_RESIDENCY_AT_DECODE=0
+    /// requests it at `begin()` as before.
+    static let headAtDecode =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_RESIDENCY_AT_DECODE"] != "0"
     let arrays: [MLXArray]
     let buffers: [any MTLBuffer]
     let seedSet: any MTLResidencySet
@@ -329,6 +335,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let owners: [ObjectIdentifier]
     let cut: Int
     let queue = DispatchQueue(label: "nemotron.decode.memory")
+    /// The head set was requested at a first verify and, with standing requests, never ended.
+    var headStanding = false
     /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
     /// requests are left standing between requests.
     static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
@@ -424,6 +432,16 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             if !decoded {
                 decoded = true
+                if NemotronDecodeResidency.headAtDecode {
+                    let ready = Array(owner.owners.prefix(owner.cut))
+                    if NemotronDecodeResidency.endsRequests || !owner.headStanding {
+                        // Standing requests: once requested, the head set stays requested across leases.
+                        owner.headStanding = true
+                        owner.request(owner.seedSet, phase: "seed", ready: ready)
+                    } else {
+                        owner.queue.async { NemotronZSkip.markCopyReady(ready) }
+                    }
+                }
                 for (i, set) in owner.decodeSets.enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
@@ -444,7 +462,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 for set in owner.targetSets + owner.extraSets { set.endResidency() }
             }
             owner.queue.sync {
-                owner.seedSet.endResidency()
+                if decoded || !NemotronDecodeResidency.headAtDecode { owner.seedSet.endResidency() }
                 if decoded { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
@@ -464,14 +482,18 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         NemotronZSkip.beginCopyReadiness(owners)
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
-            request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+            if !Self.headAtDecode {
+                request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+            }
             return Lease(self)
         }
         for set in targetSets { targetQueue.async { set.requestResidency() } }
-        let head = seedSet, ready = Array(owners.prefix(cut))
-        targetQueue.async {
-            head.requestResidency()
-            NemotronZSkip.markCopyReady(ready)
+        if !Self.headAtDecode {
+            let head = seedSet, ready = Array(owners.prefix(cut))
+            targetQueue.async {
+                head.requestResidency()
+                NemotronZSkip.markCopyReady(ready)
+            }
         }
         for set in extraSets { targetQueue.async { set.requestResidency() } }
         return Lease(self)
