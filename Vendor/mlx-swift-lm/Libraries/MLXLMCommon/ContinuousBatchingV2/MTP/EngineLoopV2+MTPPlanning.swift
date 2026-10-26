@@ -91,7 +91,7 @@ extension EngineLoopV2 {
                 if recordSkips { mtp.recordSkip("max_tokens") }
                 return .none
             }
-            return .round(k: depth)
+            return .round(k: mtp.roundDepth(for: rec, planDepth: depth))
         case .stale:
             if recordSkips { mtp.recordSkip("carry_invalid") }
             fallthrough
