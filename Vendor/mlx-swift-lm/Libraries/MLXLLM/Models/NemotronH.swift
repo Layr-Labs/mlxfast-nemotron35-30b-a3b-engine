@@ -776,7 +776,56 @@ enum NemotronHCompactSSMGated {
         inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
-        source: """
+        source: source, mutableInputs: ["counter"])
+    static let deferredKernel = deferred(mid: false)
+    static let deferredMidKernel = deferred(mid: true)
+
+    private static func deferred(mid: Bool) -> MLXFast.MLXFastKernel? {
+        let store = "state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);"
+        let anchor = "for (int t = 0; t < L; ++t) {"
+        let stored = source.components(separatedBy: store)
+        guard stored.count == 2 else { return nil }
+        let parts = stored.joined().components(separatedBy: anchor)
+        guard parts.count == 2 else { return nil }
+        func replay(_ conv: String, _ dt: String, _ keep: Int) -> String {
+            """
+            for (int t = 0; t < int(keeps[\(keep)]); ++t) {
+                auto x_ = static_cast<float>(\(conv)[t * CD + n * Dh + d_idx]);
+                auto B_ = \(conv) + t * CD + BO + g_idx * Ds;
+                auto dt_ = static_cast<float>(\(dt)[t * H + n]);
+                auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                auto dA = fast::exp(A * dt_);
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                    auto state = dA * prior[i] + dB_by_x;
+                    prior[i] = static_cast<U>(state);
+                }
+            }
+
+            """
+        }
+        let midStore = mid ? """
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                state_mid[(n * Dh + d_idx) * Ds + s_idx] = prior[i];
+            }
+
+            """ : ""
+        return MLXFast.metalKernel(
+            name: mid ? "nemotron_mtp_ssm_deferred_gated_prepared_mid"
+                : "nemotron_mtp_ssm_deferred_gated_prepared",
+            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                         "eps", "counter", "s1conv", "s1dt", "s2conv", "s2dt", "keeps"],
+            outputNames: ["out", "normed", "prepared"] + (mid ? ["state_mid"] : []),
+            source: parts[0] + replay("s1conv", "s1dt", 0) + replay("s2conv", "s2dt", 1)
+                + midStore + anchor + parts[1],
+            mutableInputs: ["counter"])
+    }
+
+    static let source = """
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -898,7 +947,7 @@ enum NemotronHCompactSSMGated {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            """, mutableInputs: ["counter"])
+            """
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -923,20 +972,13 @@ extension NemotronHRMSNormGated {
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int
     ) -> (MLXArray, MLXArray, MLXArray)? {
-        guard NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
-              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
-              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-              type(of: self) == NemotronHRMSNormGated.self,
-              groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
+        guard compactSSMPreparedEligible(heads: heads, headDim: headDim, groups: groups,
+                                         stateDim: stateDim),
               convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
               dt.dtype == .float32, dt.shape == [1, 3, 64],
               state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
-              weight.shape == [4096], weight.dtype == .bfloat16
+              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16
         else { return nil }
-        // Created and evaluated at load (`prepareCounter`), never inside a
-        // compile trace; without it the two launches stay.
-        guard NemotronHCompactSSMGated.counter != nil else { return nil }
         let outputs = NemotronHCompactSSMGated.kernel(
             [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
              eps, NemotronHCompactSSMGated.counter!],
@@ -947,6 +989,40 @@ extension NemotronHRMSNormGated {
             outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
         return (outputs[2], outputs[3], outputs[1])
+    }
+
+    func deferredSSMPreparedRows(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        state: MLXArray, projected: MLXArray, tape: NemotronMTPSSMTapeInputs
+    ) -> (MLXArray, MLXArray, MLXArray?) {
+        guard let kernel = tape.flush
+                ? NemotronHCompactSSMGated.deferredMidKernel : NemotronHCompactSSMGated.deferredKernel
+        else { preconditionFailure("Nemotron deferred SSM kernel unavailable after eligibility") }
+        let outputs = kernel(
+            [convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity,
+             eps, NemotronHCompactSSMGated.counter!,
+             tape.firstConv, tape.firstDt, tape.secondConv, tape.secondDt, tape.keeps],
+            template: [("T", DType.bfloat16), ("U", DType.float32),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                       ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: tape.flush
+                ? [[1, 3, 64, 64], [1, 3, 4096], [3, 8, 17 * 32], [1, 64, 64, 128]]
+                : [[1, 3, 64, 64], [1, 3, 4096], [3, 8, 17 * 32]],
+            outputDTypes: tape.flush
+                ? [DType.bfloat16, DType.bfloat16, DType.float32, DType.float32]
+                : [DType.bfloat16, DType.bfloat16, DType.float32])
+        return (outputs[1], outputs[2], tape.flush ? outputs[3] : nil)
+    }
+
+    func compactSSMPreparedEligible(heads: Int, headDim: Int, groups: Int, stateDim: Int) -> Bool {
+        NemotronHCompactSSMGated.enabled && NemotronMTPExecution.batchedNorm
+            && NemotronMultiRowQMV.enabled && NemotronMultiRowQMV.narrowEnabled
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && type(of: self) == NemotronHRMSNormGated.self
+            && groupSize == 512 && heads == 64 && headDim == 64 && groups == 8 && stateDim == 128
+            && weight.shape == [4096] && weight.dtype == .bfloat16
+            && NemotronHCompactSSMGated.counter != nil
     }
 }
 
