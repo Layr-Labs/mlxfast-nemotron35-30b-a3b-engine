@@ -1914,6 +1914,31 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+// Exact inline BF16 pairs remove the dependent dictionary lookup from FC2.
+// The layout remains [expert, tile, group, 128]; a UInt32 holds scale low,
+// bias high. No floating-point expression or reduction order changes.
+private func nemotronZSkipInlineSource(_ source: String) -> String? {
+    let pointers = "  const device T* sq = sk + tb * groups * OT + 4 * lid;\n"
+        + "  const device T* bq = bk + tb * groups * OT + 4 * lid;\n"
+    guard source.components(separatedBy: pointers).count == 2 else { return nil }
+    var s = source.replacingOccurrences(of: pointers, with:
+        "  const device uint* sq = (const device uint*)sk + tb * groups * OT + 4 * lid;\n")
+    var replaced = 0
+    for indent in ["      ", "        "] {
+        let from = indent + "const uint2 sr = *((const device uint2*)(sq + gi * OT));\n"
+            + indent + "const uint2 br = *((const device uint2*)(bq + gi * OT));\n"
+            + indent + "const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};\n"
+            + indent + "const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};\n"
+        let to = indent + "const uint4 sb = *((const device uint4*)(sq + gi * OT));\n"
+            + indent + "const uint sv[4] = {sb.x << 16, sb.y << 16, sb.z << 16, sb.w << 16};\n"
+            + indent + "const uint bv[4] = {sb.x & 0xffff0000u, sb.y & 0xffff0000u, sb.z & 0xffff0000u, sb.w & 0xffff0000u};\n"
+        replaced += s.components(separatedBy: from).count - 1
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    guard replaced > 0, !s.contains("bq"), !s.contains("sr."), !s.contains("br.") else { return nil }
+    return s
+}
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -1986,6 +2011,7 @@ enum NemotronZSkip {
         /// The tile-major biases, or with `dict` the bank's FP32 pair table.
         let biases: MLXArray
         var dict = false
+        var inlineSB = false
     }
 
     private static let lock = NSLock()
@@ -2041,7 +2067,7 @@ enum NemotronZSkip {
         return lock.withLock {
             layers.compactMap { _, moe in
                 guard let c = copies[ObjectIdentifier(moe.switchMLP.fc2)] else { return nil }
-                return c.dict ? [c.codes, c.scales] : [c.codes, c.scales, c.biases]
+                return [c.codes, c.scales, c.biases]
             }
         }
     }
@@ -2090,6 +2116,14 @@ enum NemotronZSkip {
     private static var dictKernel: MLXFast.MLXFastKernel? {
         fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
     }
+    private static let inlineSB = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_INLINE_SB"] != "0"
+    private static let inlineSlotKernel: MLXFast.MLXFastKernel? = {
+        guard let source = nemotronZSkipInlineSource(nemotronZSkipTiledFastSource) else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_zskip_tiled_inline_sb_slot",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"],
+            source: source, header: nemotronZSkipHeader + "\n" + nemotronMoELeaderStore)
+    }()
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
     /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
@@ -2134,6 +2168,14 @@ enum NemotronZSkip {
             func tileMajor(_ a: MLXArray) -> MLXArray {
                 a.reshaped(experts, tiles, 128, groups).transposed(0, 1, 3, 2).contiguous()
             }
+            if inlineSB, fast, inlineSlotKernel != nil,
+               bank.scales.dtype == .bfloat16, bank.biases.dtype == .bfloat16 {
+                let s = bank.scales.view(dtype: .uint16).asType(.uint32)
+                let b = bank.biases.view(dtype: .uint16).asType(.uint32)
+                let pairs = bitwiseOr(s, leftShift(b, MLXArray(UInt32(16))))
+                return Copy(codes: codes, scales: tileMajor(pairs),
+                            biases: MLXArray(UInt32(0)), inlineSB: true)
+            }
             if sbDict, dictKernel != nil,
                let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
                 return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
@@ -2161,7 +2203,7 @@ enum NemotronZSkip {
                                  copy: Copy, rows: Int) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
-        return (copy.dict ? dictKernel! : kernel)(
+        return (copy.inlineSB ? inlineSlotKernel! : (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
