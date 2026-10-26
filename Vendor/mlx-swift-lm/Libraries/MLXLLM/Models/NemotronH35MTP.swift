@@ -418,7 +418,8 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                     + draftHead.decodeResidencyArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
-                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays)
+                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
+                    + NemotronSharedDownZSkip.copyArrays)
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
@@ -540,6 +541,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
                                 from: MLXArray)?
         var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
                               from: MLXArray)?
+        var deferredSecondRow: (keys: MLXArray, values: MLXArray)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -559,6 +561,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             (paged?.cache.innerState() ?? [])
                 + pendingTokens + pendingHidden + savedTokens + savedHidden
                 + [frontier, savedFrontier].compactMap { $0 } + roots
+                + (deferredSecondRow.map { [$0.keys, $0.values] } ?? [])
         }
         var materializedBytes: Int {
             let arraysBytes = arrays.reduce(0) { total, array in
@@ -777,6 +780,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.pendingTokens = []
         s.pendingHidden = []
         s.frontier = nil
+        if let row = s.deferredSecondRow {
+            s.deferredSecondRow = nil
+            s.roots += s.cache.appendTrusted(keys: row.keys, values: row.values)
+        }
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
@@ -848,7 +855,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
         s.deviceFirstDraft = nil; s.hostAcceptedDrafts = nil; s.deviceSecondInputs = nil
-        s.deviceSecondDraft = nil
+        s.deviceSecondDraft = nil; s.deferredSecondRow = nil
     }
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {
         guard let s = requestState as? State, s.owner == ObjectIdentifier(self), !s.released else { return }
@@ -927,9 +934,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let out: MLXArray, ids: MLXArray
         if let secondDraft, secondDraft.from === first.hidden {
             // The whole second draft already ran behind the verify for this
-            // row (`speculateNextFirstDraft`); only its K/V row is appended, at
-            // the position the round-build step would write it.
-            s.roots += s.cache.appendTrusted(keys: secondDraft.keys, values: secondDraft.values)
+            s.deferredSecondRow = (keys: secondDraft.keys, values: secondDraft.values)
             out = secondDraft.out
             ids = secondDraft.ids
         } else {
@@ -965,6 +970,7 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
               targetHidden.shape == [1, width, target.configuration.hiddenSize]
         else { return }
         // Chained draft rows are never trusted; drop them before appending.
+        s.deferredSecondRow = nil
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
         // Every row's K/V goes to the head cache; only the row the device
         // picks is attended (`speculateNextFirstDraft`).
@@ -1007,10 +1013,9 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
                 .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
         }
-        let attended = module.maskedRowOutput(
+        let out = module.finishMaskedRow(
             fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
-        let out = module.finishPagedAttentionRow(attended)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
