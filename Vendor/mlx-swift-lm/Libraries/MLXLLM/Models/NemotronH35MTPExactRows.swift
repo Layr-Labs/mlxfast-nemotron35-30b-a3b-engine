@@ -1064,6 +1064,10 @@ enum NemotronSharedUpPacking {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PACK"] != "0"
     nonisolated(unsafe) private static var verified = false
+    private static let unpackedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_UNPACKED"] != "0"
+    private static let unpackedLock = NSLock()
+    nonisolated(unsafe) private static var unpackedOwners: Set<ObjectIdentifier> = []
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_shared_up_relu2_pack_r3",
         inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
@@ -1118,16 +1122,64 @@ enum NemotronSharedUpPacking {
     static func apply(_ x: MLXArray, up: Linear, down: Linear,
                       prepared: MLXArray?) -> MLXArray? {
         guard verified, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
-              let q = up as? QuantizedLinear,
-              let fused = dispatch(x.reshaped(3, x.dim(2)), q, prepared: prepared)
+              let q = up as? QuantizedLinear
         else { return nil }
+        let rows = x.reshaped(3, x.dim(2))
+        let fused: (MLXArray, MLXArray?)
+        if unpackedEnabled, NemotronSharedDownZSkip.covers(down),
+           unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) }) {
+            fused = (NemotronHeadPreparedActivation.apply(rows, q, relu2: true, rps: 2, prepared: prepared), nil)
+        } else {
+            guard let packed = dispatch(rows, q, prepared: prepared) else { return nil }
+            fused = (packed.0, packed.1)
+        }
         var activated = fused.0
         if NemotronMoELeader.selfTest {
             activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
                 x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
         }
+        if let y = NemotronSharedDownZSkip.run(activated, owner: down) {
+            guard NemotronMoELeader.selfTest else { return y }
+            return nemotronBitwiseOrNaN(y, nemotronMTPLinearRows(
+                activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1))
+        }
         return nemotronMTPLinearRows(
             activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+    }
+
+    static func prepareUnpacked(_ model: Module) {
+        unpackedLock.withLock { unpackedOwners = [] }
+        guard unpackedEnabled, verified else { return }
+        var built: Set<ObjectIdentifier> = []
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let shared = (module as? NemotronHMoE)?.sharedExperts,
+                          NemotronSharedDownZSkip.covers(shared.downProj),
+                          let q = shared.upProj as? QuantizedLinear,
+                          !built.contains(ObjectIdentifier(q)) else { continue }
+                    let k = q.weight.dim(1) * 8
+                    let dense = MLXRandom.normal([3, k], dtype: .bfloat16,
+                        key: MLXRandom.key(UInt64(0x51a0 + built.count)))
+                    let zero = MLXArray.zeros([3, k], dtype: .bfloat16)
+                    for x in [dense, zero] {
+                        guard let old = dispatch(x, q, prepared: nil) else { return false }
+                        let new = NemotronHeadPreparedActivation.apply(x, q, relu2: true, rps: 2, prepared: nil)
+                        guard (old.0.view(dtype: .uint16) .== new.view(dtype: .uint16)).all().item(Bool.self)
+                        else { return false }
+                    }
+                    built.insert(ObjectIdentifier(q))
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        unpackedLock.withLock { unpackedOwners = accepted ? built : [] }
+        FileHandle.standardError.write(Data((accepted
+            ? "nemotron shared up unpacked on: \(built.count) owners\n"
+            : "nemotron shared up unpacked off\n").utf8))
     }
 
     static func verify(_ model: Module) {
@@ -3080,12 +3132,14 @@ enum NemotronHeadScreen {
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [weight, NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups],
+                template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? (partialHalf ? partialHalfKernel : partialKernel)(
