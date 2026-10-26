@@ -105,6 +105,11 @@ final class CBv2MTPRoundInFlight {
         let policyTopTwoValues: MLXArray?
         var diagnostics: [CBv2LogitDiagnosticPacket] = []
         var includesAssistantPrefill = false
+        /// Prompt-lookup round: per row, the seed carry's hidden and the
+        /// verified window [seed, drafts] on the host. Empty for head rounds.
+        var lookupSeedHidden: [MLXArray] = []
+        var lookupWindows: [[Int]] = []
+        var promptLookup: Bool { !lookupWindows.isEmpty }
 
     }
 
@@ -165,6 +170,60 @@ enum CBv2MTPPrefillCarry {
 enum CBv2MTPPolicyPacket {
     static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_PACK_POLICY_VALUES"] != "0"
+}
+
+/// Prompt-lookup rounds (prompt lookup decoding, Saxena 2023): when a
+/// request's committed tokens end with an n-gram that also occurs earlier in
+/// its own prompt or output, the round verifies the tokens that followed the
+/// latest such occurrence instead of head drafts. Only the verify inputs
+/// change: the target scores every position and the accept walk, emitted
+/// tokens and rollback are the head round's.
+/// NEMOTRON_PLD=0 disables it. NEMOTRON_PLD_MIN (default 5) is the shortest
+/// matched suffix, NEMOTRON_PLD_MIN_DRAFT (default 3) the fewest proposed
+/// tokens worth a lookup round, NEMOTRON_MTP_ROUND_DEPTH (default 2) the head
+/// round depth. Proposals are capped by the declared depth. A request stops
+/// proposing after NEMOTRON_PLD_FAILURES (default 1; 0 never) lookup rounds
+/// that each accepted fewer than NEMOTRON_PLD_FAILURE_FRACTION (default 0.5)
+/// of their drafts.
+public enum CBv2PromptLookup {
+    private static let environment = ProcessInfo.processInfo.environment
+    public static let enabled = environment["NEMOTRON_PLD"] != "0"
+    static let minimumMatch = max(1, Int(environment["NEMOTRON_PLD_MIN"] ?? "") ?? 5)
+    static let failureLimit = max(0, Int(environment["NEMOTRON_PLD_FAILURES"] ?? "") ?? 1)
+    static let failureFraction = Double(environment["NEMOTRON_PLD_FAILURE_FRACTION"] ?? "") ?? 0.5
+    static let minimumDraft = max(1, Int(environment["NEMOTRON_PLD_MIN_DRAFT"] ?? "") ?? 3)
+    static let headDepth = max(1, Int(environment["NEMOTRON_MTP_ROUND_DEPTH"] ?? "") ?? 2)
+    /// Longest suffix compared; a match this long stops the search.
+    static let matchCap = 64
+
+    /// Up to `limit` tokens that followed the latest earlier occurrence of
+    /// the longest suffix of `tokens` (at least `minimumMatch` long).
+    static func propose(_ tokens: [Int], limit: Int) -> [Int] {
+        let n = tokens.count
+        guard limit > 0, n > minimumMatch else { return [] }
+        let last = tokens[n - 1]
+        var bestLength = 0
+        var bestNext = 0
+        var end = n - 2
+        while end >= minimumMatch - 1 {
+            if tokens[end] == last {
+                var length = 1
+                while length < matchCap, end - length >= 0,
+                    tokens[end - length] == tokens[n - 1 - length]
+                {
+                    length += 1
+                }
+                if length > bestLength {
+                    bestLength = length
+                    bestNext = end + 1
+                    if length >= matchCap { break }
+                }
+            }
+            end -= 1
+        }
+        guard bestLength >= minimumMatch else { return [] }
+        return Array(tokens[bestNext ..< min(bestNext + limit, n)])
+    }
 }
 
 /// A seed step belongs to the row cohort it prepared, not to the depth that
@@ -272,6 +331,11 @@ final class CBv2MTPRoundDriver {
     /// Step-global seed fallback without destroying persistent request
     /// history. Used when one rectangular row lacks a carry.
     private(set) var forceSeedPlan = false
+    /// Plan-scoped: prompt-lookup drafts of the rows this plan verifies
+    /// with them instead of head drafts.
+    private(set) var lookupDrafts: [CBv2RequestID: [Int]] = [:]
+    /// Per request: lookup rounds that accepted under the failure fraction.
+    private var lookupFailures: [CBv2RequestID: Int] = [:]
 
     /// One selection for the whole scheduler plan. Every speculating row in
     /// that plan uses this depth, so target verification stays rectangular.
@@ -420,6 +484,7 @@ final class CBv2MTPRoundDriver {
         }
         if !roundMarks.isEmpty { roundMarks = [:] }
         if !seedMarks.isEmpty { seedMarks = [] }
+        if !lookupDrafts.isEmpty { lookupDrafts = [:] }
         forceSeedPlan = false
         controllerMeasurementEligible = canSpeculate
         controllerDecision = depthController.select(
@@ -506,6 +571,42 @@ final class CBv2MTPRoundDriver {
     }
 
     func markRound(_ id: CBv2RequestID, k: Int) { roundMarks[id] = k }
+    /// The plan depth of one row's round: a prompt-lookup round when its
+    /// committed tokens propose at least `minimumDraft` tokens (recorded for
+    /// the verify build), otherwise a head round at the head depth.
+    func roundDepth(for rec: CBv2ScheduledRequest, planDepth: Int) -> Int {
+        let head = min(CBv2PromptLookup.headDepth, planDepth)
+        lookupDrafts.removeValue(forKey: rec.id)
+        guard CBv2PromptLookup.enabled, usesRequestStatefulDrafter,
+            planDepth > head, lookupAllowed(rec.id)
+        else { return head }
+        let drafts = CBv2PromptLookup.propose(rec.tokens, limit: planDepth)
+        guard drafts.count >= max(CBv2PromptLookup.minimumDraft, head + 1) else { return head }
+        lookupDrafts[rec.id] = drafts
+        return drafts.count
+    }
+    private func lookupAllowed(_ id: CBv2RequestID) -> Bool {
+        CBv2PromptLookup.failureLimit == 0
+            || lookupFailures[id, default: 0] < CBv2PromptLookup.failureLimit
+    }
+    /// Finalize-time outcome of one lookup round.
+    func observeLookupRound(_ id: CBv2RequestID, drafted: Int, accepted: Int) {
+        if Double(accepted) < CBv2PromptLookup.failureFraction * Double(drafted) {
+            lookupFailures[id, default: 0] += 1
+        }
+    }
+    /// True when the row's next round would verify prompt-lookup drafts at
+    /// this depth (finalize then leaves the head's first draft unstaged).
+    func wouldLookup(_ rec: CBv2ScheduledRequest, planDepth: Int) -> Bool {
+        let head = min(CBv2PromptLookup.headDepth, planDepth)
+        guard CBv2PromptLookup.enabled, usesRequestStatefulDrafter, planDepth > head,
+            lookupAllowed(rec.id)
+        else {
+            return false
+        }
+        return CBv2PromptLookup.propose(rec.tokens, limit: planDepth).count
+            >= max(CBv2PromptLookup.minimumDraft, head + 1)
+    }
     func markSeed(_ id: CBv2RequestID) { seedMarks.insert(id) }
     func roundMark(for id: CBv2RequestID) -> Int? { roundMarks[id] }
     func isSeedMarked(_ id: CBv2RequestID) -> Bool { seedMarks.contains(id) }
@@ -725,6 +826,7 @@ final class CBv2MTPRoundDriver {
         releaseAssistantState(id)
         pendingSeedCosts.invalidate(id)
         requestAcceptance.removeValue(forKey: id)
+        lookupFailures.removeValue(forKey: id)
     }
 
     /// The request left the engine for good — ids are legally reusable, so
@@ -775,6 +877,7 @@ final class CBv2MTPRoundDriver {
         seedMarks.removeAll(keepingCapacity: false)
         pendingSeedCosts.removeAll()
         requestAcceptance.removeAll(keepingCapacity: false)
+        lookupFailures.removeAll(keepingCapacity: false)
     }
 
     var requestStateCountForTesting: Int {

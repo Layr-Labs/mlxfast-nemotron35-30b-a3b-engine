@@ -502,6 +502,11 @@ extension EngineLoopV2 {
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
         let batch = verifyRows.count
+        let lookup = verifyRows.map { mtp.lookupDrafts[$0.rec.id] }
+        let promptLookup = lookup.allSatisfy { $0?.count == k }
+        precondition(
+            promptLookup || lookup.allSatisfy { $0 == nil },
+            "CBv2 MTP: one plan must verify head drafts or prompt-lookup drafts")
         var captures: [CBv2MTPRowCapture] = []
         var rowMetadata: [CBv2MTPRoundInFlight.VerifyRow] = []
         var assistantOwnersTransferred = false
@@ -580,7 +585,12 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
-        if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
+        if promptLookup {
+            // The drafts are known on the host: no head step runs this round.
+            for draftIndex in 0 ..< k {
+                draftSteps.append(MLXArray(lookup.map { Int32($0![draftIndex]) }))
+            }
+        } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
             }
@@ -707,6 +717,10 @@ extension EngineLoopV2 {
             policyTopTwoValues: target.policyTopTwo?.values)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
+        if promptLookup {
+            result.lookupSeedHidden = carryHiddens
+            result.lookupWindows = zip(seedTokens, lookup).map { [Int($0)] + $1! }
+        }
         return result
     }
 

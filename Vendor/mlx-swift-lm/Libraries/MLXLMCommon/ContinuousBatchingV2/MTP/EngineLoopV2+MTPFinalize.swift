@@ -228,7 +228,27 @@ extension EngineLoopV2 {
             // draft inputs and their trusted target hidden rows; every
             // speculative head suffix is discarded.
             let committedDraftCount = min(accepted, max(0, confirmed - 1))
-            if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            if verify.promptLookup {
+                mtp.observeLookupRound(id, drafted: k, accepted: accepted)
+                // No head step ran: queue the committed window as trusted
+                // target history (seed, accepted drafts) with its verifier
+                // hidden rows, like any other target-only observation.
+                if let state = metadata.assistantState,
+                    let observer = mtp.drafter as? any CBv2MTPHostDraftObserving
+                {
+                    (mtp.drafter as? any CBv2MTPCommittedTokenObserving)?.observeCommittedTokens(
+                        kept, requestState: state)
+                    let inputs = 1 + committedDraftCount
+                    observer.observeHostDraftedRound(
+                        seedHidden: verify.lookupSeedHidden[batchIndex],
+                        tokens: MLXArray(
+                            verify.lookupWindows[batchIndex].prefix(inputs).map { Int32($0) }
+                        ).reshaped([1, inputs]),
+                        hidden: verify.lastHidden[
+                            batchIndex ..< batchIndex + 1, 0 ..< inputs, 0...],
+                        requestState: state)
+                }
+            } else if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
                 let state = metadata.assistantState
             {
                 (stateful as? any CBv2MTPCommittedTokenObserving)?.observeCommittedTokens(
@@ -271,13 +291,19 @@ extension EngineLoopV2 {
                 // The acceptance packet was just read back, so the GPU is idle
                 // while the host finishes finalize and plans the next step:
                 // let the drafter submit the next round's first draft now.
+                // A row whose next round verifies prompt-lookup drafts runs
+                // no head step then; leave its first draft unstaged.
+                let fixedDepth = mtp.config.fixedDraftTokens ?? 0
                 if CBv2MTPFirstDraftPrestage.enabled, carryShortlist == nil,
                     let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
-                    let state = metadata.assistantState
+                    let state = metadata.assistantState,
+                    !mtp.wouldLookup(
+                        rec,
+                        planDepth: min(fixedDepth, rec.request.maxTokens - rec.generatedTokenCount - 1))
                 {
                     // A fixed depth plans the next round with exactly this
                     // many drafts whenever enough tokens remain for it.
-                    let fixed = mtp.config.fixedDraftTokens ?? 0
+                    let fixed = min(fixedDepth, CBv2PromptLookup.headDepth)
                     let depth = CBv2MTPFirstDraftPrestage.chained
                         && rec.request.maxTokens - rec.generatedTokenCount >= fixed ? fixed : 1
                     CBv2MTPSubmitMerge.begin()
@@ -420,7 +446,9 @@ extension EngineLoopV2 {
                     hidden: carryHidden!,
                     shortlist: carryShortlist,
                     previousTopTwoMargin: previousTopTwoMargin,
-                    needsHistoryTransition: mtp.tracksPersistentHistory,
+                    // A lookup round's observation already ends on this
+                    // carry's hidden.
+                    needsHistoryTransition: mtp.tracksPersistentHistory && !verify.promptLookup,
                     tokensCount: rec.tokens.count,
                     kvOffset: rec.numComputedTokens)
             }
@@ -469,6 +497,17 @@ extension CBv2MTPFirstDraftPrestaging {
     ) {
         prestageFirstDraft(token: token, hidden: hidden, requestState: requestState)
     }
+}
+
+/// Request-stateful drafter capability for rounds whose drafts came from the
+/// host (prompt lookup): no draft step ran, so the committed window [seed,
+/// accepted drafts] and its verifier hidden rows are queued as trusted
+/// history. `seedHidden` is the carry hidden that predicted the seed; it
+/// pairs with the seed unless the queued history already ends on it.
+public protocol CBv2MTPHostDraftObserving: AnyObject {
+    func observeHostDraftedRound(
+        seedHidden: MLXArray, tokens: MLXArray, hidden: MLXArray,
+        requestState: any CBv2MTPRequestState)
 }
 
 /// Optional request-stateful drafter capability: the target tokens a request
@@ -570,7 +609,7 @@ extension EngineLoopV2 {
     func mtpSpeculateAfterVerify(
         _ verify: CBv2MTPRoundInFlight.Verify, driver mtp: CBv2MTPRoundDriver
     ) {
-        guard CBv2MTPFirstDraftPrestage.speculateAfterVerify,
+        guard CBv2MTPFirstDraftPrestage.speculateAfterVerify, !verify.promptLookup,
             let speculator = mtp.drafter as? any CBv2MTPFirstDraftPrestaging
         else { return }
         let batch = verify.rows.count

@@ -414,11 +414,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
             decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 }
+                head: NemotronZSkip.withoutCopiedDraftBanks(module)
                     + draftHead.decodeResidencyArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
-                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays)
+                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
+                    + NemotronSharedDownZSkip.copyArrays)
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {
@@ -1062,6 +1063,27 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {
         state(requestState).hostAcceptedDrafts = accepted
+    }
+}
+
+extension NemotronH35MTPAssistant: CBv2MTPHostDraftObserving {
+    /// A prompt-lookup round ran no head step. After a head round the queued
+    /// history ends before the seed (its frontier is unset), so the seed
+    /// pairs with the carry hidden that predicted it; after a target-only
+    /// observation or another lookup round the frontier already is that
+    /// hidden. The window then queues like any committed target rows.
+    public func observeHostDraftedRound(
+        seedHidden: MLXArray, tokens: MLXArray, hidden: MLXArray,
+        requestState: any CBv2MTPRequestState
+    ) {
+        let s = state(requestState)
+        if s.prestagedResult != nil || s.prestagedSecond != nil {
+            discardRound(requestState: requestState)
+        }
+        if s.frontier == nil { s.frontier = seedHidden }
+        observeCommittedTarget(
+            CBv2MTPCommittedTargetObservation(tokens: tokens, hidden: hidden),
+            requestState: requestState)
     }
 }
 
