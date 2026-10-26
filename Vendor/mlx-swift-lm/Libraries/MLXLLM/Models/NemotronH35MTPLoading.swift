@@ -78,7 +78,9 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
+        NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
+        NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
@@ -97,6 +99,9 @@ extension NemotronH35MTPAssistant {
         // Keep last: it ends with Memory.clearCache().
         try NemotronDraftAttentionGeometry.warm()
         assistant.warmUpExactShapes()
+        NemotronSharedDownZSkip.warmOriginalRoutes(target) {
+            assistant.warmUpExactShapes()
+        }
         assistant.prepareDecodeResidency()
         return assistant
     }
@@ -329,9 +334,6 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let owners: [ObjectIdentifier]
     let cut: Int
     let queue = DispatchQueue(label: "nemotron.decode.memory")
-    /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
-    /// requests are left standing between requests.
-    static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
 
     /// The target's own parameter buffers, one set per backbone group (embeddings, layers in order, then the
     /// rest), requested on their own serial queue when a request's lease begins and ended with the lease.
@@ -342,6 +344,15 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
+    /// With target sets, also request the per-layer copy sets on the target queue right after the head and
+    /// extras sets, each marking its layer ready when its request returns, instead of at the first verify graph
+    /// (terrapinelf's c54ce5c7). NEMOTRON_MTP_COPIES_AFTER_HEAD=0 keeps them at the first verify.
+    static let copiesAfterHead = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
+    private(set) var copiesEnqueued = false
+    /// Shared copies stay outside the routed inventory and head seed prefix.
+    /// Readiness follows the existing extras set, independently of routed sets.
+    let extraOwners: [ObjectIdentifier]
+    let readinessOwners: [ObjectIdentifier]
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
@@ -377,7 +388,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     }
 
     init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier], target: [[MLXArray]],
-          extras: [MLXArray]) {
+          extras: [MLXArray], extraOwners: [ObjectIdentifier]) {
         guard Self.enabled, let device = MTLCreateSystemDefaultDevice() else { return nil }
         let targetSets = Self.targetEnabled ? Self.makeTargetSets(device, target) : []
         let extraSets = Self.extrasEnabled && !extras.isEmpty ? Self.makeTargetSets(device, [extras]) : []
@@ -385,6 +396,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             "nemotron target residency: \(targetSets.count) sets, decode extras: \(extraSets.count) set\n".utf8))
         self.targetSets = targetSets
         self.extraSets = extraSets
+        self.extraOwners = extraOwners
+        self.readinessOwners = owners + extraOwners
         let cut = min(Self.seedLayers, layers.count)
         guard owners.count == layers.count else { return nil }
         let groups = [head + layers.prefix(cut).flatMap { $0 }] + Array(layers.dropFirst(cut))
@@ -424,7 +437,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             if !decoded {
                 decoded = true
-                for (i, set) in owner.decodeSets.enumerated() {
+                for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
             }
@@ -434,18 +447,12 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             finished = true
             let owner = owner
-            guard NemotronDecodeResidency.endsRequests else {
-                // The requests stay standing; the next lease requests the same sets again.
-                owner.targetQueue.sync {}
-                owner.queue.sync { NemotronZSkip.endCopyReadiness() }
-                return
-            }
             owner.targetQueue.sync {
                 for set in owner.targetSets + owner.extraSets { set.endResidency() }
             }
             owner.queue.sync {
                 owner.seedSet.endResidency()
-                if decoded { for set in owner.decodeSets { set.endResidency() } }
+                if decoded || owner.copiesEnqueued { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
         }
@@ -461,9 +468,15 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
     /// set keeps its own queue.
     func begin() -> Lease {
-        NemotronZSkip.beginCopyReadiness(owners)
+        copiesEnqueued = false
+        NemotronZSkip.beginCopyReadiness(readinessOwners)
         guard !targetSets.isEmpty else {
-            for set in extraSets { targetQueue.async { set.requestResidency() } }
+            for set in extraSets {
+                targetQueue.async {
+                    set.requestResidency()
+                    NemotronZSkip.markCopyReady(self.extraOwners)
+                }
+            }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
@@ -473,9 +486,24 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             head.requestResidency()
             NemotronZSkip.markCopyReady(ready)
         }
-        for set in extraSets { targetQueue.async { set.requestResidency() } }
+        for set in extraSets {
+            targetQueue.async {
+                set.requestResidency()
+                NemotronZSkip.markCopyReady(self.extraOwners)
+            }
+        }
+        if Self.copiesAfterHead {
+            copiesEnqueued = true
+            for (i, set) in decodeSets.enumerated() {
+                let ready = [owners[cut + i]]
+                targetQueue.async {
+                    set.requestResidency()
+                    NemotronZSkip.markCopyReady(ready)
+                }
+            }
+        }
         return Lease(self)
     }
 }
 
-// Second measurement of ff544a18.
+// Second measurement of ArthurOstapenko 08393136; code unchanged.
