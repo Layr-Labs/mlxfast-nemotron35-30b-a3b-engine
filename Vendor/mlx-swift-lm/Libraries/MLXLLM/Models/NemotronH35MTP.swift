@@ -44,10 +44,6 @@ private final class NemotronMTPDraftHead {
         /// Full packed records (`NemotronHeadScreen.packRecords`), adopted the
         /// same way; when set, `packed` is not built.
         var records: MLXArray? = nil
-        /// 2-bit screen records (`NemotronHeadScreen.packRecords2`), adopted
-        /// once the plan's rescore and pick checks pass on them; when set,
-        /// neither `records` nor `packed` is built.
-        var records2: MLXArray? = nil
         /// Ticket counter of the fused select + final launch
         /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
         /// two-launch path bitwise.
@@ -61,7 +57,7 @@ private final class NemotronMTPDraftHead {
     /// fused-selection ticket counter or any request tensor.
     var decodeResidencyArrays: [MLXArray] {
         guard let screen else { return [] }
-        return [screen.groups] + [screen.upperGroups, screen.packed, screen.records, screen.records2]
+        return [screen.groups] + [screen.upperGroups, screen.packed, screen.records]
             .compactMap { $0 }
     }
 
@@ -77,7 +73,7 @@ private final class NemotronMTPDraftHead {
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
-            records: screen.records, records2: screen.records2,
+            records: screen.records,
             counter: screen.counter)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
@@ -131,13 +127,11 @@ private final class NemotronMTPDraftHead {
             FileHandle.standardError.write(Data("nemotron mtp head screen: \(message)\n".utf8))
         }
         let environment = ProcessInfo.processInfo.environment
-        // NEMOTRON_MTP_HEAD_SCREEN_BITS=4 keeps the 4-bit screen (12 groups,
-        // upper 8, keep 16); the default 2-bit records read 16 / 6 groups and
-        // keep 24 rows per chunk for the exact rescore.
-        let bits = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_BITS"] ?? "") ?? 2
-        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? (bits == 2 ? 16 : 12)
+        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 12
         let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? 1024
-        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 24 : 16)
+        // Shorter draft shortlist trades fewer selection/rescore operations
+        // against proposal recall; target verification remains authoritative.
+        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? 8
         let k = NemotronHeadScreen.width, rows = NemotronHeadScreen.rows
         guard (2...16).contains(groupCount), groupCount % 2 == 0,
               [512, 1024, 2048].contains(chunk), keep % 4 == 0, (4...min(chunk / 8, 64)).contains(keep),
@@ -180,7 +174,7 @@ private final class NemotronMTPDraftHead {
         // set (NEMOTRON_MTP_HEAD_SCREEN_UPPER_GROUPS, 0 keeps the half head):
         // the later BPE merges carry a prompt-dependent share of the target's
         // tokens, and a draft that cannot propose them is always rejected.
-        let upperCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_GROUPS"] ?? "") ?? (bits == 2 ? 6 : 8)
+        let upperCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_UPPER_GROUPS"] ?? "") ?? 8
         let upperSelection: [Int]? = (2...16).contains(upperCount) && upperCount % 2 == 0
             ? selectGroups(rows..<NemotronHeadScreen.headRows, count: upperCount) : nil
         // Qualification on fixed synthetic inputs: every kept value must be
@@ -289,66 +283,7 @@ private final class NemotronMTPDraftHead {
                 packedNotes.append("\(name) off (\(error))")
             }
         }
-        // 2-bit screen records (NEMOTRON_MTP_HEAD_SCREEN_BITS=2): adopted when,
-        // on fixed synthetic inputs and for the plan and its half-head variant,
-        // every kept value is bitwise the stock head logit over the scored rows,
-        // the kept ids are distinct and in range, and the pick is the best kept
-        // value (lowest id on ties); the 4-bit layouts are then not built.
-        if bits == 2 {
-            do {
-                let verified = try withError { () -> MLXArray? in
-                    let records2 = NemotronHeadScreen.packRecords2(
-                        weight: head.weight, scales: head.scales, biases: biases, groups: selected,
-                        upperGroups: upper)
-                    eval(records2)
-                    let candidate = chosen.plan
-                    var state: UInt64 = 0x3C6E_F372_FE94_F82B
-                    for _ in 0..<4 {
-                        let t = (0..<k).map { _ -> Float in
-                            state = state &* 6364136223846793005 &+ 1442695040888963407
-                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
-                        }
-                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
-                        for half in candidate.upperGroups == nil ? [false] : [true, false] {
-                            let result = NemotronHeadScreen.run(
-                                x, weight: candidate.weight, scales: candidate.scales,
-                                biases: candidate.biases, groups: candidate.groups,
-                                groupCount: groupCount, chunk: chunk, keep: keep,
-                                upperGroups: half ? candidate.upperGroups : nil,
-                                upperGroupCount: half ? candidate.upperGroupCount : 0,
-                                records2: records2)
-                            let scoredRows = half ? NemotronHeadScreen.headRows : rows
-                            let full = (half ? head(x) : prefix(x))[0, -1].asType(.float32)
-                            eval(full, result.id, result.candidateIds, result.candidateValues)
-                            let fullValues = full.asArray(Float.self)
-                            let ids = result.candidateIds.asArray(Int32.self)
-                            let values = result.candidateValues.asArray(Float.self)
-                            let id = Int(result.id.item(Int32.self))
-                            var best = 0
-                            for i in ids.indices
-                            where values[i] > values[best] || (values[i] == values[best] && ids[i] < ids[best]) {
-                                best = i
-                            }
-                            guard Set(ids).count == ids.count,
-                                  ids.allSatisfy({ (0..<Int32(scoredRows)).contains($0) }),
-                                  zip(ids, values).allSatisfy({ fullValues[Int($0)].bitPattern == $1.bitPattern }),
-                                  id == Int(ids[best])
-                            else { return nil }
-                        }
-                    }
-                    return records2
-                }
-                if let verified {
-                    plan.records2 = verified
-                    packedNotes.append("2-bit records on (\(verified.nbytes >> 10) KiB, rescore bitwise)")
-                } else {
-                    packedNotes.append("2-bit records off (rescore check failed)")
-                }
-            } catch {
-                packedNotes.append("2-bit records off (\(error))")
-            }
-        }
-        if plan.records2 == nil, NemotronHeadScreen.packedRecords {
+        if NemotronHeadScreen.packedRecords {
             adopt("full records") { candidate in
                 let records = NemotronHeadScreen.packRecords(
                     weight: head.weight, scales: head.scales, biases: biases, groups: selected,
@@ -357,8 +292,7 @@ private final class NemotronMTPDraftHead {
                 return records
             }
         }
-        if plan.records2 == nil, plan.records == nil, NemotronHeadScreen.packedScalesBiases,
-           (upper?.count ?? 0) <= groupCount {
+        if plan.records == nil, NemotronHeadScreen.packedScalesBiases, (upper?.count ?? 0) <= groupCount {
             adopt("scales/biases") { candidate in
                 let packed = NemotronHeadScreen.packScalesBiases(
                     scales: head.scales, biases: biases, groups: selected,
@@ -402,8 +336,7 @@ private final class NemotronMTPDraftHead {
                                     groups: plan.groups, groupCount: groupCount, chunk: chunk,
                                     keep: keep, upperGroups: half ? plan.upperGroups : nil,
                                     upperGroupCount: half ? plan.upperGroupCount : 0,
-                                    packed: plan.packed, records: plan.records, records2: plan.records2,
-                                    counter: counter)
+                                    packed: plan.packed, records: plan.records, counter: counter)
                             }
                             let reference = screened(nil)
                             if !same(reference, screened(counter)) { return nil }
@@ -435,10 +368,9 @@ private final class NemotronMTPDraftHead {
             eval(NemotronHeadScreen.run(
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
-                packed: plan.packed, records: plan.records, records2: plan.records2,
-                counter: plan.counter).id)
+                packed: plan.packed, records: plan.records, counter: plan.counter).id)
         }
-        report("on, \(plan.records2 == nil ? 4 : 2)-bit, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
+        report("on, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
             + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
             + " qualified (synthetic agreement \(chosen.agree)/4)")
@@ -1090,9 +1022,10 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
                 .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
         }
-        let out = module.finishMaskedRow(
+        let attended = module.maskedRowOutput(
             fused: take(spec.fused, row, axis: 1), queries: take(spec.queries, row, axis: 2),
             keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
+        let out = module.finishPagedAttentionRow(attended)
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = take(spec.keys, row, axis: 2), values = take(spec.values, row, axis: 2)
         s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
