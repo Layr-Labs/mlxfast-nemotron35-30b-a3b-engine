@@ -207,7 +207,7 @@ extension NemotronHMamba2Mixer {
         // and out_proj's prepared activation in one launch (see
         // NemotronHCompactSSMGated); the same normed rows, prepared activation
         // and final state as the two launches below.
-        if length == 3, NemotronMTPExecution.batchedNorm,
+        if (3...4).contains(length), NemotronMTPExecution.batchedNorm,
            let q = outProj as? QuantizedLinear, q.mode == .affine,
            q.bits == 4, q.groupSize == 64, q.bias == nil,
            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,

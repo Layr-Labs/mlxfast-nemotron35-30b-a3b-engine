@@ -126,10 +126,12 @@ extension NemotronHMoE {
         let packed: MLXArray?
         if NemotronHResidualRMSNorm.preparedMoEEnabled, NemotronMoELeader.enabled,
            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-           NemotronMoELeader.preparedGateUp, x.shape == [1, 3, 2688], x.dtype == .bfloat16 {
+           NemotronMoELeader.preparedGateUp, x.ndim == 3, x.dim(0) == 1,
+           (x.dim(1) == 3 || x.dim(1) == 4), x.dim(2) == 2688, x.dtype == .bfloat16 {
             // Share one dynamic operand buffer with both routed and shared up.
-            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
-                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
+            let rows = x.dim(1)
+            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: 2688)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(rows, 2688), pv: 8)
         } else {
             packed = nil
         }
@@ -642,6 +644,7 @@ private final class NemotronMoELeaderKernel: Sendable {
 private final class NemotronMoELeaderPreparedKernels: Sendable {
     static let shared = NemotronMoELeaderPreparedKernels()
     let gateUp: MLXFast.MLXFastKernel?
+    let gateUpTail8: MLXFast.MLXFastKernel?
     let gateUpAndPlan: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlan: MLXFast.MLXFastKernel?
     /// The same triple FC1 with its tail block in the constant 8-value form.
@@ -651,15 +654,23 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
-        let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
+        let preparedPointers = [
             ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
              "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
             ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
              "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
-        ])
+        ]
+        let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: preparedPointers)
         gateUp = preparedSource.map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_qmv_affine4_gs64_prepared",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0, header: header)
+        }
+        gateUpTail8 = nmlTail8Source(nemotronMoELeaderSource)
+            .flatMap { nmlPreparedSource($0, pointers: preparedPointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_prepared",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0, header: header)
         }
@@ -959,8 +970,10 @@ enum NemotronMoELeader {
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
                       prepared: MLXArray? = nil, tail8: Bool = false) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
-        if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
-           let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
+        if preparedGateUp, (rows == 3 || rows == 4), !perSlot,
+           bank.k % 64 == 0, bank.k % 512 != 0,
+           let kernel = (rows == 4 && tail8 ? NemotronMoELeaderPreparedKernels.shared.gateUpTail8 : nil)
+               ?? NemotronMoELeaderPreparedKernels.shared.gateUp {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
                 ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
             return kernel(
@@ -1126,10 +1139,10 @@ enum NemotronMoELeader {
         }
         let weights = scores.reshaped(rows * 6)
         // `products`: the unreduced slot products for the captured verify's
-        // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
+        // (R = 3/4) or the draft tail's (R = 1) join kernel, which sums them
         // itself (same expressions and order).
-        if products, let prod = rows == 3
-            ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
+        if products, let prod = (rows == 3 || rows == 4)
+            ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2, rows: rows)
             : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
@@ -2187,24 +2200,25 @@ enum NemotronZSkip {
         lock.withLock { copies[ObjectIdentifier(owner)] != nil }
     }
 
-    /// The R = 3 weighted slot products of a target layer ([18 * 2688] FP32,
+    /// The R = 3/4 weighted slot products of a target layer ([rows * 6 * 2688] FP32,
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 owner: SwitchLinear) -> MLXArray? {
+                                 owner: SwitchLinear, rows: Int = 3) -> MLXArray? {
         guard !needsOriginal(owner), joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
-              x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+              rows == 3 || rows == 4, x.shape == [rows * 6, 1856], x.dtype == .bfloat16,
+              inds.shape == [rows * 6], scores.shape == [rows * 6], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+        return products(x, inds, scores, copy: copy, rows: rows)
     }
 
-    /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
+    /// The R = 3/4 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
                          owner: SwitchLinear) -> MLXArray? {
-        guard !needsOriginal(owner), rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+        guard !needsOriginal(owner), rows == 3 || rows == 4,
+              x.shape == [rows * 6, 1856], x.dtype == .bfloat16,
+              inds.shape == [rows * 6], scores.shape == [rows * 6], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        return run(x, inds, scores, copy: copy, rows: rows)
     }
 
     // MARK: Draft head (one row per draft step)
