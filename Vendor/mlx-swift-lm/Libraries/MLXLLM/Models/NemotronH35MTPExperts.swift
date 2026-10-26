@@ -472,6 +472,85 @@ func nemotronSBDictSource(_ source: String) -> String? {
     return s
 }
 
+/// The 12-bit entry reader of `nemotronSBPackedSource`: a pair of entries
+/// occupies three bytes, so the stream is addressed by ENTRY INDEX (a row base
+/// lands mid-entry for the odd 42 and 29 groups per row) and one entry is
+/// three byte loads plus a variable shift. No 32-bit load anywhere, so no
+/// alignment requirement and no tail word.
+let nemotronPIdx12Header = """
+static inline uint nml_pidx12(const device uint8_t* p, ulong e) {
+  const device uint8_t* q = p + 3ul * (e >> 1);
+  const uint v = uint(q[0]) | (uint(q[1]) << 8) | (uint(q[2]) << 16);
+  return (v >> (12u * uint(e & 1ul))) & 0xFFFu;
+}
+struct NmlPIdx12 {
+  const device uint8_t* p;
+  ulong e;
+  template <typename D>
+  uint operator[](const D d) const {
+    return nml_pidx12(p, e + ulong(d));
+  }
+  template <typename D>
+  NmlPIdx12 operator+(const D d) const {
+    NmlPIdx12 r;
+    r.p = p;
+    r.e = e + ulong(d);
+    return r;
+  }
+  template <typename D>
+  NmlPIdx12& operator+=(const D d) {
+    e += ulong(d);
+    return *this;
+  }
+};
+static inline NmlPIdx12 nml_pidx12_make(const device uint8_t* p) {
+  NmlPIdx12 s;
+  s.p = p;
+  s.e = 0;
+  return s;
+}
+"""
+
+/// The 12-bit form of `nemotronSBDictSource`: `scales` holds two pair indices
+/// per three bytes (`NemotronSBDict.pack12`), `biases` the same FP32 pair
+/// table. Every index read keeps its statement and its arithmetic; only the
+/// index address moves from a uint16 pointer to an entry index in the packed
+/// stream, so each group's `s` and `b` are the same FP32 values.
+func nemotronSBPackedSource(_ source: String) -> String? {
+    let typedef = "  typedef float U;\n"
+    guard source.components(separatedBy: typedef).count == 2 else { return nil }
+    var s = source.replacingOccurrences(of: typedef, with:
+        typedef + "  const device float2* sbt = (const device float2*)biases;\n")
+    for (from, to) in [
+        ("const device T* sc = scales + ", "NmlPIdx12 sc = nml_pidx12_make((const device uint8_t*)scales) + "),
+        ("const device T* bs = biases + ", "NmlPIdx12 bs = nml_pidx12_make((const device uint8_t*)scales) + "),
+        ("const device T* sl = sc + ", "const NmlPIdx12 sl = sc + "),
+        ("const device T* bl = bs + ", "const NmlPIdx12 bl = bs + "),
+        ("U s = sl[0];", "const float2 sbp = sbt[sl[0]];\n        U s = sbp.x;"),
+        ("U b = bl[0];", "U b = sbp.y;"),
+    ] {
+        guard s.contains(from) else { return nil }
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    // The hoisted and next-block register loads of the prepared load forms.
+    for (from, to) in [
+        ("sv[row] = sc[row * in_vec_size_g];", "sv[row] = sbt[sc[row * in_vec_size_g]].x;"),
+        ("bv[row] = bs[row * in_vec_size_g];", "bv[row] = sbt[bs[row * in_vec_size_g]].y;"),
+        ("sn[row] = sc[block_size / group_size + row * in_vec_size_g];",
+         "sn[row] = sbt[sc[block_size / group_size + row * in_vec_size_g]].x;"),
+        ("bn[row] = bs[block_size / group_size + row * in_vec_size_g];",
+         "bn[row] = sbt[bs[block_size / group_size + row * in_vec_size_g]].y;"),
+    ] {
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    let rest = s.replacingOccurrences(of: "sbt[sc[", with: "").replacingOccurrences(of: "sbt[bs[", with: "")
+    guard !rest.contains("sc["), !rest.contains("bs["), !s.contains("const device T* sc"),
+          !s.contains("const device T* bs"), !s.contains("const device T* sl"),
+          !s.contains("const device T* bl"), !s.contains("bl[0]"),
+          s.components(separatedBy: "biases").count == 2 else { return nil }
+    return s
+}
+
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
@@ -649,6 +728,9 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    /// The same two on the dictionary's 12-bit index stream.
+    let tripleGateUpAndPlanDictPacked: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlanTail8DictPacked: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -713,6 +795,23 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpAndPlanDictPacked = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBPackedSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan_sbd_p12",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader + nemotronPIdx12Header)
+        }
+        tripleGateUpAndPlanTail8DictPacked = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBPackedSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd_p12",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader + nemotronPIdx12Header)
         }
     }
 }
@@ -1039,9 +1138,17 @@ enum NemotronMoELeader {
             : (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
                 ? kernels.tripleGateUpAndPlanTail8Dict
                 : (kernels.tripleGateUpAndPlan != nil ? kernels.tripleGateUpAndPlanDict : nil))
-        let result = (twin != nil && dict != nil ? twin! : kernel)(
-            twin != nil && dict != nil
-                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+        // The 12-bit index twin of the same kernel.
+        let packedTwin = dict?.launchPacked == true && tripleGateUp
+            ? (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+                ? kernels.tripleGateUpAndPlanTail8DictPacked
+                : (kernels.tripleGateUpAndPlan != nil ? kernels.tripleGateUpAndPlanDictPacked : nil))
+            : nil
+        let chosen = dict == nil ? nil : (packedTwin ?? twin)
+        let result = (chosen ?? kernel)(
+            chosen != nil
+                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.launchIndex),
+                   dict!.table, packed, inds]
                 : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
                    NemotronBankBinding.bind(bank.biases), packed, inds],
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
@@ -2135,7 +2242,8 @@ enum NemotronZSkip {
                 a.reshaped(experts, tiles, 128, groups).transposed(0, 1, 3, 2).contiguous()
             }
             if sbDict, dictKernel != nil,
-               let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
+               let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases,
+                                           allowPacked: false) {
                 return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
             }
             return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
@@ -2702,12 +2810,35 @@ inline void nml_qdot_triple(
 // NEMOTRON_MTP_SB_DICT=0 keeps the record kernels.
 enum NemotronSBDict {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SB_DICT"] != "0"
+    /// The 12-bit pack of a tensor whose pairs fit in 12 bits
+    /// (NEMOTRON_MTP_PIDX12=0 keeps every dictionary on its uint16 index).
+    static let packedEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_PIDX12"] != "0"
+    /// Load checks only: run the uint16 index and its kernel instead of the
+    /// packed twin, so both can be compared on the same real weights.
+    nonisolated(unsafe) static var forceUnpacked = false
 
     struct Dict {
-        /// One uint16 pair index per group, in the scales' shape and order.
+        /// One uint16 pair index per group, in the scales' shape and order, or
+        /// with `packed` the 12-bit entry stream (`pack12`), three bytes a pair.
         let index: MLXArray
         /// [pairs, 2] FP32: each pair's scale and bias, widened exactly from BF16.
         let table: MLXArray
+        /// `index` is the 12-bit stream and its kernels read it packed.
+        let packed: Bool
+        /// The uint16 index the packed stream reproduces bit for bit; kept for
+        /// the load-time twin checks only, released after them.
+        let unpacked: MLXArray?
+
+        /// The index array the selected kernel binds.
+        var launchIndex: MLXArray {
+            packed && !NemotronSBDict.forceUnpacked ? index : (unpacked ?? index)
+        }
+        /// The packed kernel runs for this launch.
+        var launchPacked: Bool { packed && !NemotronSBDict.forceUnpacked }
+
+        func releasingUnpacked() -> Dict {
+            Dict(index: index, table: table, packed: packed, unpacked: nil)
+        }
     }
 
     private static let lock = NSLock()
@@ -2729,10 +2860,72 @@ enum NemotronSBDict {
         lock.withLock { dicts.values.flatMap { [$0.index, $0.table] } }
     }
 
+    /// The 12-bit stream of `index`: one pair per three bytes, low 12 bits
+    /// first, then two bytes of tail. Nil when any entry needs more than 12
+    /// bits (the heads hold 5,158 distinct pairs and stay on uint16).
+    static func pack12(_ index: [UInt16]) -> [UInt8]? {
+        let count = index.count
+        var out = [UInt8](repeating: 0, count: 3 * ((count + 1) / 2) + 2)
+        for i in 0 ..< count {
+            let v = UInt32(index[i])
+            guard v < 0x1000 else { return nil }
+            let e = 3 * (i >> 1)
+            if i & 1 == 0 {
+                out[e] = UInt8(v & 0xFF)
+                out[e + 1] = (out[e + 1] & 0xF0) | UInt8((v >> 8) & 0x0F)
+            } else {
+                out[e + 1] = (out[e + 1] & 0x0F) | UInt8((v & 0x0F) << 4)
+                out[e + 2] = UInt8((v >> 4) & 0xFF)
+            }
+        }
+        return out
+    }
+
+    /// The same unpack, on the device, through the byte buffer a packed kernel
+    /// reads: `count` entries from `3 * ceil(count/2)` bytes. Integer ops only.
+    static func unpack12(_ bytes: MLXArray, count: Int) -> MLXArray {
+        let pairs = bytes[0 ..< 3 * ((count + 1) / 2)].reshaped([-1, 3])
+        let b0 = pairs[0..., 0].asType(.uint16)
+        let b1 = pairs[0..., 1].asType(.uint16)
+        let b2 = pairs[0..., 2].asType(.uint16)
+        let lo = b0 | ((b1 & 0x000F) << 8)
+        let hi = (b1 >> 4) | (b2 << 4)
+        return stacked([lo, hi], axis: -1).reshaped([-1])[0 ..< count]
+    }
+
+    /// Synthetic banks of every length class (odd and even, below and above a
+    /// row of 42 and 29 groups) with the width's boundary values, packed and
+    /// unpacked by the same two routines above.
+    private static func selfCheck12() -> Bool {
+        var seed: UInt32 = 0x9e3779b9
+        func next() -> UInt32 {
+            seed = seed &* 1664525 &+ 1013904223
+            return seed >> 8
+        }
+        for count in [1, 2, 3, 29, 41, 42, 43, 58, 63, 64, 65, 127, 128, 129, 1000] {
+            var index = [UInt16](repeating: 0, count: count)
+            for i in 0 ..< count {
+                switch i % 5 {
+                case 0: index[i] = 0
+                case 1: index[i] = 0x0FFF
+                case 2: index[i] = 0x0800
+                case 3: index[i] = UInt16(next() & 0x0FFF)
+                default: index[i] = UInt16(next() & 0x0F)
+                }
+            }
+            guard let packed = pack12(index) else { return false }
+            let got = unpack12(MLXArray(packed), count: count).asArray(UInt16.self)
+            guard got.count == count, got == index else { return false }
+        }
+        return true
+    }
+
     /// One tensor's pair dictionary, or nil when its pairs need more than 16
     /// bits or the device decode of the table differs from the BF16 -> FP32
-    /// widening of the loaded scales and biases in any bit.
-    static func make(scales: MLXArray, biases: MLXArray) -> Dict? {
+    /// widening of the loaded scales and biases in any bit. A tensor whose
+    /// pairs fit in 12 bits gets the packed index, but only when the device
+    /// unpack of the packed buffer reproduces every entry of its uint16 index.
+    static func make(scales: MLXArray, biases: MLXArray, allowPacked: Bool = true) -> Dict? {
         guard scales.dtype == .bfloat16, biases.dtype == .bfloat16, scales.shape == biases.shape
         else { return nil }
         let s = scales.view(dtype: .uint16).asArray(UInt16.self)
@@ -2778,8 +2971,23 @@ enum NemotronSBDict {
             [scales.reshaped(-1).asType(.float32), biases.reshaped(-1).asType(.float32)], axis: 1)
         guard (decoded.view(dtype: .uint32) .== widened.view(dtype: .uint32)).all().item(Bool.self)
         else { return nil }
+        // The 12-bit stream: exact only when the device unpack of the packed
+        // bytes reproduces every entry of this tensor's uint16 index, and the
+        // packer's own round trip holds on the synthetic banks.
+        var packed: MLXArray? = nil
+        if allowPacked, packedEnabled, selfCheck12(), let stream = pack12(index) {
+            let candidate = MLXArray(stream)
+            let back = unpack12(candidate, count: index.count)
+            if (back .== indexArray.reshaped(-1)).all().item(Bool.self) {
+                packed = candidate
+            }
+        }
         eval(indexArray, table)
-        return Dict(index: indexArray, table: table)
+        if let packed {
+            eval(packed)
+            return Dict(index: packed, table: table, packed: true, unpacked: indexArray)
+        }
+        return Dict(index: indexArray, table: table, packed: false, unpacked: nil)
     }
 
     /// Load time, before any verify graph is traced or warmed: a dictionary for
@@ -2810,8 +3018,21 @@ enum NemotronSBDict {
                 Data("nemotron sb dict off: a dictionary kernel differs from its record kernel\n".utf8))
             return
         }
+        // The uint16 copies existed for the twin checks only.
+        let packedCount = lock.withLock { () -> Int in
+            let n = built.values.filter { $0.packed }.count
+            dicts = built.mapValues { $0.releasingUnpacked() }
+            return n
+        }
         FileHandle.standardError.write(Data(
-            "nemotron sb dict on: \(built.count) tensors, \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
+            "nemotron sb dict on: \(built.count) tensors (\(packedCount) at 12 bits), \(fc1) FC1 banks, prepared shapes \(shapes)\n".utf8))
+    }
+
+    /// The record-vs-dictionary comparison of one FC1 launch pair.
+    private static func fc1Same0(_ a: (activation: MLXArray, plan: MLXArray),
+                                 _ b: (activation: MLXArray, plan: MLXArray)) -> MLXArray {
+        logicalAnd((a.activation.view(dtype: .uint16) .== b.activation.view(dtype: .uint16)).all(),
+                   (a.plan .== b.plan).all())
     }
 
     private static func checkKernels(_ model: Module) -> (Bool, Int, [[Int]]) {
@@ -2823,6 +3044,7 @@ enum NemotronSBDict {
         var fc1 = 0
         var shapes: [[Int]] = []
         var inProj = false, sharedUp = false
+        var inProjOK = true, sharedUpOK = true, fc1OK = true, quantOK = true, quantN = 0
         for module in model.modules() {
             if !inProj, let mixer = module as? NemotronHMamba2Mixer,
                let q = mixer.inProj as? QuantizedLinear, dict(q) != nil,
@@ -2837,11 +3059,14 @@ enum NemotronSBDict {
                         sbDict: on).map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
                 }
                 if let a = run(false), let b = run(true) {
+                    var ok = MLXArray(true)
                     for (u, v) in zip(a, b) {
-                        same = logicalAnd(same, u.dtype == .float32
+                        ok = logicalAnd(ok, u.dtype == .float32
                             ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
                             : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
                     }
+                    same = logicalAnd(same, ok)
+                    inProjOK = inProjOK && ok.item(Bool.self)
                     inProj = true
                 }
             }
@@ -2850,6 +3075,7 @@ enum NemotronSBDict {
                 let xk = (MLXRandom.normal([3, 2688], key: keys[1]) * 0.5).asType(.bfloat16)
                 if let ok = NemotronSharedUpPacking.dictMatches(xk, q) {
                     same = logicalAnd(same, ok)
+                    sharedUpOK = sharedUpOK && ok.item(Bool.self)
                     sharedUp = true
                 }
             }
@@ -2861,9 +3087,20 @@ enum NemotronSBDict {
                       let b = NemotronMoELeader.applyWithBalancePlan(
                           x, inds, bank: up, relu2: true, prepared: nil, dict: d)
                 else { continue }
-                same = logicalAnd(same, logicalAnd(
-                    (a.activation.view(dtype: .uint16) .== b.activation.view(dtype: .uint16)).all(),
-                    (a.plan .== b.plan).all()))
+                var fc1Same = logicalAnd(fc1Same0(a, b), true)
+                // The packed twin against the uint16 twin on the same weights.
+                if d.packed {
+                    forceUnpacked = true
+                    let u = NemotronMoELeader.applyWithBalancePlan(
+                        x, inds, bank: up, relu2: true, prepared: nil, dict: d)
+                    forceUnpacked = false
+                    guard let u else { continue }
+                    fc1Same = logicalAnd(fc1Same, logicalAnd(
+                        (b.activation.view(dtype: .uint16) .== u.activation.view(dtype: .uint16)).all(),
+                        (b.plan .== u.plan).all()))
+                }
+                same = logicalAnd(same, fc1Same)
+                fc1OK = fc1OK && fc1Same.item(Bool.self)
                 fc1 += 1
             } else if let q = module as? QuantizedLinear, dict(q) != nil {
                 let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
@@ -2875,9 +3112,16 @@ enum NemotronSBDict {
                 for relu2 in [false, true] {
                     let a = NemotronHeadPreparedActivation.apply(xk, q, relu2: relu2, rps: rps, sbDict: false)
                     let b = NemotronHeadPreparedActivation.apply(xk, q, relu2: relu2, rps: rps)
-                    same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                    let one = (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                    same = logicalAnd(same, one)
+                    quantOK = quantOK && one.item(Bool.self)
                 }
+                quantN += 1
             }
+        }
+        if ProcessInfo.processInfo.environment["NEMOTRON_MTP_SBD_WHICH"] == "1" {
+            FileHandle.standardError.write(Data(
+                "nemotron sb dict families: proj \(inProjOK) fc1 \(fc1OK)/\(fc1) shared \(sharedUpOK) quant \(quantOK)/\(quantN)\n".utf8))
         }
         if inProj { shapes.append([2688, 10304, 1]) }
         if sharedUp { shapes.append([2688, 3712, 1]) }

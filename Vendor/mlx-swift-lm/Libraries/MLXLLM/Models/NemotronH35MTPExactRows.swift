@@ -701,6 +701,17 @@ enum NemotronMambaInProjConvDt {
             source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
     }
     static var dictAvailable: Bool { dictKernel != nil }
+    /// The same launch on the dictionary's 12-bit index stream.
+    private static let dictPackedKernel = nemotronSBPackedSource(
+        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_sbd_p12",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader + nemotronPIdx12Header,
+            ensureRowContiguous: false)
+    }
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
@@ -730,8 +741,10 @@ enum NemotronMambaInProjConvDt {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
-        let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
+        let usePacked = dict?.launchPacked == true && dictPackedKernel != nil
+        let chosen = usePacked ? dictPackedKernel! : (dict != nil ? dictKernel! : kernel)
+        let outputs = chosen(
+            [q.weight, dict?.launchIndex ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -828,17 +841,22 @@ enum NemotronHeadPreparedActivation {
     }
     nonisolated(unsafe) private static var dictVariants: [String: MLXFast.MLXFastKernel?] = [:]
     /// The prepared QMV twin reading (scale, bias) through `NemotronSBDict`
-    /// (`nemotronSBDictSource` of the same body), or nil.
-    static func dictKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel? {
+    /// (`nemotronSBDictSource` of the same body), or nil. `packed` reads the
+    /// 12-bit index stream instead of the uint16 one.
+    static func dictKernel(half: Bool, load: Int, nsg: Bool,
+                           packed: Bool = false) -> MLXFast.MLXFastKernel? {
         let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
-            + (nsg ? "_nsg" : "") + "_sbd"
+            + (nsg ? "_nsg" : "") + "_sbd" + (packed ? "_p12" : "")
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = dictVariants[name] { return kernel }
-        let kernel = nemotronSBDictSource(nemotronPreparedVariantSource(
-            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)).map {
+        let body = nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)
+        let kernel = (packed ? nemotronSBPackedSource(body) : nemotronSBDictSource(body)).map {
             MLXFast.metalKernel(
                 name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
-                outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
+                outputNames: ["y"], source: $0,
+                header: variantHeader(half: half, load: load)
+                    + (packed ? nemotronPIdx12Header : ""))
         }
         dictVariants[name] = kernel
         return kernel
@@ -863,14 +881,15 @@ enum NemotronHeadPreparedActivation {
     }
 
     /// projectLaunch's R = 3 launch with its kernel's dictionary twin, or nil.
-    private static func dictLaunch(k: Int, n: Int, rps: Int)
+    private static func dictLaunch(k: Int, n: Int, rps: Int, packed: Bool = false)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
-        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
+        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg, packed: packed)
+        else { return nil }
         return (kernel, hf + extra, geometry.rps, geometry.nsg)
     }
     static func dictLaunchAvailable(k: Int, n: Int) -> Bool {
@@ -919,8 +938,8 @@ enum NemotronHeadPreparedActivation {
             outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
-            return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
+           case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2, packed: d.launchPacked) {
+            return kernel([q.weight, d.launchIndex, d.table, packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
                 grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
@@ -1004,8 +1023,9 @@ enum NemotronHeadPreparedActivation {
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
-            return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
+           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(
+               k: k, n: n, rps: rps, packed: d.launchPacked) {
+            return kernel([q.weight, d.launchIndex, d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -1076,6 +1096,14 @@ enum NemotronSharedUpPacking {
             inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
             outputNames: ["y", "packed"], source: $0, header: nemotronSharedUpPackHeader)
     }
+    /// The same launch on the dictionary's 12-bit index stream.
+    private static let dictPackedKernel = nemotronSBPackedSource(nemotronSharedUpPackSource()).map {
+        MLXFast.metalKernel(
+            name: "nemotron_shared_up_relu2_pack_r3_sbd_p12",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y", "packed"], source: $0,
+            header: nemotronSharedUpPackHeader + nemotronPIdx12Header)
+    }
 
     /// Load check of the dictionary twin on `q`: both outputs of both
     /// kernels on the same rows, bit for bit (nil when either cannot run).
@@ -1105,8 +1133,9 @@ enum NemotronSharedUpPacking {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
-        let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
+        let usePacked = dict?.launchPacked == true && dictPackedKernel != nil
+        let outputs = ((usePacked ? dictPackedKernel! : (dict != nil ? dictKernel! : kernel)))(
+            [q.weight, dict?.launchIndex ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", true), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
