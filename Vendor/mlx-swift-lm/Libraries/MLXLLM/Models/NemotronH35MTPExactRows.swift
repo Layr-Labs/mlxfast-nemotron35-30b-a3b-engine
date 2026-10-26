@@ -1264,9 +1264,25 @@ private final class NemotronMultiRowQMVKernel: Sendable {
             inputNames: ["residual", "w", "scales", "biases", "x", "K", "N"],
             outputNames: ["y"], source: nemotronSwapped(addingSource, nemotronMultiRowHalfSwaps),
             header: halfHeader, ensureRowContiguous: true)
+        kernelDict = nemotronSBDictSource(nemotronMultiRowQMVSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_multirow_qmv_affine4_gs64_sbd",
+                inputNames: ["w", "scales", "biases", "x", "K", "N"],
+                outputNames: ["y"], source: $0, header: nemotronMultiRowQMVHeader)
+        }
+        kernelHalfDict = nemotronSBDictSource(halfSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_multirow_qmv_affine4_gs64_hf_sbd",
+                inputNames: ["w", "scales", "biases", "x", "K", "N"],
+                outputNames: ["y"], source: $0, header: halfHeader)
+        }
     }
     let kernelHalf: MLXFast.MLXFastKernel
     let attentionOutputAddingHalf: MLXFast.MLXFastKernel
+    /// `kernel` and `kernelHalf` reading (scale, bias) through a draft head
+    /// tensor's `NemotronSBDict` pair dictionary (R = 1 only), or nil.
+    let kernelDict: MLXFast.MLXFastKernel?
+    let kernelHalfDict: MLXFast.MLXFastKernel?
     /// Kill switches (code constants; 0 = crown int -> float decode and the
     /// crown kernel objects): post-verify MTP wo + residual at R = 3 (FAST),
     /// and the R = 1 multi-row qmv (draft shared expert up).
@@ -1295,6 +1311,12 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_R1_TWIN=0 keeps the stock call for the draft step's
     /// one-row eh_proj, attention wo and shared-expert down (`nemotronR1Linear`).
     static let r1Route = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R1_TWIN"] != "0"
+    /// The dictionary twin of the R = 1 kernel `dispatch` selects, if built.
+    static var draftDictAvailable: Bool {
+        let kernels = NemotronMultiRowQMVKernel.shared
+        return (NemotronMultiRowQMVKernel.r1HalfDecodeForm != 0
+            ? kernels.kernelHalfDict : kernels.kernelDict) != nil
+    }
     /// NEMOTRON_MTP_HEAD_RPS4=0 keeps two outputs per SIMD group on the
     /// 131,072-row target head. Four halves the threadgroups that each
     /// re-read the prepared rows; every output keeps its lane split, block
@@ -1403,13 +1425,25 @@ enum NemotronMultiRowQMV {
     ]
 
     private static func dispatch(_ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
-                                 _ x: MLXArray, relu2: Bool, rps: Int) -> MLXArray {
+                                 _ x: MLXArray, relu2: Bool, rps: Int,
+                                 dict: NemotronSBDict.Dict? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = w.dim(0)
         let (kArray, nArray) = scalarPair(k, n)
         let form = NemotronMultiRowQMVKernel.r1HalfDecodeForm
         let half = rows == 1 && form != 0
-        return (half ? NemotronMultiRowQMVKernel.shared.kernelHalf
-                     : NemotronMultiRowQMVKernel.shared.kernel)(
+        let kernels = NemotronMultiRowQMVKernel.shared
+        // `dict` (one row only): the selected kernel's dictionary twin.
+        if let dict, rows == 1, let twin = half ? kernels.kernelHalfDict : kernels.kernelDict {
+            return twin(
+                [w, dict.index, dict.table, x, kArray, nArray],
+                template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
+                           ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
+                grid: (32, n / rps, 1),
+                threadGroup: (32, 2, 1),
+                outputShapes: [[rows, n]],
+                outputDTypes: [x.dtype])[0]
+        }
+        return (half ? kernels.kernelHalf : kernels.kernel)(
             [w, scales, biases, x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
@@ -1422,8 +1456,10 @@ enum NemotronMultiRowQMV {
     /// x: [rows, K] contiguous. Returns [rows, N] or nil when the shape is not
     /// one the stock M=1 dispatch would send to qmv / qmv_fast.
     /// Width one is used by the exact BF16 ReLU2 epilogue, not a GEMM.
+    /// `sbDict`: one row of a draft head tensor reads its admitted pair
+    /// dictionary (`NemotronSBDict.draftDict`); false keeps the record kernel.
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false,
-                      prepared: MLXArray? = nil) -> MLXArray? {
+                      prepared: MLXArray? = nil, sbDict: Bool = true) -> MLXArray? {
         guard enabled, x.ndim == 2, (1...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
@@ -1440,7 +1476,8 @@ enum NemotronMultiRowQMV {
             return nemotronBitwiseOrNaN(y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 2))
         }
         let rps = resultsPerSimdgroup(rows: x.dim(0), k: k, n: n)
-        let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps)
+        let dict = sbDict && x.dim(0) == 1 ? NemotronSBDict.draftDict(q) : nil
+        let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps, dict: dict)
         guard rps != 4, NemotronMoELeader.selfTest else { return y }
         return nemotronBitwiseOrNaN(
             y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 4))
@@ -2477,6 +2514,33 @@ enum NemotronTargetQKV {
         outputNames: ["qy", "ky", "vy"],
         source: tilePrefix + nemotronSwapped(nemotronMultiRowQMVSource, nemotronMultiRowHalfSwaps) + "\n}",
         header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader)
+    // The R = 1 launches reading (scale, bias) through the draft head's Q, K
+    // and V pair dictionaries (`NemotronSBDict.draftDict`): qs / ks / vs carry
+    // the uint16 pair indices and qb / kb / vb the FP32 pair tables; the body
+    // is the same row body through `nemotronSBDictSource`.
+    private static let dictTilePrefix = nemotronSwapped(tilePrefix, [
+        ("const device T* scales = ", "const device uint16_t* scales = ", 1),
+        ("const device T* biases = ", "const device float* biases = ", 1),
+    ])
+    private static let kernelDict = nemotronSBDictSource(nemotronMultiRowQMVSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_target_qkv_affine4_gs64_sbd",
+            inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
+            outputNames: ["qy", "ky", "vy"], source: dictTilePrefix + $0 + "\n}",
+            header: nemotronMultiRowQMVHeader)
+    }
+    private static let kernelHalfDict = nemotronSBDictSource(
+        nemotronSwapped(nemotronMultiRowQMVSource, nemotronMultiRowHalfSwaps)).map {
+        MLXFast.metalKernel(
+            name: "nemotron_target_qkv_affine4_gs64_hf_sbd",
+            inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K"],
+            outputNames: ["qy", "ky", "vy"], source: dictTilePrefix + $0 + "\n}",
+            header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader)
+    }
+    /// The dictionary twin of the R = 1 launch `dispatch` selects, if built.
+    static var draftDictAvailable: Bool {
+        (r1HalfDecodeForm != 0 ? kernelHalfDict : kernelDict) != nil
+    }
     private static let preparedKernelHalf = MLXFast.metalKernel(
         name: "nemotron_target_qkv_prepared_affine4_gs64_hf",
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
@@ -2523,7 +2587,8 @@ enum NemotronTargetQKV {
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
                                  prepared: Bool = false,
-                                 packed: MLXArray? = nil) -> [MLXArray] {
+                                 packed: MLXArray? = nil,
+                                 dicts: [NemotronSBDict.Dict]? = nil) -> [MLXArray] {
         let rows = x.dim(1)
         // `packed`: the same K=2688 (PV 8) layout `pack` writes, prepared by
         // the preceding join from these exact BF16 rows.
@@ -2534,15 +2599,19 @@ enum NemotronTargetQKV {
         let preparedForm = NemotronHeadPreparedActivation.decodeForm(rows: rows, fast: false)
         let r1Half = !prepared && rows == 1 && r1HalfDecodeForm != 0
         let qkvLoad = prepared && rows == 3 ? NemotronHeadPreparedActivation.qkvLoadForm : 0
-        let chosen = prepared
+        // `dicts` (Q, K, V; one row only): the selected R = 1 kernel's dictionary twin.
+        let twin = dicts == nil || prepared || rows != 1 ? nil : (r1Half ? kernelHalfDict : kernelDict)
+        let chosen = twin ?? (prepared
             ? (qkvLoad != 0 ? preparedLoadKernel(half: preparedForm != nil, load: qkvLoad)
                : (preparedForm == nil ? preparedKernel : preparedKernelHalf))
-            : (r1Half ? kernelHalf : kernel)
+            : (r1Half ? kernelHalf : kernel))
         let extra = prepared
             ? nemotronHalfTemplate(preparedForm != nil, preparedForm ?? 0)
             : nemotronHalfTemplate(r1Half, r1HalfDecodeForm)
+        let bound = twin == nil ? weights
+            : (0 ..< 3).flatMap { [weights[3 * $0], dicts![$0].index, dicts![$0].table] }
         return chosen(
-            weights + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
+            bound + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0],
             template: [("T", x.dtype), ("R", rows), ("FAST", false), ("RELU2", false),
                        ("RPS", rps)] + extra,
             grid: (32, 4608 / rps, 1), threadGroup: (32, 2, 1),
@@ -2550,9 +2619,12 @@ enum NemotronTargetQKV {
             outputDTypes: [x.dtype, x.dtype, x.dtype])
     }
 
+    /// `sbDict`: one row of the draft head reads its admitted Q, K and V pair
+    /// dictionaries (`NemotronSBDict.draftDict`, all three or none); false
+    /// keeps the record kernel.
     static func apply(
         _ x: MLXArray, query: Linear, key: Linear, value: Linear, captureMTP: Bool,
-        prepared packed: MLXArray? = nil
+        prepared packed: MLXArray? = nil, sbDict: Bool = true
     ) -> (MLXArray, MLXArray, MLXArray)? {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2563,7 +2635,10 @@ enum NemotronTargetQKV {
         else { return nil }
         let rps = resultsPerSimdgroup(rows: x.dim(1))
         let prepared = preparedEnabled && rps == 2 && x.dim(1) == 3
-        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared, packed: packed)
+        let dicts = sbDict && x.dim(1) == 1
+            ? [query, key, value].compactMap { NemotronSBDict.draftDict($0) } : []
+        var outputs = dispatch(q + k + v, x, rps: rps, prepared: prepared, packed: packed,
+                               dicts: dicts.count == 3 ? dicts : nil)
         if rps != 4, NemotronMoELeader.selfTest {
             let expected = dispatch(q + k + v, x, rps: 4)
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
@@ -3009,6 +3084,106 @@ enum NemotronHeadScreen {
         guard let upperGroups else { return lower }
         return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
     }
+
+    /// Draft-only 2-bit screen records: each selected group's 64 head values
+    /// (dequantized from the head's own 4-bit codes) re-quantized on load to
+    /// 2 bits with their own minimum and step (round to nearest, clamped to
+    /// 0...3). Per row: 4 words of codes per selected group (value j of a
+    /// word at bits 2j), then one word per group holding the minimum (low
+    /// half) and the step (high half) as float16; 5 words per selected group
+    /// (rows from `rows` up: the upper group set). Only the screen's partial
+    /// pass reads them; the kept rows are rescored on the head itself.
+    static func packRecords2(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray, groups: [Int],
+        upperGroups: [Int]?
+    ) -> MLXArray {
+        let shifts = MLXArray((0..<16).map { UInt32(2 * $0) })
+        func pack(_ range: Range<Int>, _ selected: [Int]) -> MLXArray {
+            let columns = MLXArray(selected.flatMap { g in (0..<64).map { Int32(64 * g + $0) } })
+            var parts: [MLXArray] = []
+            for start in stride(from: range.lowerBound, to: range.upperBound, by: 8192) {
+                let r = start..<min(start + 8192, range.upperBound)
+                let values = take(
+                    dequantized(weight[r], scales: scales[r], biases: biases[r], groupSize: 64, bits: 4)
+                        .asType(.float32), columns, axis: 1
+                ).reshaped(r.count, selected.count, 64)
+                let low = values.min(axis: -1, keepDims: true)
+                let step = (values.max(axis: -1, keepDims: true) - low) / 3
+                let safe = which(step .== 0, MLXArray(Float(1)), step)
+                let codes = clip(round((values - low) / safe), min: 0, max: 3).asType(.uint32)
+                let words = (codes.reshaped(r.count, selected.count, 4, 16) << shifts).sum(axis: -1)
+                    .reshaped(r.count, selected.count * 4)
+                let lowBits = low.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
+                let stepBits = step.squeezed(axis: -1).asType(.float16).view(dtype: .uint16).asType(.uint32)
+                let part = concatenated([words.asType(.uint32), lowBits | (stepBits << 16)], axis: 1)
+                eval(part)
+                parts.append(part)
+            }
+            return concatenated(parts, axis: 0).reshaped(-1)
+        }
+        let lower = pack(0..<rows, groups)
+        guard let upperGroups else { return lower }
+        return concatenated([lower, pack(rows..<headRows, upperGroups)], axis: 0)
+    }
+
+    // The 2-bit record twin of the partial pass: lane l owns half-group l
+    // (32 values = two code words) of the selected groups; scores are
+    // step * sum(code * x) + minimum * sum(x) over the selected groups.
+    private static let record2PartialSource = """
+      constexpr int VPL = 32;
+      const int lane = int(thread_index_in_simdgroup);
+      const int sg = int(threadgroup_position_in_grid.y) * NSG + int(simdgroup_index_in_threadgroup);
+      const int row0 = sg * RPS;
+      const bool upper = row0 >= LO;
+      const int H = upper ? 2 * S2 : 2 * S;
+      const bool on = lane < H;
+      const int gi = lane >> 1;
+      const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
+      const int part = lane & 1;
+      const device T* xp = x + g * 64 + part * 32;
+      float xv[VPL];
+      float xs = 0.0f;
+      _Pragma("clang loop unroll(full)")
+      for (int i = 0; i < VPL; i += 8) {
+        _Pragma("clang loop unroll(full)")
+        for (int k = 0; k < 8; k++) {
+          const float xk = on ? float(xp[i + k]) : 0.0f;
+          xs += xk;
+          xv[i + k] = xk / float(1 << (2 * k));
+        }
+      }
+      _Pragma("clang loop unroll(full)")
+      for (int r = 0; r < RPS; r++) {
+        const int row = row0 + r;
+        float acc = 0.0f;
+        if (on) {
+          const device uint32_t* rp = rec + (upper
+              ? size_t(LO) * (5 * S) + size_t(row - LO) * (5 * S2) : size_t(row) * (5 * S));
+          const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);
+          const uint ld = rp[4 * (upper ? S2 : S) + gi];
+          const float lo = float(as_type<half>(ushort(ld & 0xffffu)));
+          const float d = float(as_type<half>(ushort(ld >> 16)));
+          float a = 0.0f;
+          _Pragma("clang loop unroll(full)")
+          for (int i = 0; i < VPL / 8; i++) {
+            const uint q = uint(ws[i]);
+            a += xv[8 * i] * float(q & 0x0003u) + xv[8 * i + 1] * float(q & 0x000cu)
+                + xv[8 * i + 2] * float(q & 0x0030u) + xv[8 * i + 3] * float(q & 0x00c0u)
+                + xv[8 * i + 4] * float(q & 0x0300u) + xv[8 * i + 5] * float(q & 0x0c00u)
+                + xv[8 * i + 6] * float(q & 0x3000u) + xv[8 * i + 7] * float(q & 0xc000u);
+          }
+          acc = d * a + lo * xs;
+        }
+        acc = simd_sum(acc);
+        if (lane == 0) {
+          scores[row] = acc;
+        }
+      }
+    """
+    private static let record2PartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_record2_affine2",
+        inputNames: ["rec", "x", "groups", "groups2"],
+        outputNames: ["scores"], source: record2PartialSource)
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3146,7 +3321,7 @@ enum NemotronHeadScreen {
         _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
-        packed: MLXArray? = nil, records: MLXArray? = nil,
+        packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
         counter: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
@@ -3157,7 +3332,12 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records.map {
+        let scores = (records2.map {
+            record2PartialKernel(
+                [$0, hidden, groups, upperGroups ?? groups], template: template,
+                grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+                outputShapes: [[rows]], outputDTypes: [.float32])
+        } ?? records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
                 [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
