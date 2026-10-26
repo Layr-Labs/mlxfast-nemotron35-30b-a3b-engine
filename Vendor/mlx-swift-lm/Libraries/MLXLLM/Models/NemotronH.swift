@@ -2634,10 +2634,18 @@ private final class NemotronHPrefillKernels: Sendable {
                     for (int ee = 0; ee < E; ++ee) {
                         int start = int(counts[ee * S]);
                         int end = (ee + 1 < E) ? int(counts[(ee + 1) * S]) : n;
-                        for (int r = start; r < end && t < tmax; r += BMT) {
+                        for (int r = start; r < end && t < tmax;) {
+                            const int remaining = end - r;
+                            // Where the original batch used 32-row tiles, preserve its
+                            // 48-row padded work for a 33...48 tail instead of rounding
+                            // that tail up to a 64-row NAX body.
+                            const int take = BMT == 64 && n / E < 64
+                                && remaining > 32 && remaining <= 48
+                                ? 32 : min(BMT, remaining);
                             tiles[3 * t] = r;
-                            tiles[3 * t + 1] = min(BMT, end - r);
+                            tiles[3 * t + 1] = take;
                             tiles[3 * t + 2] = ee;
+                            r += take;
                             t++;
                         }
                     }
@@ -2710,9 +2718,7 @@ private final class NemotronHPrefillKernels: Sendable {
     }
 }
 
-/// Rows per tile the stock gather_qmm_rhs_nax dispatch picks for M rows
-/// and E experts (`bm = (M / E < 64) ? 32 : 64` in quantized.cpp).
-func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { rows / experts < 64 ? 32 : 64 }
+func nemotronGatherTileRows(rows: Int, experts: Int) -> Int { 64 }
 
 /// Expert-run tiles [count, 3] int32 of `bm` rows: (first sorted row, rows,
 /// expert); trailing slots have rows == 0.
@@ -2735,7 +2741,8 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
     else { return nil }
     let n = flat.size
     let bm = nemotronGatherTileRows(rows: n, experts: experts)
-    let count = (n + bm - 1) / bm + experts
+    let capacityRows = n / experts < 64 ? 32 : 64
+    let count = (n + capacityRows - 1) / capacityRows + experts
     let out = NemotronHPrefillKernels.shared.countingSort(
         [flat, n, count], template: [("E", experts), ("THREADS", threads), ("BMT", bm)],
         grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
@@ -4000,16 +4007,26 @@ private final class NemotronHRunGatherKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     private init() {
         kernel = MLXFast.metalKernel(
-            name: "nemotron_gather_qmm_runs",
+            name: "nemotron_gather_qmm_runs_adaptive_tiles",
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
                 threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
-                nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
-                    x, w, scales, biases, tiles, y, N, K, Ws,
-                    threadgroup_position_in_grid,
-                    simdgroup_index_in_threadgroup,
-                    thread_index_in_simdgroup);
+                // Descriptor length is uniform across the threadgroup. Both bodies
+                // retain the same K loop and independent per-row NAX fragment updates.
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
             """,
             header: nemotronRunGatherHeader)
     }
@@ -4228,7 +4245,13 @@ private class NemotronHBlock: Module {
             precondition(
                 attentionCache == nil,
                 "NemotronH recurrent layer received attention KV")
-            output = (mixer as! NemotronHMamba2Mixer).cbv2ForwardCaptured(
+            let mamba = mixer as! NemotronHMamba2Mixer
+            if let joined = mamba.cbv2ForwardCapturedJoined(hidden,
+                modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
+                prepared: prepared, residual: x, nextNorm: nextNorm) {
+                return (joined.0, joined.1, joined.2)
+            }
+            output = mamba.cbv2ForwardCaptured(
                 hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState,
                 prepared: prepared)
         case .attention:
@@ -4248,6 +4271,10 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
+            if let joined = moe.mtpForwardRowsJoined(hidden, prepared: prepared,
+                residual: x, nextNorm: nextNorm, layerIndex: modelLayerIndex) {
+                return (joined.0, joined.1, joined.2)
+            }
             if let parts = moe.mtpForwardRowsParts(hidden, prepared: prepared) {
                 output = parts.0
                 shared = parts.1
