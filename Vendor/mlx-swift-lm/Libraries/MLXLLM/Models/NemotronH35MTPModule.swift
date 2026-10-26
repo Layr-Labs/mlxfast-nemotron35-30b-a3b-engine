@@ -14,6 +14,7 @@ enum NemotronMTPDraftTail {
     }
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
+    static let oneLaunchRouter = enabled("NEMOTRON_MTP_DRAFT_ROUTER_FUSED")
 }
 
 enum NemotronMTPFrontNorms {
@@ -451,6 +452,14 @@ final class NemotronH35MTPExpertBlock: Module {
 
     func callAsFunction(residual: MLXArray, attention: MLXArray) -> MLXArray {
         if exactTailAvailable(residual), attention.shape == residual.shape,
+           let joined = NemotronHResidualRMSNorm.applyPreparedDraft(
+               residual, attention, norm: norm, consumer: mixer.switchMLP.fc1) {
+            if NemotronMTPExecution.compiledMoE {
+                return oneTokenTailCache([joined.0, joined.1, joined.2], mode: 3, owner: self)
+            }
+            return exactOneTokenTail(joined.0, normalized: joined.1, prepared: joined.2)
+        }
+        if exactTailAvailable(residual), attention.shape == residual.shape,
            let joined = NemotronHResidualRMSNorm.apply(residual, attention, norm: norm) {
             if NemotronMTPExecution.compiledMoE {
                 return oneTokenTailCache([joined.0, joined.1], mode: 2, owner: self)
@@ -473,12 +482,17 @@ final class NemotronH35MTPExpertBlock: Module {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
-    fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
+    fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?,
+                                      prepared: MLXArray? = nil) -> MLXArray {
         let h = normalized ?? norm(x)
-        let (indices, scores) = mixer.gate(h)
+        let gate = mixer.gate
+        let fused = NemotronMTPDraftTail.oneLaunchRouter && gate.topK == 6 && gate.nGroup == 1
+            && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
+            ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
+        let (indices, scores) = fused ?? gate(h)
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP, products: true)
+                h, indices, scores, mixer.switchMLP, prepared: prepared, products: true)
         else { return finalNorm(x + mixer(h)) }
         let shared = sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
@@ -501,7 +515,7 @@ private final class NemotronH35MTPOneTokenTailCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    private var entries: [Entry?] = [nil, nil, nil]
+    private var entries: [Entry?] = [nil, nil, nil, nil]
 
     func callAsFunction(_ inputs: [MLXArray], mode: Int, owner: NemotronH35MTPExpertBlock)
         -> MLXArray
@@ -524,6 +538,7 @@ private final class NemotronH35MTPOneTokenTailCache {
                 switch mode {
                 case 0: return [owner.uncompiledOneTokenTail(arrays[0])]
                 case 1: return [owner.exactOneTokenTail(arrays[0], normalized: nil)]
+                case 3: return [owner.exactOneTokenTail(arrays[0], normalized: arrays[1], prepared: arrays[2])]
                 default: return [owner.exactOneTokenTail(arrays[0], normalized: arrays[1])]
                 }
             }
@@ -539,6 +554,7 @@ private final class NemotronH35MTPOneTokenTailCache {
             switch mode {
             case 0: return owner.uncompiledOneTokenTail(inputs[0])
             case 1: return owner.exactOneTokenTail(inputs[0], normalized: nil)
+            case 3: return owner.exactOneTokenTail(inputs[0], normalized: inputs[1], prepared: inputs[2])
             default: return owner.exactOneTokenTail(inputs[0], normalized: inputs[1])
             }
         }
