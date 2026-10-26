@@ -830,6 +830,73 @@ enum NemotronHGatedRMSKernel {
             }
             """
 
+    /// The kernel above with each thread's four features read and written as
+    /// one 4-element vector (contiguous rows only) and G groups of 512 per
+    /// threadgroup (one 128-thread slice per group). Every per-element
+    /// statement, the per-thread order, and both `simd_sum` levels with their
+    /// lane layout are the kernel's.
+    private static let wideSource = """
+            uint slice = thread_position_in_threadgroup.x / 128;
+            uint gid = threadgroup_position_in_grid.x * G + slice;
+            uint lid = thread_position_in_threadgroup.x % 128;
+            uint simd_lane_id = thread_index_in_simdgroup;
+            uint simd_group_id = (thread_position_in_threadgroup.x % 128) / 32;
+            int64_t groups = int64_t(x_shape[2]) / 512;
+            int64_t row = int64_t(gid) / groups;
+            int64_t feature = (int64_t(gid) % groups) * 512 + int64_t(lid) * 4;
+            threadgroup float local_inv_mean[G];
+            threadgroup float local_sums[G][32];
+            const bool live = int64_t(gid) < int64_t(x_shape[1]) * groups;
+            float acc = 0;
+            float thread_x[4];
+            vec<T, 4> xs4 = vec<T, 4>(0);
+            vec<T, 4> gs4 = vec<T, 4>(0);
+            if (live) {
+                xs4 = *((const device vec<T, 4>*)(x + row * x_strides[1] + feature));
+                gs4 = *((const device vec<T, 4>*)(gate + row * gate_strides[1] + feature));
+            }
+            for (int i = 0; i < 4; i++) {
+                T g = gs4[i];
+                auto y = 1 / (1 + metal::exp(metal::abs(g)));
+                T sig = g < 0 ? y : 1 - y;
+                T activated = g * sig;
+                T gated = xs4[i] * activated;
+                thread_x[i] = gated;
+                acc += thread_x[i] * thread_x[i];
+            }
+            acc = simd_sum(acc);
+            if (simd_group_id == 0) {
+                local_sums[slice][simd_lane_id] = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_lane_id == 0) {
+                local_sums[slice][simd_group_id] = acc;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group_id == 0) {
+                acc = simd_sum(local_sums[slice][simd_lane_id]);
+                if (simd_lane_id == 0) {
+                    local_inv_mean[slice] = metal::precise::rsqrt(acc / 512 + eps);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (live) {
+                const vec<T, 4> ws4 = *((const device vec<T, 4>*)(weight + feature));
+                vec<T, 4> o4;
+                for (int i = 0; i < 4; i++) {
+                    T normalized = static_cast<T>(thread_x[i] * local_inv_mean[slice]);
+                    T unweighted = identity * normalized;
+                    T weighted = ws4[i] * unweighted;
+                    o4[i] = weighted;
+                }
+                *((device vec<T, 4>*)(out + row * int64_t(x_shape[2]) + feature)) = o4;
+            }
+            """
+    static let wideKernel = MLXFast.metalKernel(
+        name: "nemotron_h_gated_rms_wide",
+        inputNames: ["x", "gate", "weight", "identity", "eps"], outputNames: ["out"],
+        source: wideSource, ensureRowContiguous: false)
+
     nonisolated(unsafe) static let identity = MLXArray(1).asType(.bfloat16)
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_h_gated_rms",
@@ -912,6 +979,10 @@ class NemotronHRMSNormGated: Module {
             gate.shape == x.shape, weight.shape == [x.dim(2)],
             x.dtype == .bfloat16, gate.dtype == .bfloat16, weight.dtype == .bfloat16
         {
+            if NemotronPrefillGatedRMSWide.verified, NemotronHPrefillX5.active, x.dim(1) > 1,
+               let wide = NemotronPrefillGatedRMSWide.apply(x, gate: gate, weight: weight, eps: eps) {
+                return wide
+            }
             return NemotronHGatedRMSKernel.kernel(
                 [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
                 template: [("T", DType.bfloat16)],
@@ -1274,6 +1345,150 @@ enum NemotronFreshStateUpdate {
     }
 }
 
+/// Seed-only (request prefill) fold of the scan windows' cumsum / exp
+/// launches. NEMOTRON_PREFILL_SCAN_EXP=0 keeps the stock launches.
+enum NemotronPrefillScanExp {
+    static let scanExpEnabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SCAN_EXP"] != "0"
+    nonisolated(unsafe) static var scanExpVerified = false
+
+    /// `exp(cumsum(dtA[window], axis: -2))` for every 256-row scan window in
+    /// one launch: per (window, head) column, MLX strided_scan's statements
+    /// (32-row blocks from the window's first row, simd_prefix_inclusive_sum,
+    /// `+ prefix` with prefix starting at +0.0, carried by simd_shuffle of
+    /// lane 31; rows past the window read 0), then Exp's metal::precise::exp.
+    /// Row r of the output holds its own window's value.
+    static let scanExp = MLXFast.metalKernel(
+        name: "nemotron_prefill_window_cumsum_exp",
+        inputNames: ["dtA", "L"], outputNames: ["out"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const int head = int(threadgroup_position_in_grid.y);
+            const int start = int(threadgroup_position_in_grid.z) * STEP;
+            const int end = min(start + STEP, L);
+            float prefix = 0.0f;
+            for (int r0 = start; r0 < end; r0 += 32) {
+                const int i = r0 + int(lane);
+                float v = i < end
+                    ? dtA[i * dtA_strides[1] + head * dtA_strides[2]] : 0.0f;
+                v = simd_prefix_inclusive_sum(v);
+                v = v + prefix;
+                prefix = simd_shuffle(v, 31);
+                if (i < end) {
+                    out[size_t(i) * H + head] = metal::precise::exp(v);
+                }
+            }
+            """, ensureRowContiguous: false)
+
+    static func applyScanExp(_ dtA: MLXArray, step: Int) -> MLXArray? {
+        guard scanExpVerified, dtA.ndim == 3, dtA.dim(0) == 1, dtA.dtype == .float32, step == 256
+        else { return nil }
+        let l = dtA.dim(1), h = dtA.dim(2)
+        return scanExp(
+            [dtA, l], template: [("H", h), ("STEP", step)],
+            grid: (32, h, (l + step - 1) / step), threadGroup: (32, 1, 1),
+            outputShapes: [[1, l, h]], outputDTypes: [.float32])[0]
+    }
+
+    static func qualify() {
+        scanExpVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill scan exp: \(message)\n".utf8))
+        }
+        guard NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        var scanChecked = 0
+        if scanExpEnabled {
+            do {
+                scanExpVerified = try withError { () -> Bool in
+                    for (index, l) in [488, 300, 256, 257, 9, 512].enumerated() {
+                        let seed = UInt64(0x5ca0_0000 + index)
+                        // dt (softplus-range, some large) times A (negative).
+                        let dt = MLXRandom.uniform(0 ..< 2, [1, l, 64], key: MLXRandom.key(seed))
+                        let a = -MLX.exp(MLXRandom.normal([64], key: MLXRandom.key(seed + 1)))
+                        let dtA = (dt * a.reshaped(1, 1, -1)).asType(.float32)
+                        guard let fused = applyScanExpUnchecked(dtA) else { return false }
+                        var same = MLXArray(true)
+                        for start in stride(from: 0, to: l, by: 256) {
+                            let end = min(start + 256, l)
+                            let stock = MLX.exp(MLX.cumsum(dtA[0..., start ..< end, 0...], axis: -2))
+                            same = same .&& (fused[0..., start ..< end, 0...].view(dtype: .uint32)
+                                .== stock.view(dtype: .uint32)).all()
+                        }
+                        if !same.item(Bool.self) { return false }
+                        scanChecked += 1
+                    }
+                    return true
+                }
+            } catch {
+                scanExpVerified = false
+            }
+        }
+        report("\(scanExpVerified ? "on" : "off") (\(scanChecked) cases bitwise equal)")
+    }
+
+    private static func applyScanExpUnchecked(_ dtA: MLXArray) -> MLXArray? {
+        let saved = scanExpVerified
+        scanExpVerified = true
+        defer { scanExpVerified = saved }
+        return applyScanExp(dtA, step: 256)
+    }
+}
+
+/// Seed-only: at the early-eval layer boundaries the block's `x + output`
+/// and the next block's RMSNorm run as `NemotronHResidualRMSNorm.apply`
+/// (the join every other layer already uses) instead of the stock add and
+/// rms launches. `qualify` checks the join against the stock pair with the
+/// target's own norm weights. NEMOTRON_PREFILL_BOUNDARY_JOIN=0 keeps the pair.
+/// Seed only: the request prefill's last block joins norm_f like every other
+/// block joins its next norm (`NemotronHResidualRMSNorm.apply`, or the MoE
+/// join when the last block is an MoE block), one launch fewer. Requires
+/// `NemotronPrefillBoundaryJoin`, whose check covers norm_f among the 2688-wide
+/// norms. NEMOTRON_PREFILL_FINAL_NORM_JOIN=0 keeps the add and norm_f launches.
+let nemotronPrefillFinalNormJoin =
+    ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FINAL_NORM_JOIN"] != "0"
+
+enum NemotronPrefillBoundaryJoin {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_BOUNDARY_JOIN"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill boundary join: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        let norms = target.modules().compactMap { $0 as? RMSNorm }
+            .filter { type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] }
+        guard !norms.isEmpty else { return report("off (no 2688 RMSNorm)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, norm) in norms.enumerated() where index % 4 == 0 || index == norms.count - 1 {
+                    for rows in [488, 9] {
+                        let seed = UInt64(0xb7a0_0000 + index * 8 + rows)
+                        let x = MLXRandom.normal([1, rows, 2688], dtype: .bfloat16, scale: 4,
+                                                 key: MLXRandom.key(seed))
+                        let y = MLXRandom.normal([1, rows, 2688], dtype: .bfloat16, scale: 2,
+                                                 key: MLXRandom.key(seed + 1))
+                        guard let joined = NemotronHResidualRMSNorm.apply(x, y, norm: norm) else { return false }
+                        let sum = x + y
+                        let same = MLX.logicalAnd(
+                            (joined.0.view(dtype: .uint16) .== sum.view(dtype: .uint16)).all(),
+                            (joined.1.view(dtype: .uint16) .== norm(sum).view(dtype: .uint16)).all())
+                        if !same.item(Bool.self) { return false }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (join differs from add + rms after \(checked) cases)")
+    }
+}
+
 // MARK: - Multi-token SSM scan (copy of SSM.swift ssmAttn, fewer copies)
 
 /// tril(CB_g * exp(S), 0) with CB broadcast over the R heads of its group:
@@ -1287,13 +1502,185 @@ private final class NemotronHScanKernels: Sendable {
     let windowOut: MLXFast.MLXFastKernel
     let stateUpdate: MLXFast.MLXFastKernel
     let dtxDecayT: MLXFast.MLXFastKernel
+    let dtxDecayT4: MLXFast.MLXFastKernel
     let windowOutFinal: MLXFast.MLXFastKernel
+    let windowOutFresh: MLXFast.MLXFastKernel
+    let windowOutFinalSG: MLXFast.MLXFastKernel
+    /// `windowOutFinalSG`'s source (also the base of `NemotronPrefillFreshStateFold.windowOut`).
+    static let windowOutFinalSGSource = """
+                constexpr int RB = SRB;
+                constexpr int TB = 32 / RB;
+                
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const uint bh = threadgroup_position_in_grid.z;
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                const int nb = (n + TC - 1) / TC;
+                if (int(threadgroup_position_in_grid.y) >= nb) {
+                    if (COPY) {
+                        const int cb = int(threadgroup_position_in_grid.y) - nb;
+                        constexpr int RT = RB * SGS;
+                        for (int q = int(sg) * 32 + int(lane); q < TC * RT; q += 32 * SGS) {
+                            const int t = cb * TC + q / RT;
+                            const int i = int(threadgroup_position_in_grid.x) * RT + q % RT;
+                            if (t < s0) {
+                                out[((size_t(bb) * LT + t) * H + hh) * DH + i] =
+                                    P[bb * P_strides[0] + t * P_strides[1] + hh * P_strides[2]
+                                      + i * P_strides[3]];
+                            }
+                        }
+                    }
+                    return;
+                }
+                const int i0 = (int(threadgroup_position_in_grid.x) * SGS + int(sg)) * RB;
+                const int k0 = int(lane) * 4;
+                const int t0 = int(threadgroup_position_in_grid.y) * TC;
+                const int t1 = min(t0 + TC, n);
+                const device float* sp = state + bb * state_strides[0] + hh * state_strides[1];
+                float st[RB][4];
+                for (int r = 0; r < RB; ++r) {
+                    for (int tn = 0; tn < 4; ++tn) {
+                        st[r][tn] = sp[(i0 + r) * state_strides[2] + (k0 + tn) * state_strides[3]];
+                    }
+                }
+                const device CT* cp = C + bb * C_strides[0] + (hh / R) * C_strides[2];
+                const int orow = int(lane) / TB;
+                const int ot = int(lane) % TB;
+                const float dv = static_cast<float>(Dw[hh * Dw_strides[0]]);
+                for (int tb = t0; tb < t1; tb += TB) {
+                    // v[r * TB + j]: this lane's partial of output (row r, token j).
+                    float v[32];
+                    for (int j = 0; j < TB; ++j) {
+                        const int t = min(tb + j, n - 1);
+                        float cv[4];
+                        if (C_strides[3] == 1) {
+                            const vec<CT, 4> c4 = *((const device vec<CT, 4>*)(cp + t * C_strides[1] + k0));
+                            cv[0] = static_cast<float>(c4.x);
+                            cv[1] = static_cast<float>(c4.y);
+                            cv[2] = static_cast<float>(c4.z);
+                            cv[3] = static_cast<float>(c4.w);
+                        } else {
+                            for (int tn = 0; tn < 4; ++tn) {
+                                cv[tn] = static_cast<float>(cp[t * C_strides[1] + (k0 + tn) * C_strides[3]]);
+                            }
+                        }
+                        for (int r = 0; r < RB; ++r) {
+                            float acc = 0.0f;
+                            for (int tn = 0; tn < 4; ++tn) {
+                                acc += st[r][tn] * cv[tn];
+                            }
+                            v[r * TB + j] = acc;
+                        }
+                    }
+                    // windowOutFinal's tree (lane offsets 16, 8, 4, 2, 1) as a
+                    // butterfly: at offset m a lane keeps the outputs whose bit m
+                    // matches its own and adds its partner's partial of each, so
+                    // every add pairs the same lanes; lane L ends with output L.
+                    float w16[16];
+                    const bool b16 = (lane & 16) != 0;
+                    for (int q = 0; q < 16; ++q) {
+                        const float keep = b16 ? v[q + 16] : v[q];
+                        const float send = b16 ? v[q] : v[q + 16];
+                        w16[q] = keep + simd_shuffle_xor(send, 16);
+                    }
+                    float w8[8];
+                    const bool b8 = (lane & 8) != 0;
+                    for (int q = 0; q < 8; ++q) {
+                        const float keep = b8 ? w16[q + 8] : w16[q];
+                        const float send = b8 ? w16[q] : w16[q + 8];
+                        w8[q] = keep + simd_shuffle_xor(send, 8);
+                    }
+                    float w4[4];
+                    const bool b4 = (lane & 4) != 0;
+                    for (int q = 0; q < 4; ++q) {
+                        const float keep = b4 ? w8[q + 4] : w8[q];
+                        const float send = b4 ? w8[q] : w8[q + 4];
+                        w4[q] = keep + simd_shuffle_xor(send, 4);
+                    }
+                    float w2[2];
+                    const bool b2 = (lane & 2) != 0;
+                    for (int q = 0; q < 2; ++q) {
+                        const float keep = b2 ? w4[q + 2] : w4[q];
+                        const float send = b2 ? w4[q] : w4[q + 2];
+                        w2[q] = keep + simd_shuffle_xor(send, 2);
+                    }
+                    const bool b1 = (lane & 1) != 0;
+                    const float keep1 = b1 ? w2[1] : w2[0];
+                    const float send1 = b1 ? w2[0] : w2[1];
+                    const float yp = keep1 + simd_shuffle_xor(send1, 1);
+                    const int t = tb + ot;
+                    if (t < t1) {
+                        const float e = ec[bb * ec_strides[0] + t * ec_strides[1] + hh * ec_strides[2]];
+                        const float p = e * yp;
+                        const float yv = y[bb * y_strides[0] + hh * y_strides[1] + t * y_strides[2]
+                            + (i0 + orow) * y_strides[3]];
+                        const float u = yv + p;
+                        const OT w = static_cast<OT>(u);
+                        const float xv = static_cast<float>(X[bb * X_strides[0] + (xs + t) * X_strides[1]
+                            + hh * X_strides[2] + (i0 + orow) * X_strides[3]]);
+                        const OT xd = static_cast<OT>(xv * dv);
+                        const OT o = static_cast<OT>(static_cast<float>(w) + static_cast<float>(xd));
+                        out[((size_t(bb) * LT + s0 + t) * H + hh) * DH + i0 + orow] = o;
+                    }
+                }
+            """
+    let scanDecaySkip: MLXFast.MLXFastKernel
     private init() {
         // (dtx * decay) written as the contiguous [B, H, DH, n] array that
         // `.swappedAxes(1, 2).swappedAxes(2, 3).reshaped(...)` copies it into:
         // the same single fp32 product per element, one pass instead of the
         // product and the reshape copy. A 32 x 32 (token, row) tile per
         // threadgroup keeps both the read and the transposed write coalesced.
+        // dtxDecayT over a 32-token x 64-row tile per 256-thread group, the
+        // dtx rows read and the output rows written as float4 (contiguous
+        // inner strides only): the same single fp32 product per element.
+        dtxDecayT4 = MLXFast.metalKernel(
+            name: "nemotron_ssm_dtx_decay_t4",
+            inputNames: ["dtx", "last", "n"], outputNames: ["out"],
+            source: """
+                threadgroup float tile[32][65];
+                const uint tid = thread_position_in_threadgroup.x;
+                const int tb = int(threadgroup_position_in_grid.x) * 32;
+                const uint bh = threadgroup_position_in_grid.z;
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                // Read: 16 threads cover a token's 64 rows as float4; 16 tokens per pass.
+                for (int pass = 0; pass < 2; ++pass) {
+                    const int tl = int(tid / 16) + 16 * pass;
+                    const int i4 = int(tid % 16) * 4;
+                    const int t = tb + tl;
+                    float4 v = float4(0.0f);
+                    if (t < n) {
+                        const float4 a = *((const device float4*)(dtx + bb * dtx_strides[0] + t * dtx_strides[1]
+                            + hh * dtx_strides[2] + i4));
+                        const float e = last[bb * last_strides[0] + hh * last_strides[1]
+                            + t * last_strides[3]];
+                        v = float4(a.x * e, a.y * e, a.z * e, a.w * e);
+                    }
+                    tile[tl][i4 + 0] = v.x;
+                    tile[tl][i4 + 1] = v.y;
+                    tile[tl][i4 + 2] = v.z;
+                    tile[tl][i4 + 3] = v.w;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Write: 8 threads cover a row's 32 tokens as float4; 32 rows per pass.
+                for (int pass = 0; pass < 2; ++pass) {
+                    const int i = int(tid / 8) + 32 * pass;
+                    const int t4 = int(tid % 8) * 4;
+                    const int t = tb + t4;
+                    device float* o = out + (size_t(bh) * DH + i) * n + t;
+                    if (t + 3 < n) {
+                        *((device float4*)o) = float4(tile[t4][i], tile[t4 + 1][i], tile[t4 + 2][i], tile[t4 + 3][i]);
+                    } else {
+                        for (int u = 0; u < 4; ++u) {
+                            if (t + u < n) {
+                                o[u] = tile[t4 + u][i];
+                            }
+                        }
+                    }
+                }
+            """, ensureRowContiguous: false)
         dtxDecayT = MLXFast.metalKernel(
             name: "nemotron_ssm_dtx_decay_t",
             inputNames: ["dtx", "last", "n"], outputNames: ["out"],
@@ -1442,6 +1829,18 @@ private final class NemotronHScanKernels: Sendable {
         // s0 + t. Rows t < s0 come from the earlier windows' epilogued outputs P
         // (grid.y blocks past this window's), copied into the full [B, LT, H,
         // DH] output in place of the concatenation.
+        // windowOutFinal with SGS simdgroups (of SRB rows each) per threadgroup
+        // instead of four of eight. Each lane's partials are windowOutFinal's
+        // four `acc += st * cv` statements (C read as one 4-element vector when
+        // its last stride is 1), and the 32 lane partials of an output are
+        // added in windowOutFinal's tree (lane offsets 16, 8, 4, 2, 1) as a
+        // simd_shuffle_xor butterfly instead of a threadgroup exchange, so
+        // every add pairs the same lanes and lane L ends with output L. The
+        // copied prefix is spread over the group's rows.
+        windowOutFinalSG = MLXFast.metalKernel(
+            name: "nemotron_ssm_window_out_final_sg",
+            inputNames: ["state", "C", "y", "ec", "n", "X", "Dw", "P", "s0", "xs"], outputNames: ["out"],
+            source: Self.windowOutFinalSGSource, ensureRowContiguous: false)
         windowOutFinal = MLXFast.metalKernel(
             name: "nemotron_ssm_window_out_final",
             inputNames: ["state", "C", "y", "ec", "n", "X", "Dw", "P", "s0", "xs"], outputNames: ["out"],
@@ -1535,6 +1934,55 @@ private final class NemotronHScanKernels: Sendable {
                     simdgroup_barrier(mem_flags::mem_threadgroup);
                 }
             """, ensureRowContiguous: false)
+        // windowOutFinal for a fresh request's first window (`state` all
+        // +0.0, nothing copied): every lane partial of state . C is +0.0, so
+        // yp is +0.0 and u = yv + e * yp; the epilogue statements are
+        // windowOutFinal's. One thread per (token, row), no state or C reads.
+        windowOutFresh = MLXFast.metalKernel(
+            name: "nemotron_ssm_window_out_fresh",
+            inputNames: ["y", "ec", "n", "X", "Dw"], outputNames: ["out"],
+            source: """
+                // Four consecutive rows per thread (vector reads of y and X and
+                // a vector store when their row stride is 1).
+                const uint i0 = thread_position_in_grid.x * 4;
+                const int t = int(thread_position_in_grid.y);
+                const uint bh = thread_position_in_grid.z;
+                if (int(i0) >= DH || t >= n) {
+                    return;
+                }
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                const float dv = static_cast<float>(Dw[hh * Dw_strides[0]]);
+                const float e = ec[bb * ec_strides[0] + t * ec_strides[1] + hh * ec_strides[2]];
+                const bool vy = y_strides[3] == 1;
+                const bool vx = X_strides[3] == 1;
+                const device float* yr = y + bb * y_strides[0] + hh * y_strides[1] + t * y_strides[2];
+                const device OT* xr = X + bb * X_strides[0] + t * X_strides[1] + hh * X_strides[2];
+                float4 y4;
+                vec<OT, 4> x4;
+                if (vy) {
+                    y4 = *((const device float4*)(yr + i0));
+                } else {
+                    for (int u = 0; u < 4; ++u) y4[u] = yr[(i0 + u) * y_strides[3]];
+                }
+                if (vx) {
+                    x4 = *((const device vec<OT, 4>*)(xr + i0));
+                } else {
+                    for (int u = 0; u < 4; ++u) x4[u] = xr[(i0 + u) * X_strides[3]];
+                }
+                vec<OT, 4> o4;
+                for (int u = 0; u < 4; ++u) {
+                    const float yp = 0.0f;
+                    const float p = e * yp;
+                    const float yv = y4[u];
+                    const float uu = yv + p;
+                    const OT w = static_cast<OT>(uu);
+                    const float xv = static_cast<float>(x4[u]);
+                    const OT xd = static_cast<OT>(xv * dv);
+                    o4[u] = static_cast<OT>(static_cast<float>(w) + static_cast<float>(xd));
+                }
+                *((device vec<OT, 4>*)(out + ((size_t(bb) * LT + t) * H + hh) * DH + i0)) = o4;
+            """, ensureRowContiguous: false)
         // Fused segsum (tril(x, -1) -> cumsum(axis -2) in strided_scan order)
         // + exp + CB product + tril, plus the decay's last row.
         scanDecay = MLXFast.metalKernel(
@@ -1585,6 +2033,65 @@ private final class NemotronHScanKernels: Sendable {
                     const uint wc = writer % 8;
                     const int wi = rb + int(wr);
                     const uint wj = j0 + wc;
+                    if (wi < L && int(wj) < L) {
+                        o[size_t(wi) * L + wj] = tile[wr][wc];
+                    }
+                }
+            """)
+        // scanDecay with the work its zeros do not need skipped: a 32-row
+        // block that lies wholly above the group's eight columns writes only
+        // its zeros (its masked scan adds +0.0 and leaves the carried prefix
+        // +0.0), and exp runs only where its value is stored (j <= i, or the
+        // last row). Every stored value comes from scanDecay's statements.
+        scanDecaySkip = MLXFast.metalKernel(
+            name: "nemotron_ssm_scan_decay_skip",
+            inputNames: ["dtA", "CB", "L"], outputNames: ["out", "last"],
+            source: """
+                threadgroup float tile[32][9];
+                const uint lane = thread_index_in_simdgroup;
+                const uint s = simdgroup_index_in_threadgroup;
+                const uint j0 = threadgroup_position_in_grid.x * 8;
+                const uint bh = threadgroup_position_in_grid.z;
+                const uint bb = bh / H;
+                const uint hh = bh % H;
+                const uint j = j0 + s;
+                const device CBT* cb = CB + size_t(bb * (H / R) + hh / R) * L * L;
+                device float* o = out + size_t(bh) * L * L;
+                float prefix = 0.0f;
+                const uint writer = s * 32 + lane;
+                const uint wr = writer / 8;
+                const uint wc = writer % 8;
+                for (int rb = 0; rb < L; rb += 32) {
+                    const int wi = rb + int(wr);
+                    const uint wj = j0 + wc;
+                    if (rb + 31 < int(j0)) {
+                        if (wi < L && int(wj) < L) {
+                            o[size_t(wi) * L + wj] = 0.0f;
+                        }
+                        continue;
+                    }
+                    const int i = rb + int(lane);
+                    float v = 0.0f;
+                    if (i < L && int(j) < L && i > int(j)) {
+                        v = dtA[(size_t(bb) * L + i) * H + hh];
+                    }
+                    v = simd_prefix_inclusive_sum(v);
+                    v = v + prefix;
+                    prefix = simd_shuffle(v, 31);
+                    float r = 0.0f;
+                    if (i < L && int(j) < L && (int(j) <= i || i == L - 1)) {
+                        float d = metal::precise::exp(v);
+                        if (i == L - 1) {
+                            last[size_t(bh) * L + j] = d;
+                        }
+                        if (int(j) <= i) {
+                            float c = static_cast<float>(cb[size_t(i) * L + j]);
+                            r = c * d;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    tile[lane][s] = r;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                     if (wi < L && int(wj) < L) {
                         o[size_t(wi) * L + wj] = tile[wr][wc];
                     }
@@ -1645,7 +2152,7 @@ func nemotronSSMAttn(
     x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
     dt: MLXArray, dtBias: MLXArray, state: MLXArray?,
     timeStepLimit: (Float, Float),
-    prepared: (dtA: MLXArray, dtx: MLXArray)? = nil
+    prepared: (dtA: MLXArray, dtx: MLXArray, bF32: MLXArray?)? = nil
 ) -> (MLXArray, MLXArray) {
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
@@ -1655,7 +2162,7 @@ func nemotronSSMAttn(
     let dtx: MLXArray
     if let prepared {
         // `NemotronPrefillConvDt`: the same dtA and dtx, bit for bit.
-        (dtA, dtx) = prepared
+        (dtA, dtx) = (prepared.dtA, prepared.dtx)
     } else {
         let dt = nemotronPrefillComputeDt(dt, dtBias, timeStepLimit)
         let A = -MLX.exp(ALog).asType(dt.dtype)
@@ -1664,6 +2171,9 @@ func nemotronSSMAttn(
     }
 
     let step = 256
+    // Seed only: every window's exp(cumsum(dtA)) in one launch.
+    let windowCumExp: MLXArray? = NemotronHPrefillX5.active && b == 1
+        ? NemotronPrefillScanExp.applyScanExp(dtA, step: step) : nil
     // The fused epilogue needs every window on the windowOut path below,
     // whose dtype conditions hold for an fp32 state and fp32 dtA.
     let fuseEpilogue = NemotronHPrefillX5.ssmEpilogue && NemotronHPrefillX5.active && d == 128 && dh % 32 == 0
@@ -1672,6 +2182,10 @@ func nemotronSSMAttn(
     var currentState = state
     var outputs = [MLXArray]()
     outputs.reserveCapacity((l + step - 1) / step)
+    // Seed only: a fresh first window's state left to the second window
+    // (`NemotronPrefillFreshStateFold`).
+    let foldFresh = NemotronPrefillFreshStateFold.usable(l: l, step: step, fuseEpilogue: fuseEpilogue)
+    var freshFold: (prod: MLXArray, ec: MLXArray, n: Int)? = nil
     for start in stride(from: 0, to: l, by: step) {
         let end = min(start + step, l)
         let n = end - start
@@ -1683,10 +2197,31 @@ func nemotronSSMAttn(
         stepB = MLX.transposed(stepB, axes: [0, 2, 3, 1])
         let CB = MLX.swappedAxes(stepC, 1, 2).matmul(stepB)
 
-        let surrogateAttentionMatrix: MLXArray
+        // Seed only: the decay matrix and its matmul in one launch
+        // (`NemotronPrefillScanDecayGemm`).
+        // A fresh request's first window also takes `windowOutFresh`'s
+        // epilogue in that launch.
+        let freshGemm = start == 0 && currentState == nil && fuseEpilogue && b == 1
+            && NemotronPrefillFreshWindowOut.verified
+            ? windowCumExp.flatMap { cumExp in
+                NemotronPrefillScanDecayGemm.applyFresh(
+                    dtA: stepDtA, CB: CB, dtx: stepDtx, n: n, h: h, g: g, dh: dh,
+                    ec: cumExp[0..., start ..< end, 0...], x: x, D: D, lt: end == l ? l : n)
+            } : nil
+        let scanGemm = freshGemm == nil ? NemotronPrefillScanDecayGemm.apply(
+            dtA: stepDtA, CB: CB, dtx: stepDtx, n: n, b: b, h: h, g: g, dh: dh) : nil
+        let surrogateAttentionMatrix: MLXArray?
         let decayLast: MLXArray
-        if NemotronHPrefillX5.enabled, stepDtA.dtype == .float32, h % g == 0 {
-            let fused = NemotronHScanKernels.shared.scanDecay(
+        if let freshGemm {
+            surrogateAttentionMatrix = nil
+            decayLast = freshGemm.last
+        } else if let scanGemm {
+            surrogateAttentionMatrix = nil
+            decayLast = scanGemm.last
+        } else if NemotronHPrefillX5.enabled, stepDtA.dtype == .float32, h % g == 0 {
+            // Seed only: the launch that skips work its zeros do not need.
+            let fused = (NemotronPrefillScanDecaySkip.verified && NemotronHPrefillX5.active
+                ? NemotronHScanKernels.shared.scanDecaySkip : NemotronHScanKernels.shared.scanDecay)(
                 [stepDtA, CB, n],
                 template: [("CBT", CB.dtype), ("H", h), ("R", repeats)],
                 grid: (((n + 7) / 8) * 256, 1, b * h), threadGroup: (256, 1, 1),
@@ -1711,20 +2246,38 @@ func nemotronSSMAttn(
                     MLX.repeated(CB, count: repeats, axis: 1) * decayFull, k: 0)
             }
         }
-        let yWindow = surrogateAttentionMatrix.matmul(stepDtx.swappedAxes(1, 2))
+        // With `freshGemm` the window output is already formed and nothing reads `yWindow`.
+        let yWindow = freshGemm != nil ? NemotronMambaZeroState.scalar(.float32)
+            : scanGemm?.y ?? surrogateAttentionMatrix!.matmul(stepDtx.swappedAxes(1, 2))
 
         // decay[..., -1:, :] == exp(segsum[..., -1:, :]) element-wise.
         let decay = decayLast.transposed(0, 3, 1, 2)
         let nextStateProduct: MLXArray
         if b == 1, h == 64, g == 8, dh == 64, d == 128, n >= 64,
            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu {
+            // Seed: B already written as the f32 block the promotion would make.
+            let groupedBF32 = prepared?.bF32.map {
+                nemotronPrefillBF32Window($0, start: start, end: end, groups: g, state: d)
+            }
+            // Seed only: the left operand and the matmul in one launch
+            // (`NemotronPrefillStateGemm`).
+            if let groupedBF32, let fusedProduct = NemotronPrefillStateGemm.apply(
+                dtx: stepDtx, last: decayLast, bWindow: groupedBF32, n: n, h: h, g: g, dh: dh, d: d) {
+                nextStateProduct = fusedProduct
+            } else {
             // Broadcast each B group over its heads, preserving the reduction
             // axis and input order without materializing eight copies.
             let groupedB = stepB.swappedAxes(2, 3).reshaped(b, g, 1, n, d)
             let groupedDtxDecay: MLXArray
             if NemotronHPrefillX5.ssmDtxDecay, NemotronHPrefillX5.active, stepDtx.dtype == .float32,
                decayLast.dtype == .float32 {
-                groupedDtxDecay = NemotronHScanKernels.shared.dtxDecayT(
+                groupedDtxDecay = NemotronPrefillDtxDecay4.usable(stepDtx, n: n, dh: dh)
+                    ? NemotronHScanKernels.shared.dtxDecayT4(
+                        [stepDtx, decayLast, n],
+                        template: [("H", h), ("DH", dh)],
+                        grid: (((n + 31) / 32) * 256, 1, b * h), threadGroup: (256, 1, 1),
+                        outputShapes: [[b, g, repeats, dh, n]], outputDTypes: [.float32])[0]
+                    : NemotronHScanKernels.shared.dtxDecayT(
                     [stepDtx, decayLast, n],
                     template: [("H", h), ("DH", dh)],
                     grid: (((n + 31) / 32) * 32, dh / 32 * 8, b * h), threadGroup: (32, 8, 1),
@@ -1733,7 +2286,8 @@ func nemotronSSMAttn(
                 groupedDtxDecay = (stepDtx * decay).swappedAxes(1, 2).swappedAxes(2, 3)
                     .reshaped(b, g, repeats, dh, n)
             }
-            nextStateProduct = groupedDtxDecay.matmul(groupedB).reshaped(b, h, dh, d)
+            nextStateProduct = groupedDtxDecay.matmul(groupedBF32 ?? groupedB).reshaped(b, h, dh, d)
+            }
         } else {
             let dtxdecay = (stepDtx * decay).swappedAxes(1, 2).swappedAxes(2, 3)
             stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
@@ -1741,12 +2295,33 @@ func nemotronSSMAttn(
         }
         var nextState = nextStateProduct
 
-        let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
+        let expDtACumsum = windowCumExp.map { $0[0..., start ..< end, 0...] }
+            ?? MLX.exp(MLX.cumsum(stepDtA, axis: -2))
         let lastDecay = expDtACumsum[0..., -1, 0..., .newAxis, .newAxis]
         let previousState: MLXArray
-        if let currentState {
+        var freshWindow = false
+        var foldedFrom: (prod: MLXArray, ec: MLXArray, n: Int)? = nil
+        if var currentState {
+            if let fold = freshFold {
+                freshFold = nil
+                if nextState.dtype == .float32, nextState.shape == fold.prod.shape,
+                   expDtACumsum.dtype == .float32 {
+                    foldedFrom = fold
+                } else {
+                    currentState = NemotronHScanKernels.shared.stateUpdate(
+                        [fold.prod, NemotronMambaZeroState.view([b, h, dh, d], dtype: .float32), fold.ec, fold.n],
+                        template: [("H", h), ("DH", dh), ("DS", d)],
+                        grid: (dh * d / 4, b * h, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[b, h, dh, d]], outputDTypes: [.float32])[0]
+                }
+            }
             previousState = currentState
-            if NemotronHPrefillX5.ssmStateUpdate, NemotronHPrefillX5.active, nextState.dtype == .float32,
+            if let fold = foldedFrom {
+                // `previousState` is the first window's product here.
+                nextState = NemotronPrefillFreshStateFold.update(
+                    prod: nextState, prod1: fold.prod, ec: expDtACumsum, ec1: fold.ec, n: n, n1: fold.n,
+                    b: b, h: h, dh: dh, d: d)
+            } else if NemotronHPrefillX5.ssmStateUpdate, NemotronHPrefillX5.active, nextState.dtype == .float32,
                previousState.dtype == .float32, expDtACumsum.dtype == .float32,
                nextState.shape == previousState.shape, d % 4 == 0 {
                 precondition(nextState.dim(1) == h && nextState.dim(2) == dh && nextState.dim(3) == d,
@@ -1764,16 +2339,21 @@ func nemotronSSMAttn(
             // decay[h] * +0.0 for every (i, k): the same Multiply (same
             // promotion and operand order) on [b, h, 1, 1], then the same Add.
             previousState = NemotronMambaZeroState.view([b, h, dh, d], dtype: .float32)
+            freshWindow = true
             if NemotronFreshStateUpdate.verified, NemotronHPrefillX5.ssmStateUpdate,
                NemotronHPrefillX5.active, nextState.dtype == .float32,
                expDtACumsum.dtype == .float32, nextState.shape == [b, h, dh, d], d % 4 == 0 {
                 // The same e * (+0.0) then add per element, in one launch
-                // (`NemotronFreshStateUpdate`).
-                nextState = NemotronHScanKernels.shared.stateUpdate(
-                    [nextState, previousState, expDtACumsum, n],
-                    template: [("H", h), ("DH", dh), ("DS", d)],
-                    grid: (dh * d / 4, b * h, 1), threadGroup: (256, 1, 1),
-                    outputShapes: [[b, h, dh, d]], outputDTypes: [.float32])[0]
+                // (`NemotronFreshStateUpdate`), or in the second window's launches.
+                if foldFresh, start == 0, end < l {
+                    freshFold = (nextState, expDtACumsum, n)
+                } else {
+                    nextState = NemotronHScanKernels.shared.stateUpdate(
+                        [nextState, previousState, expDtACumsum, n],
+                        template: [("H", h), ("DH", dh), ("DS", d)],
+                        grid: (dh * d / 4, b * h, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[b, h, dh, d]], outputDTypes: [.float32])[0]
+                }
             } else {
                 nextState = nextState + lastDecay * NemotronMambaZeroState.scalar(.float32)
             }
@@ -1786,12 +2366,29 @@ func nemotronSSMAttn(
             let prior: MLXArray = copied == 0 ? stepC
                 : outputs.count == 1 ? outputs[0] : MLX.concatenated(outputs, axis: 1)
             let copyBlocks = (copied + 31) / 32
-            let fused = NemotronHScanKernels.shared.windowOutFinal(
-                [previousState, stepC, yWindow, expDtACumsum, n, x, D, prior, copied, start],
-                template: [("CT", stepC.dtype), ("OT", x.dtype), ("H", h), ("R", repeats),
-                           ("DH", dh), ("TC", 32), ("LT", last ? l : n), ("COPY", copied > 0)],
-                grid: (dh / 32 * 128, (n + 31) / 32 + copyBlocks, b * h), threadGroup: (128, 1, 1),
-                outputShapes: [[b, last ? l : n, h, dh]], outputDTypes: [x.dtype])[0]
+            // Seed only: a fresh request's first window reads no state.
+            let fused: MLXArray
+            if let freshGemm, copied == 0 {
+                fused = freshGemm.o
+            } else if let fold = foldedFrom, let foldOut = NemotronPrefillFreshStateFold.windowOut {
+                fused = NemotronPrefillWindowOutSG.run(
+                    foldOut, sgs: NemotronPrefillWindowOutSG.sgs,
+                    [previousState, stepC, yWindow, expDtACumsum, n, x, D, prior, copied, start,
+                     NemotronMambaZeroState.view([b, h, dh, d], dtype: .float32), fold.ec, fold.n],
+                    ct: stepC.dtype, ot: x.dtype, h: h, r: repeats, dh: dh, lt: last ? l : n, copy: copied > 0,
+                    n: n, copyBlocks: copyBlocks, b: b, outRows: last ? l : n)
+            } else {
+                fused = freshWindow && copied == 0 && start == 0 && NemotronPrefillFreshWindowOut.verified
+                    ? NemotronPrefillFreshWindowOut.apply(
+                        y: yWindow, ec: expDtACumsum, n: n, x: x, D: D, lt: last ? l : n)
+                    : NemotronPrefillWindowOutSG.run(
+                        NemotronPrefillWindowOutSG.verified ? NemotronHScanKernels.shared.windowOutFinalSG
+                            : NemotronHScanKernels.shared.windowOutFinal,
+                        sgs: NemotronPrefillWindowOutSG.verified ? NemotronPrefillWindowOutSG.sgs : 0,
+                        [previousState, stepC, yWindow, expDtACumsum, n, x, D, prior, copied, start],
+                        ct: stepC.dtype, ot: x.dtype, h: h, r: repeats, dh: dh, lt: last ? l : n, copy: copied > 0,
+                        n: n, copyBlocks: copyBlocks, b: b, outRows: last ? l : n)
+            }
             if last {
                 return (fused, nextState)
             }
@@ -1819,6 +2416,1079 @@ func nemotronSSMAttn(
 
     let y = MLX.concatenated(outputs, axis: 1) + x * D.reshaped(1, 1, h, 1)
     return (y, currentState ?? MLXArray.zeros([b, h, dh, d], dtype: .float32))
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): a fresh
+/// request's first scan window state, `prod1 + e1 * (+0.0)` (the
+/// `NemotronFreshStateUpdate` launch), is not written; the second window's
+/// two readers evaluate it per element with the same statements instead.
+/// `stateUpdate` computes `prod + e * (prod1 + e1 * zero)` and `windowOut`
+/// is `windowOutFinalSG` whose state rows are loaded as `prod1 + e1 * zero`.
+/// `qualify` checks both bit for bit against the fresh state update followed
+/// by the stock second-window launches, with signed zeros, infinities and NaN
+/// in the products and decays. NEMOTRON_PREFILL_FRESH_STATE_FOLD=0 keeps the
+/// first window's launch.
+enum NemotronPrefillFreshStateFold {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FRESH_STATE_FOLD"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static let stateUpdate = MLXFast.metalKernel(
+        name: "nemotron_ssm_state_update_fresh_fold",
+        inputNames: ["prod", "prod1", "zero", "ec", "ec1", "n", "n1"], outputNames: ["out"],
+        source: """
+            const uint idx = thread_position_in_grid.x * 4;
+            const uint bh = thread_position_in_grid.y;
+            const uint bb = bh / H;
+            const uint hh = bh % H;
+            const uint i = idx / DS;
+            const uint k = idx % DS;
+            const float e = ec[bb * ec_strides[0] + (n - 1) * ec_strides[1] + hh * ec_strides[2]];
+            const float e1 = ec1[bb * ec1_strides[0] + (n1 - 1) * ec1_strides[1] + hh * ec1_strides[2]];
+            const device float* zs = zero + bb * zero_strides[0] + hh * zero_strides[1]
+                + i * zero_strides[2];
+            const device float* ps = prod1 + bb * prod1_strides[0] + hh * prod1_strides[1]
+                + i * prod1_strides[2];
+            const device float* qs = prod + bb * prod_strides[0] + hh * prod_strides[1]
+                + i * prod_strides[2];
+            device float* o = out + (size_t(bh) * DH + i) * DS;
+            for (uint j = 0; j < 4; ++j) {
+                const float p1 = e1 * zs[(k + j) * zero_strides[3]];
+                const float s1 = ps[(k + j) * prod1_strides[3]] + p1;
+                const float p = e * s1;
+                o[k + j] = qs[(k + j) * prod_strides[3]] + p;
+            }
+        """, ensureRowContiguous: false)
+
+    private static let stateBase =
+        "const device float* sp = state + bb * state_strides[0] + hh * state_strides[1];"
+    private static let foldedBase =
+        "const device float* sp = state + bb * state_strides[0] + hh * state_strides[1];"
+        + " const float e1 = ec1[bb * ec1_strides[0] + (n1 - 1) * ec1_strides[1] + hh * ec1_strides[2]];"
+        + " const device float* zp = zero + bb * zero_strides[0] + hh * zero_strides[1];"
+    private static let stateLoad =
+        "st[r][tn] = sp[(i0 + r) * state_strides[2] + (k0 + tn) * state_strides[3]];"
+    private static let foldedLoad =
+        "{ const float p1 = e1 * zp[(i0 + r) * zero_strides[2] + (k0 + tn) * zero_strides[3]];"
+        + " st[r][tn] = sp[(i0 + r) * state_strides[2] + (k0 + tn) * state_strides[3]] + p1; }"
+
+    /// `windowOutFinalSG` with `state` = the first window's product; nil if
+    /// its state load is not found exactly once.
+    static let windowOut: MLXFast.MLXFastKernel? = {
+        var source = NemotronHScanKernels.windowOutFinalSGSource
+        for (old, new) in [(NemotronPrefillFreshStateFold.stateBase, NemotronPrefillFreshStateFold.foldedBase),
+                           (NemotronPrefillFreshStateFold.stateLoad, NemotronPrefillFreshStateFold.foldedLoad)] {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return MLXFast.metalKernel(
+            name: "nemotron_ssm_window_out_final_sg_fresh_fold",
+            inputNames: ["state", "C", "y", "ec", "n", "X", "Dw", "P", "s0", "xs", "zero", "ec1", "n1"],
+            outputNames: ["out"], source: source, ensureRowContiguous: false)
+    }()
+
+    /// Whether a fresh first window of `l` rows may leave its state to the
+    /// second window (the second window then takes these two launches).
+    static func usable(l: Int, step: Int, fuseEpilogue: Bool) -> Bool {
+        verified && NemotronHPrefillX5.active && fuseEpilogue && l > step && windowOut != nil
+            && NemotronPrefillWindowOutSG.verified && NemotronHPrefillX5.ssmStateUpdate
+    }
+
+    static func update(prod: MLXArray, prod1: MLXArray, ec: MLXArray, ec1: MLXArray, n: Int, n1: Int,
+                       b: Int, h: Int, dh: Int, d: Int) -> MLXArray {
+        let zero = NemotronMambaZeroState.view([b, h, dh, d], dtype: .float32)
+        return stateUpdate(
+            [prod, prod1, zero, ec, ec1, n, n1],
+            template: [("H", h), ("DH", dh), ("DS", d)],
+            grid: (dh * d / 4, b * h, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[b, h, dh, d]], outputDTypes: [.float32])[0]
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill fresh state fold: \(message)\n".utf8))
+        }
+        guard enabled, NemotronFreshStateUpdate.verified, NemotronPrefillWindowOutSG.verified,
+              NemotronHPrefillX5.ssmStateUpdate, NemotronHPrefillX5.ssmEpilogue
+        else { return report("off (setting)") }
+        guard let windowOut else { return report("off (window output source not as expected)") }
+        let (h, g, dh, d) = (64, 8, 64, 128)
+        let sgs = NemotronPrefillWindowOutSG.sgs
+        let kernels = NemotronHScanKernels.shared
+        let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
+                                 Float(bitPattern: 0x8001_0000), 3e38])
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (seed, (n1, n, l)) in [(256, 232, 488), (256, 256, 512), (256, 17, 273), (256, 100, 600)]
+                    .enumerated() {
+                    let key = MLXRandom.split(key: MLXRandom.key(UInt64(0xf01d + seed)), into: 10)
+                    var prod1 = MLXRandom.normal([1, h, dh, d], key: key[0]) * Float(2 + seed)
+                    prod1 = concatenated([specials, prod1.reshaped(-1)[8...]]).reshaped(1, h, dh, d)
+                    let prod = MLXRandom.normal([1, h, dh, d], key: key[1]) * Float(1 + seed)
+                    var ec1 = MLX.exp(-MLX.abs(MLXRandom.normal([1, n1, h], key: key[2])))
+                    // The decay the state update reads (row n1 - 1) of four heads.
+                    ec1 = concatenated([ec1.reshaped(-1)[..<((n1 - 1) * h)],
+                                        MLXArray([Float(0), .infinity, .nan, 1e-30]),
+                                        ec1.reshaped(-1)[((n1 - 1) * h + 4)...]]).reshaped(1, n1, h)
+                    let ec = MLX.exp(-MLX.abs(MLXRandom.normal([1, n, h], key: key[3])))
+                    let zero = NemotronMambaZeroState.view([1, h, dh, d], dtype: .float32)
+                    let state1 = kernels.stateUpdate(
+                        [prod1, zero, ec1, n1],
+                        template: [("H", h), ("DH", dh), ("DS", d)],
+                        grid: (dh * d / 4, h, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, h, dh, d]], outputDTypes: [.float32])[0]
+                    let stock = kernels.stateUpdate(
+                        [prod, state1, ec, n],
+                        template: [("H", h), ("DH", dh), ("DS", d)],
+                        grid: (dh * d / 4, h, 1), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, h, dh, d]], outputDTypes: [.float32])[0]
+                    let folded = update(prod: prod, prod1: prod1, ec: ec, ec1: ec1, n: n, n1: n1,
+                                        b: 1, h: h, dh: dh, d: d)
+                    var same = (folded.view(dtype: .uint32) .== stock.view(dtype: .uint32)).all()
+                    // The second window's output, final (copying the first window's rows) when it
+                    // ends the prefill.
+                    let C = (MLXRandom.normal([1, n, g, d], key: key[4]) * Float(1 + seed)).asType(.bfloat16)
+                    let y = MLXRandom.normal([1, h, n, dh], key: key[5])
+                    let x = MLXRandom.normal([1, l, h, dh], key: key[6]).asType(.bfloat16)
+                    let D = MLXRandom.normal([h], key: key[7]).asType(.bfloat16)
+                    let start = n1
+                    let last = start + n == l
+                    let copied = last ? start : 0
+                    let prior = copied == 0 ? C
+                        : MLXRandom.normal([1, copied, h, dh], key: key[8]).asType(.bfloat16)
+                    let copyBlocks = (copied + 31) / 32
+                    func go(_ kernel: MLXFast.MLXFastKernel, _ inputs: [any ScalarOrArray]) -> MLXArray {
+                        NemotronPrefillWindowOutSG.run(
+                            kernel, sgs: sgs, inputs, ct: C.dtype, ot: x.dtype, h: h, r: h / g, dh: dh,
+                            lt: last ? l : n, copy: copied > 0, n: n, copyBlocks: copyBlocks, b: 1,
+                            outRows: last ? l : n)
+                    }
+                    let a = go(kernels.windowOutFinalSG, [state1, C, y, ec, n, x, D, prior, copied, start])
+                    let bOut = go(windowOut, [prod1, C, y, ec, n, x, D, prior, copied, start, zero, ec1, n1])
+                    same = same .&& (a.view(dtype: .uint16) .== bOut.view(dtype: .uint16)).all()
+                    if !same.item(Bool.self) { return false }
+                    cases += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(cases) cases bitwise equal)"
+                        : "off (differs from the fresh state update and second window after \(cases) cases)")
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): a scan window's
+/// `scanDecay(Skip)` launch and the FP32 matmul of its [b, h, n, n] masked
+/// decay matrix with `dtx` in one launch that never writes the matrix. Each
+/// threadgroup rebuilds its 64-row strip of the matrix, 32 columns at a time,
+/// with `scanDecaySkip`'s statements (the column's 32-row
+/// `simd_prefix_inclusive_sum` blocks from the block holding the column, the
+/// carried prefix, `precise::exp`, the CB product and the `last` row), and
+/// multiplies it with the MLX NAX GEMM loop's fragments: 32 x 32 simdgroup
+/// tiles, K in 32-column steps from 0 with the last step zero-padded, and
+/// `tile_matmad_nax` per step. `qualify` compares `y` and `last` with the two
+/// launches bit for bit. NEMOTRON_PREFILL_SCAN_GEMM=0 keeps them.
+enum NemotronPrefillScanDecayGemm {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SCAN_GEMM"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// The kernel body; with `freshOut` the accumulators go through
+    /// `windowOutFresh`'s epilogue (a fresh request's first window) instead
+    /// of being stored as `y`.
+    private static func source(freshOut: Bool) -> String {
+        let body = """
+            constexpr short SM = 32;
+            constexpr short SN = 32;
+            constexpr short SK = 32;
+            constexpr short TM = SM / 16;
+            constexpr short TN = SN / 16;
+            constexpr short TK = SK / 16;
+            constexpr int AS = SK + 1;
+            threadgroup float As[64 * AS];
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int m0 = int(threadgroup_position_in_grid.x) * 64;
+            const uint bh = threadgroup_position_in_grid.z;
+            const uint bb = bh / H;
+            const uint hh = bh % H;
+            const device CBT* cb = CB + size_t(bb * (H / R) + hh / R) * L * L;
+            const device float* da = dtA + size_t(bb) * L * H + hh;
+            const int ldb = H * DH;
+            const device float* xb = dtx + size_t(bb) * L * ldb + size_t(hh) * DH;
+            const short tm = SM * short(sg / 2);
+            const short tn = SN * short(sg % 2);
+            NAXTile<float, TM, TN> Dtile;
+            Dtile.clear();
+            for (int k0 = 0; k0 < L; k0 += SK) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int c = int(sg); c < SK; c += 4) {
+                    const int j = k0 + c;
+                    const int jb = (j / 32) * 32;
+                    float prefix = 0.0f;
+                    for (int rb = jb; rb < m0; rb += 32) {
+                        const int i = rb + int(lane);
+                        float v = 0.0f;
+                        if (i < L && j < L && i > j) {
+                            v = da[size_t(i) * H];
+                        }
+                        v = simd_prefix_inclusive_sum(v);
+                        v = v + prefix;
+                        prefix = simd_shuffle(v, 31);
+                    }
+                    for (int q = 0; q < 2; ++q) {
+                        const int rb = m0 + 32 * q;
+                        const int i = rb + int(lane);
+                        float r = 0.0f;
+                        if (rb + 31 >= jb) {
+                            float v = 0.0f;
+                            if (i < L && j < L && i > j) {
+                                v = da[size_t(i) * H];
+                            }
+                            v = simd_prefix_inclusive_sum(v);
+                            v = v + prefix;
+                            prefix = simd_shuffle(v, 31);
+                            if (i < L && j < L && (j <= i || i == L - 1)) {
+                                float d = metal::precise::exp(v);
+                                if (i == L - 1) {
+                                    last[size_t(bh) * L + j] = d;
+                                }
+                                if (j <= i) {
+                                    float cv = static_cast<float>(cb[size_t(i) * L + j]);
+                                    r = cv * d;
+                                }
+                            }
+                        }
+                        As[(32 * q + int(lane)) * AS + c] = r;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                NAXTile<float, TM, TK> Atile;
+                NAXTile<float, TK, TN> Btile;
+                Atile.template load<float, AS, 1>(As + tm * AS);
+                const device float* bp = xb + size_t(k0) * ldb + tn;
+                if (k0 + SK <= L) {
+                    Btile.load(bp, ldb);
+                } else {
+                    Btile.load_safe(bp, ldb, short2(SN, short(L - k0)));
+                }
+                tile_matmad_nax(
+                    Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<false>{});
+            }
+            STORE_SECTION
+        """
+        let store = freshOut ? """
+            // windowOutFresh's statements on each accumulator element.
+            const short2 sc = BaseNAXFrag::get_coord();
+            const float dv = static_cast<float>(Dw[hh * Dw_strides[0]]);
+            STEEL_PRAGMA_UNROLL
+            for (short fm = 0; fm < TM; ++fm) {
+                STEEL_PRAGMA_UNROLL
+                for (short fn = 0; fn < TN; ++fn) {
+                    const thread typename NAXTile<float, TM, TN>::frag_type& fr = Dtile.frag_at(fm, fn);
+                    STEEL_PRAGMA_UNROLL
+                    for (short ii = 0; ii < 2; ++ii) {
+                        const int t = m0 + int(tm) + fm * 16 + int(sc.y) + ii * 8;
+                        if (t < L) {
+                            const int i0 = int(tn) + fn * 16 + int(sc.x);
+                            const float e = ec[(size_t(bb) * L + t) * H + hh];
+                            const device OT* xr = X + bb * X_strides[0] + t * X_strides[1] + hh * X_strides[2];
+                            vec<OT, 4> o4;
+                            for (int u = 0; u < 4; ++u) {
+                                const float yp = 0.0f;
+                                const float p = e * yp;
+                                const float yv = fr[ii * 4 + u];
+                                const float uu = yv + p;
+                                const OT w = static_cast<OT>(uu);
+                                const float xv = static_cast<float>(xr[(i0 + u) * X_strides[3]]);
+                                const OT xd = static_cast<OT>(xv * dv);
+                                o4[u] = static_cast<OT>(static_cast<float>(w) + static_cast<float>(xd));
+                            }
+                            *((device vec<OT, 4>*)(o + ((size_t(bb) * LT + t) * H + hh) * DH + i0)) = o4;
+                        }
+                    }
+                }
+            }
+            """ : """
+            const int rows = min(int(SM), L - (m0 + int(tm)));
+            if (rows > 0) {
+                device float* yp = y + (size_t(bh) * L + m0 + tm) * DH + tn;
+                if (rows == int(SM)) {
+                    Dtile.store(yp, DH);
+                } else {
+                    Dtile.store_slice(yp, DH, short2(0, 0), short2(SN, short(rows)));
+                }
+            }
+            """
+        return body.replacingOccurrences(of: "STORE_SECTION", with: store)
+    }
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_scan_decay_gemm",
+        inputNames: ["dtA", "CB", "dtx", "L"], outputNames: ["y", "last"],
+        source: NemotronPrefillScanDecayGemm.source(freshOut: false),
+        header: nemotronRunGatherHeader)
+
+    /// The fresh first window's output ([b, LT, h, dh], `windowOutFresh`'s
+    /// values) and `last`.
+    static let freshKernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_scan_decay_gemm_fresh_out",
+        inputNames: ["dtA", "CB", "dtx", "L", "ec", "X", "Dw"], outputNames: ["o", "last"],
+        source: NemotronPrefillScanDecayGemm.source(freshOut: true),
+        header: nemotronRunGatherHeader, ensureRowContiguous: false)
+
+    /// The window's `(yWindow, decayLast)`; nil outside the request prefill or
+    /// the kernel's shapes.
+    static func apply(dtA: MLXArray, CB: MLXArray, dtx: MLXArray, n: Int, b: Int, h: Int, g: Int, dh: Int)
+        -> (y: MLXArray, last: MLXArray)?
+    {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(dtA: dtA, CB: CB, dtx: dtx, n: n, b: b, h: h, g: g, dh: dh)
+    }
+
+    private static func launch(dtA: MLXArray, CB: MLXArray, dtx: MLXArray, n: Int, b: Int, h: Int, g: Int,
+                               dh: Int) -> (y: MLXArray, last: MLXArray)? {
+        guard NemotronHPrefillX5.runGather, b == 1, dh == 64, g > 0, h % g == 0,
+              dtA.dtype == .float32, dtx.dtype == .float32,
+              CB.dtype == .bfloat16 || CB.dtype == .float16 || CB.dtype == .float32,
+              dtA.shape == [b, n, h], dtx.shape == [b, n, h, dh], CB.shape == [b, g, n, n]
+        else { return nil }
+        let out = kernel(
+            [dtA, CB, dtx, n],
+            template: [("CBT", CB.dtype), ("H", h), ("R", h / g), ("DH", dh)],
+            grid: (((n + 63) / 64) * 128, 1, b * h), threadGroup: (128, 1, 1),
+            outputShapes: [[b, h, n, dh], [b, h, 1, n]], outputDTypes: [.float32, .float32])
+        return (out[0], out[1])
+    }
+
+    nonisolated(unsafe) static var freshVerified = false
+
+    /// A fresh request's first window: `(windowOutFresh output, decayLast)`
+    /// from one launch; nil outside the request prefill or the shapes.
+    static func applyFresh(dtA: MLXArray, CB: MLXArray, dtx: MLXArray, n: Int, h: Int, g: Int, dh: Int,
+                           ec: MLXArray, x: MLXArray, D: MLXArray, lt: Int) -> (o: MLXArray, last: MLXArray)?
+    {
+        guard verified, freshVerified, NemotronHPrefillX5.active else { return nil }
+        return launchFresh(dtA: dtA, CB: CB, dtx: dtx, n: n, h: h, g: g, dh: dh, ec: ec, x: x, D: D, lt: lt)
+    }
+
+    private static func launchFresh(dtA: MLXArray, CB: MLXArray, dtx: MLXArray, n: Int, h: Int, g: Int, dh: Int,
+                                    ec: MLXArray, x: MLXArray, D: MLXArray, lt: Int)
+        -> (o: MLXArray, last: MLXArray)?
+    {
+        guard NemotronHPrefillX5.runGather, dh == 64, g > 0, h % g == 0,
+              dtA.dtype == .float32, dtx.dtype == .float32,
+              CB.dtype == .bfloat16 || CB.dtype == .float16 || CB.dtype == .float32,
+              dtA.shape == [1, n, h], dtx.shape == [1, n, h, dh], CB.shape == [1, g, n, n],
+              dtA.strides.last == 1, dtx.strides.last == 1, CB.strides.last == 1,
+              dtA.strides[1] == h, dtx.strides[1] == h * dh, dtx.strides[2] == dh, CB.strides[2] == n,
+              CB.strides[1] == n * n,
+              ec.dtype == .float32, ec.shape == [1, n, h], ec.strides[1] == h, ec.strides[2] == 1,
+              x.dtype == .bfloat16 || x.dtype == .float16, x.ndim == 4, x.dim(0) == 1, x.dim(1) >= n,
+              x.dim(2) == h, x.dim(3) == dh, D.dtype == x.dtype, D.shape == [h], lt >= n
+        else { return nil }
+        let out = freshKernel(
+            [dtA, CB, dtx, n, ec, x, D],
+            template: [("CBT", CB.dtype), ("H", h), ("R", h / g), ("DH", dh), ("OT", x.dtype), ("LT", lt)],
+            grid: (((n + 63) / 64) * 128, 1, h), threadGroup: (128, 1, 1),
+            outputShapes: [[1, lt, h, dh], [1, h, 1, n]], outputDTypes: [x.dtype, .float32])
+        return (out[0], out[1])
+    }
+
+    /// `freshKernel` against `scanDecay(Skip)`, the matmul and
+    /// `windowOutFresh`, bit for bit.
+    static func qualifyFresh() {
+        freshVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill scan gemm fresh out: \(message)\n".utf8))
+        }
+        guard verified, NemotronPrefillFreshWindowOut.verified else { return report("off (setting)") }
+        let (h, g, dh) = (64, 8, 64)
+        let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
+                                 Float(bitPattern: 0x8001_0000), 3e38])
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (seed, (n, l)) in [(256, 488), (256, 300), (100, 100), (17, 17)].enumerated() {
+                    let key = MLXRandom.split(key: MLXRandom.key(UInt64(0xf5e0 + seed)), into: 6)
+                    let dtAFull = -MLX.abs(MLXRandom.normal([1, l, h], key: key[0])) * Float(0.05 * Double(1 + seed))
+                    var dtxFull = MLXRandom.normal([1, l, h, dh], key: key[1]) * Float(1 + seed)
+                    if seed == 1 {
+                        dtxFull = concatenated([specials, dtxFull.reshaped(-1)[8...]]).reshaped(1, l, h, dh)
+                    }
+                    let CB = (MLXRandom.normal([1, g, n, n], key: key[2]) * Float(2 + seed)).asType(.bfloat16)
+                    let ecFull = MLX.exp(-MLX.abs(MLXRandom.normal([1, l, h], key: key[3])))
+                    // x as a column slice of a wider row, as the convolution split leaves it.
+                    let wide = MLXRandom.normal([1, l, h * dh + 64], key: key[4]).asType(.bfloat16)
+                    let x = wide[0..., 0..., 0 ..< (h * dh)].reshaped(1, l, h, dh)
+                    let D = MLXRandom.normal([h], key: key[5]).asType(.bfloat16)
+                    let dtA = dtAFull[0..., 0 ..< n, 0...]
+                    let dtx = dtxFull[0..., 0 ..< n, 0..., 0...]
+                    let ec = ecFull[0..., 0 ..< n, 0...]
+                    let lt = n == l ? l : n
+                    let decay = (NemotronPrefillScanDecaySkip.verified ? NemotronHScanKernels.shared.scanDecaySkip
+                        : NemotronHScanKernels.shared.scanDecay)(
+                        [dtA, CB, n],
+                        template: [("CBT", CB.dtype), ("H", h), ("R", h / g)],
+                        grid: (((n + 7) / 8) * 256, 1, h), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, h, n, n], [1, h, 1, n]], outputDTypes: [.float32, .float32])
+                    let stockY = decay[0].matmul(dtx.swappedAxes(1, 2))
+                    let stockO = NemotronPrefillFreshWindowOut.apply(y: stockY, ec: ec, n: n, x: x, D: D, lt: lt)
+                    guard let fused = launchFresh(dtA: dtA, CB: CB, dtx: dtx, n: n, h: h, g: g, dh: dh,
+                                                  ec: ec, x: x, D: D, lt: lt)
+                    else { return false }
+                    let rows = stockO[0..., 0 ..< n, 0..., 0...]
+                    let same = (fused.o[0..., 0 ..< n, 0..., 0...].view(dtype: .uint16) .== rows.view(dtype: .uint16)).all()
+                        .&& (fused.last.view(dtype: .uint32) .== decay[1].view(dtype: .uint32)).all()
+                    if !same.item(Bool.self) { return false }
+                    cases += 1
+                }
+                return true
+            }
+            freshVerified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(freshVerified ? "on (\(cases) cases bitwise equal)"
+                             : "off (differs from the two launches and windowOutFresh after \(cases) cases)")
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill scan gemm: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled, NemotronHPrefillX5.runGather else {
+            return report("off (setting)")
+        }
+        let (h, g, dh) = (64, 8, 64)
+        let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
+                                 Float(bitPattern: 0x8001_0000), 3e38])
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (seed, (n, l, start)) in [(256, 488, 0), (232, 488, 256), (256, 512, 256), (100, 356, 256),
+                                              (17, 17, 0)].enumerated() {
+                    let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x5ca9 + seed)), into: 4)
+                    let dtAFull = -MLX.abs(MLXRandom.normal([1, l, h], key: key[0])) * Float(0.05 * Double(1 + seed))
+                    var dtxFull = MLXRandom.normal([1, l, h, dh], key: key[1]) * Float(1 + seed)
+                    if seed == 1 {
+                        dtxFull = concatenated([dtxFull.reshaped(-1)[..<(start * h * dh + 3 * dh)], specials,
+                                                dtxFull.reshaped(-1)[(start * h * dh + 3 * dh + 8)...]])
+                            .reshaped(1, l, h, dh)
+                    }
+                    var CB = MLXRandom.normal([1, g, n, n], key: key[2]) * Float(2 + seed)
+                    if seed == 2 {
+                        CB = concatenated([specials, CB.reshaped(-1)[8...]]).reshaped(1, g, n, n)
+                    }
+                    CB = CB.asType(.bfloat16)
+                    let dtA = dtAFull[0..., start ..< (start + n), 0...]
+                    let dtx = dtxFull[0..., start ..< (start + n), 0..., 0...]
+                    let decay = (NemotronPrefillScanDecaySkip.verified ? NemotronHScanKernels.shared.scanDecaySkip
+                        : NemotronHScanKernels.shared.scanDecay)(
+                        [dtA, CB, n],
+                        template: [("CBT", CB.dtype), ("H", h), ("R", h / g)],
+                        grid: (((n + 7) / 8) * 256, 1, h), threadGroup: (256, 1, 1),
+                        outputShapes: [[1, h, n, n], [1, h, 1, n]], outputDTypes: [.float32, .float32])
+                    let stockY = decay[0].matmul(dtx.swappedAxes(1, 2))
+                    guard let fused = launch(dtA: dtA, CB: CB, dtx: dtx, n: n, b: 1, h: h, g: g, dh: dh) else {
+                        return false
+                    }
+                    let same = (fused.y.view(dtype: .uint32) .== stockY.view(dtype: .uint32)).all()
+                        .&& (fused.last.view(dtype: .uint32) .== decay[1].view(dtype: .uint32)).all()
+                    if !same.item(Bool.self) { return false }
+                    cases += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(cases) cases bitwise equal)"
+                        : "off (differs from the scan decay launch and matmul after \(cases) cases)")
+        qualifyFresh()
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): a scan window's
+/// state product, `dtxDecayT` (`dtx[t, h, i] * last[h, t]` written as the
+/// [b, g, R, dh, n] left operand) and its FP32 matmul with the window's FP32 B
+/// block, in one launch that never writes the left operand. Each threadgroup
+/// (one head) forms the operand 32 tokens at a time with `dtxDecayT`'s
+/// product and multiplies it with the MLX NAX GEMM loop's fragments (32 x 32
+/// simdgroup tiles, K in 32-token steps from 0 with the last step
+/// zero-padded, `tile_matmad_nax` per step). `qualify` compares the product
+/// with the two launches bit for bit. NEMOTRON_PREFILL_STATE_GEMM=0 keeps them.
+enum NemotronPrefillStateGemm {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_STATE_GEMM"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_state_gemm",
+        inputNames: ["dtx", "last", "B", "n"], outputNames: ["out"],
+        source: """
+            constexpr short SM = 32;
+            constexpr short SN = 32;
+            constexpr short SK = 32;
+            constexpr short TM = SM / 16;
+            constexpr short TN = SN / 16;
+            constexpr short TK = SK / 16;
+            constexpr int AS = SK + 1;
+            threadgroup float As[DH * AS];
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const int tid = int(sg) * 32 + int(lane);
+            const uint bh = threadgroup_position_in_grid.z;
+            const uint bb = bh / H;
+            const uint hh = bh % H;
+            const uint gg = hh / R;
+            const short tm = SM * short(sg / 4);
+            const short tn = SN * short(sg % 4);
+            const device float* xr = dtx + size_t(bb) * n * H * DH + size_t(hh) * DH;
+            const device float* er = last + size_t(bh) * n;
+            const device float* bp0 = B + (size_t(bb) * (H / R) + gg) * size_t(n) * DS;
+            NAXTile<float, TM, TN> Dtile;
+            Dtile.clear();
+            for (int k0 = 0; k0 < n; k0 += SK) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int e = tid; e < DH * SK; e += 256) {
+                    const int i = e % DH;
+                    const int t = e / DH;
+                    const int tt = k0 + t;
+                    float v = 0.0f;
+                    if (tt < n) {
+                        const float a = xr[size_t(tt) * H * DH + i];
+                        const float ee = er[tt];
+                        v = a * ee;
+                    }
+                    As[i * AS + t] = v;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                NAXTile<float, TM, TK> Atile;
+                NAXTile<float, TK, TN> Btile;
+                Atile.template load<float, AS, 1>(As + tm * AS);
+                const device float* bp = bp0 + size_t(k0) * DS + tn;
+                if (k0 + SK <= n) {
+                    Btile.load(bp, DS);
+                } else {
+                    Btile.load_safe(bp, DS, short2(SN, short(n - k0)));
+                }
+                tile_matmad_nax(
+                    Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<false>{});
+            }
+            Dtile.store(out + (size_t(bh) * DH + tm) * DS + tn, DS);
+        """,
+        header: nemotronRunGatherHeader)
+
+    /// `dtxDecayT(dtx, last).matmul(bWindow).reshaped(b, h, dh, d)`; nil
+    /// outside the request prefill or the kernel's shapes.
+    static func apply(dtx: MLXArray, last: MLXArray, bWindow: MLXArray, n: Int, h: Int, g: Int, dh: Int, d: Int)
+        -> MLXArray?
+    {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(dtx: dtx, last: last, bWindow: bWindow, n: n, h: h, g: g, dh: dh, d: d)
+    }
+
+    private static func launch(dtx: MLXArray, last: MLXArray, bWindow: MLXArray, n: Int, h: Int, g: Int,
+                               dh: Int, d: Int) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, dh == 64, d == 128, g > 0, h % g == 0,
+              dtx.dtype == .float32, last.dtype == .float32, bWindow.dtype == .float32,
+              dtx.shape == [1, n, h, dh], last.shape == [1, h, 1, n], bWindow.shape == [1, g, 1, n, d]
+        else { return nil }
+        return kernel(
+            [dtx, last, bWindow, n],
+            template: [("H", h), ("R", h / g), ("DH", dh), ("DS", d)],
+            grid: (256, 1, h), threadGroup: (256, 1, 1),
+            outputShapes: [[1, h, dh, d]], outputDTypes: [.float32])[0]
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill state gemm: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled, NemotronHPrefillX5.runGather else {
+            return report("off (setting)")
+        }
+        let (h, g, dh, d) = (64, 8, 64, 128)
+        let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
+                                 Float(bitPattern: 0x8001_0000), 3e38])
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (seed, (n, l, start)) in [(256, 488, 0), (232, 488, 256), (256, 512, 256), (100, 356, 256),
+                                              (64, 64, 0)].enumerated() {
+                    let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x57a7 + seed)), into: 3)
+                    var dtxFull = MLXRandom.normal([1, l, h, dh], key: key[0]) * Float(1 + seed)
+                    if seed == 1 {
+                        dtxFull = concatenated([specials, dtxFull.reshaped(-1)[8...]]).reshaped(1, l, h, dh)
+                    }
+                    var last = MLX.exp(-MLX.abs(MLXRandom.normal([1, h, 1, n], key: key[1])))
+                    if seed == 2 {
+                        last = concatenated([MLXArray([Float(0), .infinity, .nan, 1e-30]),
+                                             last.reshaped(-1)[4...]]).reshaped(1, h, 1, n)
+                    }
+                    let flat = MLXRandom.normal([l * g * d], key: key[2]) * Float(2 + seed)
+                    let bWindow = nemotronPrefillBF32Window(flat, start: start, end: start + n, groups: g, state: d)
+                    let dtx = dtxFull[0..., start ..< (start + n), 0..., 0...]
+                    let operand = NemotronHScanKernels.shared.dtxDecayT(
+                        [dtx, last, n],
+                        template: [("H", h), ("DH", dh)],
+                        grid: (((n + 31) / 32) * 32, dh / 32 * 8, h), threadGroup: (32, 8, 1),
+                        outputShapes: [[1, g, h / g, dh, n]], outputDTypes: [.float32])[0]
+                    let stock = operand.matmul(bWindow).reshaped(1, h, dh, d)
+                    guard let fused = launch(dtx: dtx, last: last, bWindow: bWindow, n: n, h: h, g: g, dh: dh, d: d)
+                    else { return false }
+                    let same = (fused.view(dtype: .uint32) .== stock.view(dtype: .uint32)).all()
+                    if !same.item(Bool.self) { return false }
+                    cases += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(cases) cases bitwise equal)"
+                        : "off (differs from the transpose launch and matmul after \(cases) cases)")
+    }
+}
+
+/// Seed-only: `windowOutFinalSG` (two simdgroups of eight rows per
+/// threadgroup) in place of `windowOutFinal`; `qualify` checks it bit for bit,
+/// with and without the copied prefix. NEMOTRON_PREFILL_WINDOW_OUT_SG=0 keeps
+/// `windowOutFinal`.
+enum NemotronPrefillWindowOutSG {
+    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_WINDOW_OUT_SG"] ?? "") ?? 2
+    nonisolated(unsafe) static var verified = false
+
+    static let rows = 8
+    static func run(_ kernel: MLXFast.MLXFastKernel, sgs: Int, rb: Int = rows, _ inputs: [any ScalarOrArray],
+                    ct: DType, ot: DType, h: Int, r: Int, dh: Int, lt: Int, copy: Bool, n: Int, copyBlocks: Int,
+                    b: Int, outRows: Int) -> MLXArray {
+        let original = sgs == 0
+        var template: [(String, any KernelTemplateArg)] = [("CT", ct), ("OT", ot), ("H", h), ("R", r),
+                       ("DH", dh), ("TC", 32), ("LT", lt), ("COPY", copy)]
+        if !original { template.append(("SGS", sgs)); template.append(("SRB", rb)) }
+        return kernel(
+            inputs, template: template,
+            grid: (original ? dh / 32 * 128 : dh / (rb * sgs) * 32 * sgs, (n + 31) / 32 + copyBlocks, b * h),
+            threadGroup: (original ? 128 : 32 * sgs, 1, 1),
+            outputShapes: [[b, outRows, h, dh]], outputDTypes: [ot])[0]
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill window out sg: \(message)\n".utf8))
+        }
+        guard sgs > 0, NemotronHPrefillX5.enabled, NemotronHPrefillX5.ssmEpilogue else { return report("off (setting)") }
+        let (h, g, dh, d) = (64, 8, 64, 128)
+        var ok = MLXArray(true)
+        var cases = 0
+        for (seed, (n, l, start)) in [(256, 488, 0), (232, 488, 256), (100, 100, 0), (17, 273, 256)].enumerated() {
+            let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x5a5a + seed)), into: 7)
+            let state = MLXRandom.normal([1, h, dh, d], key: key[0]) * Float(1 + seed)
+            let C = (MLXRandom.normal([1, n, g, d], key: key[1]) * Float(1 + seed)).asType(.bfloat16)
+            let y = MLXRandom.normal([1, h, n, dh], key: key[2])
+            let ec = MLX.exp(-MLX.abs(MLXRandom.normal([1, n, h], key: key[3])))
+            let x = MLXRandom.normal([1, l, h, dh], key: key[4]).asType(.bfloat16)
+            let D = MLXRandom.normal([h], key: key[5]).asType(.bfloat16)
+            let last = start + n == l
+            let copied = last ? start : 0
+            let prior = copied == 0 ? C : MLXRandom.normal([1, copied, h, dh], key: key[6]).asType(.bfloat16)
+            let copyBlocks = (copied + 31) / 32
+            let inputs: [any ScalarOrArray] = [state, C, y, ec, n, x, D, prior, copied, start]
+            func go(_ kernel: MLXFast.MLXFastKernel, _ sg: Int, rb: Int = rows) -> MLXArray {
+                run(kernel, sgs: sg, rb: rb, inputs, ct: C.dtype, ot: x.dtype, h: h, r: h / g, dh: dh,
+                    lt: last ? l : n, copy: copied > 0, n: n, copyBlocks: copyBlocks, b: 1, outRows: last ? l : n)
+            }
+            let a = go(NemotronHScanKernels.shared.windowOutFinal, 0)
+            let bOut = go(NemotronHScanKernels.shared.windowOutFinalSG, sgs)
+            ok = MLX.logicalAnd(ok, (a.view(dtype: .uint16) .== bOut.view(dtype: .uint16)).all())
+            eval(ok)
+            cases += 1
+        }
+        verified = ok.item(Bool.self)
+        report(verified ? "on (sgs \(sgs), \(cases) cases bitwise equal)" : "off (differs from windowOutFinal)")
+    }
+}
+
+/// Seed-only: the request prefill's gated RMS norm through
+/// `NemotronHGatedRMSKernel.wideKernel` (vector loads and stores, G groups per
+/// threadgroup) when the rows are contiguous. `qualify` checks it against the
+/// kernel bit for bit. NEMOTRON_PREFILL_GATED_RMS_WIDE=0 keeps the kernel.
+enum NemotronPrefillGatedRMSWide {
+    static let groupsPerThreadgroup =
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_GATED_RMS_WIDE"] ?? "") ?? 2
+    nonisolated(unsafe) static var verified = false
+
+    static func apply(_ x: MLXArray, gate: MLXArray, weight: MLXArray, eps: Float, g: Int = groupsPerThreadgroup)
+        -> MLXArray?
+    {
+        guard g > 0, x.ndim == 3, x.strides.last == 1, gate.strides.last == 1, weight.strides.last == 1,
+              x.strides[1] % 4 == 0, gate.strides[1] % 4 == 0 else { return nil }
+        let total = x.dim(1) * (x.dim(2) / 512)
+        return NemotronHGatedRMSKernel.wideKernel(
+            [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+            template: [("T", DType.bfloat16), ("G", g)],
+            grid: (128 * g * ((total + g - 1) / g), 1, 1),
+            threadGroup: (128 * g, 1, 1), outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill gated rms wide: \(message)\n".utf8))
+        }
+        guard groupsPerThreadgroup > 0, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        var ok = MLXArray(true)
+        var cases = 0
+        for (seed, rows) in [488, 256, 17, 3].enumerated() {
+            let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x96a7 + seed)), into: 3)
+            let x = (MLXRandom.normal([1, rows, 4096], key: key[0]) * Float(1 + seed)).asType(.bfloat16)
+            let gate = (MLXRandom.normal([1, rows, 4096], key: key[1]) * 2).asType(.bfloat16)
+            let weight = (MLXRandom.normal([4096], key: key[2])).asType(.bfloat16)
+            let eps = Float(1e-5)
+            let a = NemotronHGatedRMSKernel.kernel(
+                [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (128 * rows * 8, 1, 1),
+                threadGroup: (128, 1, 1), outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
+            guard let b = apply(x, gate: gate, weight: weight, eps: eps) else { return report("off (layout)") }
+            ok = MLX.logicalAnd(ok, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+            eval(ok)
+            cases += 1
+        }
+        verified = ok.item(Bool.self)
+        report(verified ? "on (G \(groupsPerThreadgroup), \(cases) cases bitwise equal)" : "off (differs from the kernel)")
+    }
+}
+
+/// Seed-only: `scanDecaySkip` in place of `scanDecay` (same grid and outputs);
+/// `qualify` checks both outputs bit for bit. NEMOTRON_PREFILL_SCAN_DECAY_SKIP=0
+/// keeps `scanDecay`.
+enum NemotronPrefillScanDecaySkip {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SCAN_DECAY_SKIP"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill scan decay skip: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        let (h, g) = (64, 8)
+        var ok = MLXArray(true)
+        var cases = 0
+        for (seed, n) in [256, 232, 100, 17, 1].enumerated() {
+            let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x5c1d + seed)), into: 2)
+            let dtA = -MLX.abs(MLXRandom.normal([1, n, h], key: key[0])) * Float(0.1 * Double(1 + seed))
+            let CB = (MLXRandom.normal([1, g, n, n], key: key[1]) * Float(1 + seed)).asType(.bfloat16)
+            func go(_ kernel: MLXFast.MLXFastKernel) -> [MLXArray] {
+                kernel([dtA, CB, n], template: [("CBT", CB.dtype), ("H", h), ("R", h / g)],
+                       grid: (((n + 7) / 8) * 256, 1, h), threadGroup: (256, 1, 1),
+                       outputShapes: [[1, h, n, n], [1, h, 1, n]], outputDTypes: [.float32, .float32])
+            }
+            let a = go(NemotronHScanKernels.shared.scanDecay)
+            let b = go(NemotronHScanKernels.shared.scanDecaySkip)
+            for (u, w) in zip(a, b) {
+                ok = MLX.logicalAnd(ok, (u.view(dtype: .uint32) .== w.view(dtype: .uint32)).all())
+            }
+            eval(ok)
+            cases += 1
+        }
+        verified = ok.item(Bool.self)
+        report(verified ? "on (\(cases) cases bitwise equal)" : "off (differs from scanDecay)")
+    }
+}
+
+extension NemotronHResidualRMSNorm {
+    /// `source` with the request prefill's MoE output as `rhs`: the
+    /// `combineAdd` statements (the K weighted sorted expert rows `y[inv]` of
+    /// the row summed from +0.0 in slot order, astype(T), then the shared add
+    /// of `addend`) feed the unchanged residual add and norm, so the result
+    /// is `lhs + (y + shared)` as the stock MoE block forms it.
+    private static func moeJoinSource() -> String {
+        let offset = "const size_t offset = size_t(gid) * axis_size + lid * n_reads;"
+        let add = "T sum = lhs[offset + i] + rhs[offset + i];"
+        precondition(source.components(separatedBy: offset).count == 2)
+        precondition(source.components(separatedBy: add).count == 2)
+        return source.replacingOccurrences(of: offset, with: offset + """
+
+                        float total[n_reads];
+                        for (int k = 0; k < K; ++k) {
+                            uint src = inv[gid * K + k];
+                            float s = scores[gid * K + k];
+                            const device T* row = y + size_t(src) * axis_size + lid * n_reads;
+                            for (uint j = 0; j < n_reads; ++j) {
+                                float v = static_cast<float>(row[j]);
+                                float p = v * s;
+                                float a = p + 0.0f;
+                                if (k == 0) {
+                                    total[j] = a;
+                                } else {
+                                    total[j] = a + total[j];
+                                }
+                            }
+                        }
+            """)
+            .replacingOccurrences(of: add, with: """
+            const T r = static_cast<T>(total[i]);
+                            T part = static_cast<T>(static_cast<float>(r) + static_cast<float>(addend[offset + i]));
+                            T sum = lhs[offset + i] + part;
+            """)
+    }
+    private static let moeJoinKernel = MLXFast.metalKernel(
+        name: "nemotron_h_moe_join_rms_bf16",
+        inputNames: ["lhs", "y", "inv", "scores", "addend", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: moeJoinSource(), ensureRowContiguous: true)
+
+    /// Request prefill MoE block join (`NemotronPrefillMoEJoin`): `y` is the
+    /// [rows * k, 2688] sorted expert rows, `inverse` / `scores` the k slots
+    /// of each row; (residual, normalized) as `combineAdd` then `apply`.
+    static func applyMoEJoin(
+        _ lhs: MLXArray, y: MLXArray, inverse: MLXArray, scores: MLXArray, addend: MLXArray,
+        k: Int, norm: RMSNorm
+    ) -> (MLXArray, MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
+            lhs.dtype == .bfloat16, addend.shape == lhs.shape, addend.dtype == .bfloat16,
+            (1...8).contains(k), y.dtype == .bfloat16, y.size == lhs.dim(1) * k * 2688,
+            inverse.dtype == .uint32, inverse.size == lhs.dim(1) * k,
+            scores.dtype == .float32, scores.size == inverse.size,
+            type(of: norm) == RMSNorm.self,
+            norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let result = moeJoinKernel(
+            [lhs, y, inverse, scores, addend, norm.weight, UInt32(lhs.dim(2)), norm.eps],
+            template: [("T", DType.bfloat16), ("K", k)],
+            grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): each MoE
+/// block's join with the next block's norm (norm_f after the last block)
+/// rides the combine-add launch (`NemotronHResidualRMSNorm.applyMoEJoin`), one
+/// launch per row instead of the combine add and the residual + norm launch,
+/// and the MoE output is no longer stored and reloaded (23 launches per seed;
+/// only where the combine add runs, L > 10 rows). `qualify` checks the
+/// (residual, normalized) pair bitwise against the stock graph (unsort
+/// gather, score multiply, K-way sum, astype, shared add, residual add,
+/// rms_norm) and against the two launches it replaces, for every norm these
+/// joins use, on seeded rows at L = 488, 300 and 9 with special values in the
+/// expert rows, the shared output and the residual, and zero and unit scores.
+/// NEMOTRON_PREFILL_MOE_JOIN=0 keeps the two launches.
+enum NemotronPrefillMoEJoin {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_MOE_JOIN"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill moe join: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled, NemotronPrefillCombineAdd.verified else {
+            return report("off (setting)")
+        }
+        guard let backbone = target.modules().compactMap({ $0 as? NemotronHBackbone }).first,
+              let moe = backbone.layers.lazy.compactMap({ $0.mixer as? NemotronHMoE }).first
+        else { return report("off (no MoE block)") }
+        let layers = backbone.layers
+        // The norm of each MoE block's join: the next block's, norm_f after the last.
+        let norms = layers.indices.filter { layers[$0].blockType == .moe }
+            .map { $0 + 1 < layers.count ? layers[$0 + 1].norm : backbone.normF }
+        let (k, width) = (moe.numExpertsPerTok, backbone.normF.weight.dim(0))
+        // +-0, +-inf, +-NaN, +-subnormal, +-max, 1 (BF16 bits).
+        let specials: [UInt16] = [
+            0x0000, 0x8000, 0x7f80, 0xff80, 0x7fc0, 0xffc0, 0x0001, 0x8001, 0x7f7f, 0xff7f, 0x3f80,
+        ]
+        func equal(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+        }
+        var checked = 0
+        var failure = "outputs differ"
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, rows) in [488, 300, 9].enumerated() {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x30e1_0000 + index)), into: 5)
+                    // Special j goes to row 3j of the residual, slot j % k of row
+                    // 3j + 1 of the expert rows and row 3j + 2 of the shared output
+                    // (one per row: a row's norm reads it whole); later rows stay clean.
+                    let count = min(specials.count, (rows - 1) / 3)
+                    func mark(_ a: MLXArray, column: Int, at row: (Int) -> Int) -> MLXArray {
+                        var value = [UInt16](repeating: 0, count: a.size / width)
+                        var hit = [Bool](repeating: false, count: value.count)
+                        for j in 0 ..< count {
+                            value[row(j)] = specials[j]
+                            hit[row(j)] = true
+                        }
+                        let columns = MLXArray(0 ..< width).reshaped(1, width) .== MLXArray(Int32(column))
+                        return which(MLXArray(hit).reshaped(-1, 1) .&& columns,
+                                     MLXArray(value).view(dtype: .bfloat16).reshaped(-1, 1),
+                                     a.reshaped(-1, width)).reshaped(a.shape)
+                    }
+                    let lhs = mark(MLXRandom.normal([1, rows, width], dtype: .bfloat16, scale: 8, key: keys[0]),
+                                   column: 7) { 3 * $0 }
+                    let unsorted = mark(MLXRandom.normal([rows * k, width], dtype: .bfloat16, scale: 4,
+                                                         key: keys[1]),
+                                        column: 1001) { (3 * $0 + 1) * k + $0 % k }
+                    let addend = mark(MLXRandom.normal([1, rows, width], dtype: .bfloat16, scale: 4,
+                                                       key: keys[2]),
+                                      column: 2002) { 3 * $0 + 2 }
+                    // The slot holding an expert-row special weighs it 0 (odd j) or 1 (even j).
+                    var weight = [Float](repeating: 0, count: rows * k)
+                    var weighted = [Bool](repeating: false, count: rows * k)
+                    for j in 0 ..< count {
+                        weight[(3 * j + 1) * k + j % k] = j % 2 == 0 ? 1 : 0
+                        weighted[(3 * j + 1) * k + j % k] = true
+                    }
+                    let scores = which(MLXArray(weighted).reshaped(1, rows, k), MLXArray(weight).reshaped(1, rows, k),
+                                       MLXRandom.uniform(0 ..< 1, [1, rows, k], key: keys[3]))
+                    // Sorted row i holds slot order[i]; slot s sits at sorted row inverse[s].
+                    let order = argSort(MLXRandom.uniform(0 ..< 1, [rows * k], key: keys[4]))
+                    let inverse = argSort(order).asType(.uint32)
+                    let y = unsorted[order]
+                    // Stock graph: unsort gather, fp32 score multiply, K-way sum,
+                    // astype, the MoE's shared add, then the block's residual add.
+                    let routed = (y[inverse].reshaped(1, rows, k, width) * scores[.ellipsis, .newAxis])
+                        .sum(axis: -2).asType(.bfloat16)
+                    let residual = lhs + (routed + addend)
+                    // The launches the join replaces: combine add, then residual + norm.
+                    let combined = NemotronHPrefillKernels.shared.combineAdd(
+                        [y, inverse, scores, width, addend], template: [("T", DType.bfloat16), ("K", k)],
+                        grid: (width / 4, rows, 1), threadGroup: (32, 1, 1),
+                        outputShapes: [[1, rows, width]], outputDTypes: [.bfloat16])[0]
+                    eval(lhs, y, inverse, scores, addend, residual, combined)
+                    for norm in norms {
+                        guard let fused = NemotronHResidualRMSNorm.applyMoEJoin(
+                                  lhs, y: y, inverse: inverse, scores: scores, addend: addend, k: k, norm: norm),
+                              let launches = NemotronHResidualRMSNorm.apply(lhs, combined, norm: norm)
+                        else {
+                            failure = "a launch refused the shapes"
+                            return false
+                        }
+                        if !(equal(fused.0, residual) .&& equal(fused.1, norm(residual))).item(Bool.self) {
+                            failure = "outputs differ from the stock graph"
+                            return false
+                        }
+                        if !(equal(fused.0, launches.0) .&& equal(fused.1, launches.1)).item(Bool.self) {
+                            failure = "outputs differ from combine add + residual norm"
+                            return false
+                        }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)" : "off (\(failure) after \(checked) cases)")
+    }
+}
+
+/// Seed-only: `dtxDecayT4` (float4 rows, 32 x 64 tiles) in place of
+/// `dtxDecayT` when the rows are contiguous and 16-byte aligned; `qualify`
+/// checks it bit for bit. NEMOTRON_PREFILL_DTX_DECAY_VEC=0 keeps `dtxDecayT`.
+enum NemotronPrefillDtxDecay4 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_DTX_DECAY_VEC"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func usable(_ dtx: MLXArray, n: Int, dh: Int) -> Bool {
+        verified && dh == 64 && dtx.ndim == 4 && dtx.strides[3] == 1 && dtx.strides[2] % 4 == 0
+            && dtx.strides[1] % 4 == 0 && dtx.strides[0] % 4 == 0
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill dtx decay vec: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        let (h, g, dh) = (64, 8, 64)
+        var same = MLXArray(true)
+        for (seed, (n, l, start)) in [(256, 488, 0), (232, 488, 256), (17, 17, 0), (100, 300, 200)].enumerated() {
+            let key = MLXRandom.split(key: MLXRandom.key(UInt64(0xd7c4 + seed)), into: 2)
+            let full = MLXRandom.normal([1, l, h, dh], key: key[0])
+            let dtx = full[0..., start ..< (start + n), 0..., 0...]
+            let last = MLX.exp(-MLX.abs(MLXRandom.normal([1, h, 1, n], key: key[1])))
+            let a = NemotronHScanKernels.shared.dtxDecayT(
+                [dtx, last, n], template: [("H", h), ("DH", dh)],
+                grid: (((n + 31) / 32) * 32, dh / 32 * 8, h), threadGroup: (32, 8, 1),
+                outputShapes: [[1, g, h / g, dh, n]], outputDTypes: [.float32])[0]
+            let b = NemotronHScanKernels.shared.dtxDecayT4(
+                [dtx, last, n], template: [("H", h), ("DH", dh)],
+                grid: (((n + 31) / 32) * 256, 1, h), threadGroup: (256, 1, 1),
+                outputShapes: [[1, g, h / g, dh, n]], outputDTypes: [.float32])[0]
+            same = same .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+            eval(same)
+        }
+        verified = same.item(Bool.self)
+        report(verified ? "on (4 cases bitwise equal)" : "off (differs from dtxDecayT)")
+    }
+}
+
+/// Seed-only: a fresh request's first scan window has an all +0.0 input
+/// state, so the window output's `state . C` term is +0.0 for every (token,
+/// row) and `windowOutFinal` reduces to its epilogue. `qualify` checks the
+/// shortcut against `windowOutFinal` on the zero state view, bit for bit.
+/// NEMOTRON_PREFILL_FRESH_WINDOW_OUT=0 keeps `windowOutFinal`.
+enum NemotronPrefillFreshWindowOut {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FRESH_WINDOW_OUT"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func apply(y: MLXArray, ec: MLXArray, n: Int, x: MLXArray, D: MLXArray, lt: Int) -> MLXArray {
+        let (b, _, h, dh) = x.shape4
+        return NemotronHScanKernels.shared.windowOutFresh(
+            [y, ec, n, x, D],
+            template: [("OT", x.dtype), ("H", h), ("DH", dh), ("LT", lt)],
+            grid: (dh / 4, n, b * h), threadGroup: (dh / 4, max(1, 1024 / dh), 1),
+            outputShapes: [[b, lt, h, dh]], outputDTypes: [x.dtype])[0]
+    }
+
+    static func qualify() {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill fresh window out: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled, NemotronHPrefillX5.ssmEpilogue else {
+            return report("off (setting)")
+        }
+        let (h, g, dh, d) = (64, 8, 64, 128)
+        var ok = MLXArray(true)
+        var cases = 0
+        for (seed, (n, l)) in [(256, 488), (256, 300), (100, 100), (488, 488)].enumerated() {
+            let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x5eed + seed)), into: 5)
+            let C = (MLXRandom.normal([1, n, g, d], key: key[0]) * Float(1 + seed)).asType(.bfloat16)
+            let y = MLXRandom.normal([1, h, n, dh], key: key[1]) * Float(1 + seed)
+            let ec = MLX.exp(-MLX.abs(MLXRandom.normal([1, n, h], key: key[2])))
+            let x = MLXRandom.normal([1, l, h, dh], key: key[3]).asType(.bfloat16)
+            let D = MLXRandom.normal([h], key: key[4]).asType(.bfloat16)
+            let last = n == l
+            let state = NemotronMambaZeroState.view([1, h, dh, d], dtype: .float32)
+            let stock = NemotronHScanKernels.shared.windowOutFinal(
+                [state, C, y, ec, n, x, D, C, 0, 0],
+                template: [("CT", C.dtype), ("OT", x.dtype), ("H", h), ("R", h / g),
+                           ("DH", dh), ("TC", 32), ("LT", last ? l : n), ("COPY", false)],
+                grid: (dh / 32 * 128, (n + 31) / 32, h), threadGroup: (128, 1, 1),
+                outputShapes: [[1, last ? l : n, h, dh]], outputDTypes: [x.dtype])[0]
+            let fresh = apply(y: y, ec: ec, n: n, x: x, D: D, lt: last ? l : n)
+            ok = MLX.logicalAnd(ok, (stock.view(dtype: .uint16) .== fresh.view(dtype: .uint16)).all())
+            eval(ok)
+            cases += 1
+        }
+        verified = ok.item(Bool.self)
+        report(verified ? "on (\(cases) cases bitwise equal)" : "off (differs from the window output kernel)")
+    }
 }
 
 /// Fresh-request Mamba prefill: a request with no recurrent input state
@@ -2018,11 +3688,7 @@ enum NemotronPrefillConvDt {
         }
         """
 
-    static let kernel = MLXFast.metalKernel(
-        name: "nemotron_prefill_conv_silu_dt",
-        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A"],
-        outputNames: ["out", "hist", "dtA", "dtx"],
-        source: """
+    static let source = """
             const int is1 = int(input_strides[1]), is2 = int(input_strides[2]);
             const int os1 = int(oldState_strides[1]), os2 = int(oldState_strides[2]);
             const int ws0 = int(weight_strides[0]), ws1 = int(weight_strides[1]);
@@ -2072,6 +3738,183 @@ enum NemotronPrefillConvDt {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 const float dtv = tdt[(channel - c0) / DH];
                 dtx[position * (H * DH) + channel] = dtv * static_cast<float>(o);
+            }
+            """
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_prefill_conv_silu_dt",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A"],
+        outputNames: ["out", "hist", "dtA", "dtx"],
+        source: source, header: header, ensureRowContiguous: false)
+
+    /// The same launch also writing B for the scan windows' state product
+    /// (`bf32Verified`): per window w the contiguous f32 [G, n_w, DS] block
+    /// at offset start_w * G * DS of a flat buffer. NEMOTRON_PREFILL_BF32=0
+    /// keeps the stock promotion copies.
+    static let bf32Enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_BF32"] != "0"
+    nonisolated(unsafe) static var bf32Verified = false
+    static let kernelB = MLXFast.metalKernel(
+        name: "nemotron_prefill_conv_silu_dt_b",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A"],
+        outputNames: ["out", "hist", "dtA", "dtx", "bf32"],
+        source: """
+            const int is1 = int(input_strides[1]), is2 = int(input_strides[2]);
+            const int os1 = int(oldState_strides[1]), os2 = int(oldState_strides[2]);
+            const int ws0 = int(weight_strides[0]), ws1 = int(weight_strides[1]);
+            const int ds1 = int(dtIn_strides[1]), ds2 = int(dtIn_strides[2]);
+            int channel = int(thread_position_in_grid.x);
+            int position = int(thread_position_in_grid.y);
+            if (channel >= C) {
+                int head = channel - C;
+                if (head >= H) return;
+                float dtv = nemotron_prefill_dt(
+                    static_cast<float>(dtIn[position * ds1 + head * ds2])
+                    + static_cast<float>(dtBias[head * dtBias_strides[0]]), dtLo, dtHi);
+                dtA[position * H + head] = dtv * A[head * A_strides[0]];
+                return;
+            }
+            if (position >= L - 3) {
+                hist[(position - (L - 3)) * C + channel] =
+                    input[position * is1 + channel * is2];
+            }
+            float acc = 0;
+            for (int i = 0; i < 4; ++i) {
+                int row = position + int(i);
+                T value = row < 3
+                    ? oldState[row * os1 + channel * os2]
+                    : input[(row - 3) * is1 + channel * is2];
+                acc += static_cast<float>(value)
+                    * weight[channel * ws0 + int(i) * ws1];
+            }
+            T convolved = static_cast<T>(acc);
+            T x = convolved + bias[channel * bias_strides[0]];
+            auto y = 1 / (1 + metal::exp(metal::abs(x)));
+            T sigmoid = x < 0 ? y : 1 - y;
+            T o = x * sigmoid;
+            out[position * C + channel] = o;
+            if (channel >= H * DH && channel < H * DH + G * DS) {
+                // B as the f32 [G, n, DS] block of its scan window, the
+                // contiguous array astype(f32) makes of the state product's
+                // swapped / reshaped BF16 B (same values, same layout).
+                const int cb = channel - H * DH;
+                const int w0 = (position / STEP) * STEP;
+                const int nw = min(STEP, L - w0);
+                bf32[size_t(w0) * (G * DS) + size_t(cb / DS) * nw * DS
+                     + size_t(position - w0) * DS + (cb % DS)] = static_cast<float>(o);
+            }
+            // x threadgroups (uniform: C and H * DH are multiples of the
+            // 256-thread group): the group's 256 / DH heads' dt once each.
+            const int c0 = int(threadgroup_position_in_grid.x) * 256;
+            if (c0 < H * DH) {
+                threadgroup float tdt[256 / DH];
+                const uint lt = thread_position_in_threadgroup.x;
+                if (lt < 256 / DH) {
+                    const int head = c0 / DH + int(lt);
+                    tdt[lt] = nemotron_prefill_dt(
+                        static_cast<float>(dtIn[position * ds1 + head * ds2])
+                        + static_cast<float>(dtBias[head * dtBias_strides[0]]), dtLo, dtHi);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float dtv = tdt[(channel - c0) / DH];
+                dtx[position * (H * DH) + channel] = dtv * static_cast<float>(o);
+            }
+            """, header: header, ensureRowContiguous: false)
+
+    /// kernelB with four consecutive channels per thread: the input rows,
+    /// weights and bias read as 4-element vectors (contiguous channels) and
+    /// out, dtx and the f32 B block written as 4-element vectors. Every
+    /// channel's statements are kernelB's. Seed only (`b4Verified`).
+    /// NEMOTRON_PREFILL_CONV_DT_VEC=0 keeps kernelB.
+    static let b4Enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_CONV_DT_VEC"] != "0"
+    nonisolated(unsafe) static var b4Verified = false
+    nonisolated(unsafe) static var testingB4 = false
+    static let kernelB4 = MLXFast.metalKernel(
+        name: "nemotron_prefill_conv_silu_dt_b4",
+        inputNames: ["oldState", "input", "weight", "bias", "dtIn", "dtBias", "dtLo", "dtHi", "A"],
+        outputNames: ["out", "hist", "dtA", "dtx", "bf32"],
+        source: """
+            const int is1 = int(input_strides[1]), is2 = int(input_strides[2]);
+            const int os1 = int(oldState_strides[1]), os2 = int(oldState_strides[2]);
+            const int ws0 = int(weight_strides[0]), ws1 = int(weight_strides[1]);
+            const int ds1 = int(dtIn_strides[1]), ds2 = int(dtIn_strides[2]);
+            const int quad = int(thread_position_in_grid.x);
+            const int position = int(thread_position_in_grid.y);
+            if (quad >= C / 4) {
+                int head = quad - C / 4;
+                if (head >= H) return;
+                float dtv = nemotron_prefill_dt(
+                    static_cast<float>(dtIn[position * ds1 + head * ds2])
+                    + static_cast<float>(dtBias[head * dtBias_strides[0]]), dtLo, dtHi);
+                dtA[position * H + head] = dtv * A[head * A_strides[0]];
+                return;
+            }
+            const int ch0 = quad * 4;
+            T rows[4][4];
+            for (int i = 0; i < 4; ++i) {
+                int row = position + i;
+                if (row < 3) {
+                    for (int u = 0; u < 4; ++u) {
+                        rows[i][u] = oldState[row * os1 + (ch0 + u) * os2];
+                    }
+                } else if (is2 == 1) {
+                    const vec<T, 4> r4 = *((const device vec<T, 4>*)(input + (row - 3) * is1 + ch0));
+                    for (int u = 0; u < 4; ++u) {
+                        rows[i][u] = r4[u];
+                    }
+                } else {
+                    for (int u = 0; u < 4; ++u) {
+                        rows[i][u] = input[(row - 3) * is1 + (ch0 + u) * is2];
+                    }
+                }
+            }
+            if (position >= L - 3) {
+                for (int u = 0; u < 4; ++u) {
+                    hist[(position - (L - 3)) * C + ch0 + u] = input[position * is1 + (ch0 + u) * is2];
+                }
+            }
+            vec<T, 4> o4;
+            for (int u = 0; u < 4; ++u) {
+                const int channel = ch0 + u;
+                float acc = 0;
+                for (int i = 0; i < 4; ++i) {
+                    T value = rows[i][u];
+                    acc += static_cast<float>(value)
+                        * weight[channel * ws0 + int(i) * ws1];
+                }
+                T convolved = static_cast<T>(acc);
+                T x = convolved + bias[channel * bias_strides[0]];
+                auto y = 1 / (1 + metal::exp(metal::abs(x)));
+                T sigmoid = x < 0 ? y : 1 - y;
+                T o = x * sigmoid;
+                o4[u] = o;
+            }
+            *((device vec<T, 4>*)(out + position * C + ch0)) = o4;
+            if (ch0 >= H * DH && ch0 < H * DH + G * DS) {
+                const int cb = ch0 - H * DH;
+                const int w0 = (position / STEP) * STEP;
+                const int nw = min(STEP, L - w0);
+                *((device float4*)(bf32 + size_t(w0) * (G * DS) + size_t(cb / DS) * nw * DS
+                     + size_t(position - w0) * DS + (cb % DS))) =
+                    float4(static_cast<float>(o4[0]), static_cast<float>(o4[1]),
+                           static_cast<float>(o4[2]), static_cast<float>(o4[3]));
+            }
+            // x threadgroups of 256 threads cover 1024 channels (uniform: C and
+            // H * DH are multiples of 1024): the group's 1024 / DH heads' dt.
+            const int c0 = int(threadgroup_position_in_grid.x) * 1024;
+            if (c0 < H * DH) {
+                threadgroup float tdt[1024 / DH];
+                const uint lt = thread_position_in_threadgroup.x;
+                if (lt < 1024 / DH) {
+                    const int head = c0 / DH + int(lt);
+                    tdt[lt] = nemotron_prefill_dt(
+                        static_cast<float>(dtIn[position * ds1 + head * ds2])
+                        + static_cast<float>(dtBias[head * dtBias_strides[0]]), dtLo, dtHi);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                const float dtv = tdt[(ch0 - c0) / DH];
+                *((device float4*)(dtx + position * (H * DH) + ch0)) =
+                    float4(dtv * static_cast<float>(o4[0]), dtv * static_cast<float>(o4[1]),
+                           dtv * static_cast<float>(o4[2]), dtv * static_cast<float>(o4[3]));
             }
             """, header: header, ensureRowContiguous: false)
 
@@ -2127,7 +3970,123 @@ enum NemotronPrefillConvDt {
         }
         report(verified ? "on (\(checked) cases bitwise equal)"
                         : "off (outputs differ from the stock graph after \(checked) cases)")
+        qualifyB(firstMixer, lastMixer)
     }
+
+    /// B buffer check: the B-writing launch's four outputs equal the plain
+    /// launch's, every window block equals astype(f32) of the stock swapped /
+    /// reshaped BF16 B, and the state-product matmul on it is bitwise the
+    /// matmul on the BF16 view (the stock promotion path).
+    private static func qualifyB(_ mixers: NemotronHMamba2Mixer...) {
+        bf32Verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill b f32: \(message)\n".utf8))
+        }
+        guard verified, bf32Enabled else { return report("off (setting)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (mi, mixer) in mixers.enumerated() {
+                    for (ci, (length, fresh)) in [(488, true), (300, false), (9, true), (257, true)].enumerated() {
+                        let seed = UInt64(0x7b32_0000 + mi * 64 + ci)
+                        let width = mixer.intermediateSize + mixer.convDim + mixer.numHeads
+                        let projected = MLXRandom.normal(
+                            [1, length, width + 5], dtype: .bfloat16, scale: 2, key: MLXRandom.key(seed))
+                        let input = projected[
+                            0..., 0..., mixer.intermediateSize ..< (mixer.intermediateSize + mixer.convDim)]
+                        let dt = projected[0..., 0..., (mixer.intermediateSize + mixer.convDim) ..< width]
+                        let oldState = fresh
+                            ? NemotronMambaZeroState.view([1, 3, mixer.convDim], dtype: .bfloat16)
+                            : MLXRandom.normal(
+                                [1, 3, mixer.convDim], dtype: .bfloat16, key: MLXRandom.key(seed + 1))
+                        guard let plain = mixer.prefillConvDt(oldState, input, dt),
+                              let withB = mixer.prefillConvDt(oldState, input, dt, writeB: true),
+                              let bf32 = withB.4
+                        else { return false }
+                        var same = MLXArray(true)
+                        for (a, b) in [(withB.0, plain.0), (withB.1, plain.1)] {
+                            same = same .&& (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                        }
+                        for (a, b) in [(withB.2, plain.2), (withB.3, plain.3)] {
+                            same = same .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                        }
+                        let (g, d) = (mixer.numGroups, mixer.ssmStateSize)
+                        let B = split(plain.0, indices: [mixer.intermediateSize, mixer.intermediateSize + g * d],
+                                      axis: -1)[1].reshaped(1, length, g, d)
+                        for start in stride(from: 0, to: length, by: 256) {
+                            let end = min(start + 256, length), n = end - start
+                            let stepB = MLX.transposed(B[0..., start ..< end, 0..., 0...], axes: [0, 2, 3, 1])
+                            let groupedB = stepB.swappedAxes(2, 3).reshaped(1, g, 1, n, d)
+                            let mine = nemotronPrefillBF32Window(bf32, start: start, end: end, groups: g, state: d)
+                            same = same .&& (mine.view(dtype: .uint32)
+                                .== groupedB.asType(.float32).view(dtype: .uint32)).all()
+                            let dtxd = MLXRandom.normal([1, g, mixer.numHeads / g, mixer.headDim, n],
+                                                        key: MLXRandom.key(seed + UInt64(10 + start)))
+                            same = same .&& (dtxd.matmul(mine).view(dtype: .uint32)
+                                .== dtxd.matmul(groupedB).view(dtype: .uint32)).all()
+                        }
+                        if !same.item(Bool.self) { return false }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            bf32Verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(bf32Verified ? "on (\(checked) cases bitwise equal, matmul included)"
+                            : "off (outputs differ after \(checked) cases)")
+        qualifyB4(mixers)
+    }
+
+    /// kernelB4 against kernelB, all five outputs bit for bit, on the same
+    /// seeded cases as `qualifyB`.
+    private static func qualifyB4(_ mixers: [NemotronHMamba2Mixer]) {
+        b4Verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill conv dt vec4: \(message)\n".utf8))
+        }
+        guard bf32Verified, b4Enabled else { return report("off (setting)") }
+        var checked = 0
+        var same = MLXArray(true)
+        for (mi, mixer) in mixers.enumerated() {
+            for (ci, (length, fresh)) in [(488, true), (300, false), (9, true), (257, true)].enumerated() {
+                let seed = UInt64(0x7b34_0000 + mi * 64 + ci)
+                let width = mixer.intermediateSize + mixer.convDim + mixer.numHeads
+                let projected = MLXRandom.normal(
+                    [1, length, width + 5], dtype: .bfloat16, scale: 2, key: MLXRandom.key(seed))
+                let input = projected[0..., 0..., mixer.intermediateSize ..< (mixer.intermediateSize + mixer.convDim)]
+                let dt = projected[0..., 0..., (mixer.intermediateSize + mixer.convDim) ..< width]
+                let oldState = fresh
+                    ? NemotronMambaZeroState.view([1, 3, mixer.convDim], dtype: .bfloat16)
+                    : MLXRandom.normal([1, 3, mixer.convDim], dtype: .bfloat16, key: MLXRandom.key(seed + 1))
+                guard let a = mixer.prefillConvDt(oldState, input, dt, writeB: true), let aB = a.4 else {
+                    return report("off (shapes)")
+                }
+                testingB4 = true
+                let b = mixer.prefillConvDt(oldState, input, dt, writeB: true)
+                testingB4 = false
+                guard let b, let bB = b.4 else { return report("off (shapes)") }
+                for (u, w) in [(a.0, b.0), (a.1, b.1)] {
+                    same = same .&& (u.view(dtype: .uint16) .== w.view(dtype: .uint16)).all()
+                }
+                for (u, w) in [(a.2, b.2), (a.3, b.3), (aB, bB)] {
+                    same = same .&& (u.view(dtype: .uint32) .== w.view(dtype: .uint32)).all()
+                }
+                eval(same)
+                checked += 1
+            }
+        }
+        b4Verified = same.item(Bool.self)
+        report(b4Verified ? "on (\(checked) cases bitwise equal)" : "off (differs from kernelB)")
+    }
+}
+
+/// Window [start, end) of the B buffer `NemotronPrefillConvDt.kernelB`
+/// writes, as the contiguous [1, G, 1, n, DS] f32 array.
+func nemotronPrefillBF32Window(_ flat: MLXArray, start: Int, end: Int, groups: Int, state: Int) -> MLXArray {
+    flat[(start * groups * state) ..< (end * groups * state)].reshaped(1, groups, 1, end - start, state)
 }
 
 class NemotronHMamba2Mixer: Module, NemotronHMixer {
@@ -2150,6 +4109,22 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
+    /// Seed only: `-exp(A_log)` as FP32, evaluated once on the first request
+    /// prefill (the same three operations as `prefillConvDt`'s graph, so the
+    /// same values) instead of three launches per request.
+    /// NEMOTRON_PREFILL_SEED_DECAY_A=0 keeps them per request.
+    private final class SeedDecayA: @unchecked Sendable { var value: MLXArray? }
+    private let cachedSeedDecayA = SeedDecayA()
+    private static let seedDecayAEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SEED_DECAY_A"] != "0"
+    private var seedDecayA: MLXArray? {
+        guard Self.seedDecayAEnabled, NemotronHPrefillX5.active else { return nil }
+        if let value = cachedSeedDecayA.value { return value }
+        let value = -MLX.exp(aLog).asType(.float32)
+        eval(value)
+        cachedSeedDecayA.value = value
+        return value
+    }
     @ParameterInfo(key: "D") var D: MLXArray
 
     @ModuleInfo(key: "norm") var norm: NemotronHRMSNormGated
@@ -2199,8 +4174,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     /// `NemotronPrefillConvDt` for a [1, L > 8] request prefill: (SiLU conv
     /// output, conv history [1, 3, C], dtA [1, L, H], dtx [1, L, H, Dh]);
     /// nil when the shapes or dtypes are not the kernel's.
-    func prefillConvDt(_ oldState: MLXArray, _ input: MLXArray, _ dt: MLXArray)
-        -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+    func prefillConvDt(_ oldState: MLXArray, _ input: MLXArray, _ dt: MLXArray, writeB: Bool = false)
+        -> (MLXArray, MLXArray, MLXArray, MLXArray, MLXArray?)? {
         guard convKernelSize == 4, oldState.shape == [1, 3, convDim],
             input.ndim == 3, input.dim(0) == 1, input.dim(1) > 8,
             input.dim(2) == convDim, oldState.dtype == .bfloat16, input.dtype == .bfloat16,
@@ -2216,7 +4191,24 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
         else { return nil }
         let length = input.dim(1)
-        let A = -MLX.exp(aLog).asType(.float32)
+        let A = seedDecayA ?? -MLX.exp(aLog).asType(.float32)
+        if writeB {
+            guard numGroups * ssmStateSize + intermediateSize <= convDim else { return nil }
+            // Seed only: four channels per thread (`kernelB4`).
+            let vec4 = (NemotronPrefillConvDt.b4Verified && NemotronHPrefillX5.active
+                    || NemotronPrefillConvDt.testingB4)
+                && convDim % 1024 == 0 && intermediateSize % 1024 == 0 && headDim <= 1024 && ssmStateSize % 4 == 0
+            let arrays = (vec4 ? NemotronPrefillConvDt.kernelB4 : NemotronPrefillConvDt.kernelB)(
+                [oldState, input, conv1d.weight, bias, dt, dtBias,
+                 MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), A],
+                template: [("T", DType.bfloat16), ("C", convDim), ("H", numHeads), ("DH", headDim),
+                           ("L", length), ("G", numGroups), ("DS", ssmStateSize), ("STEP", 256)],
+                grid: (vec4 ? convDim / 4 + numHeads : convDim + numHeads, length, 1), threadGroup: (256, 1, 1),
+                outputShapes: [[1, length, convDim], [1, 3, convDim], [1, length, numHeads],
+                               [1, length, numHeads, headDim], [length * numGroups * ssmStateSize]],
+                outputDTypes: [.bfloat16, .bfloat16, .float32, .float32, .float32])
+            return (arrays[0], arrays[1], arrays[2], arrays[3], arrays[4])
+        }
         let arrays = NemotronPrefillConvDt.kernel(
             [oldState, input, conv1d.weight, bias, dt, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1), A],
@@ -2226,7 +4218,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             outputShapes: [[1, length, convDim], [1, 3, convDim], [1, length, numHeads],
                            [1, length, numHeads, headDim]],
             outputDTypes: [.bfloat16, .bfloat16, .float32, .float32])
-        return (arrays[0], arrays[1], arrays[2], arrays[3])
+        return (arrays[0], arrays[1], arrays[2], arrays[3], nil)
     }
 
     /// The stock graph `prefillConvDt` replaces (for its load-time check).
@@ -2438,7 +4430,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // launch (`NemotronPrefillConvDt`, bitwise the stock graph).
         let front = NemotronPrefillConvDt.verified && NemotronHPrefillX5.active
             && hiddenStates.dim(1) > 8
-            ? prefillConvDt(convState, convInput, dt) : nil
+            ? prefillConvDt(convState, convInput, dt,
+                            writeB: NemotronPrefillConvDt.bf32Verified) : nil
         let convOutput: MLXArray
         let nextConvState: MLXArray
         if let front {
@@ -2473,7 +4466,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             ? nemotronSSMAttn(
                 x: hidden, ALog: aLog, B: B, C: C, D: D, dt: dtArray,
                 dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit,
-                prepared: front.map { (dtA: $0.2, dtx: $0.3) })
+                prepared: front.map { (dtA: $0.2, dtx: $0.3, bF32: $0.4) })
             : nemotronDecodeSSM(
             hiddenStates: hidden,
             ALog: aLog,
@@ -2600,6 +4593,24 @@ class NemotronHAttention: Module, NemotronHMixer {
             captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
+    }
+
+    /// `cbv2Projections` of one draft row (`targetQKV`) through the launch that
+    /// also stores the row's K/V into `kCache` / `vCache` ([1, 2, capacity,
+    /// 128] planes) at token `row`; nil (nothing built) when that launch does
+    /// not apply.
+    func cbv2ProjectionsWritingRow(
+        _ x: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+              let outputs = NemotronTargetQKV.applyWritingRow(
+                  x, query: wq, key: wk, value: wv, kCache: kCache, vCache: vCache,
+                  row: row, capacity: capacity)
+        else { return nil }
+        return NemotronMoELeader.selfTest
+            ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+               nemotronBitwiseOrNaN(outputs.2, wv(x)))
+            : outputs
     }
 
     /// `projections`, when given, are `cbv2Projections` of this same `x`
@@ -2739,7 +4750,16 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             }
             return nemotronR1Linear(activated.reshaped(1, 1, 3712), downProj)
         }
-        return downProj(relu2(upProj(x)))
+        // Request prefill: up projection and relu2 in one launch (`NemotronPrefillSharedUpGather`).
+        if let activated = NemotronPrefillSharedUpGather.apply(x, upProj) {
+            return downProj(activated)
+        }
+        let up = upProj(x)
+        // Request prefill: the stock relu2 in one launch (`NemotronPrefillSharedRelu2`).
+        if let activated = NemotronPrefillSharedRelu2.apply(up) {
+            return downProj(activated)
+        }
+        return downProj(relu2(up))
     }
 
     // Protocol conformance
@@ -3008,8 +5028,9 @@ class NemotronHSwitchMLP: Module {
     /// same shape and dtype as the result) inside the request prefill, the
     /// MoE block's `y + addend` in the combine launch; `added` says whether it
     /// was applied.
-    func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, addend: MLXArray?)
-        -> (out: MLXArray, added: Bool)? {
+    func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, addend: MLXArray?,
+                            join: (residual: MLXArray, norm: RMSNorm)? = nil)
+        -> (out: MLXArray, added: Bool, normalized: MLXArray?)? {
         let k = indices.dim(-1)
         guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
               scores.shape == indices.shape,
@@ -3048,7 +5069,12 @@ class NemotronHSwitchMLP: Module {
             return lin(input, idx, sortedIndices: true)
         }
         var y: MLXArray
-        if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
+        if let tiles = runTiles, let rowsK = orderK, let q = fc1 as? QuantizedSwitchLinear,
+            let activated = NemotronPrefillDirectFC1.apply(
+                x.reshaped(tokens, 1, inputDims), q, rows: rowsK, tiles: tiles) {
+            // Seed only: fc1 reads the token rows directly; `xs` stays lazy.
+            y = activated
+        } else if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
             let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
             y = activated
         } else {
@@ -3070,17 +5096,24 @@ class NemotronHSwitchMLP: Module {
         outShape[outShape.count - 1] = inputDims
         if let addend, NemotronPrefillCombineAdd.verified, NemotronHPrefillX5.active,
            addend.shape == outShape, addend.dtype == y.dtype {
-            return (kernels.combineAdd(
+            // terrapinelf's MoE join: the block's residual add and next norm in this launch.
+            if let join, NemotronPrefillMoEJoin.verified,
+               let joined = NemotronHResidualRMSNorm.applyMoEJoin(
+                   join.residual, y: y, inverse: inverse, scores: scores, addend: addend, k: k,
+                   norm: join.norm) {
+                return (joined.0, true, joined.1)
+            }
+            return ((NemotronPrefillCombineAdd.vec4Verified ? kernels.combineAdd4 : kernels.combineAdd)(
                 [y, inverse, scores, inputDims, addend],
                 template: [("T", y.dtype), ("K", k)],
-                grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
-                outputShapes: [outShape], outputDTypes: [y.dtype])[0], true)
+                grid: (inputDims / 4, tokens, 1), threadGroup: (NemotronPrefillCombineAdd.vec4Verified ? 64 : 32, 1, 1),
+                outputShapes: [outShape], outputDTypes: [y.dtype])[0], true, nil)
         }
         return (kernels.combine(
             [y, inverse, scores, inputDims],
             template: [("T", y.dtype), ("K", k)],
             grid: (inputDims / 4, tokens, 1), threadGroup: (32, 1, 1),
-            outputShapes: [outShape], outputDTypes: [y.dtype])[0], false)
+            outputShapes: [outShape], outputDTypes: [y.dtype])[0], false, nil)
     }
 
     func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
@@ -3114,9 +5147,11 @@ private final class NemotronHPrefillKernels: Sendable {
     let inversePermutation: MLXFast.MLXFastKernel
     let countingSort: MLXFast.MLXFastKernel
     let countingSortChunked: MLXFast.MLXFastKernel
+    let relu2v4: MLXFast.MLXFastKernel
     let relu2: MLXFast.MLXFastKernel
     let combine: MLXFast.MLXFastKernel
     let combineAdd: MLXFast.MLXFastKernel
+    let combineAdd4: MLXFast.MLXFastKernel
     private init() {
         // Stable counting sort of expert ids (MLX argsort is a stable merge
         // sort, so ties keep ascending flat index): one threadgroup of E*S
@@ -3358,6 +5393,23 @@ private final class NemotronHPrefillKernels: Sendable {
                 uint p = thread_position_in_grid.x;
                 inv[order[p]] = static_cast<T>(p);
             """)
+        // relu2 with four consecutive elements per thread (vector load and
+        // store); the per-element statements are relu2's.
+        relu2v4 = MLXFast.metalKernel(
+            name: "nemotron_relu2_v4",
+            inputNames: ["x"], outputNames: ["out"],
+            source: """
+                uint i = thread_position_in_grid.x * 4;
+                const vec<T, 4> v4 = *((const device vec<T, 4>*)(x + i));
+                vec<T, 4> o4;
+                for (int j = 0; j < 4; ++j) {
+                    T v = v4[j];
+                    T zero = static_cast<T>(0);
+                    T m = metal::isnan(v) ? v : (v > zero ? v : zero);
+                    o4[j] = m * m;
+                }
+                *((device vec<T, 4>*)(out + i)) = o4;
+            """)
         // Stock relu2: Maximum(x, 0) (NaN-propagating) then Multiply(m, m), in T.
         relu2 = MLXFast.metalKernel(
             name: "nemotron_relu2",
@@ -3404,6 +5456,39 @@ private final class NemotronHPrefillKernels: Sendable {
         // `combine` followed by the MoE block's `y + shared` (the stock
         // T + T add) on each output element; seed only, after
         // `NemotronPrefillCombineAdd.qualify`.
+        // combineAdd with each row's four values read as one 4-element vector
+        // (y, addend) and written as one (out); the statements per value are
+        // combineAdd's. Rows are contiguous (row-contiguous inputs).
+        combineAdd4 = MLXFast.metalKernel(
+            name: "nemotron_moe_unsort_combine_add4",
+            inputNames: ["y", "inv", "scores", "N", "addend"], outputNames: ["out"],
+            source: """
+                uint c = thread_position_in_grid.x * 4;
+                uint t = thread_position_in_grid.y;
+                float total[4];
+                for (int k = 0; k < K; ++k) {
+                    uint src = inv[t * K + k];
+                    float s = scores[t * K + k];
+                    const vec<T, 4> row = *((const device vec<T, 4>*)(y + size_t(src) * N + c));
+                    for (int j = 0; j < 4; ++j) {
+                        float v = static_cast<float>(row[j]);
+                        float p = v * s;
+                        float a = p + 0.0f;
+                        if (k == 0) {
+                            total[j] = a;
+                        } else {
+                            total[j] = a + total[j];
+                        }
+                    }
+                }
+                const vec<T, 4> a4 = *((const device vec<T, 4>*)(addend + size_t(t) * N + c));
+                vec<T, 4> o4;
+                for (int j = 0; j < 4; ++j) {
+                    const T r = static_cast<T>(total[j]);
+                    o4[j] = static_cast<T>(static_cast<float>(r) + static_cast<float>(a4[j]));
+                }
+                *((device vec<T, 4>*)(out + size_t(t) * N + c)) = o4;
+            """)
         combineAdd = MLXFast.metalKernel(
             name: "nemotron_moe_unsort_combine_add",
             inputNames: ["y", "inv", "scores", "N", "addend"], outputNames: ["out"],
@@ -3549,6 +5634,123 @@ enum NemotronPrefillCombineAdd {
         }
         report(verified ? "on (\(checked) cases bitwise equal)"
                         : "off (outputs differ from combine + add after \(checked) cases)")
+        qualifyVec4()
+    }
+
+    /// `combineAdd4` (vector loads and stores) against `combineAdd`, bit for
+    /// bit. NEMOTRON_PREFILL_COMBINE_ADD_VEC=0 keeps `combineAdd`.
+    nonisolated(unsafe) static var vec4Verified = false
+    static func qualifyVec4() {
+        vec4Verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill combine add vec4: \(message)\n".utf8))
+        }
+        guard verified, ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_COMBINE_ADD_VEC"] != "0" else {
+            return report("off (setting)")
+        }
+        let kernels = NemotronHPrefillKernels.shared
+        var same = MLXArray(true)
+        for (index, (tokens, k, n)) in [(488, 6, 2688), (97, 6, 2688), (16, 2, 64)].enumerated() {
+            let seed = UInt64(0xc0a4_0000 + index)
+            let y = MLXRandom.normal([tokens * k, n], dtype: .bfloat16, scale: 4, key: MLXRandom.key(seed))
+            let inv = argSort(MLXRandom.uniform(0 ..< 1, [tokens * k], key: MLXRandom.key(seed + 1))).asType(.uint32)
+            let scores = MLXRandom.uniform(0 ..< 1, [1, tokens, k], key: MLXRandom.key(seed + 2))
+            let addend = MLXRandom.normal([1, tokens, n], dtype: .bfloat16, scale: 4, key: MLXRandom.key(seed + 3))
+            func go(_ kernel: MLXFast.MLXFastKernel, _ tg: Int) -> MLXArray {
+                kernel([y, inv, scores, n, addend], template: [("T", DType.bfloat16), ("K", k)],
+                       grid: (n / 4, tokens, 1), threadGroup: (tg, 1, 1),
+                       outputShapes: [[1, tokens, n]], outputDTypes: [.bfloat16])[0]
+            }
+            same = same .&& (go(kernels.combineAdd, 32).view(dtype: .uint16)
+                .== go(kernels.combineAdd4, 64).view(dtype: .uint16)).all()
+            eval(same)
+        }
+        vec4Verified = same.item(Bool.self)
+        report(vec4Verified ? "on (3 cases bitwise equal)" : "off (differs from combineAdd)")
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`) shared-expert
+/// relu2: the stock `maximum(up, 0)` (the int scalar cast to T, then the
+/// NaN-propagating Maximum) and `m * m` as one `relu2` launch, the kernel the
+/// routed experts use. Replaces three launches per MoE layer and two passes
+/// over the [L, 3712] activation. `qualify` checks it bitwise against the
+/// stock chain on the target's shared up-projection of seeded rows, with
+/// signed zeros, infinities, NaN and subnormals injected.
+/// NEMOTRON_PREFILL_SHARED_RELU2=0 keeps the stock chain.
+enum NemotronPrefillSharedRelu2 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_RELU2"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// relu2 of a request-prefill shared up-projection in one launch; nil
+    /// outside the request prefill or the kernel's shapes and dtypes.
+    static func apply(_ up: MLXArray) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(up)
+    }
+
+    private static func launch(_ up: MLXArray) -> MLXArray? {
+        // Stock relu2 promotes against an int scalar; fuse only when that
+        // keeps the activation dtype (graph metadata, never evaluated).
+        guard up.ndim == 3, up.dim(0) == 1, up.dim(1) > 8,
+              up.dtype == .bfloat16 || up.dtype == .float16,
+              MLX.maximum(up, MLXArray(0)).dtype == up.dtype
+        else { return nil }
+        // Four elements per thread when the size allows (`relu2v4`, the same
+        // per-element statements). NEMOTRON_PREFILL_SHARED_RELU2_VEC=0 keeps
+        // one element per thread.
+        if up.size % 4 == 0, ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_RELU2_VEC"] != "0" {
+            return NemotronHPrefillKernels.shared.relu2v4(
+                [up], template: [("T", up.dtype)],
+                grid: (up.size / 4, 1, 1), threadGroup: (256, 1, 1),
+                outputShapes: [up.shape], outputDTypes: [up.dtype])[0]
+        }
+        return NemotronHPrefillKernels.shared.relu2(
+            [up], template: [("T", up.dtype)],
+            grid: (up.size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [up.shape], outputDTypes: [up.dtype])[0]
+    }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill shared relu2: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.enabled else { return report("off (setting)") }
+        guard let moe = target.modules().compactMap({ $0 as? NemotronHMoE }).first,
+              let mlp = moe.sharedExperts
+        else { return report("off (no shared expert)") }
+        // +-0, +-inf, NaN (both signs, a payload), subnormals, +-max, values
+        // whose square overflows or lands in the subnormal range, +-1.
+        let specials = MLXArray([
+            0x0000, 0x8000, 0x7f80, 0xff80, 0x7fc0, 0xffc0, 0x7f81, 0x0001, 0x8001, 0x007f,
+            0x0080, 0x7f7f, 0xff7f, 0x5f80, 0xdf80, 0x1f80, 0x9f80, 0x3f80, 0xbf80,
+        ] as [UInt16]).view(dtype: .bfloat16)
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, rows) in [488, 300, 9].enumerated() {
+                    let seed = UInt64(0x5e1a_0000 + index)
+                    let x = MLXRandom.normal([1, rows, moe.switchMLP.inputDims], scale: 2,
+                                             key: MLXRandom.key(seed)).asType(.bfloat16)
+                    var up = mlp.upProj(x)
+                    let width = up.dim(2)
+                    up = concatenated([specials, up.reshaped(-1)[specials.size...]])
+                        .reshaped(1, rows, width)
+                    guard let fused = launch(up) else { return false }
+                    let stock = relu2(up)
+                    let same = (fused.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+                    if !same.item(Bool.self) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from maximum + multiply after \(checked) cases)")
     }
 }
 
@@ -4922,6 +7124,285 @@ func nemotronRunGather(
         outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
 }
 
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`) routed fc1: the
+/// run gather reads each sorted row's token row of the MoE input through the
+/// counting sort's `orderK` instead of the expanded `xs` copy, so the `xs`
+/// gather stays lazy and is never launched. Every A-fragment element is the
+/// same BF16 value at the same fragment position (rows past the tile are
+/// zero, as `load_safe` writes them); the loader, K loop, NAX MMA sequence and
+/// typed ReLU2 store are the run gather's. Carried from newjordan's
+/// `8007c64b` (`nemotron_load_routed`), with the adaptive 32/64-row tile
+/// dispatch of the current run gather. `qualify` compares it with
+/// `nemotronRunGather` on `xs` bit for bit on the target's first MoE fc1
+/// with seeded inputs and routes. NEMOTRON_PREFILL_DIRECT_FC1=0 keeps `xs`.
+enum NemotronPrefillDirectFC1 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_DIRECT_FC1"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// The run gather header with a row-indexed A-tile load; nil if any edit
+    /// point is not found exactly once.
+    private static let header: String? = {
+        var source = nemotronRunGatherHeader
+        func swap(_ old: String, _ new: String) -> Bool {
+            guard source.components(separatedBy: old).count == 2 else { return false }
+            source = source.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        let edits: [(String, String)] = [
+            ("// Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned\n", #"""
+template <typename Tile, typename T>
+METAL_FUNC void nemotron_load_routed(
+    thread Tile& tile, const device T* const thread* rows, const int offset,
+    const short valid_rows) {
+  using Frag = typename Tile::NAXFrag_t;
+  const short2 sc = Frag::get_coord();
+  STEEL_PRAGMA_UNROLL
+  for (short mr = 0; mr < Tile::kTileRows; ++mr) {
+    STEEL_PRAGMA_UNROLL
+    for (short mc = 0; mc < Tile::kTileCols; ++mc) {
+      thread typename Tile::frag_type& values = tile.frag_at(mr, mc);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < Frag::kElemRows; ++i) {
+        const short row = mr * Frag::kFragRows + sc.y + i * Frag::kElemRowsJump;
+        if (row < valid_rows) {
+          const device T* source_row = rows[mr * Frag::kElemRows + i] + offset;
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < Frag::kElemCols; ++j) {
+            const short col = mc * Frag::kFragCols + sc.x + j;
+            values[i * Frag::kElemCols + j] = static_cast<T>(source_row[col]);
+          }
+        } else {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < Frag::kElemCols; ++j) {
+            values[i * Frag::kElemCols + j] = T(0);
+          }
+        }
+      }
+    }
+  }
+}
+
+// Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned
+
+"""#),
+            ("METAL_FUNC void nemotron_gather_qmm_runs_impl(",
+             "METAL_FUNC void nemotron_gather_qmm_runs_direct_impl("),
+            ("const device int* tiles,\n    device T* y,",
+             "const device int* tiles,\n    const device uint32_t* routed_rows,\n    device T* y,"),
+            ("x += size_t(row0) * K;", "// x is the unexpanded token rows; routed_rows maps sorted rows to them."),
+            ("const device T* xn = x + tm * K;", #"""
+const device T* xn = x;
+  const short2 row_coord = BaseNAXFrag::get_coord();
+  const device T* routed[TM * BaseNAXFrag::kElemRows];
+  STEEL_PRAGMA_UNROLL
+  for (short mr = 0; mr < TM; ++mr) {
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < BaseNAXFrag::kElemRows; ++i) {
+      const short row = mr * BaseNAXFrag::kFragRows + row_coord.y
+          + i * BaseNAXFrag::kElemRowsJump;
+      routed[mr * BaseNAXFrag::kElemRows + i] = row < sgp_sm
+          ? x + size_t(routed_rows[row0 + tm + row]) * K : x;
+    }
+  }
+"""#),
+            ("Atile.load(xn + kk1, K);", "nemotron_load_routed(Atile, routed, int(xn - x) + kk1, sgp_sm);"),
+            ("Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));",
+             "nemotron_load_routed(Atile, routed, int(xn - x) + kk1, sgp_sm);"),
+            ("Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));",
+             "nemotron_load_routed(Atile, routed, int(xn - x) + kk1, sgp_sm);"),
+        ]
+        for (old, new) in edits {
+            guard swap(old, new) else { return nil }
+        }
+        return source
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel? = NemotronPrefillDirectFC1.header.map { header in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_direct_input",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_direct_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, routed_rows, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_direct_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, routed_rows, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
+            """,
+            header: header)
+    }
+
+    /// `nemotronRunGather(xs, lin, tiles:, relu2: true)` with `xs` =
+    /// `x[rows]` (x: [tokens, 1, K]); nil outside the request prefill or the
+    /// run gather's shapes.
+    static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
+                      tiles: NemotronHRunTiles) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(x, lin, rows: rows, tiles: tiles)
+    }
+
+    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
+                               tiles: NemotronHRunTiles) -> MLXArray? {
+        guard let kernel, NemotronHPrefillX5.runGather,
+              lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
+              x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
+              MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+              rows.ndim == 1, rows.dtype == .uint32, rows.size == tiles.rows
+        else { return nil }
+        let ops = lin.nemotronGatherOperands(for: x.dtype)
+        guard !ops.hasLinearBias, let biases = ops.biases, ops.weight.dtype == .uint32,
+              ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
+        else { return nil }
+        let n = tiles.rows, k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
+        guard n >= 16, n / experts >= 4,
+              tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
+              ops.weight.dim(2) * 8 == k, k % 64 == 0,
+              ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
+        else { return nil }
+        return kernel(
+            [x, ops.weight, ops.scales, biases, tiles.tiles, rows, nOut, k],
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
+                       ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", true)],
+            grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+    }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill direct fc1: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather, NemotronPrefillCountingSort.verified else {
+            return report("off (setting)")
+        }
+        guard kernel != nil else { return report("off (run gather source not as expected)") }
+        guard let moe = target.modules().compactMap({ $0 as? NemotronHMoE }).first,
+              let fc1 = moe.switchMLP.fc1 as? QuantizedSwitchLinear
+        else { return report("off (no quantized MoE fc1)") }
+        let experts = moe.switchMLP.numExperts, k = moe.numExpertsPerTok
+        let width = moe.switchMLP.inputDims
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, (tokens, skew)) in [(488, Float(2)), (488, 0), (488, 9), (300, 4), (97, 1)].enumerated() {
+                    let seed = UInt64(0xd1f1_0000 + index)
+                    let logits = MLXRandom.normal([tokens, experts], key: MLXRandom.key(seed))
+                        + skew * MLXRandom.normal([1, experts], key: MLXRandom.key(seed + 1))
+                    let flat = argSort(-logits, axis: -1)[0..., ..<k].asType(.uint32).flattened()
+                    guard let sorted = nemotronCountingSortChunked(flat, experts: experts, k: k) else {
+                        return false
+                    }
+                    let x = MLXRandom.normal([1, tokens, width], scale: 2, key: MLXRandom.key(seed + 2))
+                        .asType(.bfloat16)
+                    let xs = MLX.expandedDimensions(x, axes: [-2, -3])
+                        .flattened(start: 0, end: -3)[sorted.orderK]
+                    guard let stock = nemotronRunGather(xs, fc1, tiles: sorted.tiles, relu2: true),
+                          let direct = launch(x.reshaped(tokens, 1, width), fc1, rows: sorted.orderK,
+                                              tiles: sorted.tiles)
+                    else { return false }
+                    let same = (direct.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+                    if !same.item(Bool.self) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from the expanded-row run gather after \(checked) cases)")
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): the shared
+/// expert's up projection and relu2 as one run-aligned NAX gather launch
+/// (`NemotronHRunGatherKernel`, typed ReLU2 store) over a single "expert" (the
+/// shared up weights) whose row tiles cover the request's tokens, instead of
+/// the quantized matmul and the relu2 launch. `qualify` compares it with
+/// `relu2(upProj(x))` bit for bit on the target's shared up projection.
+/// NEMOTRON_PREFILL_SHARED_UP_GATHER=0 keeps the two launches.
+enum NemotronPrefillSharedUpGather {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_UP_GATHER"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    static func apply(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(x, up)
+    }
+
+    private static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, let q = up as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases = q.biases,
+              x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+              q.weight.dtype == .uint32, q.weight.ndim == 2, q.scales.dtype == x.dtype, biases.dtype == x.dtype
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64],
+              biases.shape == q.scales.shape
+        else { return nil }
+        // At least three descriptors (>= 8 elements, so `tiles` stays a device
+        // buffer); a descriptor with zero rows is skipped by the kernel.
+        let used = (rows + 63) / 64
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
+        }
+        let tiles = MLXArray(desc).reshaped(count, 3)
+        let y = NemotronHRunGatherKernel.shared.kernel(
+            [x.reshaped(rows, 1, k), q.weight.expandedDimensions(axis: 0), q.scales.expandedDimensions(axis: 0),
+             biases.expandedDimensions(axis: 0), tiles, nOut, k],
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", 64), ("BN", 64), ("BK", 64),
+                       ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", true), ("RELU2", true)],
+            grid: (((nOut + 63) / 64) * 128, count, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(1, rows, nOut)
+    }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill shared up gather: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather else { return report("off (setting)") }
+        guard let moe = target.modules().compactMap({ $0 as? NemotronHMoE }).first,
+              let mlp = moe.sharedExperts
+        else { return report("off (no shared expert)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, rows) in [488, 300, 97, 64, 9 + 8].enumerated() {
+                    let x = MLXRandom.normal([1, rows, moe.switchMLP.inputDims], scale: 2,
+                                             key: MLXRandom.key(UInt64(0x5a6e_0000 + index))).asType(.bfloat16)
+                    guard let fused = launch(x, mlp.upProj) else { return false }
+                    let stock = relu2(mlp.upProj(x))
+                    let same = (fused.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+                    if !same.item(Bool.self) { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal)"
+                        : "off (outputs differ from the quantized matmul and relu2 after \(checked) cases)")
+    }
+}
+
 // MARK: - MoE
 
 class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
@@ -4955,13 +7436,25 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        cbv2Forward(x, join: nil).out
+    }
+
+    /// `callAsFunction`; with `join` (the CBv2 block's residual input and the
+    /// next block's norm) inside the request prefill, the combine launch also
+    /// applies the block's residual add and that norm
+    /// (`NemotronPrefillMoEJoin`): `out` is then the residual and
+    /// `normalized` the norm's output.
+    func cbv2Forward(_ x: MLXArray, join: (residual: MLXArray, norm: RMSNorm)?)
+        -> (out: MLXArray, normalized: MLXArray?)
+    {
         let (inds, scores) = gate(x)
         // Request prefill: the shared-expert add rides the combine launch.
         let shared: MLXArray? = NemotronPrefillCombineAdd.verified && NemotronHPrefillX5.active
             ? sharedExperts.map { $0(x) } : nil
         var y: MLXArray
         var added = false
-        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared) {
+        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared, join: join) {
+            if let normalized = fused.normalized { return (fused.out, normalized) }
             y = fused.out
             added = fused.added
         } else {
@@ -4973,7 +7466,7 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             y = y + (shared ?? sharedExperts(x))
         }
 
-        return y
+        return (y, nil)
     }
 
     // Protocol conformance
@@ -5073,8 +7566,15 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            output = captureMTP
-                ? moe.mtpForwardRows(hidden, prepared: preparedActivation) : moe(hidden)
+            if captureMTP {
+                output = moe.mtpForwardRows(hidden, prepared: preparedActivation)
+            } else {
+                // Request prefill: the combine launch also takes this block's
+                // join with the next norm (`NemotronPrefillMoEJoin`).
+                let result = moe.cbv2Forward(hidden, join: nextNorm.map { (residual: x, norm: $0) })
+                if let normalized = result.normalized { return (result.out, normalized, nil) }
+                output = result.out
+            }
         }
         if nextPreparedMoE, let nextNorm,
            let triple = NemotronHResidualRMSNorm.applyPrepared(x, output, norm: nextNorm) {
@@ -5269,6 +7769,8 @@ private class NemotronHBackbone: Module {
         var attentionIndex = 0
         var submittedPrefillChunk: MLXArray? = nil
         let prefillChunks = inputs.dim(1) > 1 && !captureMTP
+        let finalNormJoin = prefillChunks && nemotronPrefillFinalNormJoin
+            && NemotronPrefillBoundaryJoin.verified && NemotronHPrefillX5.active
         let earlyEvalInterval = prefillChunks ? nemotronPrefillEvalInterval : nemotronEarlyEvalInterval
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -5286,12 +7788,18 @@ private class NemotronHBackbone: Module {
             // The layers that hand the fused residual+norm down are unchanged:
             // they stay tied to the default spacing, so a different eval
             // interval only adds boundaries and never alters the graph.
+            // Seed request prefill: the residual + next-norm join also at the
+            // early-eval boundaries (`NemotronPrefillBoundaryJoin`).
             let suppressedNorm = nemotronEarlyEvalInterval > 0 && next < layers.count
                 && next % nemotronEarlyEvalInterval == 0
+                && !(prefillChunks && NemotronPrefillBoundaryJoin.verified && NemotronHPrefillX5.active)
             let submitsEarly = earlyEvalInterval > 0 && next < layers.count
                 && next % earlyEvalInterval == 0
+            // Seed request prefill: the last block's residual add and norm_f
+            // also take the join launch (`nemotronPrefillFinalNormJoin`).
             let nextNorm = next < layers.count && !suppressedNorm
-                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm
+                : (finalNormJoin && next == layers.count ? normF : nil)
             let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
@@ -5338,6 +7846,8 @@ private class NemotronHBackbone: Module {
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
+        // The last block's join already applied norm_f.
+        if finalNormJoin, let preparedNorm { return preparedNorm }
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
     }
 
