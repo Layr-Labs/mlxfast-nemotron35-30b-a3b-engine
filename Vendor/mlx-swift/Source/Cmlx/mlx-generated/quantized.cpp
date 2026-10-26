@@ -3161,12 +3161,3 @@ template <typename T, int group_size, int bits, bool has_global_scale = false>
 }
 
 } // namespace mlx::core::metal
-
-// Host-only immutable-backing lookup. The generated Metal source above is unchanged.
-#include "mlx/array.h"
-extern "C" void* nemotron_decode_backing(void* opaque) {
-  if (!opaque) return nullptr;
-  auto& a = *static_cast<mlx::core::array*>(opaque);
-  if (!a.is_available() || !a.data_shared_ptr()) return nullptr;
-  return a.buffer().ptr();
-}

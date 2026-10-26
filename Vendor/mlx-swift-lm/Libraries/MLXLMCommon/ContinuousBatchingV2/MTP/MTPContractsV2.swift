@@ -37,17 +37,6 @@ import MLX
 /// from logits without forcing device evaluation.
 public protocol CBv2MTPPolicyTopTwoProviding: AnyObject {
     func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray)
-    /// `cbv2MTPTopTwo` of `logits` [1, B * (1 + k), vocab] plus the flat int32
-    /// acceptance packet (drafts = window columns 1...k, top-1 ids, top-2
-    /// value bits) from the same launches. nil: not supported here.
-    func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
-        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
-}
-
-extension CBv2MTPPolicyTopTwoProviding {
-    public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
-        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
-    { nil }
 }
 
 /// Runtime availability for type-erased model adapters whose static wrapper
