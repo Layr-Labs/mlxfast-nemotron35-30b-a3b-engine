@@ -777,6 +777,7 @@ enum NemotronHCompactSSMGated {
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
         source: """
+            coherent(device) device T* published_y = (coherent(device) device T*)out;
             auto n = thread_position_in_grid.z;
             auto h_idx = n % H;
             auto g_idx = n / G;
@@ -810,7 +811,7 @@ enum NemotronHCompactSSMGated {
                 }
                 acc = simd_sum(acc);
                 if (thread_index_in_simdgroup == 0) {
-                    out[(t * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+                    published_y[(t * H + n) * Dh + d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
                 }
             }
 
@@ -849,7 +850,7 @@ enum NemotronHCompactSSMGated {
                         auto y = 1 / (1 + metal::exp(metal::abs(g)));
                         T sig = g < 0 ? y : 1 - y;
                         T activated = g * sig;
-                        T gated = out[int64_t(row) * (H * Dh) + f] * activated;
+                        T gated = published_y[int64_t(row) * (H * Dh) + f] * activated;
                         thread_x[i] = gated;
                         acc += thread_x[i] * thread_x[i];
                     }
