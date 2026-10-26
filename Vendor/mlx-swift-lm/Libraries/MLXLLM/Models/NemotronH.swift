@@ -2602,6 +2602,24 @@ class NemotronHAttention: Module, NemotronHMixer {
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
     }
 
+    /// `cbv2Projections` of one draft row (`targetQKV`) through the launch that
+    /// also stores the row's K/V into `kCache` / `vCache` ([1, 2, capacity,
+    /// 128] planes) at token `row`; nil (nothing built) when that launch does
+    /// not apply.
+    func cbv2ProjectionsWritingRow(
+        _ x: MLXArray, kCache: MLXArray, vCache: MLXArray, row: Int, capacity: Int
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard numHeads == 32, numKeyValueHeads == 2, headDim == 128,
+              let outputs = NemotronTargetQKV.applyWritingRow(
+                  x, query: wq, key: wk, value: wv, kCache: kCache, vCache: vCache,
+                  row: row, capacity: capacity)
+        else { return nil }
+        return NemotronMoELeader.selfTest
+            ? (nemotronBitwiseOrNaN(outputs.0, wq(x)), nemotronBitwiseOrNaN(outputs.1, wk(x)),
+               nemotronBitwiseOrNaN(outputs.2, wv(x)))
+            : outputs
+    }
+
     /// `projections`, when given, are `cbv2Projections` of this same `x`
     /// computed earlier (the MTP draft head queues them before its cache is final).
     func cbv2Forward(
