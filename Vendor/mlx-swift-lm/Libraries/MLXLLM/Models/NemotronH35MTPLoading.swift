@@ -78,11 +78,13 @@ extension NemotronH35MTPAssistant {
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
+        NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
+        assistant.prepareImmutableDecodeBindings()
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
@@ -329,6 +331,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let owners: [ObjectIdentifier]
     let cut: Int
     let queue = DispatchQueue(label: "nemotron.decode.memory")
+    private let standingLock = NSLock()
+    private var baseRequestsStanding = false
+    private var decodeRequestsStanding = false
     /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
     /// requests are left standing between requests.
     static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
@@ -342,6 +347,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
+    /// With target sets, the per-layer copy sets are requested on the target queue right after the extras, each
+    /// marking its layer ready when its request returns, instead of at the first verify graph.
+    static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
@@ -417,15 +425,30 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
     final class Lease: CBv2MTPMemoryLease {
         let owner: NemotronDecodeResidency
+        private let requestedBase: Bool
+        private let preenqueuedDecode: Bool
+        private var requestedDecode: Bool
         private var decoded = false
         private var finished = false
-        init(_ owner: NemotronDecodeResidency) { self.owner = owner }
+        init(_ owner: NemotronDecodeResidency, requestedBase: Bool, preenqueuedDecode: Bool = false) {
+            self.owner = owner
+            self.requestedBase = requestedBase
+            self.preenqueuedDecode = preenqueuedDecode
+            self.requestedDecode = preenqueuedDecode
+        }
         func beginDecode() {
             guard !finished else { return }
             if !decoded {
                 decoded = true
-                for (i, set) in owner.decodeSets.enumerated() {
-                    owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
+                if !requestedDecode {
+                    if !NemotronDecodeResidency.endsRequests && owner.standingRequests().decode {
+                        NemotronZSkip.markCopyReady(Array(owner.owners.dropFirst(owner.cut)))
+                    } else {
+                        requestedDecode = true
+                        for (i, set) in owner.decodeSets.enumerated() {
+                            owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
+                        }
+                    }
                 }
             }
             _ = NemotronZSkip.snapshotCopyReadiness()
@@ -435,9 +458,12 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             finished = true
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
-                // The requests stay standing; the next lease requests the same sets again.
-                owner.targetQueue.sync {}
-                owner.queue.sync { NemotronZSkip.endCopyReadiness() }
+                if requestedBase { owner.targetQueue.sync {} }
+                if (requestedDecode && !preenqueuedDecode) || (requestedBase && owner.targetSets.isEmpty) {
+                    owner.queue.sync {}
+                }
+                owner.markRequestsStanding(base: requestedBase, decode: requestedDecode)
+                NemotronZSkip.endCopyReadiness()
                 return
             }
             owner.targetQueue.sync {
@@ -445,11 +471,20 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             }
             owner.queue.sync {
                 owner.seedSet.endResidency()
-                if decoded { for set in owner.decodeSets { set.endResidency() } }
+                if requestedDecode { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
         }
         deinit { finish() }
+    }
+    private func standingRequests() -> (base: Bool, decode: Bool) {
+        standingLock.withLock { (baseRequestsStanding, decodeRequestsStanding) }
+    }
+    private func markRequestsStanding(base: Bool, decode: Bool) {
+        standingLock.withLock {
+            baseRequestsStanding = baseRequestsStanding || base
+            decodeRequestsStanding = decodeRequestsStanding || decode
+        }
     }
     private func request(_ set: any MTLResidencySet, phase: String, ready: [ObjectIdentifier]) {
         queue.async {
@@ -462,10 +497,14 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// set keeps its own queue.
     func begin() -> Lease {
         NemotronZSkip.beginCopyReadiness(owners)
+        if !Self.endsRequests && standingRequests().base {
+            NemotronZSkip.markCopyReady(Array(owners.prefix(cut)))
+            return Lease(self, requestedBase: false)
+        }
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
-            return Lease(self)
+            return Lease(self, requestedBase: true)
         }
         for set in targetSets { targetQueue.async { set.requestResidency() } }
         let head = seedSet, ready = Array(owners.prefix(cut))
@@ -474,8 +513,23 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
         for set in extraSets { targetQueue.async { set.requestResidency() } }
-        return Lease(self)
+        let preenqueuedDecode: Bool
+        if Self.copiesAfterExtras {
+            preenqueuedDecode = true
+            for (i, set) in decodeSets.enumerated() {
+                let ready = [owners[cut + i]]
+                targetQueue.async {
+                    set.requestResidency()
+                    NemotronZSkip.markCopyReady(ready)
+                }
+            }
+        } else {
+            preenqueuedDecode = false
+        }
+        return Lease(self, requestedBase: true, preenqueuedDecode: preenqueuedDecode)
     }
 }
 
 // Second measurement of ff544a18.
+
+// Third measurement entry of this tree.
