@@ -583,7 +583,8 @@ enum NemotronHEmbeddingRows {
               biases.shape == q.scales.shape, (dims / 2) % 64 == 0
         else { return nil }
         let count = tokens.dim(1)
-        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
+        return kernel([tokens.reshaped(count), NemotronBankBinding.bind(q.weight),
+                       NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(biases)],
             template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
                        ("G", dims / 64)],
             grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
@@ -4753,6 +4754,15 @@ public class NemotronHModel:
             return lmHead(hidden)
         }
         return backbone.embeddings.asLinear(hidden)
+    }
+
+    func warmDenseViews() {
+        var extra: [MLXArray] = []
+        if type(of: backbone.embeddings) == QuantizedEmbedding.self,
+           let q = backbone.embeddings as? QuantizedEmbedding {
+            extra = [q.weight, q.scales] + (q.biases.map { [$0] } ?? [])
+        }
+        NemotronBankBinding.warmDense(self, extra: extra)
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {

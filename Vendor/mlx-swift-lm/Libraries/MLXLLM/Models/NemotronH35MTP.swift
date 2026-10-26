@@ -358,6 +358,8 @@ private final class NemotronMTPDraftHead {
             }
         }
         screen = plan
+        NemotronBankBinding.warmDense(nil, extra: [plan.weight, plan.scales, plan.biases]
+            + [plan.records, plan.packed].compactMap { $0 })
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
         // well, so neither builds inside a timed window.
@@ -414,11 +416,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
             decodeResidency = NemotronDecodeResidency(
-                head: module.parameters().flattened().map { $0.1 }
+                head: NemotronZSkip.withoutCopiedDraftBanks(module)
                     + draftHead.decodeResidencyArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
-                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays)
+                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
+                    + NemotronSharedDownZSkip.copyArrays)
         }
     }
     public func beginMTPMemoryPreparation() -> (any CBv2MTPMemoryLease)? {

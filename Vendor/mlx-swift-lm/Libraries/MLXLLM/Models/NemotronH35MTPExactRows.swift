@@ -731,7 +731,8 @@ enum NemotronMambaInProjConvDt {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(dict?.index ?? q.scales),
+             dict?.table ?? NemotronBankBinding.bind(biases), packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -920,14 +921,16 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
-            return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
+            return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(d.index), d.table,
+                           packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
                 grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
         }
         let (kernel, hf, rps, nsg) = projectLaunch(rows: 3, k: k, n: n, rps: 2)
-        return kernel([q.weight, q.scales, q.biases!, packed[0], args.0, args.1],
+        return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales),
+                       NemotronBankBinding.bind(q.biases!), packed[0], args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)] + hf,
             grid: (32, n / rps, 1), threadGroup: (32, nsg, 1),
@@ -1005,13 +1008,15 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
            case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
-            return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
+            return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(d.index), d.table,
+                           packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
         }
         let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
-        return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
+        return kernel([NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales),
+                       NemotronBankBinding.bind(q.biases!), packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
@@ -1064,6 +1069,10 @@ enum NemotronSharedUpPacking {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_PACK"] != "0"
     nonisolated(unsafe) private static var verified = false
+    private static let unpackedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_UNPACKED"] != "0"
+    private static let unpackedLock = NSLock()
+    nonisolated(unsafe) private static var unpackedOwners: Set<ObjectIdentifier> = []
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_shared_up_relu2_pack_r3",
         inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
@@ -1106,7 +1115,8 @@ enum NemotronSharedUpPacking {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, input, args.0, args.1],
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(dict?.index ?? q.scales),
+             dict?.table ?? NemotronBankBinding.bind(biases), input, args.0, args.1],
             template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                        ("RELU2", true), ("RPS", 2)],
             grid: (32, n / 2, 1), threadGroup: (32, 4, 1),
@@ -1118,16 +1128,64 @@ enum NemotronSharedUpPacking {
     static func apply(_ x: MLXArray, up: Linear, down: Linear,
                       prepared: MLXArray?) -> MLXArray? {
         guard verified, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
-              let q = up as? QuantizedLinear,
-              let fused = dispatch(x.reshaped(3, x.dim(2)), q, prepared: prepared)
+              let q = up as? QuantizedLinear
         else { return nil }
+        let rows = x.reshaped(3, x.dim(2))
+        let fused: (MLXArray, MLXArray?)
+        if unpackedEnabled, NemotronSharedDownZSkip.covers(down),
+           unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) }) {
+            fused = (NemotronHeadPreparedActivation.apply(rows, q, relu2: true, rps: 2, prepared: prepared), nil)
+        } else {
+            guard let packed = dispatch(rows, q, prepared: prepared) else { return nil }
+            fused = (packed.0, packed.1)
+        }
         var activated = fused.0
         if NemotronMoELeader.selfTest {
             activated = nemotronBitwiseOrNaN(activated, NemotronHeadPreparedActivation.apply(
                 x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2, prepared: prepared))
         }
+        if let y = NemotronSharedDownZSkip.run(activated, owner: down) {
+            guard NemotronMoELeader.selfTest else { return y }
+            return nemotronBitwiseOrNaN(y, nemotronMTPLinearRows(
+                activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1))
+        }
         return nemotronMTPLinearRows(
             activated.reshaped(1, 3, q.weight.dim(0)), down, prepared: fused.1)
+    }
+
+    static func prepareUnpacked(_ model: Module) {
+        unpackedLock.withLock { unpackedOwners = [] }
+        guard unpackedEnabled, verified else { return }
+        var built: Set<ObjectIdentifier> = []
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let shared = (module as? NemotronHMoE)?.sharedExperts,
+                          NemotronSharedDownZSkip.covers(shared.downProj),
+                          let q = shared.upProj as? QuantizedLinear,
+                          !built.contains(ObjectIdentifier(q)) else { continue }
+                    let k = q.weight.dim(1) * 8
+                    let dense = MLXRandom.normal([3, k], dtype: .bfloat16,
+                        key: MLXRandom.key(UInt64(0x51a0 + built.count)))
+                    let zero = MLXArray.zeros([3, k], dtype: .bfloat16)
+                    for x in [dense, zero] {
+                        guard let old = dispatch(x, q, prepared: nil) else { return false }
+                        let new = NemotronHeadPreparedActivation.apply(x, q, relu2: true, rps: 2, prepared: nil)
+                        guard (old.0.view(dtype: .uint16) .== new.view(dtype: .uint16)).all().item(Bool.self)
+                        else { return false }
+                    }
+                    built.insert(ObjectIdentifier(q))
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        unpackedLock.withLock { unpackedOwners = accepted ? built : [] }
+        FileHandle.standardError.write(Data((accepted
+            ? "nemotron shared up unpacked on: \(built.count) owners\n"
+            : "nemotron shared up unpacked off\n").utf8))
     }
 
     static func verify(_ model: Module) {
@@ -1274,7 +1332,8 @@ enum NemotronMultiRowQMV {
         let half = rows == 3 && form != 0
         let y = (half ? NemotronMultiRowQMVKernel.shared.attentionOutputAddingHalf
                       : NemotronMultiRowQMVKernel.shared.attentionOutputAdding)(
-            [residual.reshaped(rows, 2688), q.weight, q.scales, offsets,
+            [residual.reshaped(rows, 2688), NemotronBankBinding.bind(q.weight),
+             NemotronBankBinding.bind(q.scales), NemotronBankBinding.bind(offsets),
              x.reshaped(rows, 4096), k, n],
             template: [("T", x.dtype), ("R", rows), ("FAST", true),
                        ("RELU2", false), ("RPS", rps)] + nemotronHalfTemplate(half, form),
@@ -1336,7 +1395,8 @@ enum NemotronMultiRowQMV {
         let half = rows == 1 && form != 0
         return (half ? NemotronMultiRowQMVKernel.shared.kernelHalf
                      : NemotronMultiRowQMVKernel.shared.kernel)(
-            [w, scales, biases, x, kArray, nArray],
+            [NemotronBankBinding.bind(w), NemotronBankBinding.bind(scales),
+             NemotronBankBinding.bind(biases), x, kArray, nArray],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
                        ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
             grid: (32, n / rps, 1),
@@ -1484,7 +1544,8 @@ enum NemotronMultiRowQMVRowInputs {
         // The same outputs-per-SIMD-group the stacked call picks for (R, K, N).
         let rps = NemotronMultiRowQMV.resultsPerSimdgroup(rows: rows.count, k: k, n: n)
         return kernel(rows: rows.count)(
-            [q.weight, q.scales, biases] + rows + [kArray, nArray],
+            [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales),
+             NemotronBankBinding.bind(biases)] + rows + [kArray, nArray],
             template: [("T", DType.bfloat16), ("R", rows.count), ("FAST", k % 512 == 0),
                        ("RELU2", false), ("RPS", rps)],
             grid: (32, n / rps, 1),
@@ -2200,6 +2261,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
     /// order do not depend on which rows share a threadgroup, so the gates,
@@ -2220,10 +2282,11 @@ enum NemotronMTPRouterRowsSelect {
     /// x: [1, R, 2688] bf16 (R = 1...4), weight: a row-major [128, 2688] bf16
     /// router, bias: [128] fp32. Returns (indices [1, R, 6] uint32,
     /// weights [1, R, 6] fp32), or nil outside the qualified shapes.
-    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false)
+    static func run(_ x: MLXArray, _ weight: MLXArray, bias: MLXArray, force: Bool = false,
+                    draft: Bool = false)
         -> (MLXArray, MLXArray)?
     {
-        guard enabled, force || verified, let counter,
+        guard enabled, force || verified, let counter = draft ? Self.draftCounter : Self.counter,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               x.ndim == 3, x.dim(0) == 1, (1...4).contains(x.dim(1)),
               x.dim(2) == 2688, x.dtype == .bfloat16,
@@ -2257,6 +2320,9 @@ enum NemotronMTPRouterRowsSelect {
         let zero = MLXArray.zeros([1], dtype: .uint32)
         eval(zero)
         counter = zero
+        let draftZero = MLXArray.zeros([1], dtype: .uint32)
+        eval(draftZero)
+        draftCounter = draftZero
         var ok = MLXArray(true)
         do {
             let matched = try withError { () -> Bool in
@@ -2439,7 +2505,8 @@ enum NemotronTargetQKV {
               q.scales.dtype == .bfloat16, q.scales.shape == [rows, 42],
               let offsets = q.biases, offsets.dtype == .bfloat16, offsets.shape == [rows, 42]
         else { return nil }
-        return [q.weight, q.scales, offsets]
+        return [NemotronBankBinding.bind(q.weight), NemotronBankBinding.bind(q.scales),
+                NemotronBankBinding.bind(offsets)]
     }
 
     private static func dispatch(_ weights: [MLXArray], _ x: MLXArray, rps: Int,
@@ -3080,16 +3147,19 @@ enum NemotronHeadScreen {
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
         let scores = (records.map {
             (partialHalf ? recordPartialHalfKernel : recordPartialKernel)(
-                [$0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind($0), hidden, groups, upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? packed.map {
             (partialHalf ? packedPartialHalfKernel : packedPartialKernel)(
-                [weight, $0, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+                [NemotronBankBinding.bind(weight), NemotronBankBinding.bind($0), hidden, groups,
+                 upperGroups ?? groups], template: partialTemplate,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
         } ?? (partialHalf ? partialHalfKernel : partialKernel)(
-            [weight, scales, biases, hidden, groups, upperGroups ?? groups], template: partialTemplate,
+            [NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales),
+             NemotronBankBinding.bind(biases), hidden, groups, upperGroups ?? groups],
+            template: partialTemplate,
             grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
             outputShapes: [[rows]], outputDTypes: [.float32]))[0]
         let chunks = rows / chunk
@@ -3097,7 +3167,8 @@ enum NemotronHeadScreen {
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
             let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
-                [scores, weight, scales, biases, hidden, counter],
+                [scores, NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales),
+                 NemotronBankBinding.bind(biases), hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
                            ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
                 grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
@@ -3106,7 +3177,8 @@ enum NemotronHeadScreen {
             return Result(id: picked[4], scores: scores, candidateIds: picked[0], candidateValues: picked[1])
         }
         let picked = (selectHalf ? selectHalfKernel : selectKernel)(
-            [scores, weight, scales, biases, hidden],
+            [scores, NemotronBankBinding.bind(weight), NemotronBankBinding.bind(scales),
+             NemotronBankBinding.bind(biases), hidden],
             template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups)]
                 + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),
             grid: (32, selectGroups * chunks, 1), threadGroup: (32, selectGroups, 1),
