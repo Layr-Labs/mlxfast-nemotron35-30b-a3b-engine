@@ -322,6 +322,12 @@ private func nemotronDecodeBacking(_ opaque: UnsafeMutableRawPointer) -> UnsafeM
 final class NemotronDecodeResidency: @unchecked Sendable {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DECODE_RESIDENCY"] != "0"
     static let seedLayers = 0
+    /// The head's set is requested with the decode sets at the first verify
+    /// instead of inside `begin()`, so its residency request does not run
+    /// beside the seed prefill. NEMOTRON_MTP_HEAD_RESIDENCY_AT_DECODE=0
+    /// requests it at `begin()` as before.
+    static let headAtDecode =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_RESIDENCY_AT_DECODE"] != "0"
     let arrays: [MLXArray]
     let buffers: [any MTLBuffer]
     let seedSet: any MTLResidencySet
@@ -421,6 +427,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             guard !finished else { return }
             if !decoded {
                 decoded = true
+                if NemotronDecodeResidency.headAtDecode {
+                    owner.request(owner.seedSet, phase: "seed", ready: Array(owner.owners.prefix(owner.cut)))
+                }
                 for (i, set) in owner.decodeSets.enumerated() {
                     owner.request(set, phase: "layer", ready: [owner.owners[owner.cut + i]])
                 }
@@ -435,7 +444,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 for set in owner.targetSets + owner.extraSets { set.endResidency() }
             }
             owner.queue.sync {
-                owner.seedSet.endResidency()
+                if decoded || !NemotronDecodeResidency.headAtDecode { owner.seedSet.endResidency() }
                 if decoded { for set in owner.decodeSets { set.endResidency() } }
                 NemotronZSkip.endCopyReadiness()
             }
@@ -453,7 +462,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             targetQueue.async { set.requestResidency() }
         }
         NemotronZSkip.beginCopyReadiness(owners)
-        request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+        if !Self.headAtDecode {
+            request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
+        }
         return Lease(self)
     }
 }
