@@ -272,6 +272,8 @@ extension EngineLoopV2 {
                 // while the host finishes finalize and plans the next step:
                 // let the drafter submit the next round's first draft now.
                 if CBv2MTPFirstDraftPrestage.enabled, carryShortlist == nil,
+                    (!CBv2MTPFirstDraftPrestage.skipTerminalPrefetch
+                        || rec.request.maxTokens - rec.generatedTokenCount > 1),
                     let prestager = mtp.drafter as? any CBv2MTPFirstDraftPrestaging,
                     let state = metadata.assistantState
                 {
@@ -518,6 +520,11 @@ enum CBv2MTPReadbackSpin {
 }
 
 public enum CBv2MTPFirstDraftPrestage {
+    /// The planner reserves one output for the target. Do not prepare a
+    /// later speculative round when the request cannot have room for it.
+    /// CBV2_MTP_SKIP_TERMINAL_PREFETCH=0 restores the original schedule.
+    public static let skipTerminalPrefetch =
+        ProcessInfo.processInfo.environment["CBV2_MTP_SKIP_TERMINAL_PREFETCH"] != "0"
     /// CBV2_MTP_PRESTAGE_FIRST_DRAFT=0 restores submission at round build.
     public static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_PRESTAGE_FIRST_DRAFT"] != "0"
@@ -582,6 +589,14 @@ extension EngineLoopV2 {
         defer { CBv2MTPSubmitMerge.flush() }
         for (index, row) in verify.rows.enumerated() {
             guard let state = row.assistantState else { continue }
+            // This verify emits at least one token for a continuing row.
+            // With at most two slots now, the next round has at most one;
+            // mtpDepthWithinOutputBudget therefore forbids positive depth.
+            // Missing records keep the existing lifecycle and release path.
+            if CBv2MTPFirstDraftPrestage.skipTerminalPrefetch,
+                let rec = scheduler.record(for: row.id),
+                rec.request.maxTokens - rec.generatedTokenCount <= 2
+            { continue }
             speculator.speculateAfterVerify(
                 targetTokens: targets[index ..< (index + 1)],
                 targetHidden: verify.lastHidden[index ..< (index + 1)],
