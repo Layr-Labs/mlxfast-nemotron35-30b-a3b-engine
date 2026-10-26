@@ -1591,6 +1591,9 @@ private let nemotronMTPVerifySDPASource = """
   constexpr int BD = 32;
   constexpr int qk_per_thread = D / BD;
   constexpr int v_per_thread = V / BD;
+  static_assert(qk_per_thread == 4 && v_per_thread == 4);
+  static_assert(sizeof(packed_vec<T, 4>) == 4 * sizeof(T));
+  static_assert(alignof(packed_vec<T, 4>) == alignof(T));
   int inner_k_stride = BN * int(k_seq_stride);
   int inner_v_stride = BN * int(v_seq_stride);
 
@@ -1628,8 +1631,9 @@ private let nemotronMTPVerifySDPASource = """
   out += o_offset * V + simd_gid * v_per_thread;
 
   // Read the query and 0 the output accumulator
+  const auto q4 = *reinterpret_cast<const device packed_vec<T, 4>*>(queries);
   for (int i = 0; i < qk_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+    q[i] = static_cast<U>(scale) * q4[i];
   }
   for (int i = 0; i < v_per_thread; i++) {
     o[i] = 0;
@@ -1654,8 +1658,9 @@ private let nemotronMTPVerifySDPASource = """
     }
     if (use_key) {
       // Read the key
+      const auto k4 = *reinterpret_cast<const device packed_vec<T, 4>*>(keys);
       for (int j = 0; j < qk_per_thread; j++) {
-        k[j] = keys[j];
+        k[j] = k4[j];
       }
 
       // Compute the i-th score
@@ -1677,8 +1682,9 @@ private let nemotronMTPVerifySDPASource = """
       sum_exp_score = sum_exp_score * factor + exp_score;
 
       // Update the output accumulator
+      const auto v4 = *reinterpret_cast<const device packed_vec<T, 4>*>(values);
       for (int j = 0; j < v_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
+        o[j] = o[j] * factor + exp_score * v4[j];
       }
     }
 
@@ -1736,11 +1742,13 @@ private let nemotronMTPVerifySDPAUnroll4Loop = """
       U kk[4][qk_per_thread];
       U vv[4][v_per_thread];
       for (int u = 0; u < 4; u++) {
+        const auto k4 = *reinterpret_cast<const device packed_vec<T, 4>*>(keys + u * inner_k_stride);
+        const auto v4 = *reinterpret_cast<const device packed_vec<T, 4>*>(values + u * inner_v_stride);
         for (int j = 0; j < qk_per_thread; j++) {
-          kk[u][j] = keys[u * inner_k_stride + j];
+          kk[u][j] = k4[j];
         }
         for (int j = 0; j < v_per_thread; j++) {
-          vv[u][j] = values[u * inner_v_stride + j];
+          vv[u][j] = v4[j];
         }
       }
       U key_scores[4];
