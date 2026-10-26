@@ -27,6 +27,12 @@ public enum CBv2CriticalPathCuts {
     /// cached host-built zeros array per length instead of a per-call fill.
     public static let cachedZeroSinks = on("CBV2_PAGED_CACHED_ZERO_SINKS")
 
+    /// Single-segment paged gathers (the MTP head's pool) read into a real
+    /// kernel output: no zeros fill of an in-place destination, no completion
+    /// launch, and `gather` hands out slice views of that output instead of
+    /// one Int-subscript copy per plane. Every gathered element is the same.
+    public static let segmentReadOutput = on("CBV2_PAGED_READ_OUTPUT")
+
     /// NemotronH compact verify: a strict-prefix commit replays the Mamba
     /// layers' SSM states in grouped launches (up to six layers each)
     /// instead of one launch per layer. Each layer's replay is the per-layer
