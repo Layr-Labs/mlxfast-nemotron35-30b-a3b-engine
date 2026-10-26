@@ -407,7 +407,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             set.commit()
             sets.append(set)
         }
-        self.arrays = head + layers.flatMap { $0 }
+        // MLX backing ownership prevents allocator reuse of admitted extras.
+        self.arrays = head + layers.flatMap { $0 } + (extraSets.isEmpty ? [] : extras)
         self.buffers = buffers
         self.seedSet = sets[0]
         self.decodeSets = Array(sets.dropFirst())

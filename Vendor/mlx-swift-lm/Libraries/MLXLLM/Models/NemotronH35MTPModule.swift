@@ -2,6 +2,7 @@
 // next-token embedding -> fusion -> attention -> MoE -> final norm.
 // Tensor contract cross-checked against NVIDIA's BF16 checkpoint and
 // jundot/omlx patches/mlx_lm_mtp/nemotron_h_model.py (2026-09-08).
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -191,6 +192,87 @@ enum NemotronMTPFrontNorms {
     }
 }
 
+/// Join the original private-history K/V banks outside Module state.
+final class NemotronMTPHistoryKVJoin {
+    private struct Entry {
+        let identities: [UInt]
+        let stream: StreamOrDevice
+        let snapshots: [MLXArray]
+        let banks: [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entry: Entry?
+
+    /// Evaluated banks only; a partial warm-up must not disable the other extras.
+    var residencyArrays: [MLXArray] {
+        lock.withLock {
+            guard let banks = entry?.banks, banks.allSatisfy({
+                var available = false
+                return _mlx_array_is_available(&available, $0.ctx) == 0 && available
+            }) else { return [] }
+            return banks
+        }
+    }
+
+    func apply(_ x: MLXArray, mixer: NemotronHAttention) -> (keys: MLXArray, values: MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+            x.ndim == 3, x.dim(0) == 1, (2...512).contains(x.dim(1)),
+            x.dim(2) == 2688, x.dtype == .bfloat16,
+            mixer.numKeyValueHeads == 2, mixer.headDim == 128,
+            let key = mixer.wk as? QuantizedLinear, let value = mixer.wv as? QuantizedLinear,
+            type(of: key) == QuantizedLinear.self, type(of: value) == QuantizedLinear.self,
+            key.bias == nil, value.bias == nil,
+            key.mode == .affine, value.mode == .affine,
+            key.bits == 4, value.bits == 4, key.groupSize == 64, value.groupSize == 64,
+            key.weight.shape == [256, 336], value.weight.shape == [256, 336],
+            key.weight.dtype == .uint32, value.weight.dtype == .uint32,
+            key.scales.shape == [256, 42], value.scales.shape == [256, 42],
+            key.scales.dtype == .bfloat16, value.scales.dtype == .bfloat16,
+            let keyBias = key.biases, let valueBias = value.biases,
+            keyBias.shape == [256, 42], valueBias.shape == [256, 42],
+            keyBias.dtype == .bfloat16, valueBias.dtype == .bfloat16
+        else { return nil }
+        return lock.withLock {
+            let sources = [key.weight, key.scales, keyBias, value.weight, value.scales, valueBias]
+            var identities: [UInt] = []
+            for source in sources {
+                var identity: UInt = 0
+                var canCache = false
+                guard _mlx_array_constant_cache_identity(&identity, &canCache, source.ctx) == 0,
+                    canCache
+                else { return nil }
+                identities.append(identity)
+            }
+            let stream = StreamOrDevice.default
+            let banks: [MLXArray]
+            if let entry, entry.identities == identities, entry.stream == stream {
+                banks = entry.banks
+            } else {
+                // Keep the source descriptors while their IDs are cached.
+                let snapshots = sources.map { source in
+                    var context = mlx_array_new()
+                    mlx_array_set(&context, source.ctx)
+                    return MLXArray(context)
+                }
+                banks = (0..<3).map {
+                    concatenated([snapshots[$0], snapshots[$0 + 3]], axis: 0, stream: stream)
+                }
+                entry = Entry(identities: identities, stream: stream, snapshots: snapshots, banks: banks)
+            }
+            // Native N512 can change private draft rounding.
+            let joined = quantizedMM(
+                x, banks[0], scales: banks[1], biases: banks[2], transpose: true,
+                groupSize: 64, bits: 4, mode: .affine, stream: stream)
+            let rows = x.dim(1)
+            let keys = joined[0..., 0..., 0..<256].reshaped(1, rows, 2, 128)
+                .transposed(0, 2, 1, 3).contiguous()
+            let values = joined[0..., 0..., 256..<512].reshaped(1, rows, 2, 128)
+                .transposed(0, 2, 1, 3).contiguous()
+            return (keys, values)
+        }
+    }
+}
+
 final class NemotronH35MTPAttentionBlock: Module {
     let hiddenSize: Int
     @ModuleInfo(key: "eh_proj") var projection: Linear
@@ -199,6 +281,8 @@ final class NemotronH35MTPAttentionBlock: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHAttention
     private let draftFrontCache = NemotronH35MTPDraftFrontCache()
+    private let historyKVJoin = NemotronMTPHistoryKVJoin()
+    var historyKVResidencyArrays: [MLXArray] { historyKVJoin.residencyArrays }
 
     init(_ args: NemotronHConfiguration) {
         hiddenSize = args.hiddenSize
@@ -345,6 +429,9 @@ final class NemotronH35MTPAttentionBlock: Module {
         hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
     ) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
+        if let joined = historyKVJoin.apply(x, mixer: mixer) {
+            return cache.appendTrusted(keys: joined.keys, values: joined.values)
+        }
         let batch = x.dim(0), length = x.dim(1)
         let keys = mixer.wk(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
             .transposed(0, 2, 1, 3)
