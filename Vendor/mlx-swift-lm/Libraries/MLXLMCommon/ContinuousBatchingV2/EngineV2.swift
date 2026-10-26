@@ -113,6 +113,7 @@ final class CBv2EngineGauges: @unchecked Sendable {
 /// `cancel` (lock), `capacity()` (lock), and `shutdown()`
 /// (queue-synchronized drain).
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
+    static let wakeOnInit = ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_WAKE"] != "0"
     private let loop: EngineLoopV2
     private let admission: AdmissionV2
     /// Retained for runtime KV re-slicing (`updateKVBytesCapacity`); all
@@ -217,6 +218,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig(),
         processMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil
     ) {
+        if Self.wakeOnInit { asyncEval(MLXArray(Int32(1)) + MLXArray(Int32(1))) }
         self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
