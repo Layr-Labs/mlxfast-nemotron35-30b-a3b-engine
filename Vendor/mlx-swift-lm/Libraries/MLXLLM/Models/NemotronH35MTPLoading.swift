@@ -81,7 +81,6 @@ extension NemotronH35MTPAssistant {
         NemotronZSkip.prepare(target)
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
-        NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -730,5 +729,3 @@ final class NemotronCPUWarm: @unchecked Sendable {
         exited.wait()
     }
 }
-
-// Measurement entry of the carried 3f932e3c tree.
