@@ -239,11 +239,23 @@ extension NemotronHMoE {
         } else {
             packed = nil
         }
+        var y: MLXArray
+        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
+        let colaunch = products && NemotronFC2SharedColaunch.enabled
+            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         // Router matmul retains M=1. Gathered experts already have M=1 per
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
         let scores: MLXArray
-        if NemotronMTPExecution.batchedRouter {
+        if NemotronMTPExecution.batchedRouter, let colaunch, let packed,
+           NemotronSharedUpPacking.unpackedApplies(colaunch.x, up: colaunch.mlp.upProj, down: colaunch.mlp.downProj),
+           let fused = NemotronRouterSharedUpColaunch.run(x, gate: gate, up: colaunch.mlp.upProj, prepared: packed) {
+            // The router and the shared up in one launch; the shared up rows
+            // feed the shared down launch below.
+            indices = fused.indices
+            scores = fused.weights
+            colaunch.up = fused.up
+        } else if NemotronMTPExecution.batchedRouter {
             let routed = gate.mtpForwardRows(x)
             indices = routed.0
             scores = routed.1
@@ -252,10 +264,6 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
-        var y: MLXArray
-        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
-        let colaunch = products && NemotronFC2SharedColaunch.enabled
-            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
             y = reduced
@@ -780,7 +788,29 @@ private final class NemotronMoELeaderKernel: Sendable {
                 source: $0,
                 header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
         }
+        // The two dictionary twins with both main K loops unrolled by two
+        // (NEMOTRON_U2_DRAFT; the draft head's one-row routed FC1 only).
+        kernelDictU2 = nemotronU2Source(nemotronSBDictSource(nemotronMoELeaderSource),
+                                        loop: NemotronU2.leaderLoop, count: 2).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_affine4_gs64_sbd_u2",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
+        tail8DictU2 = nemotronU2Source(nmlTail8Source(nemotronMoELeaderSource).flatMap(nemotronSBDictSource),
+                                       loop: NemotronU2.leaderLoop, count: 2).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_sbd_u2",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
     }
+    let kernelDictU2: MLXFast.MLXFastKernel?
+    let tail8DictU2: MLXFast.MLXFastKernel?
 }
 
 private final class NemotronMoELeaderPreparedKernels: Sendable {
@@ -1182,7 +1212,7 @@ enum NemotronMoELeader {
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
                       prepared: MLXArray? = nil, tail8: Bool = false,
-                      dict: NemotronSBDict.Dict? = nil) -> MLXArray {
+                      dict: NemotronSBDict.Dict? = nil, u2: Bool? = nil) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
@@ -1203,8 +1233,11 @@ enum NemotronMoELeader {
         let kernel = (tail8 ? kernels.tail8 : nil) ?? kernels.kernel
         // `dict`: the selected kernel's twin, reading the bank's pair indices
         // (addressed from their base like the scales) and its FP32 pair table.
+        // `u2` (nil: NEMOTRON_U2_DRAFT once admitted): that twin with its main loops unrolled by two.
+        let unrolled = (u2 ?? NemotronU2.draft)
+            ? (tail8 && kernels.tail8 != nil ? kernels.tail8DictU2 : kernels.kernelDictU2) : nil
         if let dict, rows == 1,
-           let twin = tail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict {
+           let twin = unrolled ?? (tail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict) {
             return twin(
                 [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index),
                  dict.table, x, inds],
@@ -1454,7 +1487,8 @@ enum NemotronMoELeader {
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
         _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, products: Bool = false,
-        colaunch: NemotronFC2SharedColaunch.Shared? = nil
+        colaunch: NemotronFC2SharedColaunch.Shared? = nil, after: MLXArray? = nil,
+        draftDep: MLXArray? = nil, activation: ((MLXArray) -> Void)? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -1502,6 +1536,8 @@ enum NemotronMoELeader {
             balancePlan = nil
         }
         let weights = scores.reshaped(rows * 6)
+        // `NemotronDraftColaunch` (draft tail): the FC1 rows, as the shared down's tape-order input.
+        activation?(act)
         // `products`: the unreduced slot products for the captured verify's
         // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
         // itself (same expressions and order).
@@ -1511,7 +1547,9 @@ enum NemotronMoELeader {
         }
         if products, let prod = rows == 3
             ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
-            : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
+            : (rows == 1 ? NemotronZSkip.draftProducts(
+                after.map { depends(input: act, dependencies: [$0]) } ?? act, flat, weights, owner: mlp.fc2,
+                dep: draftDep) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -2797,6 +2835,28 @@ enum NemotronZSkip {
     private static var dictKernel: MLXFast.MLXFastKernel? {
         fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
     }
+    /// `NemotronDraftColaunch`: the fast tiled slot kernels (plain and dictionary) with one more input, `dep`,
+    /// bound last and never read. The body is the same source text; the extra buffer only orders the launch
+    /// after `dep`'s producer in MLX's eval tape.
+    private static let tiledFastSlotKernelDep = MLXFast.metalKernel(
+        name: "nemotron_zskip_fc2_slots_tiled_fast_dep",
+        inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
+        outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
+            outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    /// The `dep` twin of the slot kernel `products` selects for `copy`, or nil (not the fast tiled form).
+    private static func depKernel(for copy: Copy) -> MLXFast.MLXFastKernel? {
+        guard tiled, fast else { return nil }
+        return copy.dict ? tiledFastDictSlotKernelDep : tiledFastSlotKernelDep
+    }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
     /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
@@ -2865,12 +2925,13 @@ enum NemotronZSkip {
 
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     fileprivate static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                                 copy: Copy, rows: Int) -> MLXArray {
+                                 copy: Copy, rows: Int, dep: MLXArray? = nil) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
-        return (copy.dict ? dictKernel! : kernel)(
+        let twin = dep.flatMap { _ in depKernel(for: copy) }
+        return (twin ?? (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
-             NemotronBankBinding.bind(copy.biases), x, inds, scores],
+             NemotronBankBinding.bind(copy.biases), x, inds, scores] + (twin != nil ? [dep!] : []),
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
@@ -2954,11 +3015,17 @@ enum NemotronZSkip {
     }
 
     static func draftProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-                              owner: SwitchLinear) -> MLXArray? {
+                              owner: SwitchLinear, dep: MLXArray? = nil) -> MLXArray? {
         guard x.shape == [6, 1856], x.dtype == .bfloat16,
               inds.shape == [6], scores.shape == [6], scores.dtype == .float32,
               let copy = lock.withLock({ draftCopies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 1)
+        return products(x, inds, scores, copy: copy, rows: 1, dep: dep)
+    }
+
+    /// True when `owner` has a verified draft copy whose slot kernel has a `dep` twin.
+    static func draftDepAvailable(_ owner: SwitchLinear) -> Bool {
+        guard let copy = lock.withLock({ draftCopies[ObjectIdentifier(owner)] }) else { return false }
+        return depKernel(for: copy) != nil
     }
 
     /// Load time, after `prepare` (same copy layout and slot kernel) and before
@@ -3493,6 +3560,10 @@ enum NemotronFC2SharedColaunch {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH"] != "0"
         && !NemotronMoELeader.selfTest
     private static let sharedFirst = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH_SD_FIRST"] != "0"
+    /// Unless NEMOTRON_MTP_SD_EARLY=0, a covered layer runs the two separate launches the co-launch was checked
+    /// against, and the routed slot products take the shared rows as a dependency: MLX then encodes the shared
+    /// down beside the routed FC1 and the shared up beside the router.
+    private static let early = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SD_EARLY"] != "0"
     private static let slots = 18
     private static let sharedRows = 3
 
@@ -3503,6 +3574,8 @@ enum NemotronFC2SharedColaunch {
         let x: MLXArray
         let prepared: MLXArray?
         var rows: MLXArray? = nil
+        /// The shared up ReLU² rows when `NemotronRouterSharedUpColaunch` already produced them.
+        var up: MLXArray? = nil
         init(mlp: NemotronHMLP, x: MLXArray, prepared: MLXArray?) {
             self.mlp = mlp
             self.x = x
@@ -3515,9 +3588,15 @@ enum NemotronFC2SharedColaunch {
                     shared: Shared) -> MLXArray? {
         let down = shared.mlp.downProj
         guard covers(fc2: fc2, down: down),
-              let sx = NemotronSharedUpPacking.unpackedActivation(
-                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared),
-              let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
+              let sx = shared.up ?? NemotronSharedUpPacking.unpackedActivation(
+                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared) else { return nil }
+        if early, let rows = NemotronSharedDownZSkip.run(sx, owner: down),
+           let prod = NemotronZSkip.weightedProducts(
+               depends(input: x, dependencies: [rows]), inds, scores, owner: fc2) {
+            shared.rows = rows
+            return prod
+        }
+        guard let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
         shared.rows = pair.1
         return pair.0
     }
@@ -4411,5 +4490,50 @@ enum NemotronSBDict {
         }
         eval(Array(same.values))
         return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
+    }
+}
+
+// MARK: - Unroll by two: draft head and load-time admission (NEMOTRON_U2_*)
+
+extension NemotronU2 {
+    /// DRAFT: the draft head's one-row routed FC1 leader on its admitted pair dictionary (the tail-8 or plain
+    /// twin the draft selects), over route sets covering all 128 experts, ReLU2 off and on, unrolled against
+    /// record, bit for bit.
+    static func draftCheck(_ head: Module) -> (MLXArray, Int)? {
+        let kernels = NemotronMoELeaderKernel.shared
+        guard (NemotronMoELeader.leaderTail8 && kernels.tail8 != nil ? kernels.tail8DictU2 : kernels.kernelDictU2)
+                != nil else { return nil }
+        var same = MLXArray(true)
+        var cases = 0
+        for module in head.modules() {
+            if let moe = module as? NemotronHMoE, let d = NemotronSBDict.draftDict(moe.switchMLP.fc1),
+               let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16) {
+                let rows = (MLXRandom.normal([22, 2688], key: MLXRandom.key(0x52a7)) * 0.5).asType(.bfloat16)
+                for route in 0 ..< 22 {
+                    let inds = MLXArray((0 ..< 6).map { UInt32((route * 6 + $0) % 128) })
+                    let x = rows[route ..< route + 1]
+                    for relu2 in [false, true] {
+                        let a = NemotronMoELeader.apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
+                            relu2: relu2, tail8: NemotronMoELeader.leaderTail8, dict: d, u2: false)
+                        let b = NemotronMoELeader.apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
+                            relu2: relu2, tail8: NemotronMoELeader.leaderTail8, dict: d, u2: true)
+                        same = logicalAnd(same, equal(a, b))
+                        cases += 1
+                    }
+                }
+                eval(same)
+            }
+        }
+        return cases > 0 ? (same, cases) : nil
+    }
+
+    /// Load time, after the pair dictionaries (target and draft head) are built and before any verify or draft
+    /// graph is traced: each family's twin against its record kernel on the real weights (`admit`). A family
+    /// whose switch is 0, whose twin is missing or whose check misses keeps its record kernel.
+    static func qualify(target: Module, head: Module) {
+        inProj = admit(.inProj) { NemotronMambaInProjConvDt.u2Check(target) }
+        self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }
+        draft = admit(.draft) { draftCheck(head) }
+        sharedUp = admit(.sharedUp) { NemotronHeadPreparedActivation.u2CheckSharedUp(target) }
     }
 }
