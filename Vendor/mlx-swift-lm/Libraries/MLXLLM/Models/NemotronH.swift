@@ -456,6 +456,12 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
         source: withProductsReduce(sumSource()), ensureRowContiguous: true)
+    /// `sumProductsKernel` with `shared` bound before `rhs` (same source text; the body names its arguments).
+    private static let sumProductsSharedFirstKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_products_rms_sf_bf16",
+        inputNames: ["lhs", "shared", "rhs", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: withProductsReduce(sumSource()), ensureRowContiguous: true)
 
     /// Load time: the one-row products join against the separate top-six
     /// reduce plus `applySum`, bit for bit, on seeded rows and the head's norms.
@@ -484,11 +490,14 @@ enum NemotronHResidualRMSNorm {
 
     /// `rhs` [6 * 2688] FP32 is the draft tail's routed slot products
     /// (`NemotronZSkip.draftProducts`); the join sums them itself.
-    static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm)
+    /// `sharedFirst` (products only; `NemotronDraftColaunch`): the same join kernel with `shared` bound before
+    /// the products (part of the draft tail's encode order; the body names its arguments).
+    static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm,
+                         sharedFirst: Bool = false)
         -> (MLXArray, MLXArray)?
     {
         if rhs.shape == [6 * 2688] {
-            return applyProductsSum(lhs, rhs, shared: shared, norm: norm)
+            return applyProductsSum(lhs, rhs, shared: shared, norm: norm, sharedFirst: sharedFirst)
         }
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
@@ -512,7 +521,7 @@ enum NemotronHResidualRMSNorm {
     }
 
     private static func applyProductsSum(
-        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm
+        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm, sharedFirst: Bool = false
     ) -> (MLXArray, MLXArray) {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             lhs.shape == [1, 1, 2688], shared.shape == lhs.shape, lhs.dtype == .bfloat16,
@@ -525,10 +534,15 @@ enum NemotronHResidualRMSNorm {
             return (summed, norm(summed))
         }
         let (axis, eps) = scalars(norm.eps)
-        let result = sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
-            template: [("T", DType.bfloat16)],
-            grid: (672, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        let result = sharedFirst
+            ? sumProductsSharedFirstKernel([lhs, shared, products, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+            : sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
         guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
         let summed = lhs + (NemotronZSkip.reduceProducts(products, rows: 1) + shared)
         let ok = MLX.logicalAnd(
@@ -5102,6 +5116,34 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
         self._upProj.wrappedValue = Linear(args.hiddenSize, intermediate, bias: args.mlpBias)
         self._downProj.wrappedValue = Linear(intermediate, args.hiddenSize, bias: args.mlpBias)
         super.init()
+    }
+
+    /// The ordinary M = 1 shared up + relu2 rows [1, 3712] of `callAsFunction`, or nil when that route does not
+    /// apply (`NemotronDraftColaunch` then keeps `callAsFunction`).
+    func draftUpActivation(_ x: MLXArray) -> MLXArray? {
+        guard Self.ordinaryR1SharedUp, type(of: self) == NemotronHMLP.self,
+              type(of: upProj) == QuantizedLinear.self,
+              type(of: downProj) == QuantizedLinear.self,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              NemotronMTPExecution.batchedM1,
+              let up = upProj as? QuantizedLinear, up.bias == nil,
+              up.weight.shape == [3712, 336], up.scales.shape == [3712, 42],
+              let offsets = up.biases, offsets.shape == [3712, 42],
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              !NemotronMoELeader.selfTest
+        else { return nil }
+        return NemotronMultiRowQMV.apply(x.reshaped(1, 2688), up, relu2: true)
+    }
+
+    /// `nemotronR1Linear(activated, downProj)` through the R = 1 kernel's `dep` twin (`NemotronDraftColaunch`),
+    /// or nil when `nemotronR1Linear` would not take that kernel.
+    func draftDown(_ activated: MLXArray, dep: MLXArray) -> MLXArray? {
+        guard NemotronMultiRowQMV.r1Route, activated.shape == [1, 3712], activated.dtype == .bfloat16,
+              type(of: downProj) == QuantizedLinear.self, let q = downProj as? QuantizedLinear,
+              q.bias == nil, !NemotronMoELeader.selfTest,
+              let y = NemotronMultiRowQMV.apply(activated, q, dep: dep)
+        else { return nil }
+        return y.reshaped(1, 1, q.weight.dim(0))
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
