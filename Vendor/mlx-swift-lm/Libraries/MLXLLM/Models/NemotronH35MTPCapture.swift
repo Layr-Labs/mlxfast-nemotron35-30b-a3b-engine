@@ -672,6 +672,7 @@ extension NemotronH35Model {
         NemotronHCompactSSMGated.qualifyRowsTail(mixer)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: compiles and checks every folded launch.
         NemotronMTPPendingSSM.qualify(mixer)
+        NemotronHCompactSSMGated.qualifySharedDecay(mixer)
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = silu(mixer.conv1d(padded))

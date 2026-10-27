@@ -1566,6 +1566,155 @@ enum NemotronHCompactSSMGated {
             ? "on (normalized rows, prepared activation and state bitwise equal, 0 and 2 pending steps)"
             : "off (differs from the record launch)")
     }
+    /// One producer per recurrence step publishes the head-uniform decay.
+    /// Prior-state loads precede production; an extra TG barrier makes every
+    /// FP32 coefficient visible before its original recurrence consumer.
+    /// No physical SFU, register or latency reduction is asserted.
+    static let sharedDecayEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_SSM_SHARED_DECAY"] != "0"
+    nonisolated(unsafe) private(set) static var sharedDecayQualified = false
+
+    static func sharedDecaySource(_ original: String, pending: Bool) -> String? {
+        guard sharedDecayEnabled else { return nil }
+        let a = "auto A = -fast::exp(static_cast<float>(A_log[h_idx]));"
+        let decay = "auto dA = fast::exp(A * dt_);"
+        let count = pending ? 2 : 1
+        guard original.components(separatedBy: a).count == count + 1 else { return nil }
+        let parts = original.replacingOccurrences(of: a, with: "").components(separatedBy: decay)
+        guard parts.count == count + 1 else { return nil }
+        var text: String
+        if pending {
+            text = parts[0] + "auto dA = nsc_decay[t];" + parts[1]
+                + "auto dA = nsc_decay[P + t];" + parts[2]
+        } else {
+            text = parts[0] + "auto dA = nsc_decay[t];" + parts[1]
+        }
+        let firstLoop = pending ? "for (int t = 0; t < P; ++t) {"
+            : "for (int t = 0; t < L; ++t) {"
+        guard text.components(separatedBy: firstLoop).count == 2 else { return nil }
+        let read: String
+        if pending {
+            read = """
+                    float nsc_dt;
+                    if (nsc_t < NSC_P) nsc_dt = static_cast<float>(pdt[nsc_t * H + n]);
+                    else nsc_dt = static_cast<float>(dt[(nsc_t - NSC_P) * H + n]);
+            """
+        } else {
+            read = "float nsc_dt = static_cast<float>(dt[nsc_t * H + n]);\n"
+        }
+        let stage = "constexpr int NSC_P = " + (pending ? "P" : "0") + ";\n" + """
+            threadgroup float nsc_decay[NSC_P + L];
+            // Native launch is exactly (32, 8, 1). Each SIMD leader owns
+            // tasks sg, sg+8; other lanes retain the original prior words.
+            if (ds_idx == 0 && int(thread_position_in_threadgroup.y) < NSC_P + L) {
+                const float nsc_A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                for (int nsc_t = int(thread_position_in_threadgroup.y);
+                     nsc_t < NSC_P + L; nsc_t += 8) {
+            """ + read + """
+                    nsc_decay[nsc_t] = fast::exp(nsc_A * nsc_dt);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            """
+        return text.replacingOccurrences(of: firstLoop, with: stage + "\n" + firstLoop)
+    }
+
+    private static let sharedDecayRowsKernel = sharedDecaySource(source, pending: false)
+        .flatMap { rowsTail($0) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_mtp_ssm_compact_gated_prepared_sh1b_shared_decay",
+                inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                             "eps", "counter"],
+                outputNames: ["out", "state_out", "normed", "prepared"],
+                source: $0, mutableInputs: ["counter"])
+        }
+    private static let sharedDecayPendingKernel = sharedDecaySource(pendingSource, pending: true)
+        .flatMap { rowsTail($0) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_mtp_ssm_compact_gated_prepared_pending_sh1b_shared_decay",
+                inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                             "eps", "counter", "pconv", "pdt"],
+                outputNames: ["out", "state_out", "normed", "prepared"],
+                source: $0, mutableInputs: ["counter"])
+        }
+
+    /// Only the existing one-barrier-row tail has a coefficient-sharing twin.
+    static func sharedDecayKernel(pending: Bool) -> MLXFast.MLXFastKernel? {
+        pending ? sharedDecayPendingKernel : sharedDecayRowsKernel
+    }
+
+    /// Official load-time only: explicit original/twin bindings compare all
+    /// four outputs, including raw SSM rows and every final-state word.
+    /// Every P from zero through the source's maximum is checked, with
+    /// three operand scales; an error/difference keeps the original kernels.
+    static func qualifySharedDecay(_ mixer: NemotronHMamba2Mixer) {
+        sharedDecayQualified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron ssm shared decay: \(message)\n".utf8))
+        }
+        guard sharedDecayEnabled, enabled, rowsTailQualified, let counter,
+              let plain = rowsKernel, let folded = rowsPendingKernel,
+              let twin = sharedDecayRowsKernel, let foldedTwin = sharedDecayPendingKernel,
+              mixer.numHeads == 64, mixer.headDim == 64, mixer.numGroups == 8,
+              mixer.ssmStateSize == 128, mixer.convDim == 6144
+        else { return report("off (setting, source or original admission)") }
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for steps in 0 ... NemotronMTPPendingSSM.maxSteps {
+                    for (index, scale) in [Float(0.03), 1, 4].enumerated() {
+                        let seed = UInt64(0x5dc0_0000 + steps * 16 + index)
+                        let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 6)
+                        let conv = MLXRandom.normal([1, 3, 6144], scale: scale, key: keys[0]).asType(.bfloat16)
+                        let dt = MLXRandom.uniform(Float(0.001) ..< 0.5, [1, 3, 64], key: keys[1])
+                        let state = MLXRandom.normal([1, 64, 64, 128], key: keys[2]) * Float(0.1)
+                        let projected = MLXRandom.normal([1, 3, 10304], scale: scale, key: keys[3])
+                            .asType(.bfloat16)
+                        var inputs: [any ScalarOrArray] = [
+                            conv, mixer.aLog, mixer.D, dt, state, projected, mixer.norm.weight,
+                            NemotronHGatedRMSKernel.identity, mixer.norm.eps, counter]
+                        var template: [(String, any KernelTemplateArg)] = [
+                            ("T", DType.bfloat16), ("U", DType.float32),
+                            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                            ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
+                        if steps > 0 {
+                            let pconv = MLXRandom.normal([1, steps, 6144], scale: scale, key: keys[4])
+                                .asType(.bfloat16)
+                            let pdt = MLXRandom.uniform(Float(0.001) ..< 0.5, [1, steps, 64], key: keys[5])
+                            inputs += [pconv, pdt]
+                            template.append(("P", steps))
+                        }
+                        func run(_ kernel: MLXFast.MLXFastKernel) -> [MLXArray] {
+                            kernel(inputs, template: template,
+                                grid: (32, 64, 64), threadGroup: (32, 8, 1),
+                                outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128],
+                                               [1, 3, 4096], [3, 8, 17 * 32]],
+                                outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
+                        }
+                        let reference = run(steps == 0 ? plain : folded)
+                        let candidate = run(steps == 0 ? twin : foldedTwin)
+                        eval(reference + candidate)
+                        for (a, b) in zip(reference, candidate) {
+                            let dtype: DType = a.dtype == .bfloat16 ? .uint16 : .uint32
+                            if !(a.view(dtype: dtype) .== b.view(dtype: dtype)).all().item(Bool.self) {
+                                return false
+                            }
+                        }
+                        guard counter.max().item(UInt32.self) == 0 else { return false }
+                        cases += 1
+                    }
+                }
+                return true
+            }
+            sharedDecayQualified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(sharedDecayQualified ? "on (\(cases) cases, all raw/state/norm/prepared words equal)"
+                                   : "off (differs after \(cases) cases)")
+    }
+
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -1589,7 +1738,7 @@ extension NemotronHRMSNormGated {
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil, shuffle: Bool? = nil,
-        rowsTail: Bool? = nil
+        rowsTail: Bool? = nil, sharedDecay: Bool? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
@@ -1630,6 +1779,16 @@ extension NemotronHRMSNormGated {
             kernel = (rows ? NemotronHCompactSSMGated.rowsPendingKernel : nil)
                 ?? (tail ? NemotronHCompactSSMGated.shufflePendingKernel : nil)
                 ?? NemotronHCompactSSMGated.pendingKernel
+        }
+        let wantsSharedDecay = sharedDecay ?? NemotronHCompactSSMGated.sharedDecayQualified
+        if wantsSharedDecay && rows {
+            if let twin = NemotronHCompactSSMGated.sharedDecayKernel(pending: pending != nil) {
+                kernel = twin
+            } else if sharedDecay == true {
+                return nil
+            }
+        } else if sharedDecay == true {
+            return nil
         }
         let outputs = kernel(
             inputs, template: template,
