@@ -107,7 +107,6 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillSharedRelu2.qualify(target)
         NemotronPrefillDirectFC1.qualify(target)
         NemotronPrefillSharedUpGather.qualify(target)
-        NemotronPrefillFC2Copy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
         NemotronPrefillDtxDecay4.qualify()
         NemotronPrefillScanExp.qualify()
@@ -396,35 +395,15 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     }
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
-    /// With `NemotronPrefillFC2Copy` verified, a MoE layer's routed fc2 bank is replaced in its group by
-    /// that layer's decode copy (codes, pair index, pair table): the request prefill reads the copy, the
-    /// decode reads the copy, and nothing in the request reads the bank.
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
-        var copies: [Int: [MLXArray]] = [:]
-        if NemotronPrefillFC2Copy.verified {
-            for (name, module) in model.namedModules() {
-                let parts = name.split(separator: ".")
-                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
-                      let moe = module as? NemotronHMoE,
-                      let copy = NemotronZSkip.copy(for: moe.switchMLP.fc2), copy.dict else { continue }
-                copies[n] = [copy.codes, copy.scales, copy.biases]
-            }
-        }
         var groups: [Int: [MLXArray]] = [:]
         for (key, a) in model.parameters().flattened() {
             let parts = key.split(separator: ".")
             var g = Int.max
             if parts.contains("embeddings") { g = -1 }
             if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
-            if copies[g] != nil, let s = parts.firstIndex(of: "switch_mlp"), s + 1 < parts.count,
-               parts[s + 1] == "fc2" {
-                continue
-            }
             groups[g, default: []].append(a)
         }
-        for (g, arrays) in copies { groups[g, default: []].append(contentsOf: arrays) }
-        FileHandle.standardError.write(Data(
-            "nemotron target residency: \(copies.count) MoE fc2 banks replaced by their decode copies\n".utf8))
         return groups.keys.sorted().map { groups[$0]! }
     }
 
@@ -562,18 +541,12 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         }
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
-        let copiesInTarget = NemotronPrefillFC2Copy.verified && !targetSets.isEmpty
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
         if !early { for set in targetSets { targetQueue.async { set.requestResidency() } } }
-        if copiesInTarget {
-            // The request prefill reads every layer's copy (they replace the fc2 banks in the target
-            // groups), so the first verify already finds them bound: no round falls back to a bank.
-            NemotronZSkip.markCopyReady(owners)
-        }
         let head = seedSet, ready = Array(owners.prefix(cut))
         targetQueue.async {
             head.requestResidency()
@@ -602,3 +575,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
 
 // Measurement entry 2 of this tree.
+
+// Measurement entry 15 of this tree.

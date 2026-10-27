@@ -2469,11 +2469,6 @@ enum NemotronZSkip {
     /// slot products itself (`NemotronHResidualRMSNorm.applyPreparedRows`).
     static let joinReduce = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] != "0"
 
-    /// The verified copy of `owner` (a target layer's routed FC2), if any.
-    static func copy(for owner: SwitchLinear) -> Copy? {
-        lock.withLock { copies[ObjectIdentifier(owner)] }
-    }
-
     /// True when `owner` (a target layer's routed FC2) has a verified copy.
     static func covers(_ owner: SwitchLinear) -> Bool {
         lock.withLock { copies[ObjectIdentifier(owner)] != nil }
