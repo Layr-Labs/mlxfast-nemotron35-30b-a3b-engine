@@ -182,13 +182,20 @@ final class NemotronH35MTPCompactGraphCache {
                 [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MTP Mamba-window owner") }
                 let base = pendingSteps > 0 ? 5 : 3
+                let lhs = joins ? arrays[base + (usesPrepared ? 1 : 0)] : nil
+                if let lhs, let nextNorm, NemotronHeadPreparedActivation.outProjJoinVerified {
+                    NemotronHeadPreparedActivation.outProjJoinRequest = (lhs, nextNorm)
+                }
                 let values = owner.mtpCompactArrays(
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[base] : nil,
                     pending: pendingSteps > 0 ? (arrays[3], arrays[4], pendingSteps) : nil)
-                guard joins, let nextNorm else { return values }
+                let fused = NemotronHeadPreparedActivation.takeOutProjJoin()
+                guard joins, let nextNorm, let lhs else { return values }
+                // NEMOTRON_MTP_OUTPROJ_JOIN: out_proj's launch ran the join as its epilogue.
+                if let fused { return [fused.0] + Array(values[1...4]) + [fused.1, fused.2] }
                 guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
-                    arrays[base + (usesPrepared ? 1 : 0)], values[0], norm: nextNorm) else {
+                    lhs, values[0], norm: nextNorm) else {
                     preconditionFailure("Qualified Mamba compiled join became ineligible")
                 }
                 return [joined.0] + Array(values[1...4]) + [joined.1, joined.2]

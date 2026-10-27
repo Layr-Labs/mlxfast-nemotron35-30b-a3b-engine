@@ -903,6 +903,108 @@ enum NemotronMambaInProjConvDt {
     }
 }
 
+// NEMOTRON_MTP_OUTPROJ_JOIN: the captured verify's join after a Mamba out_proj or an attention o_proj
+// (`nemotron_h_residual_rms_prepared_moe_bf16_sh_1b`: residual add, the next block's RMSNorm and its prepared
+// K = 2688 rows) as the epilogue of the R = 3 [4096, 2688] prepared launch at eight SIMD groups per threadgroup.
+// Each SIMD group computes its own outputs exactly as the two-group launch does (the group count only moves
+// out_row), and a threadgroup's 16 outputs lie in one 128-output column, which is the join's SIMD group of that
+// column in each row (lanes 32c ..< 32c + 32, four values each). Every threadgroup orders its stores before a
+// device atomic on its column counter; the threadgroup that takes the column's last ticket runs, per row in its
+// own SIMD group, the join's residual add, store and sum of squares for those 128 values and the same
+// `simd_sum`, stored in the row's slot c. The threadgroup that finishes the last of the 21 columns forms each
+// row's sum over the 21 SIMD-group sums (zeros in the other lanes) and `precise::rsqrt` as the join does, then
+// the normalized rows and the prepared words chunk by chunk with the join's expressions and order. Both counters
+// are reset by the threadgroup that read their last ticket.
+private let nemotronOutProjJoinEpilogue = """
+
+  threadgroup uint noj_last;
+  threadgroup float noj_inv[4];
+  const uint noj_flat = simd_gid * 32 + simd_lid;
+  constexpr int noj_per_column = 128 / (num_simdgroups * results_per_simdgroup);
+  const int noj_column = int(tid.y) / noj_per_column;
+  threadgroup_barrier(mem_flags::mem_device);
+  if (noj_flat == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    const uint prev = atomic_fetch_add_explicit(
+        (device atomic_uint*)(counter + noj_column), 1u, memory_order_relaxed);
+    noj_last = prev == uint(noj_per_column) - 1u ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (noj_last == 0u) {
+    return;
+  }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  if (noj_flat == 0) {
+    atomic_store_explicit((device atomic_uint*)(counter + noj_column), 0u, memory_order_relaxed);
+  }
+  if (simd_gid < 3) {
+    const int row = int(simd_gid);
+    const uint v = uint(noj_column) * 32 + simd_lid;
+    const size_t offset = size_t(row) * axis_size + v * 4;
+    float acc = 0;
+    float thread_x[4];
+    for (uint i = 0; i < 4; i++) {
+      T sum = lhs[offset + i] + y[offset + i];
+      residual[offset + i] = sum;
+      thread_x[i] = sum;
+      acc += thread_x[i] * thread_x[i];
+    }
+    acc = simd_sum(acc);
+    if (simd_lid == 0) {
+      sums[row * 32 + noj_column] = acc;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  if (noj_flat == 0) {
+    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+    const uint prev = atomic_fetch_add_explicit(
+        (device atomic_uint*)(counter + 31), 1u, memory_order_relaxed);
+    noj_last = prev == uint(out_vec_size / 128) - 1u ? 1u : 0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (noj_last == 0u) {
+    return;
+  }
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  if (noj_flat == 0) {
+    atomic_store_explicit((device atomic_uint*)(counter + 31), 0u, memory_order_relaxed);
+  }
+  if (simd_gid < 3) {
+    const uint nrm_groups = 21;
+    const float acc = simd_sum(simd_lid < nrm_groups ? sums[simd_gid * 32 + simd_lid] : 0.0f);
+    if (simd_lid == 0) {
+      noj_inv[simd_gid] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint task = noj_flat; task < 3 * 336; task += 32 * num_simdgroups) {
+    const int row = int(task / 336);
+    const int chunk = int(task % 336);
+    const float nrm_inv_mean = noj_inv[row];
+    T nmj_r[8];
+    for (int i = 0; i < 8; i++) {
+      const size_t index = size_t(row) * axis_size + size_t(chunk * 8 + i);
+      const float x_i = residual[index];
+      T value = weight[chunk * 8 + i] * static_cast<T>(x_i * nrm_inv_mean);
+      normalized[index] = value;
+      nmj_r[i] = value;
+    }
+    const int base = (row * 11 + chunk / 32) * 9 * 32 + chunk % 32;
+    float total = 0;
+    total += float(nmj_r[0]) + float(nmj_r[1]) + float(nmj_r[2]) + float(nmj_r[3]);
+    total += float(nmj_r[4]) + float(nmj_r[5]) + float(nmj_r[6]) + float(nmj_r[7]);
+    packed[base + 0 * 32] = float(nmj_r[0]);
+    packed[base + 1 * 32] = float(nmj_r[1]) / 16.0f;
+    packed[base + 2 * 32] = float(nmj_r[2]) / 256.0f;
+    packed[base + 3 * 32] = float(nmj_r[3]) / 4096.0f;
+    packed[base + 4 * 32] = float(nmj_r[4]);
+    packed[base + 5 * 32] = float(nmj_r[5]) / 16.0f;
+    packed[base + 6 * 32] = float(nmj_r[6]) / 256.0f;
+    packed[base + 7 * 32] = float(nmj_r[7]) / 4096.0f;
+    packed[base + 8 * 32] = total;
+  }
+"""
+
 enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
@@ -1223,6 +1325,13 @@ enum NemotronHeadPreparedActivation {
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
                       prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        if rows == 3, k == 4096, n == 2688, !relu2, sbDict, outProjJoinVerified,
+           let request = outProjJoinRequest,
+           let joined = outProjJoined(x, q, prepared: prepared, lhs: request.lhs, norm: request.norm) {
+            outProjJoinRequest = nil
+            outProjJoinResult = (joined.1, joined.2, joined.3)
+            return joined.0
+        }
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
             ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
@@ -4478,5 +4587,127 @@ enum NemotronHeadScreen {
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+    }
+}
+
+extension NemotronHeadPreparedActivation {
+    /// NEMOTRON_MTP_OUTPROJ_JOIN=0 keeps the captured verify's join after a Mamba out_proj or an attention o_proj
+    /// as its own launch. Otherwise the R = 3 [4096, 2688] dictionary launch takes the join as its epilogue
+    /// (`nemotronOutProjJoinEpilogue`, eight SIMD groups per threadgroup) once `qualifyOutProjJoin` matched it.
+    static let outProjJoinEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_OUTPROJ_JOIN"] != "0"
+    nonisolated(unsafe) static var outProjJoinVerified = false
+    /// 21 column counters and one grid counter (slot 31), zero between launches.
+    nonisolated(unsafe) private static var outProjJoinCounter: MLXArray? = nil
+    nonisolated(unsafe) private static var outProjJoinScalars: [UInt32: (MLXArray, MLXArray)] = [:]
+    private static let outProjJoinLock = NSLock()
+    private static let outProjJoinKernel = nemotronSBDictSource(
+        nemotronPreparedVariantSource(preparedHalfSource, load: 2, nsg: true)).map {
+        MLXFast.metalKernel(
+            name: "nemotron_head_prepared_qmv_hf_ld2_nsg_sbd_join",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N", "lhs", "weight", "axis_size", "eps",
+                         "counter"],
+            outputNames: ["y", "residual", "normalized", "packed", "sums"],
+            source: $0 + nemotronOutProjJoinEpilogue, header: variantHeader(half: true, load: 2),
+            mutableInputs: ["counter"])
+    }
+    /// Set while a captured-verify block builds its mixer: the join's residual input and norm, consumed by the
+    /// block's [4096, 2688] launch, and that launch's (residual, normalized, prepared) for the block's join.
+    nonisolated(unsafe) static var outProjJoinRequest: (lhs: MLXArray, norm: RMSNorm)? = nil
+    nonisolated(unsafe) static var outProjJoinResult: (MLXArray, MLXArray, MLXArray)? = nil
+
+    /// The joined launch's outputs if the mixer's [4096, 2688] launch took the request; clears both.
+    static func takeOutProjJoin() -> (MLXArray, MLXArray, MLXArray)? {
+        let result = outProjJoinResult
+        outProjJoinRequest = nil
+        outProjJoinResult = nil
+        return result
+    }
+
+    /// (y [3, 2688], residual, normalized [1, 3, 2688], prepared K = 2688 rows) of `x` through `q` with the join
+    /// of `lhs` + y and `norm`, or nil when the joined launch does not apply.
+    static func outProjJoined(_ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?, lhs: MLXArray,
+                              norm: RMSNorm, force: Bool = false) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        let k = 4096, n = 2688
+        guard outProjJoinEnabled, force || outProjJoinVerified, let kernel = outProjJoinKernel,
+              let counter = outProjJoinCounter,
+              x.shape == [3, k], x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [n, k / 8], q.weight.dtype == .uint32,
+              decodeForm(rows: 3, fast: true) == 2, loadForm(k: k, n: n) == 2,
+              NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
+              lhs.shape == [1, 3, n], lhs.dtype == .bfloat16,
+              type(of: norm) == RMSNorm.self, norm.weight.shape == [n], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let pv = 16
+        let packed = compatible(prepared, rows: 3, k: k)
+            ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
+            grid: (k / pv, 3, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[3, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let (axis, eps) = outProjJoinLock.withLock { () -> (MLXArray, MLXArray) in
+            if let pair = outProjJoinScalars[norm.eps.bitPattern] { return pair }
+            let pair = (MLXArray(UInt32(n)), MLXArray(norm.eps))
+            outProjJoinScalars[norm.eps.bitPattern] = pair
+            return pair
+        }
+        let outputs = kernel([q.weight, d.index, d.table, packed, args.0, args.1, lhs, norm.weight, axis, eps,
+                              counter],
+            template: [("T", x.dtype), ("R", 3), ("FAST", true), ("RELU2", false), ("RPS", 2), ("HF", 2),
+                       ("NSG", 8)],
+            grid: (32, n / 2, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[3, n], lhs.shape, lhs.shape, [3, 11, 9 * 32], [3 * 32]],
+            outputDTypes: [x.dtype, .bfloat16, .bfloat16, .float32, .float32])
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+
+    /// Load time, before any verify graph is traced: the joined launch against the record launch and the join,
+    /// bit for bit (projection, residual, normalized rows and every live prepared word), on the first, a middle
+    /// and the last Mamba out_proj and the first attention o_proj with seeded rows and a real norm, each case
+    /// launched twice so the counter resets are exercised. Engages only if all match.
+    static func qualifyOutProjJoin(_ model: Module) {
+        outProjJoinVerified = false
+        guard outProjJoinEnabled, outProjJoinKernel != nil else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron out_proj join: \(message)\n".utf8))
+        }
+        guard NemotronHResidualRMSNorm.plumbingAvailable,
+              let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+                  type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+              }) else { return report("off (join plumbing off)") }
+        let outs = model.modules().compactMap { ($0 as? NemotronHMamba2Mixer)?.outProj as? QuantizedLinear }
+        let oprojs = model.modules().compactMap { ($0 as? NemotronHAttention)?.wo as? QuantizedLinear }
+        guard !outs.isEmpty else { return report("off (no out_proj)") }
+        let picks = [outs[0], outs[outs.count / 2], outs[outs.count - 1]] + oprojs.prefix(1)
+        let zero = MLXArray.zeros([32], dtype: .uint32)
+        eval(zero)
+        outProjJoinCounter = zero
+        var ok = MLXArray(true)
+        var cases = 0
+        for (index, q) in picks.enumerated() {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x0e1a + index)), into: 2)
+            let x = MLXRandom.normal([3, 4096], scale: 0.5, key: keys[0]).asType(.bfloat16)
+            let lhs = MLXRandom.normal([1, 3, 2688], key: keys[1]).asType(.bfloat16)
+            for _ in 0 ..< 2 {
+                guard let fused = outProjJoined(x, q, prepared: nil, lhs: lhs, norm: norm, force: true)
+                else { return report("off (not applicable)") }
+                let y = apply(x, q, relu2: false, rps: 2)
+                guard let expected = NemotronHResidualRMSNorm.applyPreparedRows(
+                    lhs, y.reshaped(1, 3, 2688), norm: norm) else { return report("off (no join)") }
+                let got = fused.3.reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+                let want = expected.2.reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+                ok = MLX.logicalAnd(ok, MLX.logicalAnd(
+                    MLX.logicalAnd((fused.0.view(dtype: .uint16) .== y.view(dtype: .uint16)).all(),
+                                   (fused.1.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all()),
+                    MLX.logicalAnd((fused.2.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all(),
+                                   MLX.logicalAnd(
+                                       (got[0..., 0..<10, 0..., 0...] .== want[0..., 0..<10, 0..., 0...]).all(),
+                                       (got[0..., 10, 0..., 0..<16] .== want[0..., 10, 0..., 0..<16]).all()))))
+                eval(ok)
+                cases += 1
+            }
+        }
+        outProjJoinVerified = ok.item(Bool.self) && (outProjJoinCounter!.max().item(UInt32.self) == 0)
+        report(outProjJoinVerified ? "on (\(cases) launches bitwise equal to the projection and join)"
+                                   : "off (differs)")
     }
 }

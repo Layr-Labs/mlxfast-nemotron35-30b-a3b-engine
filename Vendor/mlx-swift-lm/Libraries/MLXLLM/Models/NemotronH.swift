@@ -9278,9 +9278,16 @@ private class NemotronHBlock: Module {
             guard let attentionCache else {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
+            if NemotronHeadPreparedActivation.outProjJoinVerified {
+                NemotronHeadPreparedActivation.outProjJoinRequest = (x, nextNorm)
+            }
             output = (mixer as! NemotronHAttention).cbv2Forward(
                 hidden, cache: attentionCache, captureMTP: true, targetQKV: true,
                 prepared: prepared)
+            // NEMOTRON_MTP_OUTPROJ_JOIN: o_proj's launch ran the join as its epilogue.
+            if let fused = NemotronHeadPreparedActivation.takeOutProjJoin() {
+                return (fused.0, fused.1, fused.2)
+            }
         case .mlp:
             precondition(
                 attentionCache == nil,
