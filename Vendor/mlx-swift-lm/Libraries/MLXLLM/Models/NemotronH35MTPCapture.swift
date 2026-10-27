@@ -111,6 +111,116 @@ final class NemotronMTPPendingSSM {
         qualified = true
         report("on (1...\(maxSteps) pending steps bitwise equal to replay + launch)")
     }
+
+    /// Load time (depth-3 verify): the fused compact SSM + gated norm launch
+    /// at L = 4 against the generic L = 4 route (the compact SSM window
+    /// launch, the gated RMS norm launch on its y and in_proj's gate columns,
+    /// then the prepare launch of the normed rows), bit for bit in the normed
+    /// rows, out_proj's prepared activation and the final state, on the first
+    /// Mamba layer's parameters and seeded operands; then the pending-prelude
+    /// twin at L = 4 for 1...maxSteps pending steps against the compact
+    /// replay of those steps followed by the same generic route; then the
+    /// separate gated norm with the prepared output at R = 4 against the
+    /// gated norm and prepare launches. Admits `NemotronMTPR4Dense.ssmGated`,
+    /// `.pendingFold` (with the pending fold on and the plain launch
+    /// admitted) and `.gatedPrepared`.
+    static func qualifyR4(_ mixer: NemotronHMamba2Mixer) {
+        NemotronMTPR4Dense.ssmGated = false
+        NemotronMTPR4Dense.pendingFold = false
+        NemotronMTPR4Dense.gatedPrepared = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron r4 dense ssm gated: \(message)\n".utf8))
+        }
+        guard NemotronMTPR4Dense.requested else { return report("off (setting)") }
+        let (heads, dim, groups, stateDim) =
+            (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        let convDim = mixer.convDim
+        let projectedWidth = mixer.intermediateSize + convDim + heads
+        var seed: UInt64 = 0x2545_F491_4F6C_DD1D
+        func values(_ count: Int, _ low: Float, _ high: Float) -> [Float] {
+            (0 ..< count).map { _ -> Float in
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                return low + (high - low) * Float(seed >> 40) / Float(1 << 24)
+            }
+        }
+        func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            let dtype: DType = a.dtype == .float32 ? .uint32 : .uint16
+            return (a.view(dtype: dtype) .== b.view(dtype: dtype)).all()
+        }
+        // The generic L = 4 route from `start`: window launch, gated norm, prepare.
+        func generic(_ conv: MLXArray, _ dt: MLXArray, _ start: MLXArray, _ projected: MLXArray)
+            -> (MLXArray, MLXArray, MLXArray) {
+            let window = nemotronMTPSSMCompact(
+                convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: start,
+                heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                steps: 4, writeOutput: true)
+            let gate = projected[0..., 0..., ..<mixer.intermediateSize]
+            let normed = mixer.norm(window.output.reshaped(1, 4, heads * dim), gate: gate)
+            return (normed, NemotronHeadPreparedActivation.pack(normed.reshaped(4, heads * dim)),
+                    window.finalState)
+        }
+        var plain = MLXArray(true), folded = MLXArray(true), separate = MLXArray(true)
+        NemotronMTPR4Dense.ssmGated = true
+        NemotronMTPR4Dense.gatedPrepared = true
+        do {
+            try withError {
+                for steps in 0 ... maxSteps {
+                    let conv = MLXArray(values(4 * convDim, -2, 2), [1, 4, convDim]).asType(.bfloat16)
+                    let dt = MLXArray(values(4 * heads, 0.01, 0.5), [1, 4, heads])
+                    let anchor = MLXArray(values(heads * dim * stateDim, -0.5, 0.5), [1, heads, dim, stateDim])
+                    let projected = MLXArray(values(4 * projectedWidth, -3, 3), [1, 4, projectedWidth])
+                        .asType(.bfloat16)
+                    var start = anchor
+                    var pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
+                    if steps > 0 {
+                        let pconv = MLXArray(values(steps * convDim, -2, 2), [1, steps, convDim]).asType(.bfloat16)
+                        let pdt = MLXArray(values(steps * heads, 0.01, 0.5), [1, steps, heads])
+                        start = nemotronMTPSSMCompact(
+                            convolution: pconv, ALog: mixer.aLog, D: mixer.D, dt: pdt, state: anchor,
+                            heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                            steps: steps, writeOutput: false).finalState
+                        pending = (pconv, pdt, steps)
+                    }
+                    let want = generic(conv, dt, start, projected)
+                    guard let got = mixer.norm.compactSSMPreparedRows(
+                        convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: anchor,
+                        projected: projected, heads: heads, headDim: dim, groups: groups,
+                        stateDim: stateDim, pending: pending)
+                    else {
+                        if steps == 0 { plain = MLXArray(false) } else { folded = MLXArray(false) }
+                        continue
+                    }
+                    let ok = same(got.0, want.0) .&& same(got.1, want.1) .&& same(got.2, want.2)
+                    if steps == 0 { plain = plain .&& ok } else { folded = folded .&& ok }
+                    if steps <= 1 {
+                        // The separate gated norm with the prepared output (R = 4).
+                        let y = MLXArray(values(4 * heads * dim, -4, 4), [1, 4, heads * dim]).asType(.bfloat16)
+                        let gate = projected[0..., 0..., ..<mixer.intermediateSize]
+                        if let pair = mixer.norm.preparedRows(y, gate: gate) {
+                            let normed = mixer.norm(y, gate: gate)
+                            separate = separate .&& same(pair.0, normed)
+                                .&& same(pair.1, NemotronHeadPreparedActivation.pack(normed.reshaped(4, heads * dim)))
+                        } else {
+                            separate = MLXArray(false)
+                        }
+                    }
+                    eval(plain, folded, separate)
+                }
+            }
+        } catch {
+            NemotronMTPR4Dense.ssmGated = false
+            NemotronMTPR4Dense.gatedPrepared = false
+            return report("off (\(error))")
+        }
+        let plainOK = plain.item(Bool.self)
+        NemotronMTPR4Dense.ssmGated = plainOK
+        NemotronMTPR4Dense.pendingFold = plainOK && enabled && folded.item(Bool.self)
+        NemotronMTPR4Dense.gatedPrepared = separate.item(Bool.self)
+        report("fused L = 4 " + (plainOK ? "on" : "off") + ", pending twin (1...\(maxSteps) steps) "
+            + (NemotronMTPR4Dense.pendingFold ? "on" : "off") + ", separate prepared norm "
+            + (NemotronMTPR4Dense.gatedPrepared ? "on" : "off")
+            + " (bitwise against the window, norm and prepare launches)")
+    }
 }
 
 /// Cache the complete numerical Mamba verify window, with explicit current
@@ -136,7 +246,9 @@ final class NemotronH35MTPCompactGraphCache {
     func supportsJoined(_ hidden: MLXArray, owner: NemotronHMamba2Mixer) -> Bool {
         Self.enabled && NemotronMTPExecution.batchedM1 && NemotronMTPExecution.batchedNorm
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
-            && hidden.shape == [1, 3, 2688] && hidden.dtype == .bfloat16
+            && (hidden.shape == [1, 3, 2688]
+                || (hidden.shape == [1, 4, 2688] && NemotronMTPR4Dense.joins))
+            && hidden.dtype == .bfloat16
             && Self.nativeIdentity(owner) != nil
     }
 
@@ -250,8 +362,9 @@ final class NemotronH35MTPCompactGraphCache {
                 precondition((result[index].view(dtype: dtype) .== expected[index].view(dtype: dtype))
                     .all().item(Bool.self), "Mamba compiled join output/tape bit mismatch")
             }
-            let got = result[6].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
-            let want = expected[6].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+            let rows = hidden.dim(1)
+            let got = result[6].reshaped([rows, 11, 9, 32]).view(dtype: .uint32)
+            let want = expected[6].reshaped([rows, 11, 9, 32]).view(dtype: .uint32)
             precondition(MLX.logicalAnd(
                 (got[0..., 0..<10, 0..., 0...] .== want[0..., 0..<10, 0..., 0...]).all(),
                 (got[0..., 10, 0..., 0..<16] .== want[0..., 10, 0..., 0..<16]).all()).item(Bool.self),
@@ -367,8 +480,10 @@ extension NemotronHMamba2Mixer {
     ) -> [MLXArray] {
         let length = hiddenStates.dim(1)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: a committed strict-prefix replay
-        // arrives as its anchor and tape; the window's fused launch runs it.
-        let pending = length == 3 ? NemotronMTPPendingSSM.take(initialSSM) : nil
+        // arrives as its anchor and tape; the window's fused launch runs it
+        // (L = 3, and L = 4 once its pending twin is admitted).
+        let pending = length == 3 || (length == 4 && NemotronMTPR4Dense.pendingFold)
+            ? NemotronMTPPendingSSM.take(initialSSM) : nil
         let start = pending?.anchor ?? initialSSM
         let arrays = mtpCompactGraphCache(
             hiddenStates, convState: convState, initialSSM: start, prepared: prepared,
@@ -483,7 +598,7 @@ extension NemotronHMamba2Mixer {
         // and out_proj's prepared activation in one launch (see
         // NemotronHCompactSSMGated); the same normed rows, prepared activation
         // and final state as the two launches below.
-        if length == 3, NemotronMTPExecution.batchedNorm,
+        if length == 3 || length == 4, NemotronMTPExecution.batchedNorm,
            let q = outProj as? QuantizedLinear, q.mode == .affine,
            q.bits == 4, q.groupSize == 64, q.bias == nil,
            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
@@ -668,8 +783,6 @@ extension NemotronH35Model {
             heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
             eval(fused.0, fused.1, fused.2)
         }
-        NemotronHCompactSSMGated.qualifyShuffle(mixer)
-        NemotronHCompactSSMGated.qualifyRowsTail(mixer)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: compiles and checks every folded launch.
         NemotronMTPPendingSSM.qualify(mixer)
         for width in 2...8 {

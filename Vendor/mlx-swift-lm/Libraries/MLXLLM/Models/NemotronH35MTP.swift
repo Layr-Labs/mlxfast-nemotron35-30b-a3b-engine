@@ -55,9 +55,6 @@ private final class NemotronMTPDraftHead {
         /// The 2-bit partial pass with the upper rows two per pass, set once
         /// its scores matched the one-row record kernel's bitwise.
         var paired = false
-        /// The fused select with one barrier fewer (`NemotronHeadScreen`'s B1
-        /// select), set once its ids and kept values matched the record's.
-        var b1 = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -84,7 +81,7 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records, records2: screen.records2,
-            counter: screen.counter, paired: screen.paired, b1: screen.b1)
+            counter: screen.counter, paired: screen.paired)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -492,69 +489,6 @@ private final class NemotronMTPDraftHead {
                 }
             }
         }
-        // B1 select (NEMOTRON_MTP_SCREEN_SELECT_B1=0 keeps the record fused
-        // select): adopted only if, on synthetic inputs through the head for
-        // each half the plan screens, its id, kept ids and kept values equal the
-        // record fused select's bitwise, one launch at a time and again with all
-        // of them queued in one evaluation on the shared counter, which must
-        // read 0 afterwards.
-        var b1Note: String? = nil
-        if let counter = plan.counter, NemotronHeadScreen.b1Enabled {
-            if !NemotronHeadScreen.b1Available(keep: keep) {
-                b1Note = "off (source or keep does not qualify)"
-            } else {
-                var cases = 0
-                do {
-                    let equal = try withError { () -> Bool in
-                        func same(_ a: NemotronHeadScreen.Result, _ b: NemotronHeadScreen.Result) -> Bool {
-                            MLX.logicalAnd(
-                                (a.id .== b.id).all(),
-                                MLX.logicalAnd(
-                                    (a.candidateIds .== b.candidateIds).all(),
-                                    (a.candidateValues.view(dtype: .uint32)
-                                        .== b.candidateValues.view(dtype: .uint32)).all())).item(Bool.self)
-                        }
-                        var state: UInt64 = 0x510E_527F_ADE6_82D1
-                        var expected: [NemotronHeadScreen.Result] = []
-                        var queued: [NemotronHeadScreen.Result] = []
-                        for round in 0..<6 {
-                            let t = (0..<k).map { _ -> Float in
-                                state = state &* 6364136223846793005 &+ 1442695040888963407
-                                return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
-                            }
-                            let x = (MLXArray(t) * g * Float(1 + round % 3)).asType(.bfloat16).reshaped(1, 1, k)
-                            for half in plan.upperGroups == nil ? [false] : [false, true] {
-                                func screened(_ b1: Bool) -> NemotronHeadScreen.Result {
-                                    NemotronHeadScreen.run(
-                                        x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
-                                        groups: plan.groups, groupCount: groupCount, chunk: chunk,
-                                        keep: keep, upperGroups: half ? plan.upperGroups : nil,
-                                        upperGroupCount: half ? plan.upperGroupCount : 0,
-                                        packed: plan.packed, records: plan.records, records2: plan.records2,
-                                        counter: counter, paired: plan.paired, b1: b1)
-                                }
-                                let reference = screened(false)
-                                if !same(reference, screened(true)) { return false }
-                                expected.append(reference)
-                                queued.append(screened(true))
-                                cases += 1
-                            }
-                        }
-                        eval(queued.flatMap { [$0.id, $0.candidateIds, $0.candidateValues] })
-                        for (a, b) in zip(expected, queued) where !same(a, b) { return false }
-                        return counter.item(UInt32.self) == 0
-                    }
-                    if equal {
-                        plan.b1 = true
-                        b1Note = "on (ids, kept ids and kept values bitwise equal to the record fused select in \(cases) cases)"
-                    } else {
-                        b1Note = "off (differs from the record fused select)"
-                    }
-                } catch {
-                    b1Note = "off (\(error))"
-                }
-            }
-        }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -565,7 +499,7 @@ private final class NemotronMTPDraftHead {
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
                 packed: plan.packed, records: plan.records, records2: plan.records2,
-                counter: plan.counter, paired: plan.paired, b1: plan.b1).id)
+                counter: plan.counter, paired: plan.paired).id)
         }
         report("on, \(plan.records2 == nil ? 4 : 2)-bit, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
@@ -573,9 +507,6 @@ private final class NemotronMTPDraftHead {
             + " qualified (synthetic agreement \(chosen.agree)/4)")
         if let pairedNote {
             FileHandle.standardError.write(Data("nemotron mtp head screen paired: \(pairedNote)\n".utf8))
-        }
-        if let b1Note {
-            FileHandle.standardError.write(Data("nemotron mtp head screen select b1: \(b1Note)\n".utf8))
         }
     }
 
@@ -1319,8 +1250,9 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
                     .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
             }
             let out2 = module.maskedSecondDraft(
-                inputs: inputs, historyKeys: history.keys, historyValues: history.values,
-                own: (keys: ownKeys, values: ownValues), mask: mask)
+                inputs: inputs,
+                keys: concatenated([history.keys, ownKeys], axis: 2),
+                values: concatenated([history.values, ownValues], axis: 2), mask: mask)
             let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
             s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
             roots += [ids2, out2, ownKeys, ownValues]
