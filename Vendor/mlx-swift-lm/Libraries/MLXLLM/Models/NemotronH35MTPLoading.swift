@@ -94,10 +94,15 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
+        NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronRouterSharedUpColaunch.qualify(target)
+        NemotronDraftColaunch.qualify(assistant.module)
+        cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
+        NemotronMTPFrontNorms.qualifyShuffle(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
@@ -124,6 +129,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillScanDecayGemm.qualify()
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
+        NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -732,3 +738,9 @@ final class NemotronCPUWarm: @unchecked Sendable {
 }
 
 // Measurement entry of the carried 3f932e3c tree.
+
+// Measurement entry 2 of this tree.
+
+// Measurement of the carried 9ef6e496 tree (ercumentyildirim).
+
+// Measurement 4 of t166.
