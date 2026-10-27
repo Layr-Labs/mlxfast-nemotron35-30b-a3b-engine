@@ -120,6 +120,9 @@ public enum CBv2EngineInitHooks {
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// See `init`: commit one trivial operation when an engine is built.
     static let wakeOnInit = ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_WAKE"] != "0"
+    /// See `init`: dependent 2048 x 2048 bf16 matmuls in the wake commit (NEMOTRON_ENGINE_WAKE_MATMULS=0 keeps
+    /// the scalar add).
+    static let wakeMatmuls = Int(ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_WAKE_MATMULS"] ?? "") ?? 4
     /// See `init`: CPU threads kept busy for a few milliseconds when an engine is built.
     static let spinMillis = Int(ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_SPIN"] ?? "") ?? 40
     static let spinThreads = 4
@@ -231,7 +234,19 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // trivial operation before the engine is assembled so that the wake-up
         // overlaps this setup and the first prefill chunk's graph build.
         // NEMOTRON_ENGINE_WAKE=0 skips it.
-        if Self.wakeOnInit { asyncEval(MLXArray(Int32(1)) + MLXArray(Int32(1))) }
+        if Self.wakeOnInit {
+            if Self.wakeMatmuls > 0 {
+                // A few dependent bf16 matmuls instead of one scalar add: the GPU
+                // wakes on the first and runs real work while the host is still
+                // building the engine and the first prefill chunk. The values are
+                // never read.
+                var a = MLXArray.ones([2048, 2048], dtype: .bfloat16)
+                for _ in 0 ..< Self.wakeMatmuls { a = matmul(a, a) * MLXArray(Float(1.0 / 2048)).asType(.bfloat16) }
+                asyncEval(a)
+            } else {
+                asyncEval(MLXArray(Int32(1)) + MLXArray(Int32(1)))
+            }
+        }
         // The same idle SoC also runs its CPU clusters at their lowest state.
         // `spinThreads` threads keep integer units busy for `spinMillis`
         // milliseconds while the GPU wakes and the first prefill chunks are
