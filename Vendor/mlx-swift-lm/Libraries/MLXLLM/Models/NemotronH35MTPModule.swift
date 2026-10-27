@@ -15,6 +15,104 @@ enum NemotronMTPDraftTail {
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
     static let oneLaunchRouter = enabled("NEMOTRON_MTP_DRAFT_ROUTER_FUSED")
+    static let sharedEarly = enabled("NEMOTRON_MTP_DRAFT_SD_EARLY")
+}
+
+/// Draft encode order. In each draft step the head's routed fc2 (zero-skip slot kernel) and its shared-expert
+/// down (R = 1 multi-row QMV) do not depend on each other. The default graph (record, and t131's shared-early
+/// `depends` form) encodes {shared up, router} | {shared down, FC1} | {fc2}. Here the fc2 binds the shared up
+/// rows and the shared down binds the FC1 rows (one extra input each, never read), and the join binds `shared`
+/// before the products, so MLX encodes {router, shared up} | {FC1} | {shared down, fc2}: the router leads its
+/// interval and the FC1 runs alone. Every kernel body is the default graph's source text, so every output is
+/// bitwise the same; `qualify` checks it on the head's real weights at load and keeps the default graph on any
+/// difference. NEMOTRON_DRAFT_COLAUNCH=0 keeps it too.
+enum NemotronDraftColaunch {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_COLAUNCH"] != "0"
+    nonisolated(unsafe) private(set) static var active = false
+
+    /// Load time, after `NemotronZSkip.prepareDraft` and before any draft graph is traced: the draft tail in
+    /// this order against the default graph, bit for bit, on seeded rows through the head's real weights
+    /// (router, FC1, fc2 copy, shared up/down, join), plus the fc2, shared-down and join twins alone on seeded
+    /// relu2 rows over a density sweep. Any miss leaves the default graph.
+    static func qualify(_ head: Module) {
+        active = false
+        guard requested, !NemotronMoELeader.selfTest,
+              Device.defaultDevice().deviceType == .gpu,
+              let block = head.modules().compactMap({ $0 as? NemotronH35MTPExpertBlock }).first,
+              NemotronMTPDraftTail.exactTail, NemotronZSkip.draftDepAvailable(block.mixer.switchMLP.fc2),
+              let shared = block.mixer.sharedExperts
+        else {
+            if requested {
+                FileHandle.standardError.write(Data("nemotron draft colaunch off: not applicable\n".utf8))
+            }
+            return
+        }
+        var same = MLXArray(true)
+        var cases = 0
+        // Whole tail through the real weights.
+        for seed in 0 ..< 6 {
+            let key = MLXRandom.key(UInt64(0xdc01 + seed))
+            let x = (MLXRandom.normal([1, 1, 2688], key: key) * Float(seed < 3 ? 1 : 4)).asType(.bfloat16)
+            let a = block.exactOneTokenTail(x, normalized: nil, ordered: false)
+            let b = block.exactOneTokenTail(x, normalized: nil, ordered: true)
+            same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+            cases += 1
+        }
+        // The fc2, shared-down and join twins alone, seeded relu2-like rows, densities 0 ... 100%.
+        let fc2 = block.mixer.switchMLP.fc2
+        for (i, density) in [Float(0), 0.1, 0.47, 0.83, 1].enumerated() {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xdc11 + i)), into: 5)
+            func relu2Rows(_ shape: [Int], _ k: MLXArray) -> MLXArray {
+                let v = MLXRandom.normal(shape, key: k) * Float(0.25)
+                let keep = MLXRandom.uniform(Float(0) ..< 1, shape, key: MLXRandom.split(key: k, into: 2)[1])
+                    .< MLXArray(density)
+                return which(keep, v * v, MLXArray(Float(i % 2 == 0 ? 0 : -0.0))).asType(.bfloat16)
+            }
+            let act = relu2Rows([6, 1856], keys[0])
+            let sx = relu2Rows([1, 3712], keys[1])
+            var routes: [UInt32] = [5, 33, 64, 90, 101, 127]
+            for j in routes.indices { routes[j] = (routes[j] + UInt32(7 * i)) % 128 }
+            let inds = MLXArray(routes)
+            let scores = MLXRandom.uniform(Float(0.01) ..< 0.5, [6], key: keys[2])
+            guard let p0 = NemotronZSkip.draftProducts(act, inds, scores, owner: fc2),
+                  let p1 = NemotronZSkip.draftProducts(act, inds, scores, owner: fc2, dep: sx),
+                  let q = shared.downProj as? QuantizedLinear,
+                  let s0 = NemotronMultiRowQMV.apply(sx, q),
+                  let s1 = shared.draftDown(sx, dep: act)
+            else {
+                FileHandle.standardError.write(Data("nemotron draft colaunch off: a twin is unavailable\n".utf8))
+                return
+            }
+            let lhs = MLXRandom.normal([1, 1, 2688], key: keys[3]).asType(.bfloat16)
+            let s0r = s0.reshaped(1, 1, 2688)
+            guard let j0 = NemotronHResidualRMSNorm.applySum(lhs, p0, shared: s0r, norm: block.finalNorm),
+                  let j1 = NemotronHResidualRMSNorm.applySum(lhs, p0, shared: s0r, norm: block.finalNorm,
+                                                              sharedFirst: true)
+            else { return }
+            same = logicalAnd(same, logicalAnd(
+                (p0.view(dtype: .uint32) .== p1.view(dtype: .uint32)).all(),
+                (s0r.view(dtype: .uint16) .== s1.view(dtype: .uint16)).all()))
+            same = logicalAnd(same, logicalAnd(
+                (j0.0.view(dtype: .uint16) .== j1.0.view(dtype: .uint16)).all(),
+                (j0.1.view(dtype: .uint16) .== j1.1.view(dtype: .uint16)).all()))
+            cases += 1
+        }
+        var ok = false
+        do {
+            try withError { ok = same.item(Bool.self) }
+        } catch {
+            FileHandle.standardError.write(Data("nemotron draft colaunch off: \(error)\n".utf8))
+            return
+        }
+        guard ok else {
+            FileHandle.standardError.write(Data(
+                "nemotron draft colaunch off: the draft tail differs from the default graph\n".utf8))
+            return
+        }
+        active = true
+        FileHandle.standardError.write(Data(
+            "nemotron draft colaunch on: \(cases) cases bit-identical\n".utf8))
+    }
 }
 
 enum NemotronMTPFrontNorms {
@@ -65,10 +163,11 @@ enum NemotronMTPFrontNorms {
             }
             """
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_bf16",
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_bf16_1b" : "nemotron_mtp_front_norms_concat_bf16",
         inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
         outputNames: ["out"],
-        source: source, ensureRowContiguous: true)
+        source: NemotronHResidualRMSNorm.oneBarrierSource(source), ensureRowContiguous: true)
 
     /// The same launch also emitting eh_proj's prepared K=5376 activation
     /// (the lane-coalesced FP32 buffer `nemotron_head_prepare_activation`
@@ -110,10 +209,119 @@ enum NemotronMTPFrontNorms {
 """)
     }
     private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_prepared_bf16",
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_prepared_bf16_1b" : "nemotron_mtp_front_norms_concat_prepared_bf16",
         inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
         outputNames: ["out", "prepared"],
-        source: preparedSource(), ensureRowContiguous: true)
+        source: NemotronHResidualRMSNorm.oneBarrierSource(preparedSource()), ensureRowContiguous: true)
+
+    /// NEMOTRON_MTP_FRONT_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
+    /// Otherwise chunk c of a half (values 8c ..< 8c + 8) is lanes 2c and 2c + 1 of one SIMD group: each lane
+    /// keeps its four rounded outputs, reads its partner's through simd_shuffle_xor, and the pair writes the
+    /// chunk's nine words (the even lane its four and the total, the odd lane its four) with the same
+    /// expressions and order. Used only after `qualifyShuffle` found it bitwise equal to the copy form.
+    static let shuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_SHUFFLE"] != "0"
+    nonisolated(unsafe) private static var shuffleVerified = false
+    private static func preparedShuffleSource() -> String {
+        let decl = "float thread_x[n_reads];"
+        let store = "    out[target + i] = weight[lid * n_reads + i]\n"
+            + "        * static_cast<T>(thread_x[i] * local_inv_mean[0]);\n}"
+        precondition(source.components(separatedBy: decl).count == 2)
+        precondition(source.components(separatedBy: store).count == 2)
+        return source.replacingOccurrences(of: decl, with: decl + "\nT nmf_r[n_reads];")
+            .replacingOccurrences(of: store, with: """
+                T value = weight[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                out[target + i] = value;
+                nmf_r[i] = value;
+            }
+            {
+                const bool odd = (lid & 1u) != 0;
+                T other[4];
+                for (int i = 0; i < 4; i++) {
+                    other[i] = as_type<T>(simd_shuffle_xor(as_type<ushort>(nmf_r[i]), ushort(1)));
+                }
+                const int chunk = (second ? 336 : 0) + int(lid >> 1);
+                const int base = (int(row) * 21 + chunk / 32) * 9 * 32 + chunk % 32;
+                if (!odd) {
+                    float total = 0;
+                    total += float(nmf_r[0]) + float(nmf_r[1]) + float(nmf_r[2]) + float(nmf_r[3]);
+                    total += float(other[0]) + float(other[1]) + float(other[2]) + float(other[3]);
+                    if (NG) total += 1.0f;
+                    prepared[base + 0 * 32] = float(nmf_r[0]);
+                    prepared[base + 1 * 32] = float(nmf_r[1]) / 16.0f;
+                    prepared[base + 2 * 32] = float(nmf_r[2]) / 256.0f;
+                    prepared[base + 3 * 32] = float(nmf_r[3]) / 4096.0f;
+                    prepared[base + 8 * 32] = total;
+                } else {
+                    prepared[base + 4 * 32] = float(nmf_r[0]);
+                    prepared[base + 5 * 32] = float(nmf_r[1]) / 16.0f;
+                    prepared[base + 6 * 32] = float(nmf_r[2]) / 256.0f;
+                    prepared[base + 7 * 32] = float(nmf_r[3]) / 4096.0f;
+                }
+            }
+""")
+    }
+    private static let shuffleKernel = MLXFast.metalKernel(
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_prepared_bf16_sh_1b" : "nemotron_mtp_front_norms_concat_prepared_bf16_sh",
+        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
+        outputNames: ["out", "prepared"],
+        source: NemotronHResidualRMSNorm.oneBarrierSource(preparedShuffleSource()), ensureRowContiguous: true)
+
+    /// Load time: the shuffle-form launch against the copy-form launch, bit for bit in the joined rows and in
+    /// eh_proj's prepared activation, on seeded rows with the head's own norms at R = 1 ... 4. Admits the
+    /// shuffle form only if every case matches.
+    static func qualifyShuffle(_ block: NemotronH35MTPAttentionBlock) {
+        shuffleVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp front norms shuffle: \(message)\n".utf8))
+        }
+        guard shuffle else { return report("off (setting)") }
+        var ok = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for rows in 1 ... 4 {
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7f50 + 8 * rows + seed)), into: 2)
+                        let embedding = (MLXRandom.normal([1, rows, 2688], key: keys[0]) * Float(1 + 3 * seed))
+                            .asType(.bfloat16)
+                        let hidden = (MLXRandom.normal([1, rows, 2688], key: keys[1]) * Float(4 - 3 * seed))
+                            .asType(.bfloat16)
+                        guard let a = launch(embedding: embedding, hidden: hidden, enorm: block.embeddingNorm,
+                                             hnorm: block.hiddenNorm, shuffled: false),
+                              let b = launch(embedding: embedding, hidden: hidden, enorm: block.embeddingNorm,
+                                             hnorm: block.hiddenNorm, shuffled: true)
+                        else { ok = MLXArray(false); return }
+                        ok = ok .&& (a.0.view(dtype: .uint16) .== b.0.view(dtype: .uint16)).all()
+                            .&& (a.1.view(dtype: .uint32) .== b.1.view(dtype: .uint32)).all()
+                        cases += 1
+                    }
+                }
+                eval(ok)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        shuffleVerified = ok.item(Bool.self)
+        report(shuffleVerified ? "on (\(cases) cases bitwise equal to the copy form at R = 1 ... 4)"
+               : "off (differs from the copy form)")
+    }
+
+    /// The prepared front-norms launch in the copy or the shuffle form.
+    private static func launch(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm,
+                               shuffled: Bool) -> (MLXArray, MLXArray)? {
+        guard eligible(embedding: embedding, hidden: hidden, enorm: enorm, hnorm: hnorm) != nil else { return nil }
+        let rows = embedding.dim(1)
+        let (a, e, h) = scalars(enorm.eps, hnorm.eps)
+        let outputs = (shuffled ? shuffleKernel : preparedKernel)(
+            [embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
+            template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
+            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
 
     /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
     static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
@@ -125,7 +333,8 @@ enum NemotronMTPFrontNorms {
         else { return nil }
         let rows = embedding.dim(1)
         let (a, e, h) = scalars(enorm.eps, hnorm.eps)
-        let outputs = preparedKernel([embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
+        let outputs = (shuffleVerified ? shuffleKernel : preparedKernel)(
+            [embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
             template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
             grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
@@ -517,18 +726,36 @@ final class NemotronH35MTPExpertBlock: Module {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
-    fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
+    /// `ordered`: the `NemotronDraftColaunch` graph (nil: when qualified; false: the t71 graph).
+    func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?, ordered: Bool? = nil) -> MLXArray {
         let h = normalized ?? norm(x)
         let gate = mixer.gate
         let fused = NemotronMTPDraftTail.oneLaunchRouter && gate.topK == 6 && gate.nGroup == 1
             && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
             ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
         let (indices, scores) = fused ?? gate(h)
+        // `NemotronDraftColaunch`: the same kernels and arithmetic; only the eval tape's encode order changes.
+        if ordered ?? NemotronDraftColaunch.active, let sharedExperts = mixer.sharedExperts,
+           NemotronZSkip.draftDepAvailable(mixer.switchMLP.fc2),
+           let sx = sharedExperts.draftUpActivation(h) {
+            var fc1: MLXArray? = nil
+            if let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
+                   h, indices, scores, mixer.switchMLP, products: true,
+                   draftDep: sx, activation: { fc1 = $0 }),
+               routed.shape == [6 * 2688], let fc1,
+               let shared = sharedExperts.draftDown(sx, dep: fc1),
+               let joined = NemotronHResidualRMSNorm.applySum(
+                   x, routed, shared: shared, norm: finalNorm, sharedFirst: true) {
+                return joined.1
+            }
+        }
+        // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
+        let early = NemotronMTPDraftTail.sharedEarly ? mixer.sharedExperts.map { $0(h) } : nil
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP, products: true)
+                h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
-        let shared = sharedExperts(h)
+        let shared = early ?? sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
             return joined.1
         }
@@ -759,7 +986,7 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
-        case .lastPositionLogits: return (logits(last), hidden)
+        case .lastPositionLogits: return (NemotronSeedHeadDict.apply(last, lmHead) ?? logits(last), hidden)
         }
     }
 }
