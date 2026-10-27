@@ -1318,9 +1318,10 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_QMV_NARROW=0 keeps four outputs per SIMD group everywhere.
     static let narrowEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_NARROW"] != "0"
-    /// NEMOTRON_MTP_R1_TWIN=0 keeps the stock call for the draft step's
-    /// one-row eh_proj, attention wo and shared-expert down (`nemotronR1Linear`).
-    static let r1Route = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R1_TWIN"] != "0"
+    /// The stock call for the draft step's one-row eh_proj, attention wo and
+    /// shared-expert down (`nemotronR1Linear`); NEMOTRON_MTP_R1_TWIN=1 takes the
+    /// one-row twin route instead.
+    static let r1Route = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R1_TWIN"] == "1"
     /// The dictionary twin of the R = 1 kernel `dispatch` selects, if built.
     static var draftDictAvailable: Bool {
         let kernels = NemotronMultiRowQMVKernel.shared
@@ -1927,9 +1928,10 @@ enum NemotronMTPVerifySDPA {
     /// values; then one lane per 16-value chunk adds the chunk's four group
     /// sums in the prepare kernel's order. The separate prepare launch is not
     /// needed. Used only after `qualify` found both outputs bitwise equal.
-    /// NEMOTRON_MTP_VERIFY_SDPA_PREPARED=0 keeps the prepare launch.
+    /// Off by default (the separate prepare launch runs); NEMOTRON_MTP_VERIFY_SDPA_PREPARED=1
+    /// turns it on.
     static let preparedEnabled =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_PREPARED"] != "0"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_PREPARED"] == "1"
     nonisolated(unsafe) private static var preparedVerified = false
     private static let preparedEpilogue = """
 
