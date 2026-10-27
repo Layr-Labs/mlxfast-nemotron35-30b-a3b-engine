@@ -668,6 +668,7 @@ extension NemotronH35Model {
             heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
             eval(fused.0, fused.1, fused.2)
         }
+        NemotronHCompactSSMGated.qualifyShuffle(mixer)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: compiles and checks every folded launch.
         NemotronMTPPendingSSM.qualify(mixer)
         for width in 2...8 {
