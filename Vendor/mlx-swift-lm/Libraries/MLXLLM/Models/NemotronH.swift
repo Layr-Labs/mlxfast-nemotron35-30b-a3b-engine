@@ -261,11 +261,30 @@ enum NemotronHResidualRMSNorm {
                             T part = static_cast<T>(total) + shared[offset + i];
             """)
     }
+    /// NEMOTRON_MTP_JOIN_VEC=0 keeps the scalar slot-product reads. Otherwise each thread reads its four
+    /// columns of each of the row's six slot products as one 16-byte load before the element loop, and the
+    /// loop adds the same FP32 values in the same slot order (`withProductsVectorLoads`).
+    static let joinVectorLoads = ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOIN_VEC"] != "0"
+    private static func withProductsVectorLoads(_ s: String) -> String {
+        let loop = "for (uint i = 0; i < n_reads; i++) {"
+        let first = "float total = rhs[size_t(gid * 6) * axis_size + column];"
+        let next = "total = rhs[size_t(gid * 6 + j) * axis_size + column] + total;"
+        precondition(s.components(separatedBy: first).count == 2 && s.components(separatedBy: next).count == 2)
+        guard let range = s.range(of: loop) else { preconditionFailure("products join loop") }
+        let loads = "float4 nmj_p[6];\n            for (int j = 0; j < 6; j++) {\n"
+            + "                nmj_p[j] = *((const device float4*)(rhs + size_t(gid * 6 + j) * axis_size + lid * n_reads));\n"
+            + "            }\n            "
+        return s.replacingCharacters(in: range, with: loads + loop)
+            .replacingOccurrences(of: first, with: "float total = nmj_p[0][i];")
+            .replacingOccurrences(of: next, with: "total = nmj_p[j][i] + total;")
+    }
     private static let sumProductsPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_products_rms_prepared_bf16",
+        name: joinVectorLoads ? "nemotron_h_residual_products_rms_prepared_v4_bf16"
+            : "nemotron_h_residual_products_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
-        source: sumProductsPreparedSource(), ensureRowContiguous: true)
+        source: joinVectorLoads ? withProductsVectorLoads(sumProductsPreparedSource()) : sumProductsPreparedSource(),
+        ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
         name: "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
