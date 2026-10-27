@@ -1648,6 +1648,25 @@ enum NemotronMTPAttentionDirect {
         return y
     }
 
+    /// Same projection with preparation carried explicitly, without a side table.
+    static func projectExplicit(_ rows: [MLXArray], _ wo: Linear, prepared: MLXArray?) -> MLXArray {
+        let length = rows.count
+        func original() -> MLXArray {
+            let output = length == 1 ? rows[0] : concatenated(rows, axis: 2)
+            let merged = output.transposed(0, 2, 1, 3).reshaped(1, length, -1)
+            return nemotronMTPLinearRows(merged, wo)
+        }
+        guard let q = wo as? QuantizedLinear,
+              rows.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 && $0.dim(2) == 1 }),
+              let direct = NemotronMultiRowQMVRowInputs.apply(
+                  rows, q, prepared: prepared)
+        else { return original() }
+        var y = direct.reshaped(1, length, q.weight.dim(0))
+        if let bias = q.bias { y = y + bias }
+        if NemotronMoELeader.selfTest { y = nemotronBitwiseOrNaN(y, original()) }
+        return y
+    }
+
     /// Compile the row-pointer pipelines for every verify width (R = 2...4)
     /// on each distinct attention o_proj shape, at load, with the RPS each
     /// width uses.
@@ -1966,6 +1985,37 @@ enum NemotronMTPVerifySDPA {
         name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_prepared",
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
         source: source() + preparedEpilogue, ensureRowContiguous: false)
+    private static let dynamicPreparedKernel: MLXFast.MLXFastKernel = {
+        let seam = "  const int N = keys_shape[2] - int(tpg.z - tid.z) + 1;"
+        let original = source()
+        precondition(original.components(separatedBy: seam).count == 2,
+            "Dynamic KV attention source length seam")
+        let dynamic = original.replacingOccurrences(of: seam,
+            with: "  const int N = int(position[0]) + int(tid.z) + 1;")
+        return MLXFast.metalKernel(name: "nemotron_mtp_verify_sdpa_dynamic_capacity_prepared",
+            inputNames: ["queries", "keys", "values", "scale", "position"],
+            outputNames: ["out", "prepared"], source: dynamic + preparedEpilogue,
+            ensureRowContiguous: false)
+    }()
+
+    static var dynamicPreparedAvailable: Bool { verified && preparedVerified }
+
+    /// Caller has checked the real offset+3 <= capacity and <1024. The full
+    /// storage shape is stable; actual N is a dynamic operand, never a mask.
+    static func dynamicPrepared(_ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray,
+                                position: MLXArray, scale: Float) -> ([MLXArray], MLXArray)? {
+        guard dynamicPreparedAvailable,
+              queries.shape == [1, 32, 3, 128], queries.dtype == .bfloat16,
+              keys.ndim == 4, keys.dim(0) == 1, keys.dim(1) == 2, keys.dim(3) == 128,
+              values.shape == keys.shape, keys.dtype == .bfloat16, values.dtype == .bfloat16,
+              position.shape == [2], position.dtype == .int32 else { return nil }
+        let outputs = dynamicPreparedKernel([queries, keys, values, scaleArray(scale), position],
+            template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
+            grid: (32 * 1024, 1, 3), threadGroup: (1024, 1, 1),
+            outputShapes: [[3, 32, 128], [3, 8, 17 * 32]], outputDTypes: [.bfloat16, .float32])
+        return (split(outputs[0]), outputs[1])
+    }
+
     /// The last prepared activation `rows` built, keyed by its first row.
     nonisolated(unsafe) private static var pendingPrepared: (key: ObjectIdentifier, prepared: MLXArray)?
 
@@ -2897,6 +2947,39 @@ enum NemotronTargetQKV {
         return (outputs[0], outputs[1], outputs[2])
     }
 
+    /// Same writer with position as a graph input. Storage remains an explicit
+    /// mutable argument; request/cache objects are never compiler state.
+    static func applyWritingKVPosition(
+        _ x: MLXArray, query: Linear, key: Linear, value: Linear,
+        prepared packed: MLXArray?, kCache: MLXArray, vCache: MLXArray,
+        position: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray)? {
+        guard CBv2CriticalPathCuts.kvInPlaceAppend,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              NemotronMTPExecution.batchedM1, NemotronMultiRowQMV.enabled,
+              preparedEnabled, resultsPerSimdgroup(rows: 3) == 2,
+              kCache.ndim == 4, kCache.dim(0) == 1, kCache.dim(1) == 2, kCache.dim(3) == 128,
+              vCache.shape == kCache.shape, kCache.dtype == .bfloat16, vCache.dtype == .bfloat16,
+              position.shape == [2], position.dtype == .int32,
+              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
+              let v = buffers(value, rows: 256) else { return nil }
+        let activations = NemotronHeadPreparedActivation.compatible(packed, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        var outputs = preparedWritingKVKernel(
+            q + k + v + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
+                         kCache, vCache, position],
+            template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)],
+            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, 4096], [1, 3, 256], [1, 3, 256]],
+            outputDTypes: [x.dtype, x.dtype, x.dtype])
+        if NemotronMoELeader.selfTest {
+            let expected = dispatch(q + k + v, x, rps: 4)
+            outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
+        }
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
     /// Load-time JIT of the cache-writing launch (scratch caches only).
     static func warmWritingKV() -> [MLXArray] {
         guard CBv2CriticalPathCuts.kvInPlaceAppend, preparedEnabled,
@@ -3589,5 +3672,337 @@ enum NemotronHeadScreen {
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+    }
+}
+
+// MARK: - Fixed-capacity, dynamic-length target attention graph
+
+/// A cache of numerical recipes, never request KV or cache objects. Capacity
+/// and input preparation select signatures; offset stays a dynamic operand.
+final class NemotronDynamicKVAttentionGraph: @unchecked Sendable {
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        // Native children do not point back to their owner/cache. Keeping
+        // them alive prevents address reuse after a module replacement.
+        let retainedModules: [Module]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entries: [[Int]: Entry] = [:]
+    private var traces: [[Int]: Int] = [:]
+    private var insertionOrder: [[Int]] = []
+
+    func reset() {
+        let retired = lock.withLock { () -> [Entry] in
+            let result = Array(entries.values)
+            entries.removeAll()
+            traces.removeAll()
+            insertionOrder.removeAll()
+            return result
+        }
+        withExtendedLifetime(retired) {}
+    }
+
+    func traceCount(capacity: Int, prepared: Bool) -> Int {
+        lock.withLock { traces[[capacity, prepared ? 1 : 0]] ?? 0 }
+    }
+
+    func call(_ hidden: MLXArray, residual: MLXArray, prepared: MLXArray?,
+              keys: MLXArray, values: MLXArray, position: MLXArray,
+              owner: NemotronHAttention, nextNorm: RMSNorm) -> [MLXArray] {
+        let key = [keys.dim(2), prepared == nil ? 0 : 1]
+        let modules: [Module] = [owner, owner.wq, owner.wk, owner.wv, owner.wo, nextNorm]
+        let identity = modules.map(ObjectIdentifier.init) + [ObjectIdentifier(nextNorm.weight)]
+        let usesPrepared = prepared != nil
+        var retired: [Entry] = []
+        let entry = lock.withLock { () -> Entry in
+            if let entry = entries[key], entry.identity == identity { return entry }
+            let state = owner.innerState() + [nextNorm.weight]
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
+                [weak owner, weak self] arrays in
+                guard let owner else { preconditionFailure("Released dynamic attention owner") }
+                if let self { self.lock.withLock { self.traces[key, default: 0] += 1 } }
+                return NemotronDynamicKVAttention.numerical(arrays[0], residual: arrays[1],
+                    prepared: usesPrepared ? arrays[5] : nil, keys: arrays[2], values: arrays[3],
+                    position: arrays[4], owner: owner, nextNorm: nextNorm)
+            }
+            let replacement = Entry(identity: identity,
+                retainedModules: [owner.wq, owner.wk, owner.wv, owner.wo, nextNorm], function: function)
+            if let old = entries[key] {
+                retired.append(old)
+            } else {
+                // Bound per-owner recipes across arbitrary request capacities.
+                if entries.count >= 16, let first = insertionOrder.first {
+                    insertionOrder.removeFirst()
+                    if let old = entries.removeValue(forKey: first) { retired.append(old) }
+                    traces.removeValue(forKey: first)
+                }
+                insertionOrder.append(key)
+            }
+            entries[key] = replacement
+            return replacement
+        }
+        return withExtendedLifetime(retired) {
+            entry.function([hidden, residual, keys, values, position] + (prepared.map { [$0] } ?? []))
+        }
+    }
+}
+
+enum NemotronDynamicKVAttention {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DYNAMIC_KV_GRAPH"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var owners: Set<ObjectIdentifier> = []
+
+    private static var settings: Bool {
+        enabled && CBv2CriticalPathCuts.kvInPlaceAppend && NemotronMTPAttentionDirect.enabled
+            && NemotronMTPVerifySDPA.enabled && NemotronMTPVerifySDPA.preparedEnabled
+            && NemotronTargetQKV.preparedEnabled && NemotronMTPExecution.batchedM1
+            && NemotronMTPExecution.batchedNorm && NemotronMultiRowQMV.enabled
+            && NemotronMultiRowQMV.narrowEnabled && NemotronHResidualRMSNorm.plumbingAvailable
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+    }
+
+    private static func quantized(_ linear: Linear, n: Int, k: Int) -> Bool {
+        guard type(of: linear) == QuantizedLinear.self, let q = linear as? QuantizedLinear else { return false }
+        return q.mode == .affine && q.bits == 4 && q.groupSize == 64 && q.bias == nil
+            && q.weight.dtype == .uint32 && q.weight.shape == [n, k / 8]
+            && q.scales.dtype == .bfloat16 && q.scales.shape == [n, k / 64]
+            && q.biases?.dtype == .bfloat16 && q.biases?.shape == [n, k / 64]
+    }
+
+    private static func supports(_ owner: NemotronHAttention, _ nextNorm: RMSNorm) -> Bool {
+        settings && type(of: owner) == NemotronHAttention.self
+            && owner.numHeads == 32 && owner.numKeyValueHeads == 2 && owner.headDim == 128
+            && quantized(owner.wq, n: 4096, k: 2688) && quantized(owner.wk, n: 256, k: 2688)
+            && quantized(owner.wv, n: 256, k: 2688) && quantized(owner.wo, n: 2688, k: 4096)
+            && type(of: nextNorm) == RMSNorm.self && nextNorm.weight.shape == [2688]
+            && nextNorm.weight.dtype == .bfloat16
+    }
+
+    static func run(_ hidden: MLXArray, residual: MLXArray, prepared: MLXArray?,
+                    owner: NemotronHAttention, nextNorm: RMSNorm,
+                    cache: any CBv2AttendingLayerCache) -> [MLXArray]? {
+        guard lock.withLock({ owners.contains(ObjectIdentifier(owner)) }) else { return nil }
+        return execute(hidden, residual: residual, prepared: prepared,
+            owner: owner, nextNorm: nextNorm, cache: cache)
+    }
+
+    /// Shared runtime and scratch-lifecycle body; admission is published only
+    /// after all numerical and real-cache lifecycle checks have completed.
+    private static func execute(_ hidden: MLXArray, residual: MLXArray, prepared: MLXArray?,
+                                owner: NemotronHAttention, nextNorm: RMSNorm,
+                                cache: any CBv2AttendingLayerCache) -> [MLXArray]? {
+        guard supports(owner, nextNorm), NemotronMTPVerifySDPA.dynamicPreparedAvailable,
+              hidden.shape == [1, 3, 2688], hidden.dtype == .bfloat16,
+              residual.shape == hidden.shape, residual.dtype == hidden.dtype,
+              prepared == nil || NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688) != nil,
+              let layer = cache as? CBv2LayerCache else { return nil }
+        // Authorization MUST precede graph argument construction. Explicit
+        // array arguments may increase reference counts after this check.
+        layer.deferPositionOffsets = true
+        guard let target = layer.mtpInPlaceKVTarget(count: 3, dtype: .bfloat16, headDim: 128),
+              target.offset >= 0, target.offset + 3 < 1024 else { return nil }
+        let result = owner.dynamicKVGraph.call(hidden, residual: residual, prepared: prepared,
+            keys: target.keys, values: target.values,
+            position: MLXArray([Int32(target.offset), Int32(target.capacity)]),
+            owner: owner, nextNorm: nextNorm)
+        precondition(result.count == 4, "Dynamic KV attention graph failed after writer authorization")
+        layer.finishMTPInPlaceKVWrite(target, count: 3, written: result[3])
+        return result
+    }
+
+    /// Four explicit outputs: joined residual, next norm, its preparation,
+    /// and QKV write fence. No cache, offset integer or preparation side table
+    /// is touched here; the current [offset,capacity] is arrays[4].
+    static func numerical(_ hidden: MLXArray, residual: MLXArray, prepared: MLXArray?,
+                          keys: MLXArray, values: MLXArray, position: MLXArray,
+                          owner: NemotronHAttention, nextNorm: RMSNorm) -> [MLXArray] {
+        guard let qkv = NemotronTargetQKV.applyWritingKVPosition(hidden,
+            query: owner.wq, key: owner.wk, value: owner.wv, prepared: prepared,
+            kCache: keys, vCache: values, position: position) else {
+            preconditionFailure("Qualified dynamic KV writer became ineligible")
+        }
+        let queries = qkv.0.reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+        let orderedK = depends(input: keys, dependencies: [qkv.0])
+        let orderedV = depends(input: values, dependencies: [qkv.0])
+        guard let attention = NemotronMTPVerifySDPA.dynamicPrepared(queries, orderedK, orderedV,
+            position: position, scale: owner.scale) else {
+            preconditionFailure("Qualified dynamic KV SDPA became ineligible")
+        }
+        let output = NemotronMTPAttentionDirect.projectExplicit(attention.0, owner.wo,
+            prepared: attention.1)
+        guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(residual, output, norm: nextNorm)
+        else { preconditionFailure("Qualified dynamic attention join became ineligible") }
+        return [joined.0, joined.1, joined.2, qkv.0]
+    }
+
+    /// Original shape-varying path on independent scratch buffers. This is
+    /// load-only; `rows`/`project` retain the original preparation side table.
+    private static func reference(_ hidden: MLXArray, residual: MLXArray, prepared: MLXArray?,
+                                  keys: MLXArray, values: MLXArray, offset: Int,
+                                  owner: NemotronHAttention, nextNorm: RMSNorm) -> [MLXArray]? {
+        guard let qkv = NemotronTargetQKV.applyWritingKV(hidden, query: owner.wq, key: owner.wk,
+            value: owner.wv, prepared: prepared, kCache: keys, vCache: values,
+            offset: offset, capacity: keys.dim(2)) else { return nil }
+        let queries = qkv.0.reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+        let k = depends(input: keys[.ellipsis, ..<(offset + 3), 0...], dependencies: [qkv.0])
+        let v = depends(input: values[.ellipsis, ..<(offset + 3), 0...], dependencies: [qkv.0])
+        guard let rows = NemotronMTPVerifySDPA.rows(queries, k, v, owner.scale) else { return nil }
+        let output = NemotronMTPAttentionDirect.project(rows, owner.wo)
+        guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(residual, output, norm: nextNorm)
+        else { return nil }
+        return [joined.0, joined.1, joined.2, qkv.0]
+    }
+
+    private static func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+    }
+
+    private static func samePrepared(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        // The last K=2688 preparation tile has sixteen live lanes; do not
+        // compare the unused allocation padding of two different launches.
+        let x = a.reshaped(3, 11, 9, 32).view(dtype: .uint32)
+        let y = b.reshaped(3, 11, 9, 32).view(dtype: .uint32)
+        return (x[0..., 0..<10, 0..., 0...] .== y[0..., 0..<10, 0..., 0...]).all()
+            .&& (x[0..., 10, 0..., 0..<16] .== y[0..., 10, 0..., 0..<16]).all()
+    }
+
+    private static func qualifyHostLifecycle(_ owner: NemotronHAttention, nextNorm: RMSNorm) throws {
+        let kind = CBv2LayerKind(attention: .full, headDim: 128, kvHeads: 2, queryHeads: 32)
+        let row = CBv2FullSequenceKV(promptLength: 32, maxLength: 64, kvHeads: 2, headDim: 128)
+        let referenceRow = CBv2FullSequenceKV(promptLength: 32, maxLength: 64, kvHeads: 2, headDim: 128)
+        let cache = CBv2LayerCache(layerIndex: 0, kind: kind, rows: [row])
+        let referenceCache = CBv2LayerCache(layerIndex: 0, kind: kind, rows: [referenceRow])
+        cache.mtpSerializesRectangularAttention = true
+        referenceCache.mtpSerializesRectangularAttention = true
+        _ = row.update(keys: zeros([1, 2, 32, 128], dtype: .bfloat16),
+                       values: zeros([1, 2, 32, 128], dtype: .bfloat16))
+        _ = referenceRow.update(keys: zeros([1, 2, 32, 128], dtype: .bfloat16),
+                                values: zeros([1, 2, 32, 128], dtype: .bfloat16))
+        let hidden = (sin(MLXArray(0..<(3 * 2688)).asType(.float32) * 0.013) * 0.5)
+            .asType(.bfloat16).reshaped(1, 3, 2688)
+        let residual = (cos(MLXArray(0..<(3 * 2688)).asType(.float32) * 0.019) * 0.5)
+            .asType(.bfloat16).reshaped(1, 3, 2688)
+        let prepared = NemotronHeadPreparedActivation.pack(hidden.reshaped(3, 2688))
+        eval([hidden, residual, prepared] + cache.innerState() + referenceCache.innerState())
+        func original() -> MLXArray {
+            owner.cbv2Forward(hidden, cache: referenceCache, captureMTP: true,
+                targetQKV: true, prepared: prepared)
+        }
+        func compareOne() throws {
+            let offset = row.absoluteOffset
+            guard let actual = execute(hidden, residual: residual, prepared: prepared,
+                owner: owner, nextNorm: nextNorm, cache: cache),
+                  row.absoluteOffset == offset + 3 else {
+                throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV scratch grant/finish unavailable")
+            }
+            guard let expected = NemotronHResidualRMSNorm.applyPreparedRows(residual, original(), norm: nextNorm)
+            else { throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV scratch reference unavailable") }
+            eval(actual + [expected.0, expected.1, expected.2] + cache.innerState() + referenceCache.innerState())
+            let a = row.snapshot(), b = referenceRow.snapshot()
+            let equal = same(actual[0], expected.0) .&& same(actual[1], expected.1)
+                .&& samePrepared(actual[2], expected.2) .&& same(a.keys, b.keys) .&& same(a.values, b.values)
+            guard row.absoluteOffset == referenceRow.absoluteOffset, equal.item(Bool.self) else {
+                throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV scratch committed state differs")
+            }
+        }
+        try compareOne()
+        row.rollback(2); referenceRow.rollback(2)
+        try compareOne() // Must regain exclusive storage and overwrite rejected rows.
+        do {
+            let snapshot = row.snapshot(), referenceSnapshot = referenceRow.snapshot()
+            eval(snapshot.keys, snapshot.values, referenceSnapshot.keys, referenceSnapshot.values)
+            let before = snapshot.keys.view(dtype: .uint16).asArray(UInt16.self)
+            try withExtendedLifetime((snapshot, referenceSnapshot)) {
+                let offset = row.absoluteOffset
+                guard execute(hidden, residual: residual, prepared: prepared,
+                    owner: owner, nextNorm: nextNorm, cache: cache) == nil,
+                      row.absoluteOffset == offset else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV aliased scratch target admitted")
+                }
+                let fallback = owner.cbv2Forward(hidden, cache: cache, captureMTP: true,
+                    targetQKV: true, prepared: prepared)
+                let expected = original()
+                eval([fallback, expected] + cache.innerState() + referenceCache.innerState())
+                guard same(fallback, expected).item(Bool.self),
+                      snapshot.keys.view(dtype: .uint16).asArray(UInt16.self) == before else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV snapshot fallback changed visible prefix")
+                }
+            }
+        }
+        try compareOne() // The baseline copy-on-write fallback must leave a fresh grant usable.
+    }
+
+    static func qualify(_ model: NemotronH35Model) throws {
+        lock.withLock { owners = [] }
+        guard settings else { return }
+        let targets = model.mtpAttentionJoinOwners()
+        guard !targets.isEmpty, targets.allSatisfy({ supports($0.0, $0.1) }),
+              NemotronMTPVerifySDPA.dynamicPreparedAvailable else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV supported target prerequisites unavailable")
+        }
+        func values(_ count: Int, seed: UInt64) -> [Float] {
+            var value = seed
+            return (0..<count).map { _ in
+                value = value &* 6364136223846793005 &+ 1442695040888963407
+                return Float(Int32(truncatingIfNeeded: value >> 32)) / 2147483648.0
+            }
+        }
+        // Repeated/decreasing offsets represent full/strict commits and
+        // rollback-overwrite of a previously written unaccepted tail.
+        let cases: [(Int, [Int])] = [
+            (41, [0, 1, 29, 30, 31, 38, 30]),
+            (256, [92, 93, 94, 125, 126, 127, 253, 125]),
+            (744, [488, 489, 491, 490, 552, 616, 741, 488]),
+            (1057, [1018, 1019, 1020, 1018])]
+        var admitted: Set<ObjectIdentifier> = []
+        try withError { () -> Void in
+            for (layer, pair) in targets.enumerated() {
+                let (owner, nextNorm) = pair
+                owner.dynamicKVGraph.reset()
+                let hidden = MLXArray(values(3 * 2688, seed: UInt64(71 + layer)), [1, 3, 2688]).asType(.bfloat16)
+                let residual = MLXArray(values(3 * 2688, seed: UInt64(147 + layer)), [1, 3, 2688]).asType(.bfloat16)
+                let prepared = NemotronHeadPreparedActivation.pack(hidden.reshaped(3, 2688))
+                eval(hidden, residual, prepared)
+                for (capacity, offsets) in cases {
+                    for withPrepared in [false, true] {
+                        let rawK = values(2 * capacity * 128, seed: UInt64(900 + layer + capacity))
+                        let rawV = values(2 * capacity * 128, seed: UInt64(1700 + layer + capacity))
+                        let shape = [1, 2, capacity, 128]
+                        // Separate allocations, same original bytes.
+                        let k = MLXArray(rawK, shape).asType(.bfloat16)
+                        let v = MLXArray(rawV, shape).asType(.bfloat16)
+                        let rk = MLXArray(rawK, shape).asType(.bfloat16)
+                        let rv = MLXArray(rawV, shape).asType(.bfloat16)
+                        eval(k, v, rk, rv)
+                        let packed = withPrepared ? prepared : nil
+                        let before = owner.dynamicKVGraph.traceCount(capacity: capacity, prepared: withPrepared)
+                        for offset in offsets {
+                            let actual = owner.dynamicKVGraph.call(hidden, residual: residual, prepared: packed,
+                                keys: k, values: v, position: MLXArray([Int32(offset), Int32(capacity)]),
+                                owner: owner, nextNorm: nextNorm)
+                            guard actual.count == 4,
+                                  let expected = reference(hidden, residual: residual, prepared: packed,
+                                    keys: rk, values: rv, offset: offset, owner: owner, nextNorm: nextNorm)
+                            else { throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV missing supported graph/reference") }
+                            eval(actual + expected)
+                            let equal = same(actual[0], expected[0]) .&& same(actual[1], expected[1])
+                                .&& samePrepared(actual[2], expected[2]) .&& same(actual[3], expected[3])
+                                .&& same(k, rk) .&& same(v, rv)
+                            guard equal.item(Bool.self) else {
+                                throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV supported graph differs from original")
+                            }
+                        }
+                        guard owner.dynamicKVGraph.traceCount(capacity: capacity, prepared: withPrepared) == before + 1 else {
+                            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_DYNAMIC_KV offset caused graph retracing")
+                        }
+                    }
+                }
+                admitted.insert(ObjectIdentifier(owner))
+            }
+            if let first = targets.first { try qualifyHostLifecycle(first.0, nextNorm: first.1) }
+        }
+        lock.withLock { owners = admitted }
+        FileHandle.standardError.write(Data("nemotron dynamic KV graph: qualified \(admitted.count) attention owners\n".utf8))
     }
 }

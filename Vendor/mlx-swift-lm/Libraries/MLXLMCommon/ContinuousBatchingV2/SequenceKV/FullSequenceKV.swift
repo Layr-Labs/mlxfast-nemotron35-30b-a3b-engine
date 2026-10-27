@@ -95,6 +95,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     private var keys: MLXArray?
     private var values: MLXArray?
     private var capacity: Int
+    private(set) var mtpInPlaceEpoch: UInt64 = 0
+
+    func matchesMTPInPlaceTarget(keys expectedKeys: MLXArray, values expectedValues: MLXArray,
+                                offset: Int, capacity expectedCapacity: Int, epoch: UInt64) -> Bool {
+        keys === expectedKeys && values === expectedValues && absoluteOffset == offset
+            && capacity == expectedCapacity && mtpInPlaceEpoch == epoch
+    }
 
     /// - Parameters:
     ///   - promptLength: expected prompt length, used to size the initial
@@ -150,6 +157,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
         )
 
+        mtpInPlaceEpoch &+= 1
         ensureCapacity(absoluteOffset + n, keyTemplate: newKeys, valueTemplate: newValues)
 
         keys = Self.write(keys!, newKeys, at: absoluteOffset)
@@ -193,15 +201,23 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     /// caller's stream), so the edge stays on that stream. Later rounds read
     /// the buffers only after this round's readback.
     func commitInPlaceAppend(count n: Int, written: MLXArray) -> (MLXArray, MLXArray) {
-        precondition(keys != nil && values != nil && absoluteOffset + n <= capacity,
-            "CBv2FullSequenceKV: in-place append without a target")
-        absoluteOffset += n
+        commitInPlaceMetadata(count: n)
         let k = keys![.ellipsis, ..<absoluteOffset, 0...]
         let v = values![.ellipsis, ..<absoluteOffset, 0...]
         return (
             depends(input: k, dependencies: [written]),
             depends(input: v, dependencies: [written])
         )
+    }
+
+    /// Host publication only. A numerical graph that already returns its
+    /// ordered attention outputs needs no unused visible-KV view graphs.
+    /// GPU completion still belongs to that graph's ordinary readback.
+    func commitInPlaceMetadata(count n: Int) {
+        precondition(keys != nil && values != nil && absoluteOffset + n <= capacity,
+            "CBv2FullSequenceKV: in-place append without a target")
+        absoluteOffset += n
+        mtpInPlaceEpoch &+= 1
     }
 
     public func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int) {
@@ -236,6 +252,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             n <= absoluteOffset,
             "CBv2FullSequenceKV.rollback(\(n)) exceeds retained \(absoluteOffset)")
         absoluteOffset -= n
+        mtpInPlaceEpoch &+= 1
     }
 
     func cbv2InnerState() -> [MLXArray] {

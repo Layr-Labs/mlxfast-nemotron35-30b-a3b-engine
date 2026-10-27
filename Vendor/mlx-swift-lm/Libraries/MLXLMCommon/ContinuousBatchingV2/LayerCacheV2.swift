@@ -16,6 +16,19 @@
 import Foundation
 import MLX
 
+/// One synchronously acquired in-place target. Keep outside compiler state;
+/// only its arrays are dynamic graph arguments. No snapshot, row operation or
+/// callback may intervene between acquisition, graph construction and finish.
+public struct CBv2MTPInPlaceKVTarget {
+    public let keys: MLXArray
+    public let values: MLXArray
+    public let offset: Int
+    public let capacity: Int
+    public let count: Int
+    fileprivate let row: CBv2FullSequenceKV
+    fileprivate let epoch: UInt64
+}
+
 /// Per-layer, batch-facing cache + attention dispatcher for the v2 engine.
 public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
@@ -211,7 +224,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// configuration `updateAndAttendSerialQueryRows` serves. nil (and
     /// nothing changed) otherwise.
     public func mtpInPlaceKVTarget(count: Int, dtype: DType, headDim: Int)
-        -> (keys: MLXArray, values: MLXArray, offset: Int, capacity: Int)?
+        -> CBv2MTPInPlaceKVTarget?
     {
         guard kind.sharesKVWithLayer == nil, mtpSerializesRectangularAttention,
               rows.count == 1, count > 1,
@@ -219,7 +232,10 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
               boundSpanContexts?.contains(where: { $0 != nil }) != true,
               let row = rows[0] as? CBv2FullSequenceKV
         else { return nil }
-        return row.inPlaceAppendTarget(count: count, dtype: dtype, headDim: headDim)
+        guard let target = row.inPlaceAppendTarget(count: count, dtype: dtype, headDim: headDim)
+        else { return nil }
+        return CBv2MTPInPlaceKVTarget(keys: target.keys, values: target.values,
+            offset: target.offset, capacity: target.capacity, count: count, row: row, epoch: row.mtpInPlaceEpoch)
     }
 
     /// `updateAndAttendSerialQueryRows` after the producer kernel wrote the
@@ -237,6 +253,23 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             scale: scale, sinks: sinks, softcap: attentionSoftcap, attendRows: attendRows)
         advancePositionOffsets(by: queries.dim(2))
         return outputs
+    }
+
+    /// Publish only the metadata of an explicitly computed in-place graph.
+    /// The graph already attended behind `written`; do not attend twice.
+    public func finishMTPInPlaceKVWrite(_ target: CBv2MTPInPlaceKVTarget,
+                                      count: Int, written: MLXArray) {
+        precondition(count == target.count && count > 1,
+            "MTP KV graph write count differs from its authorized target")
+        precondition(rows.count == 1 && rows[0] === target.row,
+            "MTP KV graph target row changed before finish")
+        precondition(target.row.matchesMTPInPlaceTarget(keys: target.keys, values: target.values,
+            offset: target.offset, capacity: target.capacity, epoch: target.epoch),
+            "MTP KV graph target storage/offset changed before finish")
+        // `written` is already an ancestor of the returned joined outputs.
+        // Retain it through publication; this call is not a GPU wait/fence.
+        withExtendedLifetime(written) { target.row.commitInPlaceMetadata(count: count) }
+        advancePositionOffsets(by: count)
     }
 
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):

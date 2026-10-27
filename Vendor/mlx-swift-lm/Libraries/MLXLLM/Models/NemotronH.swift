@@ -4905,6 +4905,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 // MARK: - Attention
 
 class NemotronHAttention: Module, NemotronHMixer {
+    let dynamicKVGraph = NemotronDynamicKVAttentionGraph()
+
     let args: NemotronHConfiguration
     let scale: Float
     let numHeads: Int
@@ -8579,6 +8581,11 @@ private class NemotronHBlock: Module {
             guard let attentionCache else {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
+            let attention = mixer as! NemotronHAttention
+            if let joined = NemotronDynamicKVAttention.run(hidden, residual: x, prepared: prepared,
+                owner: attention, nextNorm: nextNorm, cache: attentionCache) {
+                return (joined[0], joined[1], joined[2])
+            }
             output = (mixer as! NemotronHAttention).cbv2Forward(
                 hidden, cache: attentionCache, captureMTP: true, targetQKV: true,
                 prepared: prepared)
@@ -9114,6 +9121,14 @@ public class NemotronHModel:
             return lmHead(hidden)
         }
         return backbone.embeddings.asLinear(hidden)
+    }
+
+    func mtpAttentionJoinOwners() -> [(NemotronHAttention, RMSNorm)] {
+        let layers = backbone.layers
+        return layers.indices.compactMap { index in
+            guard let attention = layers[index].mixer as? NemotronHAttention else { return nil }
+            return (attention, index + 1 < layers.count ? layers[index + 1].norm : backbone.normF)
+        }
     }
 
     func prepareVerifyEntry() {
