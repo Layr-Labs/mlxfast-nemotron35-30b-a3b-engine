@@ -1170,12 +1170,13 @@ enum NemotronMoELeader {
     }
 
     /// Geometry of the plan-free triple FC1: one SIMD group per threadgroup
-    /// with four outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
-    /// 2 and the leader's narrow two restore the base's threadgroups). Only
-    /// the output-to-SIMD-group map moves: every output keeps its lane split,
-    /// K order, qdot and closing simd_sum.
+    /// with one output each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
+    /// NEMOTRON_MTP_FC1_RPS=2 or 4 restores two or four outputs, NSG 2 with the leader's
+    /// narrow two the older threadgroups). Only the output-to-SIMD-group map
+    /// moves: every output keeps its lane split, K order, qdot and closing
+    /// simd_sum.
     static let fc1SimdGroups = max(1, Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_NSG"] ?? "") ?? 1)
-    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 4
+    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 1
     static let preparedGateUp = true
     static let fuseBalancePlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
@@ -2779,6 +2780,10 @@ enum NemotronSharedDownZSkip {
     static var copyArrays: [MLXArray] {
         lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
     }
+    /// The verified copy of `down` (a target layer's shared down projection), if any.
+    static func copyArrays(for down: Linear) -> (codes: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        lock.withLock { copies[ObjectIdentifier(down)].map { ($0.codes, $0.scales, $0.biases) } }
+    }
 
     private static func admissible(_ q: QuantizedLinear) -> Bool {
         type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
@@ -3633,6 +3638,25 @@ enum NemotronSBDict {
     /// Every admitted draft-head index and table (decode-only backing for the head's residency set).
     static var draftArrays: [MLXArray] {
         lock.withLock { draftDicts.values.flatMap { [$0.index, $0.table] } }
+    }
+
+    /// `arrays` without the scales and biases of the head's routed banks that have an admitted dictionary: the
+    /// head's routed experts run only one-row draft steps, whose dictionary twin binds the bank's codes, index
+    /// and table, so those scales and biases are not decode backing. NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY=1
+    /// keeps them.
+    static func withoutDictBankMetadata(_ arrays: [MLXArray], module: Module) -> [MLXArray] {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY"] != "1" else { return arrays }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, draftDict(linear) != nil else { continue }
+            for (key, a) in linear.parameters().flattened() where key == "scales" || key == "biases" {
+                skip.insert(ObjectIdentifier(a))
+            }
+        }
+        let kept = arrays.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(arrays.count - kept.count) dictionary bank scale/bias arrays left out\n".utf8))
+        return kept
     }
 
     /// The admitted routed-bank indices (for `NemotronBankBinding.warm`: addressed from their base).
