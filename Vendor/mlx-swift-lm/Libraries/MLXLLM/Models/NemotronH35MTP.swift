@@ -483,13 +483,28 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     private var decodeResidency: AnyObject?
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
+            var head = NemotronSBDict.withoutDictBankMetadata(NemotronZSkip.withoutCopiedDraftBanks(module), module: module)
+                + draftHead.decodeResidencyArrays + NemotronSBDict.draftArrays
+            var extras = NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays + NemotronSharedDownZSkip.copyArrays
+            // With `NemotronMTPFirstRoundDraft`, the head's routed banks (fc1 bank words with their pair
+            // dictionary, the fc2 copy) get their own set, requested after the extras; the head's block skips
+            // its routed experts until that request returns.
+            var late: [MLXArray] = []
+            if NemotronMTPFirstRoundDraft.enabled {
+                let block = module.layers[1] as! NemotronH35MTPExpertBlock
+                let fc1 = block.mixer.switchMLP.fc1
+                late = fc1.parameters().flattened().filter { $0.0 == "weight" }.map { $0.1 }
+                    + (NemotronSBDict.draftDict(fc1).map { [$0.index, $0.table] } ?? [])
+                    + NemotronZSkip.draftCopyArrays
+                let moved = Set(late.map(ObjectIdentifier.init))
+                head = head.filter { !moved.contains(ObjectIdentifier($0)) }
+                extras = extras.filter { !moved.contains(ObjectIdentifier($0)) }
+            }
             decodeResidency = NemotronDecodeResidency(
-                head: NemotronZSkip.withoutCopiedDraftBanks(module)
-                    + draftHead.decodeResidencyArrays + NemotronSBDict.draftArrays,
+                head: head,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
-                extras: NemotronZSkip.draftCopyArrays + NemotronSBDict.allArrays
-                    + NemotronSharedDownZSkip.copyArrays)
+                extras: extras, late: late)
             if let residency = decodeResidency as? NemotronDecodeResidency {
                 NemotronDecodeResidency.current = residency
                 CBv2EngineInitHooks.onInit = {
@@ -861,8 +876,11 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             s.deferredSecondRow = nil
             s.roots += s.cache.appendTrusted(keys: row.keys, values: row.values)
         }
+        // Before the request's first verify (`NemotronMTPFirstRoundDraft`).
+        NemotronMTPFirstRoundDraft.firstRound = !s.started
         let out = module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
+        NemotronMTPFirstRoundDraft.firstRound = false
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
         s.stagedInputCount += 1
         if first { s.trustedOffset = s.cacheOffset }
