@@ -71,6 +71,7 @@ extension NemotronH35MTPAssistant {
         }
         try assistant.module.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
         eval(assistant.module)
+        NemotronMTPNormOnlyRow.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         assistant.prepareDraftHeadScreen()
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
@@ -90,6 +91,7 @@ extension NemotronH35MTPAssistant {
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronZSkip.qualifySimdStage()
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)

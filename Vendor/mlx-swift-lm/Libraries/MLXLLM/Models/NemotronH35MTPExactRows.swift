@@ -187,6 +187,8 @@ func nemotronSwapped(_ source: String, _ swaps: [(String, String, Int)]) -> Stri
 // - INPROJ: the verify's Mamba in_proj + conv/dt launch (R = 3).
 // - HEAD: the verify's 131,072-row target head (R = 3 prepared, ld2/NSG form).
 // - DRAFT: the draft head's one-row routed FC1 leader (its pair dictionary).
+// - SHAREDUP: the verify's MoE shared-expert up (R = 3 prepared, ReLU2, its
+//   pair dictionary), [2688, 3712].
 // Each family's twin is admitted at load only after it matched its record
 // kernel bit for bit on the real weights (`NemotronU2.qualify`). Only the
 // verify and draft launch sites select it; the stepper's prompt prefill and
@@ -209,7 +211,7 @@ enum NemotronU2 {
     static let leaderLoop = "for (; k < K - block_size; k += block_size) {\n"
 
     enum Family: String, CaseIterable {
-        case inProj = "INPROJ", head = "HEAD", draft = "DRAFT"
+        case inProj = "INPROJ", head = "HEAD", draft = "DRAFT", sharedUp = "SHAREDUP"
     }
     /// NEMOTRON_U2_<FAMILY>=0 keeps that family's record kernels.
     static func setting(_ family: Family) -> Bool {
@@ -220,11 +222,13 @@ enum NemotronU2 {
     nonisolated(unsafe) static var inProj = false
     nonisolated(unsafe) static var head = false
     nonisolated(unsafe) static var draft = false
+    nonisolated(unsafe) static var sharedUp = false
 
     /// The R = 3 prepared launch of an [K, N] projection takes its twin: the
-    /// 131,072-row target head once HEAD is admitted.
+    /// 131,072-row target head once HEAD is admitted, the 3,712-row shared-expert
+    /// up once SHAREDUP is admitted.
     static func prepared(rows: Int, n: Int) -> Bool {
-        rows == 3 && n == 131072 && head
+        rows == 3 && ((n == 131072 && head) || (n == 3712 && sharedUp))
     }
 
     static func report(_ family: Family, _ message: String) {
@@ -1085,6 +1089,34 @@ enum NemotronHeadPreparedActivation {
             same = logicalAnd(same, NemotronU2.equal(a, b))
             eval(same)
             cases += 1
+        }
+        return (same, cases)
+    }
+    /// SHAREDUP: the shared-expert up of the first, a middle and the last MoE layer
+    /// (ReLU2 epilogue, each layer's pair dictionary), record kernel against twin.
+    static func u2CheckSharedUp(_ model: Module) -> (MLXArray, Int)? {
+        let ups = model.modules().compactMap { $0 as? NemotronHMoE }.compactMap { moe -> QuantizedLinear? in
+            guard let q = moe.sharedExperts?.upProj as? QuantizedLinear, q.weight.shape == [3712, 336],
+                  q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, q.weight.dtype == .uint32,
+                  q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16 else { return nil }
+            return q
+        }
+        guard !ups.isEmpty else { return nil }
+        let k = 2688, n = 3712
+        let picked = [ups[0], ups[ups.count / 2], ups[ups.count - 1]]
+        var same = MLXArray(true)
+        var cases = 0
+        for (i, q) in picked.enumerated() {
+            let dict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil && dictLaunchAvailable(k: k, n: n)
+            guard u2Available(k: k, n: n, dict: dict) else { return nil }
+            for key in MLXRandom.split(key: MLXRandom.key(UInt64(0x52b0 + i)), into: 2) {
+                let x = (MLXRandom.normal([3, k], key: key) * 0.5).asType(.bfloat16)
+                let a = apply(x, q, relu2: true, rps: 2, u2: false)
+                let b = apply(x, q, relu2: true, rps: 2, u2: true)
+                same = logicalAnd(same, NemotronU2.equal(a, b))
+                eval(same)
+                cases += 1
+            }
         }
         return (same, cases)
     }

@@ -570,7 +570,7 @@ final class NemotronH35MTPAttentionBlock: Module {
 
     fileprivate func uncompiledDraftFront(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         let fused = fuse(hidden: hidden, embedding: embedding)
-        return [fused, norm(fused)]
+        return [fused, NemotronMTPNormOnlyRow.apply(fused, norm: norm) ?? norm(fused)]
     }
 
     /// Trusted target rows only need the head's K/V projections. Their
@@ -1459,5 +1459,80 @@ enum NemotronMTPDraftSDPA {
         report(verified
             ? "on (\(checked) cases bitwise equal to the stock call; key loop unroll4, one-barrier aggregation, own row in place)"
             : "off (differs from the stock call after \(checked) cases)")
+    }
+}
+
+
+// MARK: - Normalized-only one-row draft front
+
+/// Selected from d9dc3781's actual R1 norm route, with a distinct output-only
+/// kernel: its prepared output and packing are absent here. Entire highest88
+/// seed retile and all other existing paths stay unchanged.
+enum NemotronMTPNormOnlyRow {
+    static let enabled = NemotronHResidualRMSNorm.oneBarrier
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_NORM_ONLY_R1"] != "0"
+    nonisolated(unsafe) private static var verified = false
+
+    static func apply(_ x: MLXArray, norm: RMSNorm) -> MLXArray? {
+        enabled && verified ? NemotronHResidualRMSNorm.normOnlyRow(x, norm: norm) : nil
+    }
+
+    /// Written load-time admission only. Compare the real norm's complete
+    /// words and its three real downstream projections, before any draft-front
+    /// graph is traced. New/private layouts, scales and each rounding boundary
+    /// use the same original stock RMSNorm reference; any failure keeps it.
+    static func qualify(_ block: NemotronH35MTPAttentionBlock) {
+        verified = false
+        guard enabled else { return }
+        var checked = 0, projections = 0
+        do {
+            let matched = try withError { () -> Bool in
+                var rows: [MLXArray] = []
+                for seed in 0 ..< 3 {
+                    for scale in [Float(1.0 / 64), 0.25, 1, 16, 4096] {
+                        let key = MLXRandom.key(UInt64(0xd2f0 + 8 * seed) + UInt64(rows.count))
+                        rows.append((MLXRandom.normal([1, 1, 2688], key: key) * scale).asType(.bfloat16))
+                    }
+                }
+                rows.append(MLXArray.ones([1, 1, 2688], dtype: .bfloat16) * MLXArray(Float(3)).asType(.bfloat16))
+                let spike = MLXRandom.normal([1, 1, 2688], key: MLXRandom.key(0xd2ff)) * Float(0.01)
+                rows.append(which(MLXArray(Int32(0) ..< 2688).reshaped(1, 1, 2688) .== MLXArray(Int32(1337)),
+                                  MLXArray(Float(300)), spike).asType(.bfloat16))
+                // Signed zeros and the smallest BF16 subnormal exercise the
+                // raw input read/float widening without a residual add.
+                let wordRows: [[UInt16]] = [
+                    [0x0000, 0x8000, 0x0001, 0x8001, 0x3f80, 0xbf80, 0x0080],
+                    [0x3f00, 0x3f01, 0x3f7f, 0x3f80, 0xbf00, 0xbf01, 0xbf80],
+                ]
+                for words in wordRows {
+                    rows.append(MLXArray((0 ..< 2688).map { words[$0 % words.count] })
+                        .reshaped(1, 1, 2688).view(dtype: .bfloat16))
+                }
+                for (index, row) in rows.enumerated() {
+                    // The second form has a nonzero base inside a larger
+                    // allocation; feature-contiguous, as the helper promises.
+                    for shifted in [false, true] {
+                        let x = shifted ? concatenated([row, row], axis: 1)[0..., 1 ..< 2, 0...] : row
+                        guard let got = NemotronHResidualRMSNorm.normOnlyRow(x, norm: block.norm) else { return false }
+                        let expected = block.norm(x)
+                        var same = all(got.view(dtype: .uint16) .== expected.view(dtype: .uint16))
+                        if [0, 5, 14, 16, 17, 18].contains(index) {
+                            for linear in [block.mixer.wq, block.mixer.wk, block.mixer.wv] {
+                                let a = nemotronR1Linear(got, linear)
+                                let b = nemotronR1Linear(expected, linear)
+                                same = same .&& all(a.view(dtype: .uint16) .== b.view(dtype: .uint16))
+                                projections += 1
+                            }
+                        }
+                        if !same.item(Bool.self) { return false }
+                        checked += 1
+                    }
+                }
+                return checked == 38 && projections == 36
+            }
+            verified = matched
+        } catch { verified = false }
+        FileHandle.standardError.write(Data(
+            "nemotron mtp norm only r1: \(verified ? "on" : "off") (\(checked) norm rows / \(projections) projections)\n".utf8))
     }
 }

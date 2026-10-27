@@ -484,6 +484,48 @@ enum NemotronHResidualRMSNorm {
                 which(ok, outputs[2], MLXArray(Float.nan)))
     }
 
+
+    /// One row of the original RMS statements, with its one-barrier reduction
+    /// and just the normalized output. No residual, prepared activation,
+    /// chunk packing, shuffle epilogue or additional output allocation.
+    private static let normOnlyRowSource: String? = {
+        let read = "T sum = lhs[offset + i] + rhs[offset + i];"
+        let store = "residual[offset + i] = sum;"
+        let base = oneBarrierSource(source)
+        guard base.components(separatedBy: read).count == 2,
+              base.components(separatedBy: store).count == 2
+        else { return nil }
+        let result = base.replacingOccurrences(of: read, with: "T sum = lhs[offset + i];")
+            .replacingOccurrences(of: store, with: "")
+        guard !result.contains("rhs["), !result.contains("residual["), !result.contains("prepared[")
+        else { return nil }
+        return result
+    }()
+    private static let normOnlyRowKernel = normOnlyRowSource.map {
+        MLXFast.metalKernel(
+            name: "nemotron_h_norm_only_r1_bf16_1b",
+            inputNames: ["lhs", "weight", "axis_size", "eps"], outputNames: ["normalized"],
+            source: $0, ensureRowContiguous: true)
+    }
+
+    /// Called only after the real head norm's bitwise admission. The helper is
+    /// also used by that official-remote-only admission before its flag is set.
+    static func normOnlyRow(_ x: MLXArray, norm: RMSNorm) -> MLXArray? {
+        guard oneBarrier, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16, x.strides[2] == 1,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16, norm.weight.strides == [1],
+              let normOnlyRowKernel
+        else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let output = normOnlyRowKernel([x, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [x.shape], outputDTypes: [.bfloat16])[0]
+        guard NemotronMoELeader.selfTest else { return output }
+        return nemotronBitwiseOrNaN(output, norm(x))
+    }
+
     /// Captured verify entry norm: (normalized, prepared K=2688 rows).
     static func normPreparedRows(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray)? {
         guard plumbingRows(x, norm: norm) else { return nil }
