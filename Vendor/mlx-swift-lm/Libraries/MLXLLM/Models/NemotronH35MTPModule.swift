@@ -323,6 +323,128 @@ enum NemotronMTPFrontNorms {
         return (outputs[0], outputs[1])
     }
 
+
+    static let virtualSIMDEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_VIRTUAL_SIMD"] != "0"
+    nonisolated(unsafe) private static var virtualNormOwners: [ObjectIdentifier] = []
+    private static let virtualSIMDKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_front_virtual_simd7x3", inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
+        outputNames: ["out", "prepared"], source: """
+          constexpr uint n_reads = 4;
+          const uint gid = threadgroup_position_in_grid.x;
+          const uint lid = thread_position_in_threadgroup.x;
+          const uint lane = thread_index_in_simdgroup;
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint row = gid / 2;
+          const bool second = (gid % 2) != 0;
+          const device T* x = second ? h : e;
+          const device T* weight = second ? hw : ew;
+          const float eps = second ? h_eps : e_eps;
+          threadgroup float local_sums[32];
+          float thread_x[3][4];
+          // Each physical SIMD group executes logical groups sg, sg+7,
+          // sg+14. Each retains the original four-value lane partial.
+          for (uint pass = 0; pass < 3; pass++) {
+            const uint logical_lid = lid + pass * 224;
+            const size_t offset = size_t(row) * axis_size + logical_lid * n_reads;
+            float acc = 0;
+            for (uint i = 0; i < n_reads; i++) {
+              thread_x[pass][i] = x[offset + i];
+              acc += thread_x[pass][i] * thread_x[pass][i];
+            }
+            acc = simd_sum(acc);
+            if (lane == 0) local_sums[sg + pass * 7] = acc;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          // Same original 21 ordered group sums and eleven zero lanes.
+          const float acc = simd_sum(lane < 21 ? local_sums[lane] : 0.0f);
+          const float inv_mean = metal::precise::rsqrt(acc / axis_size + eps);
+          for (uint pass = 0; pass < 3; pass++) {
+            const uint logical_lid = lid + pass * 224;
+            const size_t target = size_t(row) * (2 * size_t(axis_size))
+                + (second ? size_t(axis_size) : 0) + logical_lid * n_reads;
+            T rounded[4];
+            for (uint i = 0; i < n_reads; i++) {
+              T value = weight[logical_lid * n_reads + i]
+                  * static_cast<T>(thread_x[pass][i] * inv_mean);
+              out[target + i] = value;
+              rounded[i] = value;
+            }
+            // Original adjacent-lane prepared epilogue, with only the
+            // logical lane address changed; XOR partners remain adjacent.
+            const bool odd = (logical_lid & 1u) != 0;
+            T other[4];
+            for (int i = 0; i < 4; i++) {
+              other[i] = as_type<T>(simd_shuffle_xor(as_type<ushort>(rounded[i]), ushort(1)));
+            }
+            const int chunk = (second ? 336 : 0) + int(logical_lid >> 1);
+            const int base = (int(row) * 21 + chunk / 32) * 9 * 32 + chunk % 32;
+            if (!odd) {
+              float total = 0;
+              total += float(rounded[0]) + float(rounded[1]) + float(rounded[2]) + float(rounded[3]);
+              total += float(other[0]) + float(other[1]) + float(other[2]) + float(other[3]);
+              if (NG) total += 1.0f;
+              prepared[base + 0 * 32] = float(rounded[0]);
+              prepared[base + 1 * 32] = float(rounded[1]) / 16.0f;
+              prepared[base + 2 * 32] = float(rounded[2]) / 256.0f;
+              prepared[base + 3 * 32] = float(rounded[3]) / 4096.0f;
+              prepared[base + 8 * 32] = total;
+            } else {
+              prepared[base + 4 * 32] = float(rounded[0]);
+              prepared[base + 5 * 32] = float(rounded[1]) / 16.0f;
+              prepared[base + 6 * 32] = float(rounded[2]) / 256.0f;
+              prepared[base + 7 * 32] = float(rounded[3]) / 4096.0f;
+            }
+          }
+        """, ensureRowContiguous: true)
+
+    /// Remote-only load-time admission on the head's own immutable norms.
+    /// The old one-barrier/shuffle R3 path is the complete-word oracle.
+    static func qualifyVirtualSIMD(_ block: NemotronH35MTPAttentionBlock) {
+        virtualNormOwners = []
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron front virtual SIMD: \(text)\n".utf8))
+        }
+        guard virtualSIMDEnabled, NemotronHResidualRMSNorm.oneBarrier,
+              shuffle, shuffleVerified, !NemotronMoELeader.selfTest else { return report("off (setting)") }
+        var cases = 0
+        do {
+            let match = try withError { () -> Bool in
+                for kind in 0..<6 {
+                    let key = MLXRandom.key(UInt64(0x91d0 + kind))
+                    let scale: Float = kind == 0 ? 0 : (kind == 1 ? 0.001 : (kind < 4 ? 1 : 8))
+                    let e = (MLXRandom.normal([1, 3, 2688], key: key) * scale).asType(.bfloat16)
+                    let h = (MLXRandom.normal([1, 3, 2688], key: MLXRandom.split(key: key, into: 2)[1]) * scale)
+                        .asType(.bfloat16)
+                    guard let a = launch(embedding: e, hidden: h, enorm: block.embeddingNorm,
+                                         hnorm: block.hiddenNorm, shuffled: true) else { return false }
+                    // Only the kernel is forced during load-time trials. No
+                    // public capability is admitted until every bit matched.
+                    let (axis, ee, he) = scalars(block.embeddingNorm.eps, block.hiddenNorm.eps)
+                    for ng in [false, true] {
+                        let old = ng == NemotronMTPDraftJoins.negativeFront ? [a.0, a.1]
+                            : shuffleKernel([e, h, block.embeddingNorm.weight, block.hiddenNorm.weight, axis, ee, he],
+                                template: [("T", DType.bfloat16), ("NG", ng)],
+                                grid: (672 * 6, 1, 1), threadGroup: (672, 1, 1),
+                                outputShapes: [[1, 3, 5376], [3, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+                        let fresh = virtualSIMDKernel(
+                            [e, h, block.embeddingNorm.weight, block.hiddenNorm.weight, axis, ee, he],
+                            template: [("T", DType.bfloat16), ("NG", ng)],
+                            grid: (224 * 6, 1, 1), threadGroup: (224, 1, 1),
+                            outputShapes: [[1, 3, 5376], [3, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+                        guard (old[0].view(dtype: .uint16) .== fresh[0].view(dtype: .uint16)).all().item(Bool.self),
+                              (old[1].view(dtype: .uint32) .== fresh[1].view(dtype: .uint32)).all().item(Bool.self)
+                        else { return false }
+                        cases += 1
+                    }
+                }
+                return cases == 12
+            }
+            if match { virtualNormOwners = [ObjectIdentifier(block.embeddingNorm), ObjectIdentifier(block.hiddenNorm)] }
+        } catch { return report("off (\(error))") }
+        report(virtualNormOwners.isEmpty ? "off (difference after \(cases) cases)"
+            : "on (\(cases) all joined BF16/prepared FP32 word cases equal)")
+    }
+
     /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
     static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
         -> (MLXArray, MLXArray)?
@@ -333,10 +455,12 @@ enum NemotronMTPFrontNorms {
         else { return nil }
         let rows = embedding.dim(1)
         let (a, e, h) = scalars(enorm.eps, hnorm.eps)
-        let outputs = (shuffleVerified ? shuffleKernel : preparedKernel)(
+        let virtual = virtualSIMDEnabled && NemotronHResidualRMSNorm.oneBarrier && shuffle && shuffleVerified
+            && virtualNormOwners == [ObjectIdentifier(enorm), ObjectIdentifier(hnorm)]
+        let outputs = (virtual ? virtualSIMDKernel : (shuffleVerified ? shuffleKernel : preparedKernel))(
             [embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
             template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
-            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
+            grid: ((virtual ? 224 : 672) * 2 * rows, 1, 1), threadGroup: (virtual ? 224 : 672, 1, 1),
             outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
         let expected = reference()

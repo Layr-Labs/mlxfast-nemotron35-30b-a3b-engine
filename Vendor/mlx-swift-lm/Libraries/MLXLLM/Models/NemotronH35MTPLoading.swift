@@ -103,6 +103,7 @@ extension NemotronH35MTPAssistant {
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPFrontNorms.qualifyShuffle(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPFrontNorms.qualifyVirtualSIMD(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
