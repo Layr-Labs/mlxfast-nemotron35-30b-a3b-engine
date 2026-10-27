@@ -266,6 +266,31 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumProductsPreparedSource(), ensureRowContiguous: true)
+
+    // e4b73c29's six quartet preloads, with packed storage types so the
+    // original scalar route's valid four-byte-offset views stay valid too.
+    // All additions still occur in column order and slot0,slot1,...slot5.
+    private static let packedProductsEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOIN_PACKED4"] != "0"
+    nonisolated(unsafe) private static var packedProductsReady = false
+    private static func withPackedProductReads(_ s: String) -> String {
+        let loop = "for (uint i = 0; i < n_reads; i++) {"
+        let first = "float total = rhs[size_t(gid * 6) * axis_size + column];"
+        let next = "total = rhs[size_t(gid * 6 + j) * axis_size + column] + total;"
+        precondition(s.contains("constexpr uint n_reads = 4;"))
+        guard let range = s.range(of: loop) else { preconditionFailure("packed products loop") }
+        let loads = "float4 nmj_p[6];\nfor (int j = 0; j < 6; j++) {\n"
+            + "  nmj_p[j] = float4(*((const device packed_float4*)(rhs + size_t(gid * 6 + j) * axis_size + lid * n_reads)));\n}\n"
+        return nemotronSwapped(s.replacingCharacters(in: range, with: loads + loop), [
+            (first, "float total = nmj_p[0][i];", 1),
+            (next, "total = nmj_p[j][i] + total;", 1),
+        ])
+    }
+    private static let packedProductsKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_products_rms_prepared_packed4_bf16",
+        inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: withPackedProductReads(sumProductsPreparedSource()), ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
         name: "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
@@ -348,6 +373,8 @@ enum NemotronHResidualRMSNorm {
     /// Load time: the products join against the separate top-six reduce plus
     /// the two-operand join, bit for bit, on seeded rows and a real norm.
     static func checkProductsJoin(_ model: Module) {
+        packedProductsReady = false
+        packedProductsOwners = [:]
         productsJoinVerified = false
         guard plumbingAvailable, let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
             type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
@@ -374,6 +401,70 @@ enum NemotronHResidualRMSNorm {
         }
     }
 
+    private enum PackedProductsRefusal: Error { case failed(String) }
+    nonisolated(unsafe) private static var packedProductsOwners: [ObjectIdentifier: RMSNorm] = [:]
+
+    /// Direct private references on every actual norm owner, including a
+    /// row-contiguous products view with only four-byte backing alignment.
+    /// Compare only the 336 written chunks of the prepared output.
+    static func qualifyPackedProducts(_ model: Module) throws {
+        packedProductsReady = false
+        packedProductsOwners = [:]
+        guard packedProductsEnabled else { return }
+        guard plumbingAvailable, productsJoinVerified else {
+            throw PackedProductsRefusal.failed("native products join unavailable")
+        }
+        var owners: [ObjectIdentifier: RMSNorm] = [:]
+        var cases = 0
+        try withError { () -> Void in
+            for module in model.modules() {
+                guard let norm = module as? RMSNorm,
+                      type(of: norm) == RMSNorm.self,
+                      norm.weight.shape == [2688], norm.weight.dtype == .bfloat16 else { continue }
+                let owner = ObjectIdentifier(norm)
+                if owners[owner] != nil { continue }
+                for pattern in 0..<4 {
+                    let keys = MLXRandom.split(
+                        key: MLXRandom.key(UInt64(0x4a17_0000 + owners.count * 8 + pattern)), into: 3)
+                    let lhs = MLXRandom.normal([1, 3, 2688], key: keys[0]).asType(.bfloat16)
+                    let storage = MLXRandom.normal([18 * 2688 + 1], scale: 0.05, key: keys[1])
+                    var products = pattern == 3 ? storage[1...] : storage[..<(18 * 2688)]
+                    if pattern == 1 { products = which(abs(products) .< 0.03, MLXArray(Float(0)), products) }
+                    if pattern == 2 { products = MLXArray.zeros([18 * 2688], dtype: .float32) }
+                    let shared = MLXRandom.normal([1, 3, 2688], scale: 0.1, key: keys[2]).asType(.bfloat16)
+                    let (axis, eps) = scalars(norm.eps)
+                    func run(_ k: MLXFast.MLXFastKernel) -> [MLXArray] {
+                        k([lhs, products, shared, norm.weight, axis, eps],
+                            template: [("T", DType.bfloat16)],
+                            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
+                            outputDTypes: [.bfloat16, .bfloat16, .float32])
+                    }
+                    let a = run(sumProductsPreparedKernel)
+                    eval(a)
+                    let b = run(packedProductsKernel)
+                    eval(b)
+                    func written(_ x: MLXArray) -> MLXArray {
+                        x.view(dtype: .uint32).reshaped(3, 11, 9, 32)
+                            .transposed(0, 1, 3, 2).reshaped(3, 352, 9)[0..., ..<336, 0...]
+                    }
+                    guard halfEqual(a[0], b[0]).item(Bool.self),
+                          halfEqual(a[1], b[1]).item(Bool.self),
+                          (written(a[2]) .== written(b[2])).all().item(Bool.self) else {
+                        throw PackedProductsRefusal.failed("products quartet words owner\(owners.count) pattern\(pattern)")
+                    }
+                    cases += 1
+                }
+                owners[owner] = norm
+            }
+            guard !owners.isEmpty else { throw PackedProductsRefusal.failed("products norm coverage") }
+        }
+        packedProductsOwners = owners
+        packedProductsReady = true
+        FileHandle.standardError.write(
+            Data("nemotron products packed quartets: \(owners.count) owners \(cases) cases exact\n".utf8))
+    }
+
     /// The MoE join over the routed slot products (`NemotronZSkip`): rhs is
     /// [18 * 2688] FP32, slot-major (row r owns slots 6r ..< 6r + 6).
     private static func applyProductsRows(
@@ -388,7 +479,12 @@ enum NemotronHResidualRMSNorm {
             return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(3, 2688)))
         }
         let (axis, eps) = scalars(norm.eps)
-        let outputs = sumProductsPreparedKernel([lhs, products, shared, norm.weight, axis, eps],
+        if packedProductsEnabled && packedProductsReady {
+            precondition(packedProductsOwners[ObjectIdentifier(norm)] === norm,
+                "native packed products production owner was not admitted")
+        }
+        let selected = packedProductsEnabled && packedProductsReady ? packedProductsKernel : sumProductsPreparedKernel
+        let outputs = selected([lhs, products, shared, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
@@ -1244,11 +1340,12 @@ extension NemotronHRMSNormGated {
             ("T", DType.bfloat16), ("U", DType.float32),
             ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
             ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
-        var kernel = NemotronHCompactSSMGated.kernel
+        let quartet = NemotronSSMStateQuartets.selected(ALog, D, weight)
+        var kernel = quartet ? NemotronSSMStateQuartets.kernel : NemotronHCompactSSMGated.kernel
         if let pending {
             inputs += [pending.conv, pending.dt]
             template.append(("P", pending.steps))
-            kernel = NemotronHCompactSSMGated.pendingKernel
+            kernel = quartet ? NemotronSSMStateQuartets.pendingKernel : NemotronHCompactSSMGated.pendingKernel
         }
         let outputs = kernel(
             inputs, template: template,
@@ -1259,6 +1356,146 @@ extension NemotronHRMSNormGated {
     }
 }
 
+
+// Native state rows give each lane four consecutive FP32 words. Packed
+// vectors require only float's four-byte alignment, so a contiguous view
+// with a four-byte backing offset remains valid. No alignment assumption,
+// pointer-address query, state donation or new dispatch is introduced.
+enum NemotronSSMStateQuartets {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_STATE_QUARTETS"] != "0"
+
+    private static func source(_ record: String) -> String {
+        let load = """
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                prior[i] = state_in[n * Dh * Ds + d_idx * Ds + s_idx];
+            }
+            """
+        let quartet = """
+            const size_t nsq_base = (size_t(n) * Dh + d_idx) * Ds + 4 * ds_idx;
+            const float4 nsq_input = float4(*((const device packed_float4*)(state_in + nsq_base)));
+            for (int i = 0; i < n_per_t; ++i) {
+                prior[i] = nsq_input[i];
+            }
+            """
+        let store = """
+                    if (t == L - 1) {
+                        state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                    }
+            """
+        let finish = """
+            *((device packed_float4*)(state_out + nsq_base)) =
+                packed_float4(float4(prior[0], prior[1], prior[2], prior[3]));
+            threadgroup uint gr_last;
+            """
+        return "static_assert(Ds == 128 && Dh == 64 && H == 64 && sizeof(U) == 4, \"native state quartet\");\n"
+            + nemotronSwapped(record, [(load, quartet, 1), (store, "", 1),
+                ("threadgroup uint gr_last;", finish, 1)])
+    }
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_state_quartets_gated_prepared",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity", "eps", "counter"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: source(NemotronHCompactSSMGated.source), mutableInputs: ["counter"])
+    static let pendingKernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_state_quartets_gated_prepared_pending",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity", "eps", "counter", "pconv", "pdt"],
+        outputNames: ["out", "state_out", "normed", "prepared"],
+        source: source(NemotronHCompactSSMGated.pendingSource), mutableInputs: ["counter"])
+
+    private struct Admission { let aLog: MLXArray; let d: MLXArray; let weight: MLXArray }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var admitted: [ObjectIdentifier: Admission] = [:]
+    nonisolated(unsafe) private static var ready = false
+    static func covers(_ aLog: MLXArray, _ d: MLXArray, _ weight: MLXArray) -> Bool {
+        guard enabled else { return false }
+        return lock.withLock {
+            guard let a = admitted[ObjectIdentifier(weight)] else { return false }
+            return a.aLog === aLog && a.d === d && a.weight === weight
+        }
+    }
+    static func selected(_ aLog: MLXArray, _ d: MLXArray, _ weight: MLXArray) -> Bool {
+        guard enabled, ready else { return false }
+        precondition(covers(aLog, d, weight), "native SSM quartet production owner was not admitted")
+        return true
+    }
+    private enum Refusal: Error { case failed(String) }
+
+    /// Private full-output comparisons on every actual native Mamba bank.
+    /// Also cover a row-contiguous input view at one-float backing offset:
+    /// packed_float4's alignment is four bytes, not float4's sixteen.
+    /// This qualification executes only on the official remote worker.
+    static func qualify(_ model: Module) throws {
+        ready = false
+        lock.withLock { admitted = [:] }
+        guard enabled else { return }
+        guard NemotronHCompactSSMGated.enabled, Device.defaultDevice().deviceType == .gpu else {
+            throw Refusal.failed("native SSM unavailable")
+        }
+        var built: [ObjectIdentifier: Admission] = [:]
+        var tried = 0
+        var cases = 0
+        try withError { () -> Void in
+            for module in model.modules() {
+                guard let m = module as? NemotronHMamba2Mixer else { continue }
+                guard m.numHeads == 64, m.headDim == 64, m.numGroups == 8, m.ssmStateSize == 128,
+                      m.convDim == 6144, m.aLog.shape == [64], m.D.shape == [64],
+                      m.norm.weight.shape == [4096], m.norm.weight.dtype == .bfloat16,
+                      m.norm.groupSize == 512 else { throw Refusal.failed("native owner shape") }
+                tried += 1
+                for pattern in 0..<4 {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5714_0000 + tried * 16 + pattern)), into: 6)
+                    var conv = (MLXRandom.normal([1, 3, 6144], key: keys[0]) * 0.25).asType(.bfloat16)
+                    if pattern == 1 { conv = which(abs(conv) .< 0.2, MLXArray(Float(0)).asType(.bfloat16), conv) }
+                    if pattern == 2 { conv = MLXArray.zeros([1, 3, 6144], dtype: .bfloat16) }
+                    let dt = MLXRandom.uniform(0.01..<0.2, [1, 3, 64], key: keys[1])
+                    let storage = MLXRandom.normal([64 * 64 * 128 + 1], key: keys[2]) * 0.5
+                    let state = (pattern == 3 ? storage[1...] : storage[..<(64 * 64 * 128)])
+                        .reshaped(1, 64, 64, 128)
+                    let projected = MLXRandom.normal([1, 3, 10304], key: keys[3]).asType(.bfloat16)
+                    for steps in 0...NemotronMTPPendingSSM.maxSteps {
+                        let pconv = MLXRandom.normal([1, max(1, steps), 6144], key: keys[4]).asType(.bfloat16)
+                        let pdt = MLXRandom.uniform(0.01..<0.2, [1, max(1, steps), 64], key: keys[5])
+                        func run(_ k: MLXFast.MLXFastKernel) -> ([MLXArray], MLXArray) {
+                            let c = MLXArray.zeros([64], dtype: .uint32)
+                            eval(c)
+                            var inputs: [any ScalarOrArray] = [conv, m.aLog, m.D, dt, state, projected,
+                                m.norm.weight, NemotronHGatedRMSKernel.identity, m.norm.eps, c]
+                            var template: [(String, any KernelTemplateArg)] = [("T", DType.bfloat16), ("U", DType.float32),
+                                ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                                ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
+                            if steps > 0 { inputs += [pconv, pdt]; template.append(("P", steps)) }
+                            return (k(inputs, template: template,
+                                grid: (32, 64, 64), threadGroup: (32, 8, 1),
+                                outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
+                                outputDTypes: [.bfloat16, .float32, .bfloat16, .float32]), c)
+                        }
+                        let (a, ac) = run(steps == 0 ? NemotronHCompactSSMGated.kernel : NemotronHCompactSSMGated.pendingKernel)
+                        eval(a)
+                        let (b, bc) = run(steps == 0 ? kernel : pendingKernel)
+                        eval(b)
+                        for (u, v) in zip(a, b) {
+                            let word: DType = u.dtype == .float32 ? .uint32 : .uint16
+                            guard (u.view(dtype: word) .== v.view(dtype: word)).all().item(Bool.self) else {
+                                throw Refusal.failed("native words owner\(tried) pattern\(pattern) P\(steps)")
+                            }
+                        }
+                        guard (ac .== UInt32(0)).all().item(Bool.self), (bc .== UInt32(0)).all().item(Bool.self) else {
+                            throw Refusal.failed("native counter reset")
+                        }
+                        cases += 1
+                    }
+                }
+                built[ObjectIdentifier(m.norm.weight)] = Admission(aLog: m.aLog, d: m.D, weight: m.norm.weight)
+            }
+            guard tried > 0, built.count == tried else { throw Refusal.failed("native owner coverage") }
+        }
+        lock.withLock { admitted = built }
+        ready = true
+        FileHandle.standardError.write(Data("nemotron SSM state quartets: \(built.count) owners \(cases) cases exact\n".utf8))
+    }
+}
 
 // MARK: - Prefill x5 switches
 
@@ -5452,7 +5689,8 @@ class NemotronHSwitchMLP: Module {
             // Seed only: fc1 reads the token rows directly; `xs` stays lazy.
             y = activated
         } else if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
-            let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
+            let activated = NemotronSeedRetile.fc1Plain(xs, q, tiles: tiles)
+                ?? nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
             y = activated
         } else {
             y = gather(fc1, xs)
@@ -5470,6 +5708,9 @@ class NemotronHSwitchMLP: Module {
         if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
            let fromCopy = NemotronPrefillFC2Copy.apply(y, q, tiles: tiles) {
             y = fromCopy
+        } else if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
+                  let retiled = NemotronSeedRetile.fc2Plain(y, q, tiles: tiles) {
+            y = retiled
         } else {
             y = gather(fc2, y)
         }
@@ -5926,7 +6167,7 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
 
 /// `nemotronCountingSort` through the chunk-parallel kernel, plus
 /// order / k; nil outside its shapes (n <= 3072, experts a multiple of 32).
-private func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
+func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
     -> (order: MLXArray, inverse: MLXArray, sorted: MLXArray, tiles: NemotronHRunTiles,
         orderK: MLXArray)?
 {
@@ -6253,7 +6494,7 @@ private func nemotronWarmUpPrefillKernels(
 /// that the stock affine_gather_qmm_rhs_nax uses, followed by its run-aligned
 /// clone. Output stores add a typed ReLU2 specialization; the remaining
 /// declarations retain the stock math. Unused declarations are dropped.
-private let nemotronRunGatherHeader = #"""
+let nemotronRunGatherHeader = #"""
 // Subset of the MLX JIT preamble that stock affine_gather_qmm_rhs_nax is
 // compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Only the
 // output stores add the typed ReLU2 specialization; unused declarations are dropped.
@@ -7751,10 +7992,10 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, tiles: tiles)
+        return NemotronSeedRetile.fc2Copy(x, lin, tiles: tiles) ?? launch(x, lin, tiles: tiles)
     }
 
-    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
               let copy = NemotronZSkip.copy(for: lin), copy.dict
@@ -8422,11 +8663,12 @@ const device T* xn = x;
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
                       tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
+        return NemotronSeedRetile.fc1Routed(x, lin, rows: rows, tiles: tiles, dict: dictVerified)
+            ?? launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
     }
 
-    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
-                               tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
+                       tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
         guard let kernel, NemotronHPrefillX5.runGather,
               lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
