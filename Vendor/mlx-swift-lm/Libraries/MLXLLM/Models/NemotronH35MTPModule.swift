@@ -15,6 +15,7 @@ enum NemotronMTPDraftTail {
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
     static let oneLaunchRouter = enabled("NEMOTRON_MTP_DRAFT_ROUTER_FUSED")
+    static let sharedEarly = enabled("NEMOTRON_MTP_DRAFT_SD_EARLY")
 }
 
 enum NemotronMTPFrontNorms {
@@ -524,11 +525,13 @@ final class NemotronH35MTPExpertBlock: Module {
             && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
             ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
         let (indices, scores) = fused ?? gate(h)
+        // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
+        let early = NemotronMTPDraftTail.sharedEarly ? mixer.sharedExperts.map { $0(h) } : nil
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP, products: true)
+                h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
-        let shared = sharedExperts(h)
+        let shared = early ?? sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
             return joined.1
         }
