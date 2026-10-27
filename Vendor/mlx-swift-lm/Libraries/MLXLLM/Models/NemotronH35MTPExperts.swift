@@ -2779,6 +2779,10 @@ enum NemotronSharedDownZSkip {
     static var copyArrays: [MLXArray] {
         lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
     }
+    /// The verified copy of `down` (a target layer's shared down projection), if any.
+    static func copyArrays(for down: Linear) -> (codes: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        lock.withLock { copies[ObjectIdentifier(down)].map { ($0.codes, $0.scales, $0.biases) } }
+    }
 
     private static func admissible(_ q: QuantizedLinear) -> Bool {
         type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
@@ -3633,6 +3637,25 @@ enum NemotronSBDict {
     /// Every admitted draft-head index and table (decode-only backing for the head's residency set).
     static var draftArrays: [MLXArray] {
         lock.withLock { draftDicts.values.flatMap { [$0.index, $0.table] } }
+    }
+
+    /// `arrays` without the scales and biases of the head's routed banks that have an admitted dictionary: the
+    /// head's routed experts run only one-row draft steps, whose dictionary twin binds the bank's codes, index
+    /// and table, so those scales and biases are not decode backing. NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY=1
+    /// keeps them.
+    static func withoutDictBankMetadata(_ arrays: [MLXArray], module: Module) -> [MLXArray] {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY"] != "1" else { return arrays }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, draftDict(linear) != nil else { continue }
+            for (key, a) in linear.parameters().flattened() where key == "scales" || key == "biases" {
+                skip.insert(ObjectIdentifier(a))
+            }
+        }
+        let kept = arrays.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(arrays.count - kept.count) dictionary bank scale/bias arrays left out\n".utf8))
+        return kept
     }
 
     /// The admitted routed-bank indices (for `NemotronBankBinding.warm`: addressed from their base).
