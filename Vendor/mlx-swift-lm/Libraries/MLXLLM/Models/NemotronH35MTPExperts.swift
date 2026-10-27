@@ -2780,6 +2780,12 @@ enum NemotronSharedDownZSkip {
         lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
     }
 
+    /// `owner`'s copy: tile-major codes [1, N / 128, K, 32] (uint16) and the
+    /// tile-major BF16 scales and biases [1, N / 128, K / 64, 128], if any.
+    static func copy(for owner: Linear) -> (codes: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        lock.withLock { copies[ObjectIdentifier(owner)].map { ($0.codes, $0.scales, $0.biases) } }
+    }
+
     private static func admissible(_ q: QuantizedLinear) -> Bool {
         type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
             && q.groupSize == 64 && q.bias == nil
