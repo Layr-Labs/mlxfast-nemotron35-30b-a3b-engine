@@ -151,34 +151,71 @@ enum NemotronHResidualRMSNorm {
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         precondition(source.components(separatedBy: product).count == 2)
-        let s = source.replacingOccurrences(of: scratch,
-            with: scratch + "\nthreadgroup T rounded[2688];")
-            .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+        guard joinShuffle else {
+            let s = source.replacingOccurrences(of: scratch,
+                with: scratch + "\nthreadgroup T rounded[2688];")
+                .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+                .replacingOccurrences(of: product, with: product
+                    + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+            return s + """
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lid < 336) {
+                    const int chunk = int(lid);
+                    float values[8];
+                    float total = 0;
+                    for (int i = 0; i < 8; i += 4) {
+                        total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
+                            + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
+                        values[i] = rounded[chunk * 8 + i];
+                        values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
+                        values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
+                        values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
+                    }
+                    const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
+                    for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
+                    prepared[base + 8 * 32] = total;
+                }
+                """
+        }
+        // Chunk c (values 8c ..< 8c + 8) is lanes 2c and 2c + 1 of one SIMD group: each lane keeps its four
+        // rounded values, reads its partner's through simd_shuffle_xor, and the pair writes the chunk's nine
+        // words (the even lane its four, the total; the odd lane its four) with the same expressions and order.
+        let s = source.replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
             .replacingOccurrences(of: product, with: product
-                + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+                + "\nnormalized[offset + i] = value;\nnmj_r[i] = value;")
+            .replacingOccurrences(of: "float thread_x[n_reads];", with: "float thread_x[n_reads];\nT nmj_r[n_reads];")
+        precondition(s.contains("T nmj_r[n_reads];"))
         return s + """
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 336) {
-                const int chunk = int(lid);
-                float values[8];
-                float total = 0;
-                for (int i = 0; i < 8; i += 4) {
-                    total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
-                        + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
-                    values[i] = rounded[chunk * 8 + i];
-                    values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
-                    values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
-                    values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
-                }
+            {
+                const bool odd = (lid & 1u) != 0;
+                T other[4];
+                for (int i = 0; i < 4; i++) other[i] = as_type<T>(simd_shuffle_xor(as_type<ushort>(nmj_r[i]), ushort(1)));
+                const int chunk = int(lid >> 1);
                 const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
-                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
-                prepared[base + 8 * 32] = total;
+                if (!odd) {
+                    float total = 0;
+                    total += float(nmj_r[0]) + float(nmj_r[1]) + float(nmj_r[2]) + float(nmj_r[3]);
+                    total += float(other[0]) + float(other[1]) + float(other[2]) + float(other[3]);
+                    prepared[base + 0 * 32] = float(nmj_r[0]);
+                    prepared[base + 1 * 32] = float(nmj_r[1]) / 16.0f;
+                    prepared[base + 2 * 32] = float(nmj_r[2]) / 256.0f;
+                    prepared[base + 3 * 32] = float(nmj_r[3]) / 4096.0f;
+                    prepared[base + 8 * 32] = total;
+                } else {
+                    prepared[base + 4 * 32] = float(nmj_r[0]);
+                    prepared[base + 5 * 32] = float(nmj_r[1]) / 16.0f;
+                    prepared[base + 6 * 32] = float(nmj_r[2]) / 256.0f;
+                    prepared[base + 7 * 32] = float(nmj_r[3]) / 4096.0f;
+                }
             }
             """
     }
+    /// NEMOTRON_MTP_JOIN_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
+    static let joinShuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOIN_SHUFFLE"] != "0"
     private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_rms_prepared_moe_bf16",
+        name: joinShuffle ? "nemotron_h_residual_rms_prepared_moe_bf16_sh" : "nemotron_h_residual_rms_prepared_moe_bf16",
         inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: preparedSource(), ensureRowContiguous: true)
@@ -236,7 +273,7 @@ enum NemotronHResidualRMSNorm {
             .replacingOccurrences(of: store, with: "")
     }
     private static let sumPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_sum_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_residual_sum_rms_prepared_bf16_sh" : "nemotron_h_residual_sum_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumPreparedSource(), ensureRowContiguous: true)
@@ -262,12 +299,12 @@ enum NemotronHResidualRMSNorm {
             """)
     }
     private static let sumProductsPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_products_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_residual_products_rms_prepared_bf16_sh" : "nemotron_h_residual_products_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumProductsPreparedSource(), ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_rms_prepared_bf16_sh" : "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
         outputNames: ["normalized", "prepared"],
         source: normPreparedSource(), ensureRowContiguous: true)
@@ -456,6 +493,12 @@ enum NemotronHResidualRMSNorm {
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
         source: withProductsReduce(sumSource()), ensureRowContiguous: true)
+    /// `sumProductsKernel` with `shared` bound before `rhs` (same source text; the body names its arguments).
+    private static let sumProductsSharedFirstKernel = MLXFast.metalKernel(
+        name: "nemotron_h_residual_products_rms_sf_bf16",
+        inputNames: ["lhs", "shared", "rhs", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized"],
+        source: withProductsReduce(sumSource()), ensureRowContiguous: true)
 
     /// Load time: the one-row products join against the separate top-six
     /// reduce plus `applySum`, bit for bit, on seeded rows and the head's norms.
@@ -484,11 +527,14 @@ enum NemotronHResidualRMSNorm {
 
     /// `rhs` [6 * 2688] FP32 is the draft tail's routed slot products
     /// (`NemotronZSkip.draftProducts`); the join sums them itself.
-    static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm)
+    /// `sharedFirst` (products only; `NemotronDraftColaunch`): the same join kernel with `shared` bound before
+    /// the products (part of the draft tail's encode order; the body names its arguments).
+    static func applySum(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray, norm: RMSNorm,
+                         sharedFirst: Bool = false)
         -> (MLXArray, MLXArray)?
     {
         if rhs.shape == [6 * 2688] {
-            return applyProductsSum(lhs, rhs, shared: shared, norm: norm)
+            return applyProductsSum(lhs, rhs, shared: shared, norm: norm, sharedFirst: sharedFirst)
         }
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             lhs.ndim == 3, lhs.dim(0) == 1, lhs.dim(1) > 0, lhs.dim(2) == 2688,
@@ -512,7 +558,7 @@ enum NemotronHResidualRMSNorm {
     }
 
     private static func applyProductsSum(
-        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm
+        _ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm, sharedFirst: Bool = false
     ) -> (MLXArray, MLXArray) {
         guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
             lhs.shape == [1, 1, 2688], shared.shape == lhs.shape, lhs.dtype == .bfloat16,
@@ -525,10 +571,15 @@ enum NemotronHResidualRMSNorm {
             return (summed, norm(summed))
         }
         let (axis, eps) = scalars(norm.eps)
-        let result = sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
-            template: [("T", DType.bfloat16)],
-            grid: (672, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        let result = sharedFirst
+            ? sumProductsSharedFirstKernel([lhs, shared, products, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+            : sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
         guard NemotronMoELeader.selfTest else { return (result[0], result[1]) }
         let summed = lhs + (NemotronZSkip.reduceProducts(products, rows: 1) + shared)
         let ok = MLX.logicalAnd(
@@ -5102,6 +5153,34 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
         self._upProj.wrappedValue = Linear(args.hiddenSize, intermediate, bias: args.mlpBias)
         self._downProj.wrappedValue = Linear(intermediate, args.hiddenSize, bias: args.mlpBias)
         super.init()
+    }
+
+    /// The ordinary M = 1 shared up + relu2 rows [1, 3712] of `callAsFunction`, or nil when that route does not
+    /// apply (`NemotronDraftColaunch` then keeps `callAsFunction`).
+    func draftUpActivation(_ x: MLXArray) -> MLXArray? {
+        guard Self.ordinaryR1SharedUp, type(of: self) == NemotronHMLP.self,
+              type(of: upProj) == QuantizedLinear.self,
+              type(of: downProj) == QuantizedLinear.self,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              NemotronMTPExecution.batchedM1,
+              let up = upProj as? QuantizedLinear, up.bias == nil,
+              up.weight.shape == [3712, 336], up.scales.shape == [3712, 42],
+              let offsets = up.biases, offsets.shape == [3712, 42],
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              !NemotronMoELeader.selfTest
+        else { return nil }
+        return NemotronMultiRowQMV.apply(x.reshaped(1, 2688), up, relu2: true)
+    }
+
+    /// `nemotronR1Linear(activated, downProj)` through the R = 1 kernel's `dep` twin (`NemotronDraftColaunch`),
+    /// or nil when `nemotronR1Linear` would not take that kernel.
+    func draftDown(_ activated: MLXArray, dep: MLXArray) -> MLXArray? {
+        guard NemotronMultiRowQMV.r1Route, activated.shape == [1, 3712], activated.dtype == .bfloat16,
+              type(of: downProj) == QuantizedLinear.self, let q = downProj as? QuantizedLinear,
+              q.bias == nil, !NemotronMoELeader.selfTest,
+              let y = NemotronMultiRowQMV.apply(activated, q, dep: dep)
+        else { return nil }
+        return y.reshaped(1, 1, q.weight.dim(0))
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
