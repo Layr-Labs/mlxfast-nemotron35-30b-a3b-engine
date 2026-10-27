@@ -1299,6 +1299,20 @@ enum NemotronHPrefillX5 {
 /// GPU. Evaluation order only; values are unchanged. The teacher-forced
 /// stepper never sets `requestPrefill`, so its prefill is untouched.
 /// NEMOTRON_SEED_EARLY_COMMIT=0 keeps one command buffer for the layer.
+/// Seed only (the engine's request prefill): the cold host builds the first
+/// layers' graph much more slowly than the GPU runs it, so the request prefill
+/// also submits after each of its first `layers` layers that is not already a
+/// chunk boundary (the chunk every two layers and its wait are unchanged).
+/// Evaluation order only; values are unchanged.
+/// NEMOTRON_SEED_EARLY_SUBMITS=0 keeps the base spacing; =<n> changes the count.
+enum NemotronSeedEarlySubmits {
+    static let layers = Int(ProcessInfo.processInfo.environment["NEMOTRON_SEED_EARLY_SUBMITS"] ?? "") ?? 8
+
+    static func applies(next: Int) -> Bool {
+        layers > 0 && next <= layers && NemotronHPrefillX5.requestPrefill
+    }
+}
+
 enum NemotronSeedEarlyCommit {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_EARLY_COMMIT"] != "0"
 
@@ -5124,12 +5138,13 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
         }
         // Request prefill: up projection and relu2 in one launch (`NemotronPrefillSharedUpGather`).
         if let activated = NemotronPrefillSharedUpGather.apply(x, upProj) {
-            return downProj(activated)
+            // Request prefill: down projection from its zero-skip copy (`NemotronPrefillSharedDownCopy`).
+            return NemotronPrefillSharedDownCopy.apply(activated, downProj) ?? downProj(activated)
         }
         let up = upProj(x)
         // Request prefill: the stock relu2 in one launch (`NemotronPrefillSharedRelu2`).
         if let activated = NemotronPrefillSharedRelu2.apply(up) {
-            return downProj(activated)
+            return NemotronPrefillSharedDownCopy.apply(activated, downProj) ?? downProj(activated)
         }
         return downProj(relu2(up))
     }
@@ -7493,7 +7508,7 @@ enum NemotronPrefillFC2Copy {
     /// Columns per threadgroup (each of the two SIMD groups across N takes half).
     static let columns = Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY_BN"] ?? "") ?? 64
 
-    private static let header: String = nemotronRunGatherHeader + "\n" + #"""
+    static let header: String = nemotronRunGatherHeader + "\n" + #"""
 // Nemotron: the run gather reading the routed fc2 tile-major decode copy
 // (codes, pair index and pair table) instead of the bank. tiles[t] = (first sorted row, rows <= BM, expert). Every
 // tile holds exactly one expert segment, so the stock segment loop collapses
@@ -7825,6 +7840,153 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
         }
         report(verified ? "on (\(checked) cases bitwise equal, every MoE layer in the first)"
                         : "off (outputs differ from the bank run gather after \(checked) cases)")
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`): the shared
+/// expert's down projection reads the decode's zero-skip copy of the down
+/// weights (`NemotronSharedDownZSkip`: tile-major codes with tile-major BF16
+/// scales and biases) instead of the original `down_proj` arrays: the routed
+/// fc2 copy run gather (`NemotronPrefillFC2Copy`, one "expert" whose row tiles
+/// cover the request's tokens, as `NemotronPrefillSharedUpGather` does) with
+/// its pair-table read swapped for the copy's BF16 scale and bias. Each loader
+/// thread rebuilds the bank byte from the two nibbles and runs the stock
+/// `dequantize` statements on the BF16 scale and bias, so every weight block
+/// value is the stock loader's. The decode already reads the copy, so the
+/// decode residency's target groups hold it in place of the original down
+/// arrays (`NemotronDecodeResidency.targetGroups`). `qualify` compares it with
+/// `downProj` (the stock quantized matmul) bit for bit on every layer.
+/// NEMOTRON_PREFILL_SHARED_DOWN_COPY=0 keeps the original arrays.
+enum NemotronPrefillSharedDownCopy {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_DOWN_COPY"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// The fc2 copy header reading tile-major BF16 scales and biases; nil if
+    /// any edit point is not found exactly once.
+    private static let header: String? = {
+        var source = NemotronPrefillFC2Copy.header
+        let edits: [(String, String)] = [
+            ("METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(",
+             "METAL_FUNC void nemotron_gather_qmm_runs_copy_bf16_impl("),
+            ("    const device uint16_t* sidx,\n    const device float* table,",
+             "    const device T* sidx,\n    const device T* table,"),
+            ("  const device uint16_t* cl_idx = sidx\n"
+                + "      + (size_t(index) * size_t(N / 128) + size_t(cl_n / 128)) * size_t(K / group_size) * 128"
+                + " + (cl_n % 128);",
+             "  const size_t cl_off =\n"
+                + "      (size_t(index) * size_t(N / 128) + size_t(cl_n / 128)) * size_t(K / group_size) * 128"
+                + " + (cl_n % 128);\n"
+                + "  const device T* cl_idx = sidx + cl_off;\n  const device T* cl_bia = table + cl_off;"),
+            ("      const uint pair = uint(cl_idx[o]);\n      const float s = table[2 * pair];\n"
+                + "      const float b = table[2 * pair + 1];",
+             "      const float s = float(cl_idx[o]);\n      const float b = float(cl_bia[o]);"),
+            ("        cl_idx += 128;", "        cl_idx += 128;\n        cl_bia += 128;"),
+        ]
+        for (old, new) in edits {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        return source
+    }()
+
+    private static let kernel: MLXFast.MLXFastKernel? = NemotronPrefillSharedDownCopy.header.map { header in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_shared_down_copy",
+            inputNames: ["x", "wk", "sk", "bk", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_copy_bf16_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, wk, sk, bk, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_copy_bf16_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, wk, sk, bk, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
+            """,
+            header: header)
+    }
+
+    /// `down(x)` from the zero-skip copy for x [1, L, K] (L > 8); nil outside
+    /// the request prefill, without a copy or off its shapes.
+    static func apply(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(x, down)
+    }
+
+    private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+        guard let kernel, NemotronHPrefillX5.runGather, let q = down as? QuantizedLinear,
+              type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              let copy = NemotronSharedDownZSkip.copy(for: down)
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
+              copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+              copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
+              copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
+        else { return nil }
+        // One "expert" whose 64-row tiles cover the tokens; at least three
+        // descriptors (a descriptor with zero rows is skipped by the kernel).
+        let used = (rows + 63) / 64
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
+        }
+        let tiles = MLXArray(desc).reshaped(count, 3)
+        // x and y keep the [1, L, *] shapes (row-major rows, as the kernel reads and writes them), so
+        // the graph has the quantized matmul's depth and the launch keeps its place next to fc2.
+        return kernel(
+            [x, copy.codes, copy.scales, copy.biases, tiles, nOut, k],
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", 64), ("BN", 64), ("BK", 64),
+                       ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", false)],
+            grid: ((nOut / 64) * 128, count, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[1, rows, nOut]], outputDTypes: [x.dtype])[0]
+    }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill shared down copy: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather else { return report("off (setting)") }
+        guard kernel != nil else { return report("off (copy run gather source not as expected)") }
+        let downs = target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }
+        guard let first = downs.first, downs.allSatisfy({ NemotronSharedDownZSkip.copy(for: $0) != nil })
+        else { return report("off (not every shared down has a zero-skip copy)") }
+        let k = (first as? QuantizedLinear).map { $0.weight.dim(1) * 8 } ?? 0
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, rows) in [488, 300, 97, 64, 9 + 8].enumerated() {
+                    // relu2-like activations: non-negative, many exact zeros.
+                    var a = MLXRandom.normal([1, rows, k], scale: 2, key: MLXRandom.key(UInt64(0x5d0c_0000 + index)))
+                    a = MLX.maximum(a - 0.5, MLXArray(Float(0)))
+                    let x = (a * a).asType(.bfloat16)
+                    for down in (index == 0 ? downs : [first]) {
+                        guard let fused = launch(x, down) else { return false }
+                        let stock = down(x)
+                        let same = (fused.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+                        if !same.item(Bool.self) { return false }
+                    }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal, every shared down in the first)"
+                        : "off (outputs differ from the quantized matmul after \(checked) cases)")
     }
 }
 
@@ -8793,6 +8955,12 @@ private class NemotronHBackbone: Module {
                 // submitted chunk: the first chunk boundary still waits on
                 // nothing and every later wait is unchanged.
                 let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: 0 ..< 1) }
+                asyncEval([hidden] + states)
+            } else if prefillChunks && next < layers.count && NemotronSeedEarlySubmits.applies(next: next) {
+                // Seed only: one more submission between chunk boundaries for each
+                // of the first layers (`NemotronSeedEarlySubmits`), not recorded as a
+                // submitted chunk either, so every chunk wait is unchanged.
+                let states = recurrentState.flatMap { $0.stagedEvaluationRoots(in: (next - 1) ..< next) }
                 asyncEval([hidden] + states)
             }
         }

@@ -109,6 +109,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillDirectFC1.qualifyDict(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
+        NemotronPrefillSharedDownCopy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
         NemotronPrefillDtxDecay4.qualify()
         NemotronPrefillScanExp.qualify()
@@ -432,6 +433,18 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         // (bank words and their scale/bias form), then its routed fc2 (the decode copy when verified).
         let split = Self.splitExpertGroups
         func key(_ layer: Int, _ part: Int) -> Int { split ? 3 * layer + part : layer }
+        // With `NemotronPrefillSharedDownCopy` verified, a MoE layer's shared down arrays are replaced in
+        // its group by that layer's zero-skip copy: the request prefill and the decode read the copy.
+        var sharedDowns: [Int: [MLXArray]] = [:]
+        if NemotronPrefillSharedDownCopy.verified {
+            for (name, module) in model.namedModules() {
+                let parts = name.split(separator: ".")
+                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
+                      let down = (module as? NemotronHMoE)?.sharedExperts?.downProj,
+                      let copy = NemotronSharedDownZSkip.copy(for: down) else { continue }
+                sharedDowns[n] = [copy.codes, copy.scales, copy.biases]
+            }
+        }
         var groups: [Int: [MLXArray]] = [:]
         for (path, a) in model.parameters().flattened() {
             let parts = path.split(separator: ".")
@@ -441,6 +454,10 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) {
                 layer = n
                 g = key(n, 0)
+            }
+            if let n = layer, sharedDowns[n] != nil, let e = parts.firstIndex(of: "shared_experts"),
+               e + 1 < parts.count, parts[e + 1] == "down_proj" {
+                continue
             }
             if let n = layer, let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
                 if parts[s + 1] == "fc2" {
@@ -455,6 +472,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         }
         for (n, arrays) in copies { groups[key(n, 2), default: []].append(contentsOf: arrays) }
         for (n, arrays) in fc1Dicts { groups[key(n, 1), default: []].append(contentsOf: arrays) }
+        for (n, arrays) in sharedDowns { groups[key(n, 0), default: []].append(contentsOf: arrays) }
+        FileHandle.standardError.write(Data(
+            "nemotron target residency: \(sharedDowns.count) shared down arrays replaced by their zero-skip copies\n".utf8))
         FileHandle.standardError.write(Data(
             "nemotron target residency: \(fc1Dicts.count) MoE fc1 scales/biases replaced by their pair dictionaries\n".utf8))
         FileHandle.standardError.write(Data(
@@ -530,9 +550,14 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         let owner: NemotronDecodeResidency
         private var decoded = false
         private var finished = false
+        private var rounds = 0
+        /// The request's CPU keep-busy (`NemotronCPUWarm`), from the lease's begin (the seed) to round 4.
+        private let warm = NemotronCPUWarm.enabled ? NemotronCPUWarm() : nil
         init(_ owner: NemotronDecodeResidency) { self.owner = owner }
         func beginDecode() {
             guard !finished else { return }
+            rounds += 1
+            if rounds > NemotronCPUWarm.rounds { warm?.stop() }
             if !decoded {
                 decoded = true
                 for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
@@ -544,6 +569,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         func finish() {
             guard !finished else { return }
             finished = true
+            warm?.stopAndJoin()
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
                 // The requests stay standing; the next lease requests the same sets again.
@@ -637,4 +663,46 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Measurement entry 2 of this tree.
 
-// Measurement entry 2 of this tree.
+/// A request's CPU keep-busy. The host builds the first decode rounds right after the seed, a phase in which it
+/// mostly waits on the GPU; after an idle period the CPU then builds those rounds at a lowered clock, and the GPU
+/// waits for their command buffers. From the MTP lease's begin (the request's seed) until the fourth decode round
+/// begins, or the lease finishes if sooner, two user-interactive threads stay busy so that the cores that build
+/// the first rounds run at speed. Nothing runs between requests, and no value changes.
+/// NEMOTRON_MTP_CPU_WARM=0 disables it.
+final class NemotronCPUWarm: @unchecked Sendable {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_CPU_WARM"] != "0"
+    /// Decode rounds covered after the seed.
+    static let rounds = 3
+    private static let threads = 2
+    private let lock = NSLock()
+    private var stopped = false
+    private let exited = DispatchGroup()
+
+    init() {
+        for i in 0 ..< Self.threads {
+            exited.enter()
+            let thread = Thread { [self] in
+                while !self.isStopped {}
+                self.exited.leave()
+            }
+            thread.qualityOfService = .userInteractive
+            thread.name = "nemotron.cpu-warm.\(i)"
+            thread.start()
+        }
+    }
+
+    private var isStopped: Bool { lock.withLock { stopped } }
+
+    /// Idempotent and non-blocking: the threads leave their loops at their next check.
+    func stop() {
+        lock.withLock { stopped = true }
+    }
+
+    /// `stop`, then wait until both threads have left their loops (the lease's finish).
+    func stopAndJoin() {
+        stop()
+        exited.wait()
+    }
+}
+
+// Measurement entry 4 of this tree.
