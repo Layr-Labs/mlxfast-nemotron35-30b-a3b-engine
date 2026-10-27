@@ -23,7 +23,7 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    private var entries: [Entry?] = Array(repeating: nil, count: 16)
+    private var entries: [Entry?] = Array(repeating: nil, count: 32)
     private var generations = 0
     private var calls = 0
     private var joinedChecks = 0
@@ -52,8 +52,11 @@ final class NemotronH35MTPGraphCache {
             identity += [ObjectIdentifier(nextNorm), ObjectIdentifier(nextNorm.weight)]
         }
         let usesPrepared = prepared != nil
+        // Load qualification changes the implementation graph, never its request inputs.
+        // Distinct slots prevent any earlier dense trace surviving payload admission.
         let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
             + (NemotronZSkip.needsOriginal(owner.switchMLP.fc2) ? 4 : 0) + (joins ? 8 : 0)
+            + (NemotronSparseFC2Payload.covers(owner.switchMLP.fc2) ? 16 : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -1343,11 +1346,17 @@ enum NemotronMoELeader {
         let xr = x.reshaped(rows, 2688)
         let act: MLXArray
         let balancePlan: MLXArray?
+        var sparsePayload: NemotronSparseFC2Payload.Outputs? = nil
         // One row (the draft tail): the draft head bank's admitted pair dictionary, if any.
         let draftDict = rows == 1 ? NemotronSBDict.draftDict(mlp.fc1) : nil
         if fuseRelu2 {
             let dict = rows == 3 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
-            if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
+            if products, rows == 3, colaunch != nil, let payload = NemotronSparseFC2Payload.produce(
+                xr, flat, bank: up, prepared: prepared, dict: dict, fc2: mlp.fc2) {
+                sparsePayload = payload
+                act = payload.activation
+                balancePlan = nil
+            } else if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
                let activation = applyTripleWithoutPlan(
                    xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
                 act = activation
@@ -1373,7 +1382,8 @@ enum NemotronMoELeader {
         // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
         // itself (same expressions and order).
         if products, rows == 3, let colaunch,
-           let pair = NemotronFC2SharedColaunch.run(act, flat, weights, fc2: mlp.fc2, shared: colaunch) {
+           let pair = NemotronFC2SharedColaunch.run(act, flat, weights, fc2: mlp.fc2,
+               shared: colaunch, payload: sparsePayload) {
             return pair
         }
         if products, let prod = rows == 3
@@ -2779,6 +2789,10 @@ enum NemotronSharedDownZSkip {
     static var copyArrays: [MLXArray] {
         lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
     }
+    /// The verified copy of `down` (a target layer's shared down projection), if any.
+    static func copyArrays(for down: Linear) -> (codes: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        lock.withLock { copies[ObjectIdentifier(down)].map { ($0.codes, $0.scales, $0.biases) } }
+    }
 
     private static func admissible(_ q: QuantizedLinear) -> Bool {
         type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
@@ -2931,12 +2945,12 @@ enum NemotronFC2SharedColaunch {
 
     /// The routed slot products, with `shared.rows` set, or nil (nothing set) when the co-launch does not apply.
     static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, fc2: SwitchLinear,
-                    shared: Shared) -> MLXArray? {
+                    shared: Shared, payload: NemotronSparseFC2Payload.Outputs? = nil) -> MLXArray? {
         let down = shared.mlp.downProj
         guard covers(fc2: fc2, down: down),
               let sx = NemotronSharedUpPacking.unpackedActivation(
                   shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared),
-              let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
+              let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down, payload: payload) else { return nil }
         shared.rows = pair.1
         return pair.0
     }
@@ -2975,11 +2989,12 @@ enum NemotronFC2SharedColaunch {
           """
     }
 
-    private static func make(_ name: String, fc2: String?) -> MLXFast.MLXFastKernel? {
+    private static func make(_ name: String, fc2: String?, payload: Bool = false) -> MLXFast.MLXFastKernel? {
         guard let fc2, let shared = NemotronSharedDownZSkip.source,
               let source = source(fc2: fc2, shared: shared) else { return nil }
         return MLXFast.metalKernel(
-            name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"],
+            name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"]
+                + (payload ? ["pv", "pm"] : []),
             outputNames: ["prod", "shared_y"], source: source,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
@@ -2989,25 +3004,33 @@ enum NemotronFC2SharedColaunch {
     private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd",
                                          fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
 
+    private static let payloadPlainKernel = make("nemotron_sparse_payload_fc2_shared_down",
+        fc2: nmlPayloadConsumerSource(nemotronZSkipTiledFastSource), payload: true)
+    private static let payloadDictKernel = make("nemotron_sparse_payload_fc2_shared_down_sbd",
+        fc2: nmlPayloadConsumerSource(nemotronZSkipTiledFastSource).flatMap(nemotronZSkipDictSource), payload: true)
+
     private static let lock = NSLock()
     /// Routed FC2 owner -> its layer's shared down owner, for layers whose co-launch matched.
     nonisolated(unsafe) private static var pairs: [ObjectIdentifier: ObjectIdentifier] = [:]
 
     /// The kernel that runs `copy`'s slot body today, or nil when the routed side is not the fast tiled kernel.
-    private static func kernel(for copy: NemotronZSkip.Copy) -> MLXFast.MLXFastKernel? {
+    private static func kernel(for copy: NemotronZSkip.Copy, payload: Bool = false) -> MLXFast.MLXFastKernel? {
         guard NemotronZSkip.tiled, NemotronZSkip.fast else { return nil }
+        if payload { return copy.dict ? payloadDictKernel : payloadPlainKernel }
         return copy.dict ? dictKernel : plainKernel
     }
 
     private static func dispatch(
         _ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
-        _ copy: NemotronZSkip.Copy, _ sx: MLXArray, _ shared: NemotronSharedDownZSkip.Copy, _ sinds: MLXArray
+        _ copy: NemotronZSkip.Copy, _ sx: MLXArray, _ shared: NemotronSharedDownZSkip.Copy, _ sinds: MLXArray,
+        payload: NemotronSparseFC2Payload.Outputs? = nil
     ) -> (MLXArray, MLXArray) {
         let sgs = NemotronZSkip.sgs
         let outputs = kernel(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores,
-             shared.codes, shared.scales, shared.biases, sx, sinds],
+             shared.codes, shared.scales, shared.biases, sx, sinds]
+                + (payload.map { [$0.values, $0.meta] } ?? []),
             template: [("T", DType.bfloat16), ("KF", 1856), ("KS", NemotronSharedDownZSkip.k),
                        ("N", 2688), ("SGS", sgs), ("SLOTS", slots), ("SROWS", sharedRows),
                        ("SDFIRST", sharedFirst)],
@@ -3021,7 +3044,8 @@ enum NemotronFC2SharedColaunch {
     /// nil whenever `NemotronZSkip.weightedProducts` or `NemotronSharedDownZSkip.run` would not run (the caller
     /// then keeps the separate launches). `sx`: the shared relu2 rows [3, 3712].
     static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, fc2: SwitchLinear,
-                    sx: MLXArray, down: Linear) -> (MLXArray, MLXArray)? {
+                    sx: MLXArray, down: Linear,
+                    payload: NemotronSparseFC2Payload.Outputs? = nil) -> (MLXArray, MLXArray)? {
         guard enabled, !NemotronZSkip.needsOriginal(fc2), NemotronZSkip.joinReduce,
               NemotronHResidualRMSNorm.productsJoinVerified,
               x.shape == [18, 1856], x.dtype == .bfloat16,
@@ -3030,10 +3054,10 @@ enum NemotronFC2SharedColaunch {
               NemotronSharedDownZSkip.enabled,
               lock.withLock({ pairs[ObjectIdentifier(fc2)] == ObjectIdentifier(down) }),
               let copy = NemotronZSkip.lock.withLock({ NemotronZSkip.copies[ObjectIdentifier(fc2)] }),
-              let kernel = kernel(for: copy),
+              let kernel = kernel(for: copy, payload: payload != nil),
               let shared = sharedCopy(down)
         else { return nil }
-        return dispatch(kernel, x, inds, scores, copy, sx, shared.0, shared.1)
+        return dispatch(kernel, x, inds, scores, copy, sx, shared.0, shared.1, payload: payload)
     }
 
     private static func sharedCopy(_ down: Linear) -> (NemotronSharedDownZSkip.Copy, MLXArray)? {
@@ -3635,6 +3659,25 @@ enum NemotronSBDict {
         lock.withLock { draftDicts.values.flatMap { [$0.index, $0.table] } }
     }
 
+    /// `arrays` without the scales and biases of the head's routed banks that have an admitted dictionary: the
+    /// head's routed experts run only one-row draft steps, whose dictionary twin binds the bank's codes, index
+    /// and table, so those scales and biases are not decode backing. NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY=1
+    /// keeps them.
+    static func withoutDictBankMetadata(_ arrays: [MLXArray], module: Module) -> [MLXArray] {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY"] != "1" else { return arrays }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, draftDict(linear) != nil else { continue }
+            for (key, a) in linear.parameters().flattened() where key == "scales" || key == "biases" {
+                skip.insert(ObjectIdentifier(a))
+            }
+        }
+        let kept = arrays.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(arrays.count - kept.count) dictionary bank scale/bias arrays left out\n".utf8))
+        return kept
+    }
+
     /// The admitted routed-bank indices (for `NemotronBankBinding.warm`: addressed from their base).
     static var draftBankIndexArrays: [MLXArray] {
         lock.withLock { draftDicts.values.compactMap { $0.index.ndim == 3 ? $0.index : nil } }
@@ -3746,5 +3789,271 @@ enum NemotronSBDict {
         }
         eval(Array(same.values))
         return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
+    }
+}
+
+
+// MARK: - Current-call sparse BF16 activation payload, four values per producer
+//
+// RPS=4/NSG=1 is unchanged: one SIMD leader owns a half of an eight-value
+// FC2 chunk. Each half has a byte header and four values of fixed capacity.
+// Only live values are stored and read. There is no global compaction, atomic,
+// extra runtime packing launch, or cross-threadgroup producer dependency.
+private let nmlPayloadHeader = """
+template <typename T>
+inline void nmp_pack(const thread T* values, device T* packed, device uchar* meta) {
+  uint mask = 0, unsafe = 0, raw = 0;
+  for (int i = 0; i < 4; i++) {
+    const uint bits = uint(as_type<ushort>(values[i]));
+    const uint ab = bits & 0x7fffu;
+    mask |= ab != 0 ? 1u << i : 0u;
+    unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 16u : 0u;
+    raw |= bits == 0x8000u ? 32u : 0u;
+  }
+  int out = 0;
+  for (int i = 0; i < 4; i++) {
+    if (raw != 0 || (mask & (1u << i)) != 0) { packed[out++] = values[i]; }
+  }
+  *meta = uchar(mask | unsafe | raw);
+}
+"""
+
+private func nmlPayloadProducerSource(_ source: String) -> String? {
+    let point = "  device T* y0 = y + slot * N + out_row;\n"
+    guard source.components(separatedBy: point).count == 2 else { return nil }
+    var result = source.replacingOccurrences(of: point, with: point + """
+      static_assert(RPS == 4 && RELU2, "sparse payload requires rounded relu2 groups of four");
+      thread T nmp0[RPS], nmp1[RPS], nmp2[RPS];
+
+    """)
+    for (original, replacement, count) in [
+        ("y0[r] = nml_store<T, RELU2>(result[r]);", "nmp0[r] = nml_store<T, RELU2>(result[r]); y0[r] = nmp0[r];", 1),
+        ("y0[r] = nml_store<T, RELU2>(result0[r]);", "nmp0[r] = nml_store<T, RELU2>(result0[r]); y0[r] = nmp0[r];", 2),
+        ("y1[r] = nml_store<T, RELU2>(result1[r]);", "nmp1[r] = nml_store<T, RELU2>(result1[r]); y1[r] = nmp1[r];", 2),
+        ("y2[r] = nml_store<T, RELU2>(result2[r]);", "nmp2[r] = nml_store<T, RELU2>(result2[r]); y2[r] = nmp2[r];", 1)
+    ] {
+        guard result.components(separatedBy: original).count == count + 1 else { return nil }
+        result = result.replacingOccurrences(of: original, with: replacement)
+    }
+    return result + """
+      if (simd_lid == 0) {
+        nmp_pack<T>(nmp0, pv + slot * N + out_row, pm + slot * (N / 4) + out_row / 4);
+        if (partner >= 0) {
+          nmp_pack<T>(nmp1, pv + partner * N + out_row, pm + partner * (N / 4) + out_row / 4);
+        }
+        if (third >= 0) {
+          nmp_pack<T>(nmp2, pv + third * N + out_row, pm + third * (N / 4) + out_row / 4);
+        }
+      }
+    """
+}
+
+private func nmlPayloadConsumerSource(_ source: String) -> String? {
+    let begin = "  const device T* xs = x + slot * K;\n"
+    let end = "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    guard let a = source.range(of: begin), let b = source.range(of: end, range: a.upperBound..<source.endIndex),
+          source.components(separatedBy: begin).count == 2 else { return nil }
+    let staging = """
+      const device T* values = pv + slot * K;
+      const device uchar* metadata = pm + slot * (K / 4);
+      for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+        uint mask = 0, unsafe = 0;
+        for (int h = 0; h < 2; h++) {
+          const uint meta = uint(metadata[2 * c + h]);
+          const uint m = meta & 15u;
+          unsafe |= meta & 16u;
+          mask |= m << (4 * h);
+          int rank = 0;
+          for (int i = 0; i < 4; i++) {
+            const bool live = (meta & 32u) != 0 || (m & (1u << i)) != 0;
+            xsh[8 * c + 4 * h + i] = live ? values[8 * c + 4 * h + rank++] : T(0);
+          }
+        }
+        cmask[c] = unsafe != 0 ? uchar(255) : uchar(mask);
+      }
+    """
+    return String(source[..<a.lowerBound]) + staging + "\n" + String(source[b.lowerBound...])
+}
+
+enum NemotronSparseFC2Payload {
+    struct Outputs {
+        let activation: MLXArray
+        let values: MLXArray
+        let meta: MLXArray
+    }
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SPARSE_PAYLOAD"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var owners: Set<ObjectIdentifier> = []
+
+    private static func makeProducer(_ dict: Bool) -> MLXFast.MLXFastKernel? {
+        let triple = nemotronMoETripleGateUpSource.replacingOccurrences(of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+        let pointers = [
+            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;")]
+        guard let tail = nmlTail8Source(triple), let prepared = nmlPreparedSource(tail, pointers: pointers),
+              let payload = nmlPayloadProducerSource(prepared),
+              let source = dict ? nemotronSBDictSource(payload) : payload else { return nil }
+        return MLXFast.metalKernel(name: dict ? "nemotron_fc1_sparse_payload_sbd" : "nemotron_fc1_sparse_payload",
+            inputNames: ["w", "scales", "biases", "prepared", "inds"], outputNames: ["y", "pv", "pm"],
+            source: source, header: nemotronMoELeaderHeader + nemotronMoELeaderStore
+                + nemotronMoELeaderPreparedHeader + nemotronMoETripleDecodeHeader + nmlPayloadHeader)
+    }
+    private static let plainProducer = makeProducer(false)
+    private static let dictProducer = makeProducer(true)
+
+    private static func compatible(_ x: MLXArray, _ inds: MLXArray, _ bank: NemotronMoELeader.Bank) -> Bool {
+        enabled && NemotronMoELeader.fc1Results == 4 && NemotronMoELeader.fc1SimdGroups == 1
+            && NemotronMoELeader.fc1Tail8 && NemotronMoELeader.tripleGateUp && NemotronMoELeader.fuseBalancePlan
+            && NemotronMoELeader.preparedGateUp && NemotronZSkip.tiled && NemotronZSkip.fast
+            && x.shape == [3, 2688] && x.dtype == .bfloat16 && inds.shape == [18] && inds.dtype == .uint32
+            && bank.weight.shape == [128, 1856, 336] && bank.k == 2688 && bank.n == 1856
+    }
+
+    private static func dispatch(_ x: MLXArray, _ inds: MLXArray, bank: NemotronMoELeader.Bank,
+                                 prepared: MLXArray?, dict: NemotronSBDict.Dict?) -> Outputs? {
+        guard compatible(x, inds, bank), let kernel = dict == nil ? plainProducer : dictProducer else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let args: [MLXArray]
+        if let dict {
+            args = [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index), dict.table, packed, inds]
+        } else {
+            args = [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                    NemotronBankBinding.bind(bank.biases), packed, inds]
+        }
+        let outputs = kernel(args, template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                ("K", 2688), ("N", 1856), ("XSLOT", false), ("RELU2", true), ("RPS", 4)],
+            grid: (32, 464, 18), threadGroup: (32, 1, 1),
+            outputShapes: [[18, 1856], [18, 1856], [18, 464]], outputDTypes: [.bfloat16, .bfloat16, .uint8])
+        return Outputs(activation: outputs[0], values: outputs[1], meta: outputs[2])
+    }
+
+    static func covers(_ owner: SwitchLinear) -> Bool {
+        lock.withLock { owners.contains(ObjectIdentifier(owner)) }
+    }
+
+    static func produce(_ x: MLXArray, _ inds: MLXArray, bank: NemotronMoELeader.Bank,
+                        prepared: MLXArray?, dict: NemotronSBDict.Dict?, fc2: SwitchLinear) -> Outputs? {
+        guard covers(fc2),
+              !NemotronZSkip.needsOriginal(fc2), NemotronZSkip.covers(fc2) else { return nil }
+        return dispatch(x, inds, bank: bank, prepared: prepared, dict: dict)
+    }
+
+    // A qualification-only pack/unpack pair exercises adversarial BF16 bit
+    // patterns, including negative zero and the original dense unsafe path.
+    private static let pack = MLXFast.metalKernel(name: "nemotron_payload_qualification_pack",
+        inputNames: ["x"], outputNames: ["pv", "pm"], source: """
+          const int g = int(thread_position_in_grid.x);
+          if (g >= 18 * 464) { return; }
+          thread T v[4];
+          for (int i = 0; i < 4; i++) { v[i] = x[4 * g + i]; }
+          nmp_pack<T>(v, pv + 4 * g, pm + g);
+        """, header: nmlPayloadHeader)
+    private static let unpack = MLXFast.metalKernel(name: "nemotron_payload_qualification_unpack",
+        inputNames: ["pv", "pm"], outputNames: ["y"], source: """
+          const int g = int(thread_position_in_grid.x);
+          if (g >= 18 * 464) { return; }
+          const uint meta = uint(pm[g]);
+          int rank = 0;
+          for (int i = 0; i < 4; i++) {
+            const bool live = (meta & 32u) != 0 || (meta & (1u << i)) != 0;
+            y[4 * g + i] = live ? pv[4 * g + rank++] : T(0);
+          }
+        """)
+
+    private static func packOnly(_ x: MLXArray) -> Outputs {
+        let result = pack([x], template: [("T", DType.bfloat16)], grid: (18 * 464, 1, 1),
+            threadGroup: (128, 1, 1), outputShapes: [[18, 1856], [18, 464]], outputDTypes: [.bfloat16, .uint8])
+        return Outputs(activation: x, values: result[0], meta: result[1])
+    }
+
+    static func qualify(_ model: Module) throws {
+        lock.withLock { owners = [] }
+        guard enabled, Device.defaultDevice().deviceType == .gpu,
+              NemotronMoELeader.fc1Results == 4, NemotronMoELeader.fc1SimdGroups == 1,
+              NemotronMoELeader.fc1Tail8, NemotronMoELeader.tripleGateUp,
+              NemotronMoELeader.enabled, NemotronMoELeader.fuseRelu2,
+              NemotronMoELeader.fuseBalancePlan, NemotronMoELeader.elideUnreadPlan,
+              NemotronFC2SharedColaunch.enabled, NemotronZSkip.joinReduce,
+              NemotronHResidualRMSNorm.productsJoinVerified,
+              NemotronZSkip.tiled, NemotronZSkip.fast else { return }
+        let expectedLayers = model.modules().compactMap { $0 as? NemotronHMoE }.filter {
+            $0.numExpertsPerTok == 6 && $0.sharedExperts != nil
+        }.count
+        var accepted: Set<ObjectIdentifier> = []
+        try withError { () -> Void in
+            var seed = 0
+            for module in model.modules() {
+                guard let moe = module as? NemotronHMoE, let shared = moe.sharedExperts,
+                      NemotronFC2SharedColaunch.covers(fc2: moe.switchMLP.fc2, down: shared.downProj),
+                      let bank = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16)
+                else { continue }
+                let ids = MLXArray([UInt32(3),17,42,77,100,121,17,5,64,90,3,11,3,8,50,66,101,127])
+                let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(moe.switchMLP.fc1) : nil
+                let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5aa0 + seed)), into: 3)
+                let scores = MLXRandom.uniform(Float(0)..<1, [18], key: keys[0])
+                let normal = MLXRandom.normal([3,2688], key: keys[1]).asType(.bfloat16)
+                let inputs = [normal, (normal * 0.125).asType(.bfloat16), zeros([3,2688], dtype: .bfloat16)]
+                for x in inputs {
+                    guard let got = dispatch(x, ids, bank: bank, prepared: nil, dict: dict),
+                          let expected = NemotronMoELeader.applyTripleWithoutPlan(x, ids, bank: bank,
+                            relu2: true, prepared: nil, dict: dict) else {
+                        throw NemotronH35MTPError.invalidArtifact("NEMOTRON_SPARSE_PAYLOAD missing supported producer")
+                    }
+                    let restored = unpack([got.values,got.meta], template: [("T", DType.bfloat16)],
+                        grid: (18*464,1,1), threadGroup: (128,1,1), outputShapes: [[18,1856]], outputDTypes: [.bfloat16])[0]
+                    guard (got.activation.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all().item(Bool.self),
+                          (restored.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all().item(Bool.self),
+                          compareConsumers(got, ids, scores, shared, x.reshaped(1,3,2688), moe.switchMLP.fc2) else {
+                        throw NemotronH35MTPError.invalidArtifact("NEMOTRON_SPARSE_PAYLOAD supported producer/consumer differs")
+                    }
+                }
+                if seed == 0 {
+                    let patterns: [UInt16] = [0,0x8000,1,0x8001,0x087f,0x0880,0x0881,0x3f80,0xbf80,
+                        0x7f7f,0xff7f,0x7f80,0xff80,0x7fc0,0x7fff,0xffff]
+                    let bits = (0..<(18*1856)).map { patterns[($0 * 7 + $0/8) % patterns.count] }
+                    let masks: [UInt16] = (0..<(18*1856)).map { index in
+                        ((index / 8) % 256 & (1 << (index % 8))) != 0
+                            ? [UInt16(0x3f80),0xbf80,0x3e20,0x4a55][index % 4] : 0
+                    }
+                    let singleUnsafe: [UInt16] = (0..<(18*1856)).map { index in
+                        index % 8 == (index / 8) % 8 ? patterns[2 + (index / 64) % 14] : 0
+                    }
+                    for family in [bits, masks, singleUnsafe] {
+                        let x = MLXArray(family).reshaped(18,1856).view(dtype: .bfloat16)
+                        let p = packOnly(x)
+                        let restored = unpack([p.values,p.meta], template: [("T", DType.bfloat16)],
+                            grid: (18*464,1,1), threadGroup: (128,1,1), outputShapes: [[18,1856]], outputDTypes: [.bfloat16])[0]
+                        guard (restored.view(dtype: .uint16) .== x.view(dtype: .uint16)).all().item(Bool.self),
+                              compareConsumers(p,ids,scores,shared,normal.reshaped(1,3,2688),moe.switchMLP.fc2) else {
+                            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_SPARSE_PAYLOAD bit-pattern replay differs")
+                        }
+                    }
+                }
+                accepted.insert(ObjectIdentifier(moe.switchMLP.fc2)); seed += 1
+            }
+        }
+        guard !accepted.isEmpty, accepted.count == expectedLayers else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_SPARSE_PAYLOAD qualified \(accepted.count) of \(expectedLayers) supported target co-launches")
+        }
+        lock.withLock { owners = accepted }
+        FileHandle.standardError.write(Data("nemotron sparse activation payload: qualified \(accepted.count) MoE layers\n".utf8))
+    }
+
+    private static func compareConsumers(_ p: Outputs, _ ids: MLXArray, _ scores: MLXArray,
+        _ shared: NemotronHMLP, _ x: MLXArray, _ fc2: SwitchLinear) -> Bool {
+        let a = NemotronFC2SharedColaunch.Shared(mlp: shared, x: x, prepared: nil)
+        let b = NemotronFC2SharedColaunch.Shared(mlp: shared, x: x, prepared: nil)
+        guard let got = NemotronFC2SharedColaunch.run(p.activation, ids, scores, fc2: fc2, shared: a, payload: p),
+              let expected = NemotronFC2SharedColaunch.run(p.activation, ids, scores, fc2: fc2, shared: b),
+              let ga = a.rows, let gb = b.rows else { return false }
+        // Preserve NaN class equivalence without hiding finite/signed-zero bit changes.
+        let same = logicalOr(got.view(dtype: .uint32) .== expected.view(dtype: .uint32),
+            logicalAnd(isNaN(got), isNaN(expected)))
+        return logicalAnd(same.all(), (ga.view(dtype: .uint16) .== gb.view(dtype: .uint16)).all()).item(Bool.self)
     }
 }

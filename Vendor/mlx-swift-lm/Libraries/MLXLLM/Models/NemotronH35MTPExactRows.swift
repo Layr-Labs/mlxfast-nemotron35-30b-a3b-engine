@@ -702,6 +702,183 @@ enum NemotronMambaInProjConvDt {
     }
     static var dictAvailable: Bool { dictKernel != nil }
 
+    /// Keep the same reduced, BF16-rounded projection words in each lane for
+    /// the existing conv/dt epilogue. simd_sum already broadcasts its result;
+    /// no device publication or readback is needed for these private words.
+    static let registerEpilogueEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_REGISTER_EPILOGUE"] != "0"
+    private static func registerSource() -> String? {
+        let close = """
+          for (int row = 0; row < results_per_simdgroup; row++) {
+            for (int r = 0; r < R; r++) {
+              U v = simd_sum(result[r][row]);
+              if (simd_lid == 0) {
+                T h = static_cast<T>(v);
+                if (RELU2) {
+                  T zero = static_cast<T>(0);
+                  T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+                  h = m * m;
+                }
+                yp[r * out_vec_size + row] = h;
+              }
+            }
+          }
+        """
+        let replacement = """
+          static_assert(R == 3 && RPS == 2 && !FAST && !RELU2,
+                        "register epilogue is only the native verify in-projection");
+          // Same row-major sequence of six reductions, with named private
+          // scalars rather than a dynamically indexed thread-local array.
+          const T nmr_y00 = static_cast<T>(simd_sum(result[0][0]));
+          const T nmr_y10 = static_cast<T>(simd_sum(result[1][0]));
+          const T nmr_y20 = static_cast<T>(simd_sum(result[2][0]));
+          const T nmr_y01 = static_cast<T>(simd_sum(result[0][1]));
+          const T nmr_y11 = static_cast<T>(simd_sum(result[1][1]));
+          const T nmr_y21 = static_cast<T>(simd_sum(result[2][1]));
+          if (simd_lid == 0) {
+            yp[0 * out_vec_size + 0] = nmr_y00;
+            yp[1 * out_vec_size + 0] = nmr_y10;
+            yp[2 * out_vec_size + 0] = nmr_y20;
+            yp[0 * out_vec_size + 1] = nmr_y01;
+            yp[1 * out_vec_size + 1] = nmr_y11;
+            yp[2 * out_vec_size + 1] = nmr_y21;
+          }
+        """
+        let barrier = "  simdgroup_barrier(mem_flags::mem_device);"
+        let current = "yp[t * out_vec_size + row]"
+        let history = "yp[(crow - 3) * out_vec_size + row]"
+        let row = "      const int o = out_row + row;"
+        guard nemotronHeadPreparedQMVSource.components(separatedBy: close).count == 2,
+              nemotronMambaInProjConvDtEpilogue.components(separatedBy: barrier).count == 2,
+              nemotronMambaInProjConvDtEpilogue.components(separatedBy: current).count == 3,
+              nemotronMambaInProjConvDtEpilogue.components(separatedBy: history).count == 2,
+              nemotronMambaInProjConvDtEpilogue.components(separatedBy: row).count == 2
+        else { return nil }
+        let projection = nemotronHeadPreparedQMVSource.replacingOccurrences(of: close, with: replacement)
+        let epilogue = nemotronMambaInProjConvDtEpilogue
+            .replacingOccurrences(of: barrier, with: "  // All epilogue projection operands are private reduced words.")
+            .replacingOccurrences(of: row, with: row + "\n"
+                + "      const T nmr_p0 = row == 0 ? nmr_y00 : nmr_y01;\n"
+                + "      const T nmr_p1 = row == 0 ? nmr_y10 : nmr_y11;\n"
+                + "      const T nmr_p2 = row == 0 ? nmr_y20 : nmr_y21;")
+            .replacingOccurrences(of: current, with: "(t == 0 ? nmr_p0 : (t == 1 ? nmr_p1 : nmr_p2))")
+            .replacingOccurrences(of: history, with: "(crow == 3 ? nmr_p0 : (crow == 4 ? nmr_p1 : nmr_p2))")
+        return projection + epilogue
+    }
+    private static let registerKernel = registerSource().map {
+        MLXFast.metalKernel(name: "nemotron_mamba_in_proj_register_epilogue",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    private static let registerDictKernel = registerSource().flatMap(nemotronSBDictSource).map {
+        MLXFast.metalKernel(name: "nemotron_mamba_in_proj_register_epilogue_sbd",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    private struct RegisterAdmission {
+        let q: QuantizedLinear
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+        let convWeight: MLXArray
+        let convBias: MLXArray
+        let dtBias: MLXArray
+    }
+    private static let registerLock = NSLock()
+    nonisolated(unsafe) private static var registerAdmissions: [ObjectIdentifier: RegisterAdmission] = [:]
+    private static func registerCovers(
+        _ q: QuantizedLinear, _ convWeight: MLXArray, _ convBias: MLXArray, _ dtBias: MLXArray
+    ) -> Bool {
+        guard registerEpilogueEnabled, let biases = q.biases else { return false }
+        return registerLock.withLock {
+            guard let a = registerAdmissions[ObjectIdentifier(q)] else { return false }
+            return a.q === q && a.weight === q.weight && a.scales === q.scales
+                && a.biases === biases && a.convWeight === convWeight
+                && a.convBias === convBias && a.dtBias === dtBias
+        }
+    }
+
+    /// Every actual target bank, direct original/new plain and dictionary
+    /// launches, private activation/history. No request state is touched.
+    static func qualifyRegisterEpilogue(_ model: Module) {
+        registerLock.withLock { registerAdmissions = [:] }
+        guard registerEpilogueEnabled, enabled, NemotronMultiRowQMV.enabled,
+              NemotronMultiRowQMV.narrowEnabled, Device.defaultDevice().deviceType == .gpu
+        else { return }
+        guard let candidate = registerKernel else {
+            preconditionFailure("native in-projection register source derivation refused")
+        }
+        var built: [ObjectIdentifier: RegisterAdmission] = [:]
+        var tried = 0
+        var cases = 0
+        for module in model.modules() {
+            guard let mixer = module as? NemotronHMamba2Mixer,
+                  mixer.numHeads == 64, mixer.intermediateSize == 4096, mixer.convDim == 6144,
+                  let q = mixer.inProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+                  q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+                  q.weight.shape == [10304, 336], q.weight.dtype == .uint32,
+                  q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16,
+                  mixer.conv1d.weight.shape == [6144, 4, 1], mixer.conv1d.weight.dtype == .bfloat16,
+                  let cb = mixer.conv1d.bias, cb.shape == [6144], cb.dtype == .bfloat16,
+                  mixer.dtBias.shape == [64], [DType.bfloat16, .float32].contains(mixer.dtBias.dtype),
+                  built[ObjectIdentifier(q)] == nil else { continue }
+            tried += 1
+            var same = false
+            do {
+                same = try withError { () -> Bool in
+                    let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(q) : nil
+                    for pattern in 0..<3 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xc0e1_0000 + tried * 31 + pattern)), into: 2)
+                        var x = (MLXRandom.normal([3, 2688], key: keys[0]) * 0.25).asType(.bfloat16)
+                        if pattern == 1 { x = which(abs(x) .< 0.2, MLXArray(Float(0)).asType(.bfloat16), x) }
+                        if pattern == 2 { x = MLXArray.zeros([3, 2688], dtype: .bfloat16) }
+                        let oldState = (MLXRandom.normal([1, 3, 6144], key: keys[1]) * 0.25).asType(.bfloat16)
+                        let prepared = NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+                        let args = NemotronMultiRowQMV.scalarPair(2688, 10304)
+                        let lo = MLXArray(mixer.timeStepLimit.0), hi = MLXArray(mixer.timeStepLimit.1)
+                        for useDict in [false, true] {
+                            if useDict && dict == nil { continue }
+                            guard let original = useDict ? dictKernel : kernel,
+                                  let changed = useDict ? registerDictKernel : candidate else { return false }
+                            func run(_ k: MLXFast.MLXFastKernel) -> [MLXArray] {
+                                k([q.weight, useDict ? dict!.index : q.scales,
+                                   useDict ? dict!.table : biases, prepared, args.0, args.1,
+                                   oldState, mixer.conv1d.weight, cb, mixer.dtBias, lo, hi],
+                                  template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", false),
+                                             ("RPS", 2), ("CS", 4096), ("CC", 6144), ("DS", 10240), ("NH", 64)],
+                                  grid: (32, 5152, 1), threadGroup: (32, 2, 1),
+                                  outputShapes: [[3, 10304], [1, 3, 6144], [1, 6, 6144], [1, 3, 64]],
+                                  outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
+                            }
+                            let a = run(original), b = run(changed)
+                            eval(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3])
+                            for (u, v) in zip(a, b) {
+                                let word: DType = u.dtype == .float32 ? .uint32 : .uint16
+                                guard (u.view(dtype: word) .== v.view(dtype: word)).all().item(Bool.self)
+                                else { return false }
+                            }
+                            cases += 1
+                        }
+                    }
+                    return true
+                }
+            } catch { same = false }
+            if same {
+                built[ObjectIdentifier(q)] = RegisterAdmission(q: q, weight: q.weight, scales: q.scales,
+                    biases: biases, convWeight: mixer.conv1d.weight, convBias: cb, dtBias: mixer.dtBias)
+            }
+        }
+        precondition(tried > 0 && built.count == tried,
+                     "native in-projection register epilogue did not admit every supported bank")
+        registerLock.withLock { registerAdmissions = built }
+        FileHandle.standardError.write(Data(
+            "nemotron in-projection register epilogue: \(built.count)/\(tried) actual banks, \(cases) cases bitwise\n".utf8))
+    }
+
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
@@ -730,7 +907,11 @@ enum NemotronMambaInProjConvDt {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
-        let outputs = (dict != nil ? dictKernel! : kernel)(
+        let registers = registerCovers(q, convWeight, convBias, dtBias)
+        let selected = registers
+            ? (dict != nil ? registerDictKernel! : registerKernel!)
+            : (dict != nil ? dictKernel! : kernel)
+        let outputs = selected(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
