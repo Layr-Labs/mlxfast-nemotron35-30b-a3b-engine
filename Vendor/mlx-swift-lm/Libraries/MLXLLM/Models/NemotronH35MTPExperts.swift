@@ -2333,6 +2333,45 @@ private let nemotronZSkipTiledFastSource = """
   }
 """
 
+// Native routed FC2 staging: same words/masks and onebarrier, individual
+// elements owned acrossall16 SIMD groups instead ofeight-element lane loops.
+// Source factory is guarded and runs only in the official engine; no local expansion.
+private func nemotronZSkipWarpStagingSource(_ source: String) -> String? {
+    let from = """
+      for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+        const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+        uint m = 0, unsafe = 0;
+        for (int i = 0; i < 8; i++) {
+          const uint ab = uint(xb[i]) & 0x7fffu;
+          m |= ab != 0 ? (1u << i) : 0u;
+          unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+          xsh[8 * c + i] = xs[8 * c + i];
+        }
+        // A full-mask sentinel sends tiny/nonfinite chunks to the unchanged dense
+        // arithmetic, without a second shared array or per-output exponent tests.
+        cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
+      }
+    """ + "\n"
+    let to = """
+      // K is a multiple of32: all lanes of eachSIMD group execute the same
+      // rounds. Eight adjacent lanes OR their original mask bits and unsafe flag.
+      for (int i = sg * 32 + lid; i < K; i += SGS * 32) {
+        const uint ab = uint(((const device uint16_t*)xs)[i]) & 0x7fffu;
+        xsh[i] = xs[i];
+        uint flags = ab != 0 ? (1u << (lid & 7)) : 0u;
+        flags |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 256u : 0u;
+        flags |= simd_shuffle_xor(flags, 4);
+        flags |= simd_shuffle_xor(flags, 2);
+        flags |= simd_shuffle_xor(flags, 1);
+        if ((lid & 7) == 0) {
+          cmask[i / 8] = (flags & 256u) != 0 ? uchar(255) : uchar(flags);
+        }
+      }
+    """ + "\n"
+    guard source.components(separatedBy: from).count == 2 else { return nil }
+    return source.replacingOccurrences(of: from, with: to)
+}
+
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
 // tile-major uint16 pair index (one per group and output) and `bk` the bank's
@@ -2915,6 +2954,159 @@ enum NemotronZSkip {
                     biases: bank.biases.swappedAxes(1, 2).contiguous())
     }
 
+    // Same native16-SIMD slot kernel with a new cooperative staging ownership.
+    // No additional output or state in production. A separate diagnostic twin
+    // exposes all staged words/masks solely to the official load-time check.
+    static let warpStagingEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_WARP_STAGE"] != "0"
+    nonisolated(unsafe) private static var warpStagingQualified = false
+
+    private static func makeWarpStagingKernel(
+        _ name: String, warp: Bool, dictionary: Bool, dep: Bool = false, snapshot: Bool = false
+    ) -> MLXFast.MLXFastKernel? {
+        var source = nemotronZSkipTiledFastSource
+        if warp {
+            guard let twin = nemotronZSkipWarpStagingSource(source) else { return nil }
+            source = twin
+        }
+        if dictionary {
+            guard let twin = nemotronZSkipDictSource(source) else { return nil }
+            source = twin
+        }
+        if snapshot {
+            let anchor = "  const ulong tb = (ulong)expert * (N / OT) + int(threadgroup_position_in_grid.x);\n"
+            guard source.components(separatedBy: anchor).count == 2 else { return nil }
+            let dump = """
+              if (threadgroup_position_in_grid.x == 0) {
+                const threadgroup uint16_t* xbits = (const threadgroup uint16_t*)xsh;
+                for (int i = sg * 32 + lid; i < K; i += SGS * 32) {
+                  stage[slot * (K + chunks) + i] = xbits[i];
+                }
+                for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+                  stage[slot * (K + chunks) + K + c] = uint16_t(cmask[c]);
+                }
+              }
+            """ + "\n"
+            source = source.replacingOccurrences(of: anchor, with: dump + anchor)
+        }
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"] + (dep ? ["dep"] : []),
+            outputNames: snapshot ? ["prod", "stage"] : ["prod"], source: source,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static let warpStagePlain = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_warp_stage", warp: true, dictionary: false)
+    private static let warpStageDict = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_warp_stage_sbd", warp: true, dictionary: true)
+    private static let warpStagePlainDep = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_warp_stage_dep", warp: true, dictionary: false, dep: true)
+    private static let warpStageDictDep = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_warp_stage_sbd_dep", warp: true, dictionary: true, dep: true)
+    private static let recordStageSnapshot = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_record_stage_snapshot", warp: false, dictionary: false, snapshot: true)
+    private static let recordStageSnapshotDict = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_record_stage_snapshot_sbd", warp: false, dictionary: true, snapshot: true)
+    private static let warpStageSnapshot = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_warp_stage_snapshot", warp: true, dictionary: false, snapshot: true)
+    private static let warpStageSnapshotDict = makeWarpStagingKernel(
+        "nemotron_zskip_fc2_warp_stage_snapshot_sbd", warp: true, dictionary: true, snapshot: true)
+
+    private static func warpStageProducts(
+        _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+        copy: Copy, rows: Int, dep: MLXArray? = nil
+    ) -> MLXArray? {
+        guard tiled, fast, sgs == 16, rows == 1 || rows == 3,
+              x.shape == [rows * 6, 1856], x.dtype == .bfloat16,
+              inds.shape == [rows * 6], scores.shape == [rows * 6], scores.dtype == .float32,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              let kernel = (dep != nil
+                ? (copy.dict ? warpStageDictDep : warpStagePlainDep)
+                : (copy.dict ? warpStageDict : warpStagePlain)) else { return nil }
+        return kernel(
+            [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores] + (dep.map { [$0] } ?? []),
+            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+            grid: (32 * sgs * 21, rows * 6, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[rows * 6 * 2688]], outputDTypes: [.float32])[0]
+    }
+
+    private static func stageSnapshot(
+        _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy, rows: Int, warp: Bool
+    ) -> [MLXArray]? {
+        guard let kernel = (warp ? (copy.dict ? warpStageSnapshotDict : warpStageSnapshot)
+                                 : (copy.dict ? recordStageSnapshotDict : recordStageSnapshot)) else { return nil }
+        return kernel(
+            [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores],
+            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+            grid: (32 * sgs * 21, rows * 6, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[rows * 6 * 2688], [rows * 6, 1856 + 232]],
+            outputDTypes: [.float32, .uint16])
+    }
+
+    private enum WarpStageCheckError: Error { case unavailable, differs }
+
+    /// Every actual target/draft copy, before either inference graph is traced.
+    /// References remain the original regular/dep kernels because admission is
+    /// false throughout this check. Changed-input cases are queued per copy.
+    static func qualifyWarpStaging() {
+        warpStagingQualified = false
+        guard warpStagingEnabled, tiled, fast, sgs == 16,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu else { return }
+        let target = lock.withLock { Array(copies.values) }
+        let draft = lock.withLock { Array(draftCopies.values) }
+        guard !target.isEmpty, !draft.isEmpty else { return }
+        var checked = 0
+        do {
+            try withError { () throws -> Void in
+                for (index, entry) in (target.map { ($0, 3) } + draft.map { ($0, 1) }).enumerated() {
+                    let (copy, rows) = entry
+                    let slots = rows * 6
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5a900 + index)), into: 3)
+                    let h = abs(MLXRandom.normal([slots, 1856], key: keys[0])) + MLXArray(Float(1e-3))
+                    let keep = MLXRandom.uniform(Float(0) ..< 1, [slots, 1856], key: keys[1]) .< MLXArray(Float(0.08))
+                    let column = MLXArray((0..<1856).map(Int32.init)).reshaped(1, 1856)
+                    let zero = MLXArray(Float(0))
+                    let dense = (h * h).asType(.bfloat16)
+                    let sparse = which(keep, dense, zero).asType(.bfloat16)
+                    let one = which(column .== MLXArray(Int32(1800)), h, zero).asType(.bfloat16)
+                    let tail = which(column .>= MLXArray(Int32(1792)), dense, zero).asType(.bfloat16)
+                    let signed = which(keep, dense, MLXArray(Float(-0.0))).asType(.bfloat16)
+                    let tiny = (h * MLXArray(Float(1e-35))).asType(.bfloat16)
+                    let exceptional = which(column .== MLXArray(Int32(1800)), MLXArray(Float.nan),
+                        which(column .== MLXArray(Int32(7)), MLXArray(Float.infinity), sparse)).asType(.bfloat16)
+                    let inputs = [MLXArray.zeros([slots, 1856], dtype: .bfloat16), sparse, dense, one, tail, signed, tiny, exceptional]
+                    let inds = MLXArray((0..<slots).map { UInt32(($0 * 17 + index * 7) % 128) })
+                    let scores = MLXRandom.normal([slots], key: keys[2])
+                    var same = MLXArray(true)
+                    for x in inputs {
+                        guard let a = stageSnapshot(x, inds, scores, copy: copy, rows: rows, warp: false),
+                              let b = stageSnapshot(x, inds, scores, copy: copy, rows: rows, warp: true),
+                              a.count == 2, b.count == 2 else { throw WarpStageCheckError.unavailable }
+                        same = logicalAnd(same, (a[0].view(dtype: .uint32) .== b[0].view(dtype: .uint32)).all())
+                        same = logicalAnd(same, (a[1] .== b[1]).all())
+                        for dependency in [Optional<MLXArray>.none, Optional(h)] {
+                            let expected = products(x, inds, scores, copy: copy, rows: rows, dep: dependency)
+                            guard let got = warpStageProducts(x, inds, scores, copy: copy, rows: rows, dep: dependency)
+                            else { throw WarpStageCheckError.unavailable }
+                            same = logicalAnd(same, (expected.view(dtype: .uint32) .== got.view(dtype: .uint32)).all())
+                            checked += 1
+                        }
+                    }
+                    guard same.item(Bool.self) else { throw WarpStageCheckError.differs }
+                }
+            }
+        } catch {
+            FileHandle.standardError.write(Data("nemotron zskip warp staging: off (source, MLX error, or bit difference)\n".utf8))
+            return
+        }
+        warpStagingQualified = true
+        FileHandle.standardError.write(Data(
+            "nemotron zskip warp staging: on (\(checked) products cases plus all staged words/masks bitwise equal)\n".utf8))
+    }
+
     /// x: [rows * 6, 1856] relu2 rows per slot; inds, scores: [rows * 6].
     /// Returns [1, rows, 2688]. Every slot is its own threadgroup column, so
     /// the slot kernel is the same for any row count.
@@ -2926,6 +3118,10 @@ enum NemotronZSkip {
     /// The slot kernel alone: [rows * 6 * 2688] FP32 weighted slot products.
     fileprivate static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  copy: Copy, rows: Int, dep: MLXArray? = nil) -> MLXArray {
+        if warpStagingQualified,
+           let staged = warpStageProducts(x, inds, scores, copy: copy, rows: rows, dep: dep) {
+            return staged
+        }
         let slots = rows * 6
         let threads = 32 * sgs
         let twin = dep.flatMap { _ in depKernel(for: copy) }
