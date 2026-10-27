@@ -151,34 +151,71 @@ enum NemotronHResidualRMSNorm {
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         precondition(source.components(separatedBy: product).count == 2)
-        let s = source.replacingOccurrences(of: scratch,
-            with: scratch + "\nthreadgroup T rounded[2688];")
-            .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+        guard joinShuffle else {
+            let s = source.replacingOccurrences(of: scratch,
+                with: scratch + "\nthreadgroup T rounded[2688];")
+                .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+                .replacingOccurrences(of: product, with: product
+                    + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+            return s + """
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lid < 336) {
+                    const int chunk = int(lid);
+                    float values[8];
+                    float total = 0;
+                    for (int i = 0; i < 8; i += 4) {
+                        total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
+                            + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
+                        values[i] = rounded[chunk * 8 + i];
+                        values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
+                        values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
+                        values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
+                    }
+                    const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
+                    for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
+                    prepared[base + 8 * 32] = total;
+                }
+                """
+        }
+        // Chunk c (values 8c ..< 8c + 8) is lanes 2c and 2c + 1 of one SIMD group: each lane keeps its four
+        // rounded values, reads its partner's through simd_shuffle_xor, and the pair writes the chunk's nine
+        // words (the even lane its four, the total; the odd lane its four) with the same expressions and order.
+        let s = source.replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
             .replacingOccurrences(of: product, with: product
-                + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+                + "\nnormalized[offset + i] = value;\nnmj_r[i] = value;")
+            .replacingOccurrences(of: "float thread_x[n_reads];", with: "float thread_x[n_reads];\nT nmj_r[n_reads];")
+        precondition(s.contains("T nmj_r[n_reads];"))
         return s + """
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 336) {
-                const int chunk = int(lid);
-                float values[8];
-                float total = 0;
-                for (int i = 0; i < 8; i += 4) {
-                    total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
-                        + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
-                    values[i] = rounded[chunk * 8 + i];
-                    values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
-                    values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
-                    values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
-                }
+            {
+                const bool odd = (lid & 1u) != 0;
+                T other[4];
+                for (int i = 0; i < 4; i++) other[i] = as_type<T>(simd_shuffle_xor(as_type<ushort>(nmj_r[i]), ushort(1)));
+                const int chunk = int(lid >> 1);
                 const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
-                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
-                prepared[base + 8 * 32] = total;
+                if (!odd) {
+                    float total = 0;
+                    total += float(nmj_r[0]) + float(nmj_r[1]) + float(nmj_r[2]) + float(nmj_r[3]);
+                    total += float(other[0]) + float(other[1]) + float(other[2]) + float(other[3]);
+                    prepared[base + 0 * 32] = float(nmj_r[0]);
+                    prepared[base + 1 * 32] = float(nmj_r[1]) / 16.0f;
+                    prepared[base + 2 * 32] = float(nmj_r[2]) / 256.0f;
+                    prepared[base + 3 * 32] = float(nmj_r[3]) / 4096.0f;
+                    prepared[base + 8 * 32] = total;
+                } else {
+                    prepared[base + 4 * 32] = float(nmj_r[0]);
+                    prepared[base + 5 * 32] = float(nmj_r[1]) / 16.0f;
+                    prepared[base + 6 * 32] = float(nmj_r[2]) / 256.0f;
+                    prepared[base + 7 * 32] = float(nmj_r[3]) / 4096.0f;
+                }
             }
             """
     }
+    /// NEMOTRON_MTP_JOIN_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
+    static let joinShuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOIN_SHUFFLE"] != "0"
     private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_rms_prepared_moe_bf16",
+        name: joinShuffle ? "nemotron_h_residual_rms_prepared_moe_bf16_sh" : "nemotron_h_residual_rms_prepared_moe_bf16",
         inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: preparedSource(), ensureRowContiguous: true)
@@ -236,7 +273,7 @@ enum NemotronHResidualRMSNorm {
             .replacingOccurrences(of: store, with: "")
     }
     private static let sumPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_sum_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_residual_sum_rms_prepared_bf16_sh" : "nemotron_h_residual_sum_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumPreparedSource(), ensureRowContiguous: true)
@@ -262,12 +299,12 @@ enum NemotronHResidualRMSNorm {
             """)
     }
     private static let sumProductsPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_products_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_residual_products_rms_prepared_bf16_sh" : "nemotron_h_residual_products_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumProductsPreparedSource(), ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_rms_prepared_bf16_sh" : "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
         outputNames: ["normalized", "prepared"],
         source: normPreparedSource(), ensureRowContiguous: true)
@@ -1154,12 +1191,91 @@ enum NemotronHCompactSSMGated {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             """
+    /// NEMOTRON_SSM_TAIL_SHUFFLE=0 keeps the threadgroup copy of the rounded rows. Otherwise the group's last
+    /// threadgroup runs each row with one barrier: simdgroups 0-3 store their sums in that row's slots, every
+    /// one of them then forms the record's 32-lane sum (the four sums, zeros elsewhere) and inverse mean itself,
+    /// and each lane writes its own four prepared words; the chunk's total adds the four lanes' partial sums
+    /// (each the record's four-value expression) in lane order through simd_shuffle_down.
+    /// The launch uses it only after `qualifyShuffle` found its outputs bitwise equal to the record kernel's.
+    static let tailShuffle = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_SHUFFLE"] != "0"
+    static func shuffledTail(_ source: String) -> String? {
+        let head = "threadgroup T rounded[512];\n"
+        let loop = "for (int row = 0; row < L; ++row) {\n"
+        guard tailShuffle, source.components(separatedBy: head).count == 2,
+              let start = source.range(of: loop) else { return nil }
+        return String(source[..<start.lowerBound]).replacingOccurrences(of: head, with:
+            "            threadgroup float nst_sums[L][4];\n") + """
+                        for (int row = 0; row < L; ++row) {
+                            const uint gid = uint(row) * uint(H * Dh / 512) + grp;
+                            int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;
+                            float acc = 0;
+                            float thread_x[4];
+                            if (on) {
+                                for (int i = 0; i < 4; i++) {
+                                    int64_t f = feature + int64_t(i);
+                                    T g = proj[int64_t(row) * PS + f];
+                                    auto y = 1 / (1 + metal::exp(metal::abs(g)));
+                                    T sig = g < 0 ? y : 1 - y;
+                                    T activated = g * sig;
+                                    T gated = out[int64_t(row) * (H * Dh) + f] * activated;
+                                    thread_x[i] = gated;
+                                    acc += thread_x[i] * thread_x[i];
+                                }
+                            }
+                            acc = simd_sum(acc);
+                            if (on && simd_lane_id == 0) {
+                                nst_sums[row][simd_group_id] = acc;
+                            }
+                            threadgroup_barrier(mem_flags::mem_threadgroup);
+                            if (on) {
+                                const float total_sq = simd_sum(simd_lane_id < 4 ? nst_sums[row][simd_lane_id] : 0.0f);
+                                const float inv_mean = metal::precise::rsqrt(total_sq / 512 + eps);
+                                T w[4];
+                                for (int i = 0; i < 4; i++) {
+                                    int64_t f = feature + int64_t(i);
+                                    T normalized = static_cast<T>(thread_x[i] * inv_mean);
+                                    T unweighted = identity * normalized;
+                                    T weighted = weight[f] * unweighted;
+                                    normed[int64_t(row) * (H * Dh) + f] = weighted;
+                                    w[i] = weighted;
+                                }
+                                const float part = float(w[0]) + float(w[1]) + float(w[2]) + float(w[3]);
+                                const float p1 = simd_shuffle_down(part, ushort(1));
+                                const float p2 = simd_shuffle_down(part, ushort(2));
+                                const float p3 = simd_shuffle_down(part, ushort(3));
+                                const int k = int(lid & 3u);
+                                const int base = int(gid) * 17 * 32 + int(lid >> 2);
+                                prepared[base + (4 * k + 0) * 32] = float(w[0]);
+                                prepared[base + (4 * k + 1) * 32] = float(w[1]) / 16.0f;
+                                prepared[base + (4 * k + 2) * 32] = float(w[2]) / 256.0f;
+                                prepared[base + (4 * k + 3) * 32] = float(w[3]) / 4096.0f;
+                                if (k == 0) {
+                                    float total = 0;
+                                    total += part;
+                                    total += p1;
+                                    total += p2;
+                                    total += p3;
+                                    prepared[base + 16 * 32] = total;
+                                }
+                            }
+                        }
+
+            """
+    }
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_mtp_ssm_compact_gated_prepared",
         inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
         source: source, mutableInputs: ["counter"])
+    static let shuffleKernel = shuffledTail(source).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_ssm_compact_gated_prepared_sh",
+            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                         "eps", "counter"],
+            outputNames: ["out", "state_out", "normed", "prepared"],
+            source: $0, mutableInputs: ["counter"])
+    }
     /// NEMOTRON_MTP_SSM_PENDING_FOLD (see NemotronMTPPendingSSM): the same
     /// launch with `P` pending strict-prefix steps of earlier windows (`pconv`
     /// [1, P, CD], `pdt` [1, P, H]) run first from `state_in`, with the
@@ -1193,6 +1309,57 @@ enum NemotronHCompactSSMGated {
                      "eps", "counter", "pconv", "pdt"],
         outputNames: ["out", "state_out", "normed", "prepared"],
         source: pendingSource, mutableInputs: ["counter"])
+    static let shufflePendingKernel = shuffledTail(pendingSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_ssm_compact_gated_prepared_pending_sh",
+            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                         "eps", "counter", "pconv", "pdt"],
+            outputNames: ["out", "state_out", "normed", "prepared"],
+            source: $0, mutableInputs: ["counter"])
+    }
+    /// Set at load by `qualifyShuffle`.
+    nonisolated(unsafe) private(set) static var shuffleQualified = false
+
+    /// Load time, after `prepareCounter`: runs the record and the one-barrier tail launches (no pending steps
+    /// and two pending steps) on synthetic operands with `mixer`'s parameters and adopts the tail only if the
+    /// normalized rows, the prepared activation and the final state are bitwise equal.
+    static func qualifyShuffle(_ mixer: NemotronHMamba2Mixer) {
+        shuffleQualified = false
+        guard tailShuffle, enabled, counter != nil, shuffleKernel != nil, shufflePendingKernel != nil else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron ssm tail shuffle: \(message)\n".utf8))
+        }
+        let (heads, dim, groups, stateDim) = (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        let keys = MLXRandom.split(key: MLXRandom.key(0x55A1), into: 6)
+        let conv = MLXRandom.normal([1, 3, mixer.convDim], key: keys[0]).asType(.bfloat16)
+        let dt = MLXRandom.uniform(Float(0.001) ..< 0.2, [1, 3, heads], key: keys[1])
+        let state = MLXRandom.normal([1, heads, dim, stateDim], key: keys[2]) * 0.1
+        let projected = MLXRandom.normal(
+            [1, 3, mixer.intermediateSize + mixer.convDim + heads], key: keys[3]).asType(.bfloat16)
+        let pconv = MLXRandom.normal([1, 2, mixer.convDim], key: keys[4]).asType(.bfloat16)
+        let pdt = MLXRandom.uniform(Float(0.001) ..< 0.2, [1, 2, heads], key: keys[5])
+        func bits(_ x: MLXArray) -> MLXArray {
+            x.dtype == .bfloat16 ? x.view(dtype: .uint16) : x.view(dtype: .uint32)
+        }
+        var same = MLXArray(true)
+        for pending in [nil, (conv: pconv, dt: pdt, steps: 2)] as [(conv: MLXArray, dt: MLXArray, steps: Int)?] {
+            func run(_ shuffle: Bool) -> (MLXArray, MLXArray, MLXArray)? {
+                mixer.norm.compactSSMPreparedRows(
+                    convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                    projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                    pending: pending, shuffle: shuffle)
+            }
+            guard let a = run(false), let b = run(true) else { return report("off (launch declined)") }
+            for (x, y) in [(a.0, b.0), (a.1, b.1), (a.2, b.2)] {
+                same = logicalAnd(same, (bits(x) .== bits(y)).all())
+            }
+            eval(same)
+        }
+        shuffleQualified = same.item(Bool.self)
+        report(shuffleQualified
+            ? "on (normalized rows, prepared activation and state bitwise equal, 0 and 2 pending steps)"
+            : "off (differs from the record launch)")
+    }
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -1215,7 +1382,7 @@ extension NemotronHRMSNormGated {
     func compactSSMPreparedRows(
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
-        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
+        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil, shuffle: Bool? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
@@ -1244,11 +1411,13 @@ extension NemotronHRMSNormGated {
             ("T", DType.bfloat16), ("U", DType.float32),
             ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
             ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
-        var kernel = NemotronHCompactSSMGated.kernel
+        let tail = shuffle ?? NemotronHCompactSSMGated.shuffleQualified
+        var kernel = (tail ? NemotronHCompactSSMGated.shuffleKernel : nil) ?? NemotronHCompactSSMGated.kernel
         if let pending {
             inputs += [pending.conv, pending.dt]
             template.append(("P", pending.steps))
-            kernel = NemotronHCompactSSMGated.pendingKernel
+            kernel = (tail ? NemotronHCompactSSMGated.shufflePendingKernel : nil)
+                ?? NemotronHCompactSSMGated.pendingKernel
         }
         let outputs = kernel(
             inputs, template: template,
