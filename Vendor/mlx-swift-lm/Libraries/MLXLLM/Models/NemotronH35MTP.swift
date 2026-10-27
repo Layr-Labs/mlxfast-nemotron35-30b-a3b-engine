@@ -1210,9 +1210,11 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
         // Every row's K/V goes to the head cache; only the row the device
         // picks is attended (`speculateNextFirstDraft`).
+        // The Q/K/V launch stores the K/V rows into the head cache itself when it can
+        // (`NemotronMTPFrontRowsKVDirect`); otherwise they are appended here.
         let rows = module.frontRows(
-            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens))
-        let written = s.cache.appendTrusted(keys: rows.keys, values: rows.values)
+            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens), cache: s.cache)
+        let written = rows.written ?? s.cache.appendTrusted(keys: rows.keys, values: rows.values)
         s.speculation = (fused: rows.fused, queries: rows.queries, keys: rows.keys,
                          values: rows.values, width: width)
         s.speculationWriteGeneration = s.paged!.row.writeGeneration
@@ -1252,30 +1254,48 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
               spec.width == s.stagedInputCount + 1, let paged = s.paged
         else { return }
         let row = acceptedDrafts.asType(.int32)
-        // The picked row attends the trusted prefix and post-verify rows 0...row.
-        let rowHistory = paged.row.snapshot()
-        let rowLength = rowHistory.keys.dim(2)
+        if let walk, queueWalkedFirstDraft(
+            spec: (fused: spec.fused, queries: spec.queries, keys: spec.keys, values: spec.values, width: spec.width),
+            row: row, walk: walk, paged: paged, state: s) {
+            return
+        }
+        // The picked row attends the trusted prefix and post-verify rows 0...row: the head cache pages in place
+        // once the paged draft attention qualified (`NemotronMTPDraftSDPA.directRead`; no gather is built),
+        // else the snapshot's gathered copy.
+        let direct = NemotronMTPDraftSDPA.directRead(paged.row)
+        var rowHistory = direct == nil ? paged.row.snapshot() : nil
+        let rowLength = direct?.count ?? rowHistory!.keys.dim(2)
+        let rowDType = direct?.dtype ?? rowHistory!.keys.dtype
+        let rowOffset = direct?.offset ?? rowHistory!.offset
         let rowFirst = rowLength - spec.width
         let picked = walk.flatMap {
             NemotronMTPDraftRowPick.pick(
                 walk: $0, fused: spec.fused, queries: spec.queries, keys: spec.keys,
                 values: spec.values, firstSpeculated: rowFirst, length: rowLength,
-                dtype: rowHistory.keys.dtype)
+                dtype: rowDType)
         }
         let fusedMasks = picked.map { ($0.first, $0.second) } ?? NemotronMTPDraftMasks.masks(
-            row: row, firstSpeculated: rowFirst, length: rowLength, dtype: rowHistory.keys.dtype)
+            row: row, firstSpeculated: rowFirst, length: rowLength, dtype: rowDType)
         let rowMask: MLXArray
         if let fusedMasks {
             rowMask = fusedMasks.0
         } else {
             let rowKeep = MLXArray(Int32(0) ..< Int32(rowLength)) .<= (row + Int32(rowFirst))
             rowMask = which(rowKeep, MLXArray(Float(0)), MLXArray(-Float.infinity))
-                .asType(rowHistory.keys.dtype).reshaped(1, 1, 1, rowLength)
+                .asType(rowDType).reshaped(1, 1, 1, rowLength)
         }
-        let out = module.finishMaskedRow(
-            fused: picked?.fused ?? take(spec.fused, row, axis: 1),
-            queries: picked?.queries ?? take(spec.queries, row, axis: 2),
-            keys: rowHistory.keys, values: rowHistory.values, mask: rowMask)
+        let rowFused = picked?.fused ?? take(spec.fused, row, axis: 1)
+        let rowQueries = picked?.queries ?? take(spec.queries, row, axis: 2)
+        let out: MLXArray
+        if let direct, let read = module.finishMaskedRow(
+            fused: rowFused, queries: rowQueries, read: direct, row: paged.row, mask: rowMask) {
+            out = read
+        } else {
+            let history = rowHistory ?? paged.row.snapshot()
+            rowHistory = history
+            out = module.finishMaskedRow(
+                fused: rowFused, queries: rowQueries, keys: history.keys, values: history.values, mask: rowMask)
+        }
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
         let keys = picked?.keys ?? take(spec.keys, row, axis: 2)
         let values = picked?.values ?? take(spec.values, row, axis: 2)
@@ -1299,33 +1319,120 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         // and the draft's own row; mask out the rows past n.
         if NemotronH35MTPDeviceSecondDraft.enabled, let paged = s.paged {
             // Nothing is appended to the head cache since `rowHistory` was
-            // gathered, so its views are this snapshot; gather again only if
-            // the row moved.
-            let history = paged.row.absoluteOffset == rowHistory.offset
-                && NemotronMTPDraftMasks.reuseSnapshot ? rowHistory : paged.row.snapshot()
-            let length = history.keys.dim(2)
+            // gathered (or the pages were read in place), so its views are this
+            // snapshot; gather again only if the row moved.
+            let reuse = paged.row.absoluteOffset == rowOffset && NemotronMTPDraftMasks.reuseSnapshot
+            let direct2 = reuse && rowHistory == nil ? direct : (reuse ? nil : NemotronMTPDraftSDPA.directRead(paged.row))
+            var history = direct2 == nil ? (reuse ? rowHistory : nil) ?? paged.row.snapshot() : nil
+            let length = direct2?.count ?? history!.keys.dim(2)
+            let historyDType = direct2?.dtype ?? history!.keys.dtype
             let firstSpeculated = length - spec.width
             let own = module.draftKeyValues(inputs: inputs)
-            let ownKeys = own.keys.asType(history.keys.dtype)
-            let ownValues = own.values.asType(history.values.dtype)
+            let ownKeys = own.keys.asType(historyDType)
+            let ownValues = own.values.asType(historyDType)
             let mask: MLXArray
             if let fusedMasks, length == rowLength, firstSpeculated == rowFirst,
-               history.keys.dtype == rowHistory.keys.dtype {
+               historyDType == rowDType {
                 mask = fusedMasks.1
             } else {
                 let position = MLXArray(Int32(0) ..< Int32(length + 1))
                 let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
                 mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
-                    .asType(history.keys.dtype).reshaped(1, 1, 1, length + 1)
+                    .asType(historyDType).reshaped(1, 1, 1, length + 1)
             }
-            let out2 = module.maskedSecondDraft(
-                inputs: inputs, historyKeys: history.keys, historyValues: history.values,
-                own: (keys: ownKeys, values: ownValues), mask: mask)
+            let out2: MLXArray
+            if let direct2, let read = module.maskedSecondDraft(
+                inputs: inputs, read: direct2, row: paged.row, own: (keys: ownKeys, values: ownValues), mask: mask) {
+                out2 = read
+            } else {
+                let h = history ?? paged.row.snapshot()
+                history = h
+                out2 = module.maskedSecondDraft(
+                    inputs: inputs, historyKeys: h.keys, historyValues: h.values,
+                    own: (keys: ownKeys, values: ownValues), mask: mask)
+            }
             let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
             s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
             roots += [ids2, out2, ownKeys, ownValues]
         }
         CBv2MTPSubmitMerge.submit(roots)
+    }
+
+    /// `queueNextFirstDraft` with the device accept walk folded into its consumers, once
+    /// `NemotronMTPDraftSDPA.qualifyWalk` matched (NEMOTRON_MTP_DRAFT_WALK_FOLD): the first draft's attention
+    /// reads the walked row's query and masks from the walk, its join reads the walked fused row, and the second
+    /// draft's attention masks from the walk, so the row pick (`NemotronMTPDraftRowPick`) is not launched for
+    /// them. The same drafts, K/V rows and submissions as the record path otherwise; the seed K/V rows stay lazy
+    /// outputs of the row pick, which launches only if `prestageFirstDraft` cannot re-expose the stored row. False,
+    /// with nothing built, unless the head cache pages serve the first draft in place.
+    private func queueWalkedFirstDraft(
+        spec: (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, width: Int),
+        row: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands, paged: PagedState, state s: State
+    ) -> Bool {
+        guard let direct = NemotronMTPDraftSDPA.directRead(paged.row),
+              let out = module.finishWalkedRow(
+                  fusedRows: spec.fused, queryRows: spec.queries, walk: walk,
+                  firstSpeculated: direct.count - spec.width, read: direct, row: paged.row)
+        else { return false }
+        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
+        // The seed K/V rows as the record path takes them: the row pick's key and value rows (else the gathers of
+        // `row`). Lazy: the pick launches only when `prestageFirstDraft` reads them.
+        let seedRows = NemotronMTPDraftRowPick.pick(
+            walk: walk, fused: spec.fused, queries: spec.queries, keys: spec.keys, values: spec.values,
+            firstSpeculated: direct.count - spec.width, length: direct.count, dtype: direct.dtype)
+        let keys = seedRows?.keys ?? take(spec.keys, row, axis: 2)
+        let values = seedRows?.values ?? take(spec.values, row, axis: 2)
+        s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        let seedKV = NemotronMTPLazySeedKV.enabled ? [] : [keys, values]
+        guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
+            CBv2MTPSubmitMerge.submit([ids, out] + seedKV)
+            return true
+        }
+        let inputs = module.pagedDraftInputs(
+            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
+        s.deviceSecondInputs = (inputs: inputs, from: out)
+        var roots = [ids, out] + seedKV + inputs
+        if NemotronH35MTPDeviceSecondDraft.enabled {
+            // Nothing is appended to the head cache since `direct` was taken, so the second draft reads the same
+            // pages; read them again only if the row moved.
+            let reuse = paged.row.absoluteOffset == direct.offset && NemotronMTPDraftMasks.reuseSnapshot
+            let direct2 = reuse ? direct : NemotronMTPDraftSDPA.directRead(paged.row)
+            var history = direct2 == nil ? paged.row.snapshot() : nil
+            let length = direct2?.count ?? history!.keys.dim(2)
+            let historyDType = direct2?.dtype ?? history!.keys.dtype
+            let firstSpeculated = length - spec.width
+            let own = module.draftKeyValues(inputs: inputs)
+            let ownKeys = own.keys.asType(historyDType)
+            let ownValues = own.values.asType(historyDType)
+            var out2 = direct2.flatMap {
+                module.maskedSecondDraft(
+                    inputs: inputs, read: $0, row: paged.row, own: (keys: ownKeys, values: ownValues), walk: walk,
+                    firstSpeculated: firstSpeculated)
+            }
+            if out2 == nil {
+                // The record path's mask from `row` (the walk launch then runs).
+                let position = MLXArray(Int32(0) ..< Int32(length + 1))
+                let keep = (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length))
+                let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                    .asType(historyDType).reshaped(1, 1, 1, length + 1)
+                if let direct2, let read = module.maskedSecondDraft(
+                    inputs: inputs, read: direct2, row: paged.row, own: (keys: ownKeys, values: ownValues),
+                    mask: mask) {
+                    out2 = read
+                } else {
+                    let h = history ?? paged.row.snapshot()
+                    history = h
+                    out2 = module.maskedSecondDraft(
+                        inputs: inputs, historyKeys: h.keys, historyValues: h.values,
+                        own: (keys: ownKeys, values: ownValues), mask: mask)
+                }
+            }
+            let ids2 = draftHead.greedy(out2!, upper: s.screensUpper(firstDraft: false))
+            s.deviceSecondDraft = (ids: ids2, out: out2!, keys: ownKeys, values: ownValues, from: out)
+            roots += [ids2, out2!, ownKeys, ownValues]
+        }
+        CBv2MTPSubmitMerge.submit(roots)
+        return true
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {
