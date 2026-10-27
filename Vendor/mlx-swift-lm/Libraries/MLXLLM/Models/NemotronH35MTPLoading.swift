@@ -90,6 +90,7 @@ extension NemotronH35MTPAssistant {
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronMoELeader.qualifyTailUnroll(target, draft: assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)

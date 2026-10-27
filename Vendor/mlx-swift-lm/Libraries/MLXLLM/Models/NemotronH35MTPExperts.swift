@@ -555,6 +555,38 @@ private func nmlFC1UnrollSource(_ source: String) -> String? {
     return source.replacingOccurrences(of: loop, with: "    #pragma clang loop unroll_count(2)\n" + loop)
 }
 
+/// The R != 3 (draft tail) leader and weighted-reduce sources with both of
+/// their main K loops - the solo row's and the leader's pair - unrolled by two
+/// (NEMOTRON_MTP_TAIL_UNROLL). `#pragma clang loop unroll_count(2)` goes ahead
+/// of each `for (; k < K - block_size; ...)`, carrying that loop line's own
+/// indentation (four spaces in the leader source, six inside the weighted
+/// source's slot loop). The unrolled loop runs the same block bodies in the
+/// same order (block k, then block k + 256, with the tail block after the loop
+/// as before), so every load, product, pair, term order, accumulation, affine
+/// close, closing simd_sum, weighted product store and reduce is the record's;
+/// only the instruction stream of two consecutive blocks is laid out together.
+/// nil unless exactly two main loops are present, i.e. the record text moved
+/// and the record kernels stay.
+private func nmlTailUnrollSource(_ source: String) -> String? {
+    let loop = "for (; k < K - block_size; k += block_size) {\n"
+    let parts = source.components(separatedBy: loop)
+    guard parts.count == 3 else { return nil }
+    var s = ""
+    for (index, part) in parts.enumerated() {
+        s += part
+        guard index < 2 else { break }
+        // `part` ends with the loop line's own leading indentation.
+        var indent = ""
+        for character in part.reversed() {
+            guard character == " " else { break }
+            indent = String(character) + indent
+        }
+        guard !indent.isEmpty else { return nil }
+        s += "#pragma clang loop unroll_count(2)\n" + indent + loop
+    }
+    return s
+}
+
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
 /// (`NemotronSBDict`). `scales` carries one uint16 pair index per group and
 /// `biases` the tensor's pair table as FP32 (scale, bias), each entry the exact
@@ -749,6 +781,13 @@ private final class NemotronMoELeaderKernel: Sendable {
     /// routed FC1 pair dictionary (`NemotronSBDict.draftDict`), or nil.
     let kernelDict: MLXFast.MLXFastKernel?
     let tail8Dict: MLXFast.MLXFastKernel?
+    /// The same four kernels from the unrolled main loops
+    /// (nmlTailUnrollSource; NEMOTRON_MTP_TAIL_UNROLL), or nil when the record
+    /// text moved. Each is a separate kernel; the record stays the reference.
+    let kernelUnrolled: MLXFast.MLXFastKernel?
+    let tail8Unrolled: MLXFast.MLXFastKernel?
+    let kernelDictUnrolled: MLXFast.MLXFastKernel?
+    let tail8DictUnrolled: MLXFast.MLXFastKernel?
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_qmv_affine4_gs64",
@@ -775,6 +814,42 @@ private final class NemotronMoELeaderKernel: Sendable {
         tail8Dict = nmlTail8Source(nemotronMoELeaderSource).flatMap(nemotronSBDictSource).map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_sbd",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
+        // The same four from the unrolled main loops (the tail-8 and dictionary
+        // transforms follow the unroll unchanged).
+        let unrolledSource = nmlTailUnrollSource(nemotronMoELeaderSource)
+        kernelUnrolled = unrolledSource.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_affine4_gs64_u2",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
+        tail8Unrolled = unrolledSource.flatMap(nmlTail8Source).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_u2",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
+        kernelDictUnrolled = unrolledSource.flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_affine4_gs64_sbd_u2",
+                inputNames: ["w", "scales", "biases", "x", "inds"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore)
+        }
+        tail8DictUnrolled = unrolledSource.flatMap(nmlTail8Source)
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_qmv_tail8_affine4_gs64_sbd_u2",
                 inputNames: ["w", "scales", "biases", "x", "inds"],
                 outputNames: ["y"],
                 source: $0,
@@ -1107,6 +1182,10 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
     let kernel: MLXFast.MLXFastKernel
     /// Production-only copy with the constant 8-value tail (nmlTail8Source).
     let tail8: MLXFast.MLXFastKernel?
+    /// The same two from the unrolled main loops (nmlTailUnrollSource;
+    /// NEMOTRON_MTP_TAIL_UNROLL), or nil when the record text moved.
+    let kernelUnrolled: MLXFast.MLXFastKernel?
+    let tail8Unrolled: MLXFast.MLXFastKernel?
     private init() {
         kernel = MLXFast.metalKernel(
             name: "nemotron_moe_leader_weighted_qmv_affine4_gs64",
@@ -1118,6 +1197,25 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
         tail8 = nmlTail8Source(nemotronMoELeaderWeightedSource).map {
             MLXFast.metalKernel(
                 name: "nemotron_moe_leader_weighted_qmv_tail8_affine4_gs64",
+                inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+                ensureRowContiguous: true)
+        }
+        let unrolledSource = nmlTailUnrollSource(nemotronMoELeaderWeightedSource)
+        kernelUnrolled = unrolledSource.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_weighted_qmv_affine4_gs64_u2",
+                inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
+                outputNames: ["y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore,
+                ensureRowContiguous: true)
+        }
+        tail8Unrolled = unrolledSource.flatMap(nmlTail8Source).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_leader_weighted_qmv_tail8_affine4_gs64_u2",
                 inputNames: ["w", "scales", "biases", "x", "inds", "scores"],
                 outputNames: ["y"],
                 source: $0,
@@ -1182,7 +1280,7 @@ enum NemotronMoELeader {
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
                       prepared: MLXArray? = nil, tail8: Bool = false,
-                      dict: NemotronSBDict.Dict? = nil) -> MLXArray {
+                      dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil) -> MLXArray {
         let rps = leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
@@ -1200,11 +1298,19 @@ enum NemotronMoELeader {
                 outputDTypes: [x.dtype])[0]
         }
         let kernels = NemotronMoELeaderKernel.shared
-        let kernel = (tail8 ? kernels.tail8 : nil) ?? kernels.kernel
+        let proven = tailUnrollProven
+        let kernel = selected(
+            tail8 ? kernels.tail8Unrolled : kernels.kernelUnrolled,
+            record: (tail8 ? kernels.tail8 : nil) ?? kernels.kernel,
+            proven: tail8 ? proven.leaderTail8 : proven.leader, forced: unroll)
+            ?? kernels.kernel
         // `dict`: the selected kernel's twin, reading the bank's pair indices
         // (addressed from their base like the scales) and its FP32 pair table.
         if let dict, rows == 1,
-           let twin = tail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict {
+           let twin = selected(
+               tail8 && kernels.tail8 != nil ? kernels.tail8DictUnrolled : kernels.kernelDictUnrolled,
+               record: tail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict,
+               proven: tail8 ? proven.leaderTail8Dict : proven.leaderDict, forced: unroll) {
             return twin(
                 [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index),
                  dict.table, x, inds],
@@ -1261,6 +1367,36 @@ enum NemotronMoELeader {
     /// kernels, through production-only kernel copies.
     static let leaderTail8 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEADER_TAIL8"] != "0"
+    /// The R != 3 (draft tail) leader and weighted-reduce kernels with both of
+    /// their main K loops unrolled by two (nmlTailUnrollSource); =0 keeps the
+    /// record loops. Each kernel is selected only after `qualifyTailUnroll`
+    /// proved its own unrolled twin bit for bit equal to that record kernel on
+    /// the real banks, so a twin that missed keeps the record kernel alone.
+    static let tailUnroll =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_TAIL_UNROLL"] != "0"
+    /// Which unrolled kernels are proven; every field stays false until its own
+    /// comparison ran and matched.
+    struct TailUnroll {
+        var leader = false
+        var leaderTail8 = false
+        var leaderDict = false
+        var leaderTail8Dict = false
+        var weighted = false
+        var weightedTail8 = false
+    }
+    nonisolated(unsafe) private(set) static var tailUnrollProven = TailUnroll()
+
+    /// The unrolled twin when that kernel is proven (or the caller forces it
+    /// for a comparison) and the twin exists, else the record kernel. A nil
+    /// twin can only return the record, which `qualifyTailUnroll` never
+    /// certifies: it compares a twin only after checking it is distinct.
+    private static func selected(
+        _ unrolled: MLXFast.MLXFastKernel?, record: MLXFast.MLXFastKernel?,
+        proven: Bool, forced: Bool?
+    ) -> MLXFast.MLXFastKernel? {
+        if (forced ?? proven), let unrolled { return unrolled }
+        return record
+    }
 
     /// The ordinary prepared R3/top-six FC1 arithmetic plus the original
     /// integer FC2 plan, emitted by just the first leader/output tile.
@@ -1429,14 +1565,177 @@ enum NemotronMoELeader {
             "nemotron fc1 unroll on: \(layers) routed FC1 banks, plan-free triple FC1 bitwise equal to the record kernel\n".utf8))
     }
 
+    /// Load time, after the draft head's zero-skip and pair-dictionary copies:
+    /// the R != 3 leader's four kernels and the weighted reduce's two, from the
+    /// unrolled main loops, against their own record kernel, bit for bit, on
+    /// the real weights of every routed FC1 and FC2 bank, over the row and
+    /// route patterns these kernels launch with: one row (a draft step's solo
+    /// main loop) and two rows (a leader walking its own row and its partner's,
+    /// which is the paired main loop), both ReLU2 forms and both constant-tail
+    /// forms. The banks' K gives the tail widths these kernels actually see:
+    /// K = 2688 leaves 128 values over 32 lanes (lanes 0-15 load 8, the rest
+    /// none) and K = 1856 leaves 64 (lanes 0-7 load 8). Each kernel is proven
+    /// on its own: a missing twin, a twin that is not a distinct kernel from
+    /// its record, or any differing chunk keeps that record kernel, and the
+    /// one line reports every kernel's comparison count and each fallback's
+    /// reason.
+    static func qualifyTailUnroll(_ model: Module, draft: Module) {
+        guard enabled else { return }
+        guard tailUnroll else {
+            FileHandle.standardError.write(Data("nemotron tail unroll: off (setting)\n".utf8))
+            return
+        }
+        let leader = NemotronMoELeaderKernel.shared
+        let weighted = NemotronMoELeaderWeightedKernel.shared
+        // Every twin by identity before any comparison: an unrolled name on the
+        // record's kernel object could only certify the record kernel.
+        let twins: [(String, MLXFast.MLXFastKernel?, MLXFast.MLXFastKernel?)] = [
+            ("leader", leader.kernelUnrolled, leader.kernel),
+            ("leaderTail8", leader.tail8Unrolled, leader.tail8),
+            ("leaderDict", leader.kernelDictUnrolled, leader.kernelDict),
+            ("leaderTail8Dict", leader.tail8DictUnrolled, leader.tail8Dict),
+            ("weighted", weighted.kernelUnrolled, weighted.kernel),
+            ("weightedTail8", weighted.tail8Unrolled, weighted.tail8),
+        ]
+        var usable = Set<String>()
+        var fallback: [String] = []
+        for (name, twin, record) in twins {
+            guard let twin else {
+                fallback.append("\(name): the record main loop moved, no unrolled kernel")
+                continue
+            }
+            guard let record else {
+                fallback.append("\(name): no record kernel of that form")
+                continue
+            }
+            guard twin !== record else {
+                fallback.append("\(name): not a distinct kernel from its record")
+                continue
+            }
+            usable.insert(name)
+        }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7a11), into: 2)
+        // One row: the draft step's six distinct experts, so every slot leads
+        // itself (solo main loop). Two rows: the second row's last slot repeats
+        // the first row's first expert, so one leader walks two rows (paired
+        // main loop) while the other ten slots stay solo.
+        let routes: [[UInt32]] = [
+            [3, 17, 42, 77, 100, 121],
+            [3, 17, 42, 77, 100, 3],
+        ]
+        var same = MLXArray(true)
+        var engaged: [String: Int] = [:]
+        var banks = 0
+        var dictBanks = 0
+        for module in model.modules() + draft.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                  let up = bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                  up.weight.shape == [128, 1856, 336],
+                  let down = bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                  down.weight.shape == [128, 2688, 232] else { continue }
+            let dict = NemotronSBDict.enabled ? NemotronSBDict.draftDict(moe.switchMLP.fc1) : nil
+            if dict != nil { dictBanks += 1 }
+            banks += 1
+            for (r, route) in routes.enumerated() {
+                let rows = r + 1
+                let x = (MLXRandom.normal([rows, 2688], key: keys[r]) * 0.5).asType(.bfloat16)
+                let inds = MLXArray(route)
+                let scores = MLXRandom.uniform(Float(0) ..< 1, [rows * 6], key: keys[r])
+                    .asType(.float32)
+                for relu2 in [false, true] {
+                    for tail8 in [false, true] {
+                        let name = tail8 ? "leaderTail8" : "leader"
+                        guard usable.contains(name) else { continue }
+                        let a = apply(x, inds, rows: rows, topK: 6, bank: up, perSlot: false,
+                                      relu2: relu2, prepared: nil, tail8: tail8, unroll: false)
+                        let b = apply(x, inds, rows: rows, topK: 6, bank: up, perSlot: false,
+                                      relu2: relu2, prepared: nil, tail8: tail8, unroll: true)
+                        same = logicalAnd(same,
+                            (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                        engaged[name, default: 0] += 1
+                        // The weighted reduce eats the leader's activation and
+                        // writes [1, rows, N]: compare that whole output.
+                        for weightTail8 in [false, true] {
+                            let key = weightTail8 ? "weightedTail8" : "weighted"
+                            guard usable.contains(key) else { continue }
+                            let wa = applyWeighted(a, inds, scores, rows: rows, bank: down,
+                                                   tail8: weightTail8, unroll: false)
+                            let wb = applyWeighted(a, inds, scores, rows: rows, bank: down,
+                                                   tail8: weightTail8, unroll: true)
+                            same = logicalAnd(same,
+                                (wa.view(dtype: .uint16) .== wb.view(dtype: .uint16)).all())
+                            engaged[key, default: 0] += 1
+                        }
+                    }
+                    // The dictionary forms are one-row only (apply's guard).
+                    if rows == 1, let dict {
+                        for tail8 in [false, true] {
+                            let name = tail8 ? "leaderTail8Dict" : "leaderDict"
+                            guard usable.contains(name) else { continue }
+                            let a = apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
+                                          relu2: relu2, prepared: nil, tail8: tail8,
+                                          dict: dict, unroll: false)
+                            let b = apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
+                                          relu2: relu2, prepared: nil, tail8: tail8,
+                                          dict: dict, unroll: true)
+                            same = logicalAnd(same,
+                                (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                            engaged[name, default: 0] += 1
+                        }
+                    }
+                }
+            }
+        }
+        let names = ["leader", "leaderTail8", "leaderDict", "leaderTail8Dict",
+                     "weighted", "weightedTail8"]
+        let counts = names.map { "\($0) \(engaged[$0] ?? 0)" }.joined(separator: ", ")
+        guard banks > 0, !usable.isEmpty else {
+            fallback.append("no routed FC1/FC2 bank ran")
+            FileHandle.standardError.write(Data(
+                "nemotron tail unroll off: \(fallback.joined(separator: "; "))\n".utf8))
+            return
+        }
+        guard same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "nemotron tail unroll off: an unrolled chunk differs from the record kernel (\(counts); \(banks) banks, \(dictBanks) with pair dictionaries)\n".utf8))
+            return
+        }
+        var proven = TailUnroll()
+        for name in names where (engaged[name] ?? 0) > 0 && usable.contains(name) {
+            switch name {
+            case "leader": proven.leader = true
+            case "leaderTail8": proven.leaderTail8 = true
+            case "leaderDict": proven.leaderDict = true
+            case "leaderTail8Dict": proven.leaderTail8Dict = true
+            case "weighted": proven.weighted = true
+            case "weightedTail8": proven.weightedTail8 = true
+            default: break
+            }
+        }
+        tailUnrollProven = proven
+        for name in names where !usable.contains(name) {
+            fallback.append("\(name): the record kernel stays")
+        }
+        if dictBanks == 0 { fallback.append("leaderDict, leaderTail8Dict: no draft pair dictionary") }
+        let note = fallback.isEmpty ? "" : "; kept: \(fallback.joined(separator: "; "))"
+        FileHandle.standardError.write(Data(
+            "nemotron tail unroll on: \(banks) banks (\(dictBanks) with pair dictionaries), rows 1-2, both ReLU2 and tail forms, K tails 128 and 64, comparisons \(counts), each bitwise equal to its own record kernel\(note)\n".utf8))
+    }
+
     /// Same leader pairs as apply(), with separate FP32 products and the
     /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank, plan: MLXArray? = nil,
-                              tail8: Bool = false) -> MLXArray {
+                              tail8: Bool = false, unroll: Bool? = nil) -> MLXArray {
         if rows == 3 { return NMLBalanceWeighted.shared.run(x, inds, scores, bank, plan: plan) }
-        let kernel = (tail8 ? NemotronMoELeaderWeightedKernel.shared.tail8 : nil)
-            ?? NemotronMoELeaderWeightedKernel.shared.kernel
+        let weighted = NemotronMoELeaderWeightedKernel.shared
+        let kernel = selected(
+            tail8 ? weighted.tail8Unrolled : weighted.kernelUnrolled,
+            record: (tail8 ? weighted.tail8 : nil) ?? weighted.kernel,
+            proven: tail8 ? tailUnrollProven.weightedTail8 : tailUnrollProven.weighted,
+            forced: unroll)
+            ?? weighted.kernel
         return kernel(
             [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
              NemotronBankBinding.bind(bank.biases), x, inds, scores],
