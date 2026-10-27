@@ -1210,8 +1210,13 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         s.paged!.row.rollback(s.cacheOffset - s.trustedOffset)
         // Every row's K/V goes to the head cache; only the row the device
         // picks is attended (`speculateNextFirstDraft`).
-        let rows = module.frontRows(
-            hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens))
+        let rows: (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+        if let operands = target.mtpEmbeddingOperands(targetTokens),
+           let fused = module.frontRows(hidden: targetHidden, operands: operands) {
+            rows = fused
+        } else {
+            rows = module.frontRows(hidden: targetHidden, embedding: target.mtpEmbedding(targetTokens))
+        }
         let written = s.cache.appendTrusted(keys: rows.keys, values: rows.values)
         s.speculation = (fused: rows.fused, queries: rows.queries, keys: rows.keys,
                          values: rows.values, width: width)

@@ -348,6 +348,267 @@ enum NemotronMTPFrontNorms {
                 which(ok, outputs[1], MLXArray(Float.nan)))
     }
 
+    /// NEMOTRON_MTP_FRONT_EMBED_LANE16=0 keeps the embedding-rows launch (`NemotronHEmbeddingRows`) ahead of the front
+    /// norms. Otherwise the embedding half's threadgroup dequantizes its token's row itself, with the embedding
+    /// kernel's BF16 arithmetic; this twin uses one coefficient loader per 16-lane half-SIMD and uchar2 codes.
+    /// It keeps the same id wrap, coefficient group, byte/nibble identity and `T value = scale * d + bias`,
+    /// the BF16 value that kernel stores, and takes `thread_x[i]` from that value as the record takes it from `e`.
+    /// The hidden half and everything after the reads are the record's text. Plain, prepared and shuffle forms;
+    /// used only after `qualifyEmbed` found each bitwise equal to the embedding-rows launch plus the front norms.
+    static let embed = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_EMBED_LANE16"] != "0"
+    nonisolated(unsafe) private static var embedVerified = false
+
+    private static func embedSource(_ s: String) -> String {
+        let pointer = "const device T* x = second ? h : e;"
+        let read = """
+            for (uint i = 0; i < n_reads; i++) {
+                thread_x[i] = x[offset + i];
+                acc += thread_x[i] * thread_x[i];
+            }
+            """
+        precondition(s.components(separatedBy: pointer).count == 2, "front norms embed pointer")
+        precondition(s.components(separatedBy: read).count == 2, "front norms embed read")
+        return s.replacingOccurrences(of: pointer, with: "const device T* x = h;")
+            .replacingOccurrences(of: read, with: """
+                if (second) {
+                \(read)
+                } else {
+                    int64_t id = int64_t(ids[row]);
+                    if (id < 0) {
+                        id += int64_t(V);
+                    }
+                    // Four dimensions per lane: lanes 0...15 share one affine
+                    // coefficient pair, lanes 16...31 the next. Load only at
+                    // each half-SIMD leader, then broadcast the exact BF16 bits.
+                    // uchar2 preserves byte order without a packed-word endian assumption.
+                    const device uchar2* erow2 = (const device uchar2*)
+                        ((const device uint8_t*)w + id * int64_t(BYTES));
+                    const uchar2 codes = erow2[lid];
+                    ushort nmfe_s = 0, nmfe_b = 0;
+                    if ((simd_lane_id & 15u) == 0u) {
+                        const int64_t group = int64_t(lid / 16u);
+                        nmfe_s = as_type<ushort>(scales[id * int64_t(G) + group]);
+                        nmfe_b = as_type<ushort>(biases[id * int64_t(G) + group]);
+                    }
+                    const ushort leader = ushort(simd_lane_id & 16u);
+                    const T scale = as_type<T>(simd_shuffle(nmfe_s, leader));
+                    const T bias = as_type<T>(simd_shuffle(nmfe_b, leader));
+                    for (uint i = 0; i < n_reads; i++) {
+                        const uint val = i < 2u ? uint(codes.x) : uint(codes.y);
+                        const uint8_t d = (val >> (4u * (i & 1u))) & 0x0f;
+                        T value = scale * d + bias;
+                        thread_x[i] = value;
+                        acc += thread_x[i] * thread_x[i];
+                    }
+                }
+                """)
+    }
+    private static let embedInputs = ["ids", "w", "scales", "biases", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"]
+    private static func embedName(_ base: String) -> String {
+        NemotronHResidualRMSNorm.oneBarrier ? base + "_1b" : base
+    }
+    private static let embedKernel = MLXFast.metalKernel(
+        name: embedName("nemotron_mtp_front_norms_embed_lane16_concat_bf16"),
+        inputNames: embedInputs, outputNames: ["out"],
+        source: NemotronHResidualRMSNorm.oneBarrierSource(embedSource(source)), ensureRowContiguous: true)
+    private static let embedPreparedKernel = MLXFast.metalKernel(
+        name: embedName("nemotron_mtp_front_norms_embed_lane16_concat_prepared_bf16"),
+        inputNames: embedInputs, outputNames: ["out", "prepared"],
+        source: NemotronHResidualRMSNorm.oneBarrierSource(embedSource(preparedSource())), ensureRowContiguous: true)
+    private static let embedShuffleKernel = MLXFast.metalKernel(
+        name: embedName("nemotron_mtp_front_norms_embed_lane16_concat_prepared_bf16_sh"),
+        inputNames: embedInputs, outputNames: ["out", "prepared"],
+        source: NemotronHResidualRMSNorm.oneBarrierSource(embedSource(preparedShuffleSource())),
+        ensureRowContiguous: true)
+
+    private enum Form { case plain, prepared, shuffle }
+
+    /// A front-norms launch of `form` without the row-count guard (the load check sweeps the vocabulary in
+    /// wide launches): on the embedding rows `e`, or reading the rows of `o` itself.
+    private static func formLaunch(_ form: Form, e: MLXArray?, o: NemotronHEmbeddingRows.Operands?,
+                                   hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm) -> [MLXArray] {
+        let rows = hidden.dim(1)
+        let (a, ee, he) = scalars(enorm.eps, hnorm.eps)
+        let tail = [hidden, enorm.weight, hnorm.weight, a, ee, he]
+        var template: [(String, any KernelTemplateArg)] = [("T", DType.bfloat16)]
+        if form != .plain { template.append(("NG", NemotronMTPDraftJoins.negativeFront)) }
+        let grid = (672 * 2 * rows, 1, 1), threadGroup = (672, 1, 1)
+        let shapes: [[Int]] = form == .plain ? [[1, rows, 5376]] : [[1, rows, 5376], [rows, 21, 9 * 32]]
+        let dtypes: [DType] = form == .plain ? [.bfloat16] : [.bfloat16, .float32]
+        if let o {
+            let k = form == .plain ? embedKernel : form == .prepared ? embedPreparedKernel : embedShuffleKernel
+            return k(o.arrays + tail, template: template + o.template, grid: grid, threadGroup: threadGroup,
+                     outputShapes: shapes, outputDTypes: dtypes)
+        }
+        let k = form == .plain ? kernel : form == .prepared ? preparedKernel : shuffleKernel
+        return k([e!] + tail, template: template, grid: grid, threadGroup: threadGroup,
+                 outputShapes: shapes, outputDTypes: dtypes)
+    }
+
+    /// The conditions under which `apply` / `applyPrepared` launch the front norms on these rows' embedding
+    /// (`NemotronHEmbeddingRows.rows(o)`), stated on the operands.
+    static func serves(_ o: NemotronHEmbeddingRows.Operands, hidden: MLXArray, enorm: RMSNorm,
+                                    hnorm: RMSNorm) -> Bool {
+        embedVerified && enabled && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && o.dims == 2688 && (1...512).contains(o.count)
+            && hidden.shape == [1, o.count, 2688] && hidden.dtype == .bfloat16
+            && type(of: enorm) == RMSNorm.self && type(of: hnorm) == RMSNorm.self
+            && enorm.weight.shape == [2688] && hnorm.weight.shape == [2688]
+            && enorm.weight.dtype == .bfloat16 && hnorm.weight.dtype == .bfloat16
+    }
+
+    /// `applyPrepared` reading the token rows of `o` itself; nil where it does not serve them (the caller then
+    /// builds the embedding rows and takes `applyPrepared`).
+    static func applyPrepared(operands o: NemotronHEmbeddingRows.Operands, hidden: MLXArray, enorm: RMSNorm,
+                              hnorm: RMSNorm) -> (MLXArray, MLXArray)? {
+        guard NemotronMTPDraftJoins.enabled, o.count == 3,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              serves(o, hidden: hidden, enorm: enorm, hnorm: hnorm)
+        else { return nil }
+        let form: Form = shuffleVerified ? .shuffle : .prepared
+        let outputs = formLaunch(form, e: nil, o: o, hidden: hidden, enorm: enorm, hnorm: hnorm)
+        guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
+        let expected = formLaunch(form, e: NemotronHEmbeddingRows.rows(o), o: nil, hidden: hidden,
+                                  enorm: enorm, hnorm: hnorm)
+        let ok = MLX.logicalAnd(
+            (outputs[0].view(dtype: .uint16) .== expected[0].view(dtype: .uint16)).all(),
+            (outputs[1].view(dtype: .uint32) .== expected[1].view(dtype: .uint32)).all())
+        return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
+                which(ok, outputs[1], MLXArray(Float.nan)))
+    }
+
+    /// `apply` reading the token rows of `o` itself; nil where it does not serve them.
+    static func apply(operands o: NemotronHEmbeddingRows.Operands, hidden: MLXArray, enorm: RMSNorm,
+                      hnorm: RMSNorm) -> MLXArray? {
+        guard serves(o, hidden: hidden, enorm: enorm, hnorm: hnorm) else { return nil }
+        let joined = formLaunch(.plain, e: nil, o: o, hidden: hidden, enorm: enorm, hnorm: hnorm)[0]
+        guard NemotronMoELeader.selfTest else { return joined }
+        return nemotronBitwiseOrNaN(joined, formLaunch(
+            .plain, e: NemotronHEmbeddingRows.rows(o), o: nil, hidden: hidden, enorm: enorm, hnorm: hnorm)[0])
+    }
+
+    /// Load time, after `qualifyShuffle`: every form that can run (plain; the copy form; the shuffle form when it
+    /// qualified) against the embedding-rows launch plus the same form on its rows, bit for bit in the joined rows
+    /// and the prepared activation. Every vocabulary row once (2048 rows per launch, seeded hidden rows), then
+    /// R = 1 ... 4 with int32 and uint32 ids, negative ids (-V, -V/2, -1) and the last row, at three hidden
+    /// scales. Admits the reading forms only if every case matches.
+    static func qualifyEmbed(_ block: NemotronH35MTPAttentionBlock, target: NemotronHModel) {
+        embedVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp front norms embed lane16: \(message)\n".utf8))
+        }
+        guard embed else { return report("off (setting)") }
+        let (enorm, hnorm) = (block.embeddingNorm, block.hiddenNorm)
+        guard let probe = target.mtpEmbeddingOperands(MLXArray([Int32(0)]).reshaped(1, 1)),
+              eligible(embedding: NemotronHEmbeddingRows.rows(probe),
+                       hidden: MLXArray.zeros([1, 1, 2688], dtype: .bfloat16), enorm: enorm, hnorm: hnorm) != nil
+        else { return report("off (no embedding-rows launch ahead of the front norms)") }
+        let vocabulary = probe.vocabulary
+        let forms: [Form] = shuffleVerified ? [.plain, .prepared, .shuffle] : [.plain, .prepared]
+        var cases = 0
+        func same(_ ids: MLXArray, scale: Float, seed: UInt64) -> Bool {
+            // Up to 512 rows as the call sites build them; wider sweeps on the same arrays.
+            guard let o = ids.size <= 512 ? target.mtpEmbeddingOperands(ids.reshaped(1, ids.size))
+                : .with([ids, probe.weight, probe.scales, probe.biases])
+            else { return false }
+            let rows = ids.size
+            let hidden = (MLXRandom.normal([1, rows, 2688], key: MLXRandom.key(seed)) * scale).asType(.bfloat16)
+            let e = NemotronHEmbeddingRows.rows(o)
+            var ok = MLXArray(true)
+            for form in forms {
+                let a = formLaunch(form, e: nil, o: o, hidden: hidden, enorm: enorm, hnorm: hnorm)
+                let b = formLaunch(form, e: e, o: nil, hidden: hidden, enorm: enorm, hnorm: hnorm)
+                ok = ok .&& (a[0].view(dtype: .uint16) .== b[0].view(dtype: .uint16)).all()
+                if form != .plain { ok = ok .&& (a[1].view(dtype: .uint32) .== b[1].view(dtype: .uint32)).all() }
+                cases += 1
+            }
+            return ok.item(Bool.self)
+        }
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var start = 0
+                while start < vocabulary {
+                    let count = min(2048, vocabulary - start)
+                    let ids = MLXArray(Int32(start) ..< Int32(start + count))
+                    if !same(ids, scale: start % 4096 == 0 ? 1 : 8, seed: UInt64(0xfe00 + start / 2048)) {
+                        return false
+                    }
+                    start += count
+                }
+                var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+                func draw() -> Int {
+                    state = state &* 6364136223846793005 &+ 1442695040888963407
+                    return Int(state >> 33) % vocabulary
+                }
+                let v = Int32(vocabulary)
+                for rows in 1 ... 4 {
+                    for (i, scale) in [Float(1), 4, 16].enumerated() {
+                        let signed = (0 ..< rows).map { _ in Int32(draw()) }
+                        let unsigned = (0 ..< rows).map { _ in UInt32(draw()) }
+                        let edges = Array([-v, -(v / 2), -1, v - 1].prefix(rows))
+                        let seed = UInt64(0xfe80 + 8 * rows + i)
+                        if !same(MLXArray(signed), scale: scale, seed: seed)
+                            || !same(MLXArray(unsigned), scale: scale, seed: seed + 64)
+                            || !same(MLXArray(edges), scale: scale, seed: seed + 128) {
+                            return false
+                        }
+                    }
+                }
+                return true
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        embedVerified = admitted
+        report(admitted
+            ? "on (all \(vocabulary) rows and \(cases) launches bitwise equal to the embedding rows + front norms, forms \(forms.count))"
+            : "off (differs from the embedding rows + front norms)")
+    }
+
+    /// After the primitive word gate and QKV qualification: the only new
+    /// production call path, on real head weights, against its unchanged
+    /// materialized-embedding entry. Neither entry writes any cache/state.
+    static func qualifyEmbedFullRows(_ block: NemotronH35MTPAttentionBlock, target: NemotronHModel) {
+        guard embedVerified,
+              let probe = target.mtpEmbeddingOperands(MLXArray([Int32(0)]).reshaped(1, 1))
+        else { return }
+        let vocabulary = Int32(probe.vocabulary)
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for seed in 0..<4 {
+                    for (i, scale) in [Float(0), 1, 8].enumerated() {
+                        let values: [Int32] = seed == 0 ? [0, 1, vocabulary - 1]
+                            : seed == 1 ? [-vocabulary, -(vocabulary / 2), -1]
+                            : [Int32((7919 * seed) % Int(vocabulary)),
+                               Int32((104729 * seed) % Int(vocabulary)), vocabulary - Int32(seed + 1)]
+                        let ids = MLXArray(values).reshaped(1, 3)
+                        let hidden = (MLXRandom.normal([1, 3, 2688],
+                            key: MLXRandom.key(UInt64(0x1a16_0000 + seed * 8 + i))) * scale).asType(.bfloat16)
+                        guard let operands = target.mtpEmbeddingOperands(ids),
+                              let actual = block.frontRows(hidden: hidden, operands: operands)
+                        else { return false }
+                        let expected = block.frontRows(hidden: hidden, embedding: target.mtpEmbedding(ids))
+                        let aa = [actual.fused, actual.queries, actual.keys, actual.values]
+                        let bb = [expected.fused, expected.queries, expected.keys, expected.values]
+                        var same = MLXArray(true)
+                        for (a, b) in zip(aa, bb) {
+                            guard a.shape == b.shape, a.dtype == b.dtype else { return false }
+                            same = same .&& (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                        }
+                        if !same.item(Bool.self) { return false }
+                        cases += 1
+                    }
+                }
+                return true
+            }
+            embedVerified = matches
+        } catch { embedVerified = false }
+        FileHandle.standardError.write(Data(
+            "nemotron mtp front embed lane16 full rows: \(embedVerified ? "on" : "off") (\(cases) cases)\n".utf8))
+    }
+
     private static func eligible(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
         -> (() -> MLXArray)?
     {
@@ -476,7 +737,24 @@ final class NemotronH35MTPAttentionBlock: Module {
         let front = NemotronMTPFrontNorms.applyPrepared(
             embedding: embedding, hidden: hidden, enorm: embeddingNorm, hnorm: hiddenNorm)
         let joined = front?.0 ?? joinedNorms(hidden: hidden, embedding: embedding)
-        let fused = nemotronMTPLinearRows(joined, projection, prepared: front?.1)
+        return frontRows(joined: joined, prepared: front?.1)
+    }
+
+    /// Only the post-verify R3 front: no embedding array is materialized when
+    /// the fused reader qualifies. The original projection/QKV continuation is shared.
+    func frontRows(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)?
+    {
+        guard let front = NemotronMTPFrontNorms.applyPrepared(
+            operands: operands, hidden: hidden, enorm: embeddingNorm, hnorm: hiddenNorm)
+        else { return nil }
+        return frontRows(joined: front.0, prepared: front.1)
+    }
+
+    private func frontRows(joined: MLXArray, prepared: MLXArray?)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)
+    {
+        let fused = nemotronMTPLinearRows(joined, projection, prepared: prepared)
         var (x, xPrepared): (MLXArray, MLXArray?) = (norm(fused), nil)
         if NemotronMTPDraftJoins.enabled,
            let pair = NemotronHResidualRMSNorm.normPreparedRows(fused, norm: norm) {
@@ -901,6 +1179,12 @@ final class NemotronH35MTPModule: Module {
     {
         (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding)
     }
+    func frontRows(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands)
+        -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray)?
+    {
+        (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, operands: operands)
+    }
+
     func maskedRowOutput(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {

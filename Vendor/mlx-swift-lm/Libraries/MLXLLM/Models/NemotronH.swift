@@ -661,6 +661,35 @@ enum NemotronHEmbeddingRows {
             """, ensureRowContiguous: true)
 
     static func apply(_ tokens: MLXArray, _ embedding: Embedding) -> MLXArray? {
+        operands(tokens, embedding).map(rows)
+    }
+
+    /// What `apply` reads for `tokens`: the flat ids, the packed rows with their scales and biases, and the
+    /// kernel's V, BYTES and G. nil exactly where `apply` launches nothing.
+    struct Operands {
+        let ids: MLXArray
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+        let vocabulary: Int
+        let bytes: Int
+        let groups: Int
+        var count: Int { ids.dim(0) }
+        var dims: Int { 2 * bytes }
+        var arrays: [MLXArray] { [ids, weight, scales, biases] }
+        var template: [(String, any KernelTemplateArg)] {
+            [("V", vocabulary), ("BYTES", bytes), ("G", groups)]
+        }
+
+        /// Operands over `arrays` (`[ids, weight, scales, biases]`, e.g. a compiled trace's inputs); V, BYTES
+        /// and G from their shapes, as `operands` derives them.
+        static func with(_ arrays: [MLXArray]) -> Operands {
+            Operands(ids: arrays[0], weight: arrays[1], scales: arrays[2], biases: arrays[3],
+                     vocabulary: arrays[1].dim(0), bytes: arrays[1].dim(1) * 4, groups: arrays[2].dim(1))
+        }
+    }
+
+    static func operands(_ tokens: MLXArray, _ embedding: Embedding) -> Operands? {
         guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               tokens.ndim == 2, tokens.dim(0) == 1, (1...512).contains(tokens.dim(1)),
               tokens.dtype == .int32 || tokens.dtype == .uint32,
@@ -675,12 +704,16 @@ enum NemotronHEmbeddingRows {
         guard dims % 64 == 0, q.scales.shape == [vocabulary, dims / 64],
               biases.shape == q.scales.shape, (dims / 2) % 64 == 0
         else { return nil }
-        let count = tokens.dim(1)
-        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
-            template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
-                       ("G", dims / 64)],
-            grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
-            outputShapes: [[1, count, dims]], outputDTypes: [.bfloat16])[0]
+        return Operands(ids: tokens.reshaped(tokens.dim(1)), weight: q.weight, scales: q.scales,
+                        biases: biases, vocabulary: vocabulary, bytes: dims / 2, groups: dims / 64)
+    }
+
+    /// `apply`'s launch on its operands: [1, count, dims] BF16 rows.
+    static func rows(_ o: Operands) -> MLXArray {
+        kernel(o.arrays,
+            template: [("T", DType.bfloat16), ("V", o.vocabulary), ("BYTES", o.bytes), ("G", o.groups)],
+            grid: (o.bytes, o.count, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[1, o.count, o.dims]], outputDTypes: [.bfloat16])[0]
     }
 }
 
@@ -9818,6 +9851,12 @@ public class NemotronHModel:
     func prepareVerifyEntry() {
         guard let first = backbone.layers.first else { return }
         NemotronHResidualRMSNorm.qualifyVerifyEntry(backbone.embeddings, norm: first.norm)
+    }
+
+    /// The operands `mtpEmbedding`'s launch reads for `tokens` (nil where it would not launch), for draft-head
+    /// kernels that dequantize the token rows themselves.
+    func mtpEmbeddingOperands(_ tokens: MLXArray) -> NemotronHEmbeddingRows.Operands? {
+        NemotronHEmbeddingRows.operands(tokens, backbone.embeddings)
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {
