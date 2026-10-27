@@ -1,8 +1,10 @@
 // Short captured windows with the canonical M=1 SSM arithmetic at every step.
 // All prefix states are written in FP32; no parallel/prefill recurrence is used.
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 private enum NemotronMTPSSMKernel {
     static let kernel = MLXFast.metalKernel(
@@ -357,5 +359,260 @@ final class NemotronMTPReplayGroup {
             convolution: m.convolution, ALog: m.aLog, D: m.D, dt: m.dt, state: m.state,
             heads: m.heads, headDim: m.headDim, groups: m.groups, stateDim: m.stateDim,
             steps: keep, writeOutput: false).finalState)
+    }
+}
+
+// MARK: - Cross-window exact lazy checkpoint
+
+/// The original recurrence statements with no old C projection. Historical
+/// raw windows are read in place. Six conv/dt pairs + keep counts are thirteen
+/// buffers: the fused window has 10 ordinary inputs + 13 history + 4 outputs.
+enum NemotronMTPDeferredSSMKernel {
+    static let maxLinks = 6
+    static let inputNames = (0..<maxLinks).map { "history_conv\($0)" }
+        + (0..<maxLinks).map { "history_dt\($0)" } + ["history_keep"]
+    nonisolated(unsafe) static let emptyConv = MLXArray.zeros([1, 3, 6144], dtype: .bfloat16)
+    nonisolated(unsafe) static let emptyDt = MLXArray.zeros([1, 3, 64], dtype: .float32)
+    static let body: String = {
+        let convs = (0..<maxLinks).map { "history_conv\($0)" }.joined(separator: ", ")
+        let times = (0..<maxLinks).map { "history_dt\($0)" }.joined(separator: ", ")
+        return """
+            const device T* history_convs_[6] = {\(convs)};
+            const device float* history_times_[6] = {\(times)};
+            for (int link = 0; link < 6; ++link) {
+                for (int t = 0; t < history_keep[link]; ++t) {
+                    auto x_ = static_cast<float>(history_convs_[link][t * CD + n * Dh + d_idx]);
+                    auto B_ = history_convs_[link] + t * CD + BO + g_idx * Ds;
+                    auto dt_ = static_cast<float>(history_times_[link][t * H + n]);
+                    auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+                    auto dA = fast::exp(A * dt_);
+                    for (int i = 0; i < n_per_t; ++i) {
+                        auto s_idx = n_per_t * ds_idx + i;
+                        if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                        auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                        auto state = dA * prior[i] + dB_by_x;
+                        prior[i] = static_cast<U>(state);
+                    }
+                }
+            }
+            """
+    }()
+    static let flush = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_lazy_checkpoint_flush",
+        inputNames: ["A_log", "state_in"] + inputNames,
+        outputNames: ["state_out"],
+        source: String(NemotronMTPCompactSSMKernel.source.components(
+            separatedBy: "for (int t = 0; t < L; ++t) {")[0]) + body + """
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * ds_idx + i;
+                if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(prior[i]);
+            }
+            """)
+
+    static func materialize(checkpoint: MLXArray, aLog: MLXArray, inputs: [MLXArray]) -> MLXArray {
+        flush([aLog, checkpoint] + inputs,
+            template: [("T", DType.bfloat16), ("U", DType.float32),
+                       ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8),
+                       ("CD", 6144), ("BO", 4096)],
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 64, 64, 128]], outputDTypes: [.float32])[0]
+    }
+}
+
+/// ReplaySSM idea: https://github.com/Johnny-Liou/ReplaySSM (Apache-2.0),
+/// revision 73a9592e9d8a2268620e8883a82f5cec7442ed36. Independently implemented;
+/// no output algebra or reduced-precision checkpoints. The Yukon strict-only
+/// folded replay (1ba1cd48-7125-4070-82ec-f55e5ff0e002) is a close predecessor.
+/// A short-horizon verify may emit its exact current final state. Only full
+/// acceptance may adopt it as a checkpoint; strict acceptance keeps a bounded
+/// accepted-input history. Hard capacity and ordinary reads still materialize.
+/// Histories contain immutable window outputs, never mutable rings.
+final class NemotronMTPDeferredSSM: CBv2DeferredSSMState {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_LAZY_SSM"] != "0"
+    static let horizon = 12
+    static let checkpointThreshold = 6
+    nonisolated(unsafe) static var qualified = false
+    struct Link {
+        let convolution: MLXArray
+        let dt: MLXArray
+        let keep: Int
+    }
+    let checkpoint: MLXArray
+    let links: [Link]
+    let inputs: [MLXArray]
+    let aLog: MLXArray
+    let skip: MLXArray
+    private let aLogIdentity: UInt?
+    private let lock = NSLock()
+    private var materialized: MLXArray?
+    var steps: Int { links.reduce(0) { $0 + $1.keep } }
+
+    init(checkpoint: MLXArray, links: [Link] = [], aLog: MLXArray, skip: MLXArray) {
+        precondition(links.count <= NemotronMTPDeferredSSMKernel.maxLinks)
+        precondition(links.reduce(0) { $0 + $1.keep } <= Self.horizon)
+        precondition(checkpoint.shape == [1, 64, 64, 128] && checkpoint.dtype == .float32)
+        for link in links {
+            precondition((1...3).contains(link.keep))
+            precondition(link.convolution.shape == [1, 3, 6144] && link.convolution.dtype == .bfloat16)
+            precondition(link.dt.shape == [1, 3, 64] && link.dt.dtype == .float32)
+        }
+        self.checkpoint = checkpoint
+        self.links = links
+        // Copy the array descriptor, not parameter data. An owner update may
+        // replace its MLXArray context while old request snapshots stay exact.
+        let snapshot = MLXArray.mlxNone
+        snapshot._updateInternal(aLog)
+        self.aLog = snapshot
+        self.aLogIdentity = Self.identity(aLog)
+        self.skip = skip
+        let padding = NemotronMTPDeferredSSMKernel.maxLinks - links.count
+        self.inputs = links.map(\.convolution)
+            + Array(repeating: NemotronMTPDeferredSSMKernel.emptyConv, count: padding)
+            + links.map(\.dt) + Array(repeating: NemotronMTPDeferredSSMKernel.emptyDt, count: padding)
+            + [MLXArray(links.map { Int32($0.keep) } + Array(repeating: Int32(0), count: padding))]
+    }
+
+    private static func identity(_ array: MLXArray) -> UInt? {
+        var value: UInt = 0
+        var canCache = false
+        guard _mlx_array_constant_cache_identity(&value, &canCache, array.ctx) == 0,
+              canCache else { return nil }
+        return value
+    }
+
+    func isCompatible(aLog current: MLXArray) -> Bool {
+        guard let aLogIdentity else { return false }
+        return Self.identity(current) == aLogIdentity
+    }
+
+    var evaluationRoots: [MLXArray] { [checkpoint] + inputs }
+    var additionalRetainedByteCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        // Charge complete window backing arrays even when only one row is kept.
+        return links.reduce(24) { $0 + $1.convolution.nbytes + $1.dt.nbytes }
+            + (links.count < 6 ? NemotronMTPDeferredSSMKernel.emptyConv.nbytes
+                + NemotronMTPDeferredSSMKernel.emptyDt.nbytes : 0)
+            + (materialized?.nbytes ?? 0)
+    }
+
+    func materialize() -> MLXArray {
+        if links.isEmpty { return checkpoint }
+        lock.lock(); defer { lock.unlock() }
+        if let materialized { return materialized }
+        let result = NemotronMTPDeferredSSMKernel.materialize(
+            checkpoint: checkpoint, aLog: aLog, inputs: inputs)
+        materialized = result
+        return result
+    }
+
+    /// Reserve the whole next rectangle before starting it. A capacity flush
+    /// contains only accepted links; speculative window rows are not visible.
+    func reserving(_ width: Int) -> NemotronMTPDeferredSSM {
+        if steps + width <= Self.horizon && links.count < NemotronMTPDeferredSSMKernel.maxLinks {
+            return self
+        }
+        return NemotronMTPDeferredSSM(checkpoint: materialize(), aLog: aLog, skip: skip)
+    }
+
+    func appending(convolution next: MLXArray, dt nextDt: MLXArray,
+                   keep: Int) -> NemotronMTPDeferredSSM {
+        precondition((1...3).contains(keep) && steps + keep <= Self.horizon)
+        // MLX windows are immutable values owned by their evaluation. Retaining
+        // their raw buffers does not copy history or add per-layer GPU launches.
+        return NemotronMTPDeferredSSM(checkpoint: checkpoint,
+            links: links + [Link(convolution: next, dt: nextDt, keep: keep)], aLog: aLog, skip: skip)
+    }
+
+    static func canUse(_ owner: NemotronHMamba2Mixer, hidden: MLXArray) -> Bool {
+        qualified && supportsNative(owner, hidden: hidden)
+    }
+
+    private static func supportsNative(_ owner: NemotronHMamba2Mixer, hidden: MLXArray) -> Bool {
+        guard enabled, nemotronMTPCompactSSM,
+              NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              hidden.shape == [1, 3, 2688], hidden.dtype == .bfloat16,
+              type(of: owner) == NemotronHMamba2Mixer.self,
+              owner.numHeads == 64, owner.headDim == 64, owner.ssmStateSize == 128,
+              owner.numGroups == 8, owner.convDim == 6144, owner.convKernelSize == 4,
+              type(of: owner.norm) == NemotronHRMSNormGated.self,
+              owner.norm.groupSize == 512, owner.norm.weight.shape == [4096],
+              owner.norm.weight.dtype == .bfloat16, NemotronHCompactSSMGated.counter != nil,
+              let q = owner.outProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16
+        else { return false }
+        return true
+    }
+
+    /// Load-time device qualification and pipeline warm-up. Exact state,
+    /// normalized rows and prepared rows must match separate original kernels.
+    /// On supported native geometry a discrepancy refuses model load.
+    /// Unsupported geometries/formats keep the ordinary representation.
+    static func qualify(_ owner: NemotronHMamba2Mixer) {
+        // Unsupported geometries/formats retain ordinary fallback. The exact
+        // pinned native path refuses any failed owned-kernel qualification.
+        guard supportsNative(owner,
+            hidden: MLXArray.zeros([1, 3, 2688], dtype: .bfloat16)) else { return }
+        let convBank = (sin(MLXArray(0..<(6 * 3 * 6144)).asType(.float32) * 0.017) * 0.25)
+            .asType(.bfloat16).reshaped(6, 3, 6144)
+        let timeBank = (abs(cos(MLXArray(0..<(6 * 3 * 64)).asType(.float32) * 0.031)) * 0.07 + 0.001)
+            .reshaped(6, 3, 64)
+        let state = (sin(MLXArray(0..<(64 * 64 * 128)).asType(.float32) * 0.019) * 0.125)
+            .reshaped(1, 64, 64, 128)
+        let projected = (cos(MLXArray(0..<(3 * 10304)).asType(.float32) * 0.023) * 0.5)
+            .asType(.bfloat16).reshaped(1, 3, 10304)
+        eval(convBank, timeBank, state, projected)
+        let patterns: [[Int]] = [[], [1], [2], [3], [3, 3, 3], [1, 2, 3, 1, 2],
+                                 [1, 1, 1, 1, 1, 1], [2, 1, 2, 1, 2, 1],
+                                 [3, 3, 3, 3], [2, 2, 2, 2, 2, 2]]
+        var ok = true
+        for keeps in patterns {
+            let links = keeps.enumerated().map { i, keep in
+                Link(convolution: convBank[i..<(i + 1), 0..., 0...],
+                     dt: timeBank[i..<(i + 1), 0..., 0...], keep: keep)
+            }
+            let old = NemotronMTPDeferredSSM(checkpoint: state, links: links,
+                                            aLog: owner.aLog, skip: owner.D)
+            var referenceState = state
+            for link in links {
+                referenceState = nemotronMTPSSMCompact(convolution: link.convolution,
+                    ALog: owner.aLog, D: owner.D, dt: link.dt, state: referenceState,
+                    heads: 64, headDim: 64, groups: 8, stateDim: 128,
+                    steps: link.keep, writeOutput: false).finalState
+            }
+            let flushed = old.materialize()
+            var equal = (flushed.view(dtype: .uint32) .== referenceState.view(dtype: .uint32)).all()
+            for writesState in [false, true] {
+                guard let actual = owner.norm.compactSSMPreparedRows(
+                    convolution: convBank[0..<1, 0..., 0...], ALog: owner.aLog, D: owner.D,
+                    dt: timeBank[0..<1, 0..., 0...], state: state, projected: projected,
+                    heads: 64, headDim: 64, groups: 8, stateDim: 128,
+                    replayInputs: old.inputs, deferSSM: true, writeDeferredState: writesState),
+                      let expected = owner.norm.compactSSMPreparedRows(
+                    convolution: convBank[0..<1, 0..., 0...], ALog: owner.aLog, D: owner.D,
+                    dt: timeBank[0..<1, 0..., 0...], state: referenceState, projected: projected,
+                    heads: 64, headDim: 64, groups: 8, stateDim: 128)
+                else {
+                    preconditionFailure("NEMOTRON_MTP_LAZY_SSM: native device qualification unavailable on supported geometry")
+                }
+                equal = logicalAnd(equal, logicalAnd(
+                    (actual.0.view(dtype: .uint16) .== expected.0.view(dtype: .uint16)).all(),
+                    (actual.1.view(dtype: .uint32) .== expected.1.view(dtype: .uint32)).all()))
+                if writesState {
+                    equal = logicalAnd(equal,
+                        (actual.2.view(dtype: .uint32) .== expected.2.view(dtype: .uint32)).all())
+                }
+            }
+            eval(equal)
+            ok = ok && equal.item(Bool.self)
+        }
+        precondition(ok,
+            "NEMOTRON_MTP_LAZY_SSM: supported native device failed exact FP32 state/norm qualification")
+        qualified = true
     }
 }

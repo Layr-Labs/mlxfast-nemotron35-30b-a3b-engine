@@ -75,52 +75,23 @@ extension NemotronH35MTPAssistant {
         target.warmMTPSSMKernels(
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
-        NemotronMTPDraftRowPick.qualify()
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
-        NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
-        NemotronSharedUpPacking.prepareUnpacked(target)
-        NemotronFC2SharedColaunch.prepare(target)
-        NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
-        NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
-        target.prepareVerifyEntry()
+        NemotronBankBinding.warm(assistant.module)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
-        NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
-        NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
-        NemotronPrefillConvDt.qualify(target)
-        NemotronFreshStateUpdate.qualify()
-        NemotronPrefillCountingSort.qualify(target)
-        NemotronPrefillCombineAdd.qualify()
-        NemotronPrefillSharedRelu2.qualify(target)
-        NemotronPrefillDirectFC1.qualify(target)
-        NemotronPrefillDirectFC1.qualifyDict(target)
-        NemotronPrefillSharedUpGather.qualify(target)
-        NemotronPrefillFC2Copy.qualify(target)
-        NemotronPrefillMoEJoin.qualify(target)
-        NemotronPrefillDtxDecay4.qualify()
-        NemotronPrefillScanExp.qualify()
-        NemotronPrefillBoundaryJoin.qualify(target)
-        NemotronPrefillFreshWindowOut.qualify()
-        NemotronPrefillWindowOutSG.qualify()
-        NemotronPrefillFreshStateFold.qualify()
-        NemotronPrefillGatedRMSWide.qualify()
-        NemotronPrefillScanDecaySkip.qualify()
-        NemotronPrefillScanDecayGemm.qualify()
-        NemotronPrefillStateGemm.qualify()
-        NemotronPrefillSeedI32.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -398,67 +369,15 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     }
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
-    /// With `NemotronPrefillFC2Copy` verified, a MoE layer's routed fc2 bank is replaced in its group by
-    /// that layer's decode copy (codes, pair index, pair table): the request prefill reads the copy, the
-    /// decode reads the copy, and nothing in the request reads the bank.
-    /// NEMOTRON_RESIDENCY_SPLIT_EXPERTS=0 keeps one set per backbone layer.
-    static let splitExpertGroups = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_SPLIT_EXPERTS"] != "0"
-
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
-        var copies: [Int: [MLXArray]] = [:]
-        if NemotronPrefillFC2Copy.verified {
-            for (name, module) in model.namedModules() {
-                let parts = name.split(separator: ".")
-                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
-                      let moe = module as? NemotronHMoE,
-                      let copy = NemotronZSkip.copy(for: moe.switchMLP.fc2), copy.dict else { continue }
-                copies[n] = [copy.codes, copy.scales, copy.biases]
-            }
-        }
-        // With `NemotronPrefillDirectFC1.dictVerified`, the request prefill's fc1 reads the bank's pair
-        // dictionary (as the decode does) instead of its BF16 scales and biases.
-        var fc1Dicts: [Int: [MLXArray]] = [:]
-        if NemotronPrefillDirectFC1.dictVerified {
-            for (name, module) in model.namedModules() {
-                let parts = name.split(separator: ".")
-                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
-                      let moe = module as? NemotronHMoE,
-                      let d = NemotronSBDict.dict(moe.switchMLP.fc1) else { continue }
-                fc1Dicts[n] = [d.index, d.table]
-            }
-        }
-        // With `splitExpertGroups` a MoE layer's group is three consecutive sets in the order the request
-        // prefill reads them: the layer's own small arrays (router, shared expert, norms), its routed fc1
-        // (bank words and their scale/bias form), then its routed fc2 (the decode copy when verified).
-        let split = Self.splitExpertGroups
-        func key(_ layer: Int, _ part: Int) -> Int { split ? 3 * layer + part : layer }
         var groups: [Int: [MLXArray]] = [:]
-        for (path, a) in model.parameters().flattened() {
-            let parts = path.split(separator: ".")
+        for (key, a) in model.parameters().flattened() {
+            let parts = key.split(separator: ".")
             var g = Int.max
-            var layer: Int? = nil
-            if parts.contains("embeddings") { g = split ? -3 : -1 }
-            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) {
-                layer = n
-                g = key(n, 0)
-            }
-            if let n = layer, let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
-                if parts[s + 1] == "fc2" {
-                    if copies[n] != nil { continue }
-                    g = key(n, 2)
-                } else if parts[s + 1] == "fc1" {
-                    if fc1Dicts[n] != nil, parts[s + 2] == "scales" || parts[s + 2] == "biases" { continue }
-                    g = key(n, 1)
-                }
-            }
+            if parts.contains("embeddings") { g = -1 }
+            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
             groups[g, default: []].append(a)
         }
-        for (n, arrays) in copies { groups[key(n, 2), default: []].append(contentsOf: arrays) }
-        for (n, arrays) in fc1Dicts { groups[key(n, 1), default: []].append(contentsOf: arrays) }
-        FileHandle.standardError.write(Data(
-            "nemotron target residency: \(fc1Dicts.count) MoE fc1 scales/biases replaced by their pair dictionaries\n".utf8))
-        FileHandle.standardError.write(Data(
-            "nemotron target residency: \(copies.count) MoE fc2 banks replaced by their decode copies\n".utf8))
         return groups.keys.sorted().map { groups[$0]! }
     }
 
@@ -571,43 +490,15 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
     /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
     /// set keeps its own queue.
-    /// The lease this process built at load, for `earlyBegin` from an engine's initializer.
-    nonisolated(unsafe) static weak var current: NemotronDecodeResidency?
-    /// NEMOTRON_RESIDENCY_EARLY=0 skips it: the target groups' residency requests are enqueued (in the same
-    /// backbone order, on the same serial queue) when a request's engine is built, before the engine is
-    /// assembled; the lease's `begin` that follows within `earlyWindow` then enqueues only the head set, the
-    /// extras and the copies after them, so the serial order is the base's.
-    static let earlyEnabled = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_EARLY"] != "0"
-    private static let earlyWindow: TimeInterval = 5
-    private let earlyLock = NSLock()
-    private var earlyIssuedAt: Date?
-
-    func earlyBegin() {
-        guard Self.earlyEnabled, !targetSets.isEmpty else { return }
-        earlyLock.withLock { earlyIssuedAt = Date() }
-        for set in targetSets { targetQueue.async { set.requestResidency() } }
-    }
-
     func begin() -> Lease {
-        let early = earlyLock.withLock { () -> Bool in
-            defer { earlyIssuedAt = nil }
-            guard let at = earlyIssuedAt else { return false }
-            return Date().timeIntervalSince(at) < Self.earlyWindow
-        }
         NemotronZSkip.beginCopyReadiness(owners)
         copiesEnqueued = false
-        let copiesInTarget = NemotronPrefillFC2Copy.verified && !targetSets.isEmpty
         guard !targetSets.isEmpty else {
             for set in extraSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
-        if !early { for set in targetSets { targetQueue.async { set.requestResidency() } } }
-        if copiesInTarget {
-            // The request prefill reads every layer's copy (they replace the fc2 banks in the target
-            // groups), so the first verify already finds them bound: no round falls back to a bank.
-            NemotronZSkip.markCopyReady(owners)
-        }
+        for set in targetSets { targetQueue.async { set.requestResidency() } }
         let head = seedSet, ready = Array(owners.prefix(cut))
         targetQueue.async {
             head.requestResidency()
@@ -631,10 +522,3 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Second measurement of ff544a18.
 
 // Second measurement entry of this tree.
-
-// Second measurement of 208838c4.
-// e-man07: third measurement of c28 (b550b079, 2dbff4f2).
-
-// Measurement entry 2 of this tree.
-
-// Measurement entry 2 of this tree.

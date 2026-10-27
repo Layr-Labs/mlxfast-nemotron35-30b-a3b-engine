@@ -201,13 +201,37 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     }
 }
 
+/// An owned exact recurrence representation. Ordinary state readers materialize
+/// it; transaction evaluation submits only its small immutable input roots.
+/// Implementations must preserve the original FP32 recurrence and may not
+/// share mutable history with an unresolved transaction.
+public protocol CBv2DeferredSSMState: AnyObject {
+    var evaluationRoots: [MLXArray] { get }
+    /// Storage beyond the request's one ordinary full-state allocation.
+    var additionalRetainedByteCount: Int { get }
+    func materialize() -> MLXArray
+}
+
 public struct CBv2RecurrentLayerState {
     public let conv: MLXArray?
-    public let ssm: MLXArray?
+    private let concreteSSM: MLXArray?
+    public let deferredSSM: (any CBv2DeferredSSMState)?
+    public var ssm: MLXArray? { concreteSSM ?? deferredSSM?.materialize() }
+    public var evaluationRoots: [MLXArray] {
+        (conv.map { [$0] } ?? [])
+            + (concreteSSM.map { [$0] } ?? deferredSSM?.evaluationRoots ?? [])
+    }
 
     public init(conv: MLXArray?, ssm: MLXArray?) {
         self.conv = conv
-        self.ssm = ssm
+        self.concreteSSM = ssm
+        self.deferredSSM = nil
+    }
+
+    public init(conv: MLXArray?, deferredSSM: any CBv2DeferredSSMState) {
+        self.conv = conv
+        self.concreteSSM = nil
+        self.deferredSSM = deferredSSM
     }
 }
 
@@ -238,6 +262,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         positions: Int,
         finalConv: MLXArray,
         finalSSM: MLXArray,
+        deferredFinalSSM: (any CBv2DeferredSSMState)? = nil,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,
@@ -259,7 +284,11 @@ public struct CBv2RecurrentPrefixReplayStage {
                 "prefix replay materialized bytes must be nonnegative")
         }
         self.positions = positions
-        self.finalState = CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
+        if let deferredFinalSSM {
+            self.finalState = CBv2RecurrentLayerState(conv: finalConv, deferredSSM: deferredFinalSSM)
+        } else {
+            self.finalState = CBv2RecurrentLayerState(conv: finalConv, ssm: finalSSM)
+        }
         self.materializedByteCount = materializedByteCount
         self.evaluationRoots = evaluationRoots
         self.strictReplayRetainedByteCount = strictReplayRetainedByteCount
@@ -312,6 +341,12 @@ public final class CBv2RecurrentRequestState {
     public let byteCount: Int
     public var materializedByteCount: Int {
         var total = committed.isEmpty && deferredCommitted == nil ? 0 : byteCount
+        for layer in committed.values {
+            let extra = layer.deferredSSM?.additionalRetainedByteCount ?? 0
+            let (sum, overflow) = total.addingReportingOverflow(extra)
+            if overflow { return Int.max }
+            total = sum
+        }
         let (retainedTotal, retainedOverflow) = total.addingReportingOverflow(
             committedTransitionRetainedByteCount)
         if retainedOverflow { return Int.max }
@@ -673,7 +708,7 @@ public final class CBv2RecurrentStateEvaluation {
     public func stagedEvaluationRoots(in layers: Range<Int>) -> [MLXArray] {
         guard !evaluated, !isCaptured else { return [] }
         return staged.keys.sorted().filter { layers.contains($0) }.flatMap { index in
-            [staged[index]!.conv, staged[index]!.ssm].compactMap { $0 }
+            staged[index]!.evaluationRoots
         }
     }
 
@@ -737,6 +772,7 @@ public final class CBv2RecurrentStateEvaluation {
         positions: Int,
         finalConv: MLXArray,
         finalSSM: MLXArray,
+        deferredFinalSSM: (any CBv2DeferredSSMState)? = nil,
         materializedByteCount: Int,
         evaluationRoots: [MLXArray],
         strictReplayRetainedByteCount: Int,
@@ -766,6 +802,7 @@ public final class CBv2RecurrentStateEvaluation {
             positions: positions,
             finalConv: finalConv,
             finalSSM: finalSSM,
+            deferredFinalSSM: deferredFinalSSM,
             materializedByteCount: materializedByteCount,
             evaluationRoots: evaluationRoots,
             strictReplayRetainedByteCount: strictReplayRetainedByteCount,
@@ -793,7 +830,7 @@ public final class CBv2RecurrentStateEvaluation {
             prefixReplay: replayMode ? stagedPrefixReplay : nil)
         evaluated = true
         var roots = stagedLayers.keys.sorted().flatMap { index in
-            [stagedLayers[index]!.conv, stagedLayers[index]!.ssm].compactMap { $0 }
+            stagedLayers[index]!.evaluationRoots
         }
         for index in stagedPrefixReplay.keys.sorted() {
             roots.append(contentsOf: stagedPrefixReplay[index]!.evaluationRoots)
