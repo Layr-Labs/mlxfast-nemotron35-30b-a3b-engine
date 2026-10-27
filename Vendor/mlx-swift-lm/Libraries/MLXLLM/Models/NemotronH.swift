@@ -8167,10 +8167,13 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
         return NemotronSeedRetile.fc2Copy(x, lin, tiles: tiles) ?? launch(x, lin, tiles: tiles)
     }
 
-    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
+    /// `staged`: the A-staged clone of that mode (`NemotronSeedAStage`), offered to the seed retile only.
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
+                       staged: NemotronSeedAStage.Mode? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
-              let copy = NemotronZSkip.copy(for: lin), copy.dict
+              let copy = NemotronZSkip.copy(for: lin), copy.dict,
+              let kernel = staged == nil ? Self.kernel : staged.flatMap(NemotronSeedAStage.fc2Kernel)
         else { return nil }
         let ops = lin.nemotronGatherOperands(for: x.dtype)
         let n = x.dim(0), k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
@@ -8755,7 +8758,7 @@ const device T* xn = x;
 
     /// `header` with the pair-dictionary loader: the scales and biases operands
     /// become the fc1 bank's `NemotronSBDict` index and FP32 pair table.
-    private static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
+    static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
         var h = source
         func swap(_ old: String, _ new: String) -> Bool {
             guard h.components(separatedBy: old).count == 2 else { return false }
@@ -8839,8 +8842,10 @@ const device T* xn = x;
             ?? launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
     }
 
+    /// `staged` (dictionary kernel only): the A-staged clone of that mode, offered to the seed retile only.
     static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
-                       tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
+                       tiles: NemotronHRunTiles, useDict: Bool = false,
+                       staged: NemotronSeedAStage.Mode? = nil) -> MLXArray? {
         guard let kernel, NemotronHPrefillX5.runGather,
               lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
@@ -8857,7 +8862,8 @@ const device T* xn = x;
               ops.weight.dim(2) * 8 == k, k % 64 == 0,
               ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
         else { return nil }
-        if useDict, let dictKernel, let d = NemotronSBDict.dict(lin), d.index.shape == ops.scales.shape,
+        if useDict, let dictKernel = staged == nil ? Self.dictKernel : staged.flatMap(NemotronSeedAStage.fc1Kernel),
+           let d = NemotronSBDict.dict(lin), d.index.shape == ops.scales.shape,
            d.index.dtype == .uint16, d.table.dtype == .float32 {
             return dictKernel(
                 [x, ops.weight, d.index, d.table, tiles.tiles, rows, nOut, k],
@@ -8866,6 +8872,7 @@ const device T* xn = x;
                 grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
                 outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
         }
+        guard staged == nil else { return nil }
         return kernel(
             [x, ops.weight, ops.scales, biases, tiles.tiles, rows, nOut, k],
             template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),

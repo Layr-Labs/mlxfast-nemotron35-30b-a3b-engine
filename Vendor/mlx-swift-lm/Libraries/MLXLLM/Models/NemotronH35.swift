@@ -526,12 +526,14 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// for both roles when it qualifies.
 enum NemotronSeedRetile {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE"] != "0"
-    static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_FORCE"]
+    static let forced: String? = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_FORCE"] ?? "v0-astage"
 
     struct Variant: Sendable, Equatable {
         let name: String
         let bn: Int, bk: Int, wm: Int, wn: Int
         let direct: Bool
+        /// Set: the incumbent's own launch through its A-staged clone (`NemotronSeedAStage`).
+        var stage: NemotronSeedAStage.Mode? = nil
         var threads: Int { wm * wn * 32 }
     }
 
@@ -546,7 +548,7 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
-    ]
+    ] + NemotronSeedAStage.variants
 
     enum Source: String, Sendable { case bank, dict, copy }
 
@@ -606,6 +608,9 @@ enum NemotronSeedRetile {
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
                        rows: MLXArray?, tiles: NemotronHRunTiles) -> MLXArray? {
+        if let mode = v.stage {
+            return NemotronSeedAStage.launch(mode, role: role, x: x, lin: lin, rows: rows, tiles: tiles)
+        }
         guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
               !role.relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype
@@ -715,6 +720,7 @@ enum NemotronSeedRetile {
         guard enabled, NemotronHPrefillX5.runGather, NemotronPrefillCountingSort.verified else {
             return report("off (setting)")
         }
+        NemotronSeedAStage.report()
         let moes = target.modules().compactMap { $0 as? NemotronHMoE }
         guard let moe = moes.first, moes.allSatisfy({
             $0.switchMLP.fc1 is QuantizedSwitchLinear && $0.switchMLP.fc2 is QuantizedSwitchLinear
@@ -877,5 +883,242 @@ enum NemotronSeedRetile {
         report("\(choice[0]?.name ?? "V0")/\(choice[1]?.name ?? "V0") fc1 \(ms(0, choice[0])) ms fc2 \(ms(1, choice[1])) ms"
             + " vs V0 fc1 \(ms(0, nil)) ms fc2 \(ms(1, nil)) ms (per layer, 488 tokens, median of 25;"
             + " fc1 \(detail(0)); fc2 \(detail(1)))")
+    }
+}
+
+// MARK: - Seed A staging (S1)
+
+/// After `xn` is set: the staging geometry. `AS_K` (BK, or SK for the slice
+/// mode) is prepended by the edit.
+private let nemotronSeedAStageGeometry = #"""
+  constexpr short AS_LD = AS_K + 16 / sizeof(T);
+  // A staging: lane (fn, fm) of simdgroup (tm, tn) copies its own fragment
+  // rows (mr * 16 + fm + 8 * i) of the A block, AS_COLS consecutive k from
+  // as_col; the 4 * WN lanes that share a row cover its AS_K k once each.
+  const short2 as_coord = BaseNAXFrag::get_coord();
+  constexpr short AS_COPIERS = (BaseNAXFrag::kFragCols / BaseNAXFrag::kElemCols) * WN;
+  constexpr short AS_COLS = AS_K / AS_COPIERS;
+  static_assert(AS_K % AS_COPIERS == 0, "A staging columns");
+  const short as_col = short((as_coord.x / BaseNAXFrag::kElemCols
+      + short(simd_group_id % WN) * (BaseNAXFrag::kFragCols / BaseNAXFrag::kElemCols)) * AS_COLS);
+
+"""#
+
+/// One staging pass: every thread writes its rows' AS_COLS values of the A
+/// block (rows past the tile as T(0), as `load_safe` writes them). The edit
+/// substitutes AS_SRC_ROW (the device row of a valid row) and AS_KOFS.
+private let nemotronSeedAStageCopy = #"""
+        STEEL_PRAGMA_UNROLL
+        for (short mr = 0; mr < TM; ++mr) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < BaseNAXFrag::kElemRows; ++i) {
+            const short row = mr * BaseNAXFrag::kFragRows + as_coord.y
+                + i * BaseNAXFrag::kElemRowsJump;
+            threadgroup T* as_dst = As + (tm + row) * AS_LD + as_col;
+            if (row < sgp_sm) {
+              const device T* as_src = AS_SRC_ROW + AS_KOFS + as_col;
+              STEEL_PRAGMA_UNROLL
+              for (short j = 0; j < AS_COLS; ++j) {
+                as_dst[j] = as_src[j];
+              }
+            } else {
+              STEEL_PRAGMA_UNROLL
+              for (short j = 0; j < AS_COLS; ++j) {
+                as_dst[j] = T(0);
+              }
+            }
+          }
+        }
+
+"""#
+
+/// The head of the main loop's inner SK loop, up to the A-fragment load.
+private let nemotronSeedAStageInnerHead = #"""
+        for (int kk1 = 0; kk1 < BK; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, BR, BC> Btile;
+
+            volatile int compiler_barrier;
+
+
+"""#
+
+/// Seed-only A staging for the incumbent routed fc1 (direct rows, pair
+/// dictionary) and fc2 (tile-major copy) run gathers: clones that copy each K
+/// step's A block (BM x BK BF16 activations) once per threadgroup into
+/// threadgroup memory, inside the barrier pair that already brackets the weight
+/// block, and load the A fragments from there with the B tile's call. Grid,
+/// threads, weight loader, fragment positions and NAX MMA sequence are the
+/// incumbent's; rows past the tile are staged as T(0), as `load_safe` writes
+/// them. The clones are offered to `NemotronSeedRetile.tune` as extra variants
+/// of the incumbent's own launch, so they are qualified bit for bit against it
+/// and adopted only by the retile's timing rule; nothing dispatches them
+/// otherwise. NEMOTRON_SEED_A_STAGE=0 offers none; =full stages the BM x BK
+/// block per K step; =slice stages one SK slice per inner step (smaller
+/// threadgroup memory, two more barriers per K step); unset offers both.
+enum NemotronSeedAStage {
+    enum Mode: String, Sendable { case full, slice }
+    static let modes: [Mode] = {
+        switch ProcessInfo.processInfo.environment["NEMOTRON_SEED_A_STAGE"] {
+        case "0": return []
+        case "full": return [.full]
+        case "slice": return [.slice]
+        default: return [.full, .slice]
+        }
+    }()
+
+    /// `source` with each (old, new) applied; nil if any `old` is not found exactly once.
+    private static func edited(_ source: String, _ edits: [(String, String)]) -> String? {
+        var s = source
+        for (old, new) in edits {
+            guard s.components(separatedBy: old).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        return s
+    }
+
+    /// The staging edits of one run-gather impl. `afterLoader`: the main loop's
+    /// weight-block load (the copy follows it, before the second barrier);
+    /// `loadBlock`: the main loop's A-fragment load; `rowSource`: the device row
+    /// of a valid A row at this K step.
+    private static func edits(_ mode: Mode, impl: String, xnLine: String, afterLoader: String,
+                              loadBlock: String, rowSource: String) -> [(String, String)] {
+        func copy(_ kofs: String) -> String {
+            nemotronSeedAStageCopy.replacingOccurrences(of: "AS_SRC_ROW", with: rowSource)
+                .replacingOccurrences(of: "AS_KOFS", with: kofs)
+        }
+        let load: (String, String)
+        switch mode {
+        case .full:
+            load = (loadBlock, "            Atile.template load<T, AS_LD, 1>(As + tm * AS_LD + kk1);\n")
+        case .slice:
+            load = (nemotronSeedAStageInnerHead + loadBlock,
+                    "        for (int kk1 = 0; kk1 < BK; kk1 += SK) {\n"
+                    + "          if (kk1 > 0) {\n"
+                    + "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                    + copy("kk1")
+                    + "            threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                    + "          }\n"
+                    + "          if (sg_active) {\n"
+                    + "            NAXTile<T, TM, TK> Atile;\n"
+                    + "            NAXTile<T, BR, BC> Btile;\n\n"
+                    + "            volatile int compiler_barrier;\n\n"
+                    + "            Atile.template load<T, AS_LD, 1>(As + tm * AS_LD);\n")
+        }
+        return [
+            ("METAL_FUNC void \(impl)(", "METAL_FUNC void \(impl)_astage("),
+            ("    threadgroup T* Ws,\n    uint3 tid,", "    threadgroup T* Ws,\n    threadgroup T* As,\n    uint3 tid,"),
+            (xnLine, xnLine + "  constexpr short AS_K = \(mode == .full ? "BK" : "SK");\n" + nemotronSeedAStageGeometry),
+            (afterLoader, afterLoader + copy("0")),
+            load,
+        ]
+    }
+
+    /// The fc1 dictionary header with the A staging; nil if an edit point is missed.
+    static func fc1Header(_ mode: Mode) -> String? {
+        NemotronPrefillDirectFC1.dictHeader.flatMap {
+            edited($0, edits(
+                mode, impl: "nemotron_gather_qmm_runs_direct_dict_impl",
+                xnLine: "  const device T* xn = x;\n",
+                afterLoader: "          loader_w.load_safe(short2(BK, tgp_bn));\n        }\n",
+                loadBlock: "            if constexpr (kAlignedM.value) {\n"
+                    + "              nemotron_load_routed(Atile, routed, int(xn - x) + kk1, sgp_sm);\n"
+                    + "            } else {\n"
+                    + "              nemotron_load_routed(Atile, routed, int(xn - x) + kk1, sgp_sm);\n"
+                    + "            }\n",
+                rowSource: "(routed[mr * BaseNAXFrag::kElemRows + i] + int(xn - x))"))
+        }
+    }
+
+    /// The fc2 copy header with the A staging (edits on its copy impl only); nil if an edit point is missed.
+    static func fc2Header(_ mode: Mode) -> String? {
+        let prefix = nemotronRunGatherHeader + "\n"
+        guard NemotronPrefillFC2Copy.header.hasPrefix(prefix) else { return nil }
+        return edited(String(NemotronPrefillFC2Copy.header.dropFirst(prefix.count)), edits(
+            mode, impl: "nemotron_gather_qmm_runs_copy_impl",
+            xnLine: "  const device T* xn = x + tm * K;\n",
+            afterLoader: "        cl_load();\n\n",
+            loadBlock: "            if constexpr (kAlignedM.value) {\n"
+                + "              Atile.load(xn + kk1, K);\n"
+                + "            } else {\n"
+                + "              Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));\n"
+                + "            }\n",
+            rowSource: "(xn + row * K)")).map { prefix + $0 }
+    }
+
+    /// The kernel body: the incumbent's adaptive 32/64-row dispatch with `As` beside `Ws`.
+    private static func body(_ mode: Mode, impl: String, operands: String) -> String {
+        let call = "\(impl)_astage<T, GS, BITS, %@, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(\n"
+            + "        \(operands), Ws, As,\n"
+            + "        threadgroup_position_in_grid,\n"
+            + "        simdgroup_index_in_threadgroup,\n"
+            + "        thread_index_in_simdgroup);\n"
+        return "threadgroup T Ws[BN * (BK + 16 / sizeof(T))];\n"
+            + "threadgroup T As[BM * (\(mode == .full ? "BK" : "32") + 16 / sizeof(T))];\n"
+            + "if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {\n    "
+            + call.replacingOccurrences(of: "%@", with: "32")
+            + "} else {\n    "
+            + call.replacingOccurrences(of: "%@", with: "BM")
+            + "}\n"
+    }
+
+    private static func makeFC1(_ mode: Mode) -> MLXFast.MLXFastKernel? {
+        fc1Header(mode).map {
+            MLXFast.metalKernel(
+                name: "nemotron_gather_qmm_runs_direct_input_dict_astage" + (mode == .full ? "" : "_slice"),
+                inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+                outputNames: ["y"],
+                source: body(mode, impl: "nemotron_gather_qmm_runs_direct_dict_impl",
+                             operands: "x, w, scales, biases, tiles, routed_rows, y, N, K"),
+                header: $0)
+        }
+    }
+
+    private static func makeFC2(_ mode: Mode) -> MLXFast.MLXFastKernel? {
+        fc2Header(mode).map {
+            MLXFast.metalKernel(
+                name: "nemotron_gather_qmm_runs_fc2_copy_astage" + (mode == .full ? "" : "_slice"),
+                inputNames: ["x", "wk", "sidx", "table", "tiles", "N", "K"],
+                outputNames: ["y"],
+                source: body(mode, impl: "nemotron_gather_qmm_runs_copy_impl",
+                             operands: "x, wk, sidx, table, tiles, y, N, K"),
+                header: $0)
+        }
+    }
+
+    private static let fc1Full = makeFC1(.full)
+    private static let fc1Slice = makeFC1(.slice)
+    private static let fc2Full = makeFC2(.full)
+    private static let fc2Slice = makeFC2(.slice)
+
+    static func fc1Kernel(_ mode: Mode) -> MLXFast.MLXFastKernel? { mode == .full ? fc1Full : fc1Slice }
+    static func fc2Kernel(_ mode: Mode) -> MLXFast.MLXFastKernel? { mode == .full ? fc2Full : fc2Slice }
+
+    /// The retile variants: the incumbent geometry through the staged clone.
+    static let variants: [NemotronSeedRetile.Variant] = modes.map {
+        NemotronSeedRetile.Variant(name: $0 == .full ? "v0-astage" : "v0-astage-slice",
+                                   bn: 64, bk: 64, wm: 2, wn: 2, direct: false, stage: $0)
+    }
+
+    /// The staged clone of the incumbent launch for `role`; nil for any other role.
+    static func launch(_ mode: Mode, role: NemotronSeedRetile.Role, x: MLXArray, lin: QuantizedSwitchLinear,
+                       rows: MLXArray?, tiles: NemotronHRunTiles) -> MLXArray? {
+        switch (role.source, role.routed, rows) {
+        case (.dict, true, let rows?):
+            return NemotronPrefillDirectFC1.launch(x, lin, rows: rows, tiles: tiles, useDict: true, staged: mode)
+        case (.copy, false, _):
+            return NemotronPrefillFC2Copy.launch(x, lin, tiles: tiles, staged: mode)
+        default:
+            return nil
+        }
+    }
+
+    static func report() {
+        let line = modes.isEmpty ? "off (setting)"
+            : "offered to the seed retile: " + modes.map {
+                $0.rawValue + (fc1Kernel($0) != nil && fc2Kernel($0) != nil ? "" : " (source not as expected)")
+            }.joined(separator: ", ")
+        FileHandle.standardError.write(Data("nemotron seed a-stage: \(line)\n".utf8))
     }
 }
