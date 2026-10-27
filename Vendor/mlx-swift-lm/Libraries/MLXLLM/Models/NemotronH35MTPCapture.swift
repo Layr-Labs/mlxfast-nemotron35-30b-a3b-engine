@@ -623,6 +623,35 @@ extension NemotronHMamba2Mixer {
 
 
 extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
+    public func cbv2ForwardWithHiddenCapturedPolicy(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, usePolicy: Bool
+    ) -> CBv2MTPCapturedPolicyOutput {
+        precondition(positionIds == nil)
+        if let fused = cbv2HiddenCapturedFused(
+            tokens, caches: caches, recurrentState: recurrentState) {
+            if usePolicy, let q = lmHead as? QuantizedLinear,
+               let out = NemotronHeadPreparedActivation.widePolicy(
+                   fused.hidden, q, prepared: fused.prepared, window: tokens) {
+                return CBv2MTPCapturedPolicyOutput(logits: out.logits,
+                    lastHidden: fused.hidden, policy: out.policy)
+            }
+            // Hidden/capture has already been built: fallback projects the SAME hidden.
+            let logits = lmHead.map { nemotronMTPHeadRows(fused.hidden, $0, prepared: fused.prepared) }
+                ?? nemotronMTPMapRows(fused.hidden) { self.logits($0) }
+            return CBv2MTPCapturedPolicyOutput(logits: logits, lastHidden: fused.hidden)
+        }
+        let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState, captureMTP: true)
+        let logits = lmHead.map { nemotronMTPHeadRows(hidden, $0) }
+            ?? nemotronMTPMapRows(hidden) { self.logits($0) }
+        return CBv2MTPCapturedPolicyOutput(logits: logits, lastHidden: hidden)
+    }
+
+    func qualifyWideHeadPolicy() {
+        guard let q = lmHead as? QuantizedLinear else { return }
+        NemotronHeadPreparedActivation.qualifyWidePolicy(q)
+    }
+
     public func cbv2ForwardWithHiddenCaptured(
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?

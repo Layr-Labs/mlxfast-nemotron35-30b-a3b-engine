@@ -235,6 +235,7 @@ extension EngineLoopV2 {
             }
             let tokens = concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
+            var producerPolicy: (ids: MLXArray, values: MLXArray, packet: MLXArray)? = nil
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
                 // window; the model stages [1+k, ...] captured stacks per
@@ -255,9 +256,14 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                let captured = try checkedModelForward(phase: .mtpVerification) {
+                    recurrentModel.forwardWithHiddenCapturedPolicy(
+                        tokens: tokens, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds, usePolicy: mtp.usesRequestStatefulDrafter
+                            && !useTargetPrefix && CBv2MTPPolicyPacket.enabled)
+                }
+                output = (captured.logits, captured.lastHidden)
+                producerPolicy = captured.policy
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,
@@ -283,7 +289,10 @@ extension EngineLoopV2 {
                 let vocabulary = output.logits.dim(2)
                 let flat = output.logits.reshaped([1, batch * width, vocabulary])
                 let topTwo: (ids: MLXArray, values: MLXArray)
-                if !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
+                if let folded = producerPolicy {
+                    topTwo = (folded.ids, folded.values)
+                    packet = folded.packet
+                } else if !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
                     let folded = provider.cbv2MTPTopTwoPacket(flat, window: tokens)
                 {
                     topTwo = (folded.ids, folded.values)

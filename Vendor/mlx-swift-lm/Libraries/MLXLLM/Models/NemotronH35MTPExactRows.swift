@@ -1219,6 +1219,188 @@ enum NemotronHeadPreparedActivation {
         return prepared
     }
 
+
+    static let widePolicyEnabled = ProcessInfo.processInfo.environment["NEMOTRON_HEAD_PRODUCER_POLICY"] != "0"
+    nonisolated(unsafe) private static var widePolicyOwner: ObjectIdentifier?
+    nonisolated(unsafe) private static var widePolicyKernels: [String: MLXFast.MLXFastKernel?] = [:]
+    private static let widePolicyLock = NSLock()
+
+    /// Only output ownership changes. The selected prepared QMV body, including
+    /// HF/tail8/load2/dictionary/U2, is rebuilt independently for every subtile.
+    /// This factory executes only when the official runtime constructs a kernel.
+    private static func widePolicyKernel(dict: Bool, u2: Bool) -> MLXFast.MLXFastKernel? {
+        let (_, hf) = projectKernel(rows: 3, fast: false)
+        let key = "nemotron_head_producer_policy" + (dict ? "_sbd" : "") + (u2 ? "_u2" : "")
+        widePolicyLock.lock(); defer { widePolicyLock.unlock() }
+        if let cached = widePolicyKernels[key] { return cached }
+        var body: String? = nemotronPreparedVariantSource(
+            hf.isEmpty ? nemotronHeadPreparedQMVSource : preparedHalfSource, load: 2, nsg: true)
+        if dict { body = body.flatMap { nemotronSBDictSource($0) } }
+        if u2 { body = nemotronU2Source(body, loop: NemotronU2.qmvLoop, count: 1) }
+        guard var body else { return nil }
+        let address = "const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +"
+        let store = "yp[r * out_vec_size + row] = h;"
+        guard body.components(separatedBy: address).count == 2,
+              body.components(separatedBy: store).count == 2 else { return nil }
+        body = body.replacingOccurrences(of: address,
+            with: "const int out_row = tid.y * 512 + output_block * (num_simdgroups * results_per_simdgroup) +")
+        body = body.replacingOccurrences(of: store, with: store + """
+
+            darkbloom_qwen35_mtp_top2_insert(tile_top[r], float(h), uint(out_row + row));
+        """)
+        let source = """
+          thread darkbloom_qwen35_mtp_top2_state tile_top[R];
+          for (int r = 0; r < R; r++) tile_top[r] = darkbloom_qwen35_mtp_top2_empty();
+          #pragma clang loop unroll(disable)
+          for (int output_block = 0; output_block < 32; output_block++) {
+        """ + body + """
+          }
+          // N == 131072, RPS == 2, NSG == 8: all 256 CTAs own exactly 512
+          // valid outputs, so no thread can take the body's early return.
+          const uint sg = simdgroup_index_in_threadgroup;
+          const uint lane = thread_index_in_simdgroup;
+          threadgroup darkbloom_qwen35_mtp_top2_state group_top[R][8];
+          if (lane == 0) {
+            for (int r = 0; r < R; r++) group_top[r][sg] = tile_top[r];
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (sg == 0) {
+            for (int r = 0; r < R; r++) {
+              darkbloom_qwen35_mtp_top2_state best = lane < 8
+                  ? group_top[r][lane] : darkbloom_qwen35_mtp_top2_empty();
+              for (ushort delta = 4; delta > 0; delta >>= 1) {
+                darkbloom_qwen35_mtp_top2_state other =
+                    darkbloom_qwen35_mtp_top2_shuffle_down(best, delta);
+                if (lane < delta) {
+                  if (other.count > 0) darkbloom_qwen35_mtp_top2_insert(best, other.first_value, other.first_id);
+                  if (other.count > 1) darkbloom_qwen35_mtp_top2_insert(best, other.second_value, other.second_id);
+                }
+              }
+              if (lane == 0) {
+                const uint base = (uint(r) * 256 + threadgroup_position_in_grid.y) * 2;
+                partial_ids[base] = int(best.first_id);
+                partial_ids[base + 1] = int(best.second_id);
+                partial_values[base] = best.first_value;
+                partial_values[base + 1] = best.second_value;
+              }
+            }
+          }
+        """
+        let kernel = MLXFast.metalKernel(name: key,
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y", "partial_ids", "partial_values"], source: source,
+            header: variantHeader(half: !hf.isEmpty, load: 2) + CBv2MTPProducerPolicy.metalHeader)
+        widePolicyKernels[key] = kernel
+        return kernel
+    }
+
+    private static func widePolicyEligible(_ q: QuantizedLinear) -> Bool {
+        widePolicyEnabled && NemotronMTPExecution.exactMultirowHead
+            && NemotronMultiRowQMV.enabled && NemotronMultiRowQMV.narrowEnabled
+            && !NemotronMoELeader.selfTest && CBv2MTPTopTwoPacket.enabled
+            && CBv2MTPProducerPolicy.available
+            && q.weight.shape == [131072, 336] && q.weight.dtype == .uint32
+            && q.groupSize == 64 && q.bits == 4 && q.mode == .affine && q.bias == nil
+            && q.scales.shape == [131072, 42] && q.scales.dtype == .bfloat16
+            && q.biases?.shape == [131072, 42] && q.biases?.dtype == .bfloat16
+            && loadForm(k: 2688, n: 131072) == 2
+            && preparedGeometry[[2688, 131072]]?.rps == 2
+            && preparedGeometry[[2688, 131072]]?.nsg == 8
+    }
+
+    private static func launchWidePolicy(_ x: MLXArray, _ q: QuantizedLinear,
+        prepared: MLXArray?, window: MLXArray, dict: Bool, u2: Bool)
+        -> (logits: MLXArray, policy: (ids: MLXArray, values: MLXArray, packet: MLXArray))? {
+        guard x.shape == [3, 2688], x.dtype == .bfloat16,
+              window.shape == [1, 3], window.dtype == .int32,
+              let kernel = widePolicyKernel(dict: dict, u2: u2) else { return nil }
+        let w: MLXArray, scales: MLXArray, biases: MLXArray
+        if dict {
+            guard let d = NemotronSBDict.dict(q) else { return nil }
+            w = q.weight; scales = d.index; biases = d.table
+        } else {
+            guard let b = q.biases else { return nil }
+            w = q.weight; scales = q.scales; biases = b
+        }
+        let packed = compatible(prepared, rows: 3, k: 2688) ?? pack(x)
+        let args = NemotronMultiRowQMV.scalarPair(2688, 131072)
+        let (_, hf) = projectKernel(rows: 3, fast: false)
+        let output = kernel([w, scales, biases, packed, args.0, args.1],
+            template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2), ("NSG", 8)] + hf,
+            grid: (32, 256 * 8, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[3, 131072], [3, 256, 2], [3, 256, 2]],
+            outputDTypes: [.bfloat16, .int32, .float32])
+        guard let policy = CBv2MTPProducerPolicy.finish(ids: output[1], values: output[2], window: window)
+        else { return nil }
+        return (output[0].reshaped([1, 3, 131072]), policy)
+    }
+
+    static func widePolicy(_ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?, window: MLXArray)
+        -> (logits: MLXArray, policy: (ids: MLXArray, values: MLXArray, packet: MLXArray))? {
+        guard widePolicyOwner == ObjectIdentifier(q), widePolicyEligible(q),
+              x.shape == [1, 3, 2688], x.dtype == .bfloat16 else { return nil }
+        let dict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil
+            && dictLaunchAvailable(k: 2688, n: 131072)
+        return launchWidePolicy(x.reshaped([3, 2688]), q, prepared: prepared, window: window,
+            dict: dict, u2: NemotronU2.prepared(rows: 3, n: 131072))
+    }
+
+    /// Official-remote load-time admission; no timed window, capture, cache or
+    /// request state is involved. All real-head logits and policy bits compare.
+    static func qualifyWidePolicy(_ q: QuantizedLinear) {
+        widePolicyOwner = nil
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron head producer policy: \(text)\n".utf8))
+        }
+        guard widePolicyEligible(q) else { return report("off (setting or unsupported head)") }
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                guard CBv2MTPProducerPolicy.qualify() else { return false }
+                let canDict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil
+                    && dictLaunchAvailable(k: 2688, n: 131072)
+                for dict in (canDict ? [false, true] : [false]) {
+                    for u2 in [false, true] {
+                        guard !u2 || u2Available(k: 2688, n: 131072, dict: dict) else { continue }
+                        // Zero rows force exact whole-vocabulary ties; two live
+                        // changing inputs/windows catch accidental output reuse.
+                        for kind in 0..<3 {
+                            let a = kind == 0 ? MLXArray.zeros([3, 2688], dtype: .bfloat16)
+                                : (MLXRandom.normal([3, 2688], key: MLXRandom.key(UInt64(0x91a0 + kind)))
+                                    * Float(kind == 1 ? 0.5 : 8)).asType(.bfloat16)
+                            let b = (MLXRandom.normal([3, 2688], key: MLXRandom.key(UInt64(0x91b0 + kind)))
+                                * Float(0.75)).asType(.bfloat16)
+                            let wa = MLXArray([Int32(0), 131071, 1]).reshaped([1, 3])
+                            let wb = MLXArray([Int32(77 + kind), 13, 87000]).reshaped([1, 3])
+                            let pa = kind == 2 ? pack(a) : nil
+                            let pb = pack(b)
+                            let oldA = apply(a, q, relu2: false, rps: 2, prepared: pa, sbDict: dict, u2: u2)
+                                .reshaped([1, 3, 131072])
+                            let oldB = apply(b, q, relu2: false, rps: 2, prepared: pb, sbDict: dict, u2: u2)
+                                .reshaped([1, 3, 131072])
+                            guard let newA = launchWidePolicy(a, q, prepared: pa, window: wa, dict: dict, u2: u2),
+                                  let newB = launchWidePolicy(b, q, prepared: pb, window: wb, dict: dict, u2: u2),
+                                  let policyA = cbv2TopTwoRowsPacket(oldA, window: wa),
+                                  let policyB = cbv2TopTwoRowsPacket(oldB, window: wb) else { return false }
+                            for (old, new, policy) in [(oldB, newB, policyB), (oldA, newA, policyA)] {
+                                let same = NemotronU2.equal(old, new.logits)
+                                    .&& NemotronU2.equal(policy.ids, new.policy.ids)
+                                    .&& NemotronU2.equal(policy.values, new.policy.values)
+                                    .&& NemotronU2.equal(policy.packet, new.policy.packet)
+                                if !same.item(Bool.self) { return false }
+                                cases += 1
+                            }
+                        }
+                    }
+                }
+                return cases > 0
+            }
+            if matches { widePolicyOwner = ObjectIdentifier(q) }
+        } catch { return report("off (\(error))") }
+        report(widePolicyOwner != nil ? "on (\(cases) complete head/policy cases bitwise equal)"
+            : "off (difference after \(cases) cases)")
+    }
+
     /// `u2`: the R = 3 launch's unroll-by-two twin (nil: the admitted family, `NemotronU2.prepared`).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
                       prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil) -> MLXArray {

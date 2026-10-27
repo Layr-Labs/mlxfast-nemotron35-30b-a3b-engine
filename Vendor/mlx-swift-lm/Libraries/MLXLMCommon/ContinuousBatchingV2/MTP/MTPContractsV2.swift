@@ -122,6 +122,32 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    func cbv2ForwardWithHiddenCapturedPolicy(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, usePolicy: Bool
+    ) -> CBv2MTPCapturedPolicyOutput
+}
+
+/// No tensor-identity side channel: evidence belongs to this exact forward/window.
+public struct CBv2MTPCapturedPolicyOutput {
+    public let logits: MLXArray
+    public let lastHidden: MLXArray
+    public let policy: (ids: MLXArray, values: MLXArray, packet: MLXArray)?
+    public init(logits: MLXArray, lastHidden: MLXArray,
+                policy: (ids: MLXArray, values: MLXArray, packet: MLXArray)? = nil) {
+        self.logits = logits; self.lastHidden = lastHidden; self.policy = policy
+    }
+}
+
+extension CBv2RecurrentCaptureMTPForwardable {
+    public func cbv2ForwardWithHiddenCapturedPolicy(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, usePolicy: Bool
+    ) -> CBv2MTPCapturedPolicyOutput {
+        let out = cbv2ForwardWithHiddenCaptured(tokens, caches: caches,
+            recurrentState: recurrentState, positionIds: positionIds)
+        return CBv2MTPCapturedPolicyOutput(logits: out.logits, lastHidden: out.lastHidden)
+    }
 }
 
 /// Steppable models that can drive MTP rounds. Additive refinement of
@@ -185,9 +211,22 @@ public protocol CBv2RecurrentMTPSteppableModel:
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    func forwardWithHiddenCapturedPolicy(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, usePolicy: Bool
+    ) -> CBv2MTPCapturedPolicyOutput
 }
 
 extension CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenCapturedPolicy(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?, usePolicy: Bool
+    ) -> CBv2MTPCapturedPolicyOutput {
+        let out = forwardWithHiddenCaptured(tokens: tokens, caches: caches,
+            recurrentState: recurrentState, positionIds: positionIds)
+        return CBv2MTPCapturedPolicyOutput(logits: out.logits, lastHidden: out.lastHidden)
+    }
+
     public func forwardWithHiddenForPrefill(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,

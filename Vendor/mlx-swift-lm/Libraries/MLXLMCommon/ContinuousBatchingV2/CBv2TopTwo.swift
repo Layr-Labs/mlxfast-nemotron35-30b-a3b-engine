@@ -552,3 +552,95 @@ package func cbv2TopTwoRowsPacketWarm(logitsDType: DType) {
     guard let warmed = cbv2TopTwoRowsPacket(logits, window: window) else { return }
     eval(warmed.ids, warmed.values, warmed.packet)
 }
+
+// Explicit producer-owned partials. Existing top-two kernels and callers remain unchanged.
+public enum CBv2MTPProducerPolicy {
+    public static var available: Bool {
+        CBv2MTPTopTwoPacket.enabled && CBv2MTPTopTwoShuffle.enabled && CBv2MTPTopTwoShuffle.verified
+    }
+    /// Official-remote adversarial finalizer admission against the original
+    /// full-logit scan. All 512 candidate ids occur once in producer inputs.
+    public static func qualify() -> Bool {
+        for kind in 0..<6 {
+            var logits = MLXRandom.normal([1, 3, 512], key: MLXRandom.key(UInt64(0x91c0 + kind))) * 3
+            switch kind {
+            case 1: logits = round(logits)
+            case 2: logits = which(abs(logits) .> MLXArray(Float(5)), MLXArray(Float.nan), logits)
+            case 3: logits = which(logits .> MLXArray(Float(5)), MLXArray(Float.infinity),
+                which(logits .< MLXArray(Float(-5)), MLXArray(-Float.infinity), logits))
+            case 4: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(Float(-0.0)), round(logits))
+            case 5: logits = MLXArray.zeros([1, 3, 512])
+            default: break
+            }
+            // BF16 round/widen matches what the fused producer inserts.
+            logits = logits.asType(.bfloat16).asType(.float32)
+            let ids = broadcast(MLXArray((0..<512).map { Int32($0) }).reshaped([1, 256, 2]), to: [3, 256, 2])
+            let window = MLXArray([Int32(kind), 511 - Int32(kind), 17]).reshaped([1, 3])
+            guard let a = cbv2TopTwoRowsPacket(logits, window: window, shuffle: false),
+                  let b = finish(ids: ids, values: logits.reshaped([3, 256, 2]), window: window)
+            else { return false }
+            let same = (a.ids .== b.ids).all()
+                .&& (a.values.view(dtype: .uint32) .== b.values.view(dtype: .uint32)).all()
+                .&& (a.packet .== b.packet).all()
+            if !same.item(Bool.self) { return false }
+        }
+        return true
+    }
+    public static var metalHeader: String { cbv2TopTwoShuffleHeader }
+    private static let finalize = MLXFast.metalKernel(
+        name: "nemotron_mtp_producer_policy_finalize", inputNames: ["partial_ids", "partial_values", "window"],
+        outputNames: ["top_ids", "top_values", "packet"], source: """
+        uint lane = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
+        for (uint group = lane; group < uint(PARTS); group += 32) {
+            uint base = (row * uint(PARTS) + group) * 2;
+            darkbloom_qwen35_mtp_top2_insert(
+                local, partial_values[base], uint(partial_ids[base]));
+            darkbloom_qwen35_mtp_top2_insert(
+                local, partial_values[base + 1], uint(partial_ids[base + 1]));
+        }
+
+        for (ushort delta = 16; delta > 0; delta >>= 1) {
+            darkbloom_qwen35_mtp_top2_state other =
+                darkbloom_qwen35_mtp_top2_shuffle_down(local, delta);
+            if (lane < delta) {
+                darkbloom_qwen35_mtp_top2_insert(
+                    local, other.first_value, other.first_id);
+                darkbloom_qwen35_mtp_top2_insert(
+                    local, other.second_value, other.second_id);
+            }
+        }
+
+        if (lane == 0) {
+            uint output_base = row * 2;
+            top_ids[output_base] = int(local.first_id);
+            top_ids[output_base + 1] = int(local.second_id);
+            top_values[output_base] = local.first_value;
+            top_values[output_base + 1] = local.second_value;
+
+            uint batch = uint(window_shape[0]);
+            uint width = uint(window_shape[1]);
+            uint drafts = batch * (width - 1);
+            uint rows = batch * width;
+            packet[drafts + row] = int(local.first_id);
+            packet[drafts + rows + output_base] = as_type<int>(local.first_value);
+            packet[drafts + rows + output_base + 1] = as_type<int>(local.second_value);
+            uint column = row % width;
+            if (column > 0) {
+                packet[(row / width) * (width - 1) + (column - 1)] = window[row];
+            }
+        }
+    """, header: cbv2TopTwoShuffleHeader, ensureRowContiguous: true)
+
+    public static func finish(ids: MLXArray, values: MLXArray, window: MLXArray)
+        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+        guard CBv2MTPTopTwoPacket.enabled, ids.shape == [3, 256, 2], values.shape == ids.shape,
+              ids.dtype == .int32, values.dtype == .float32,
+              window.shape == [1, 3], window.dtype == .int32 else { return nil }
+        let out = finalize([ids, values, window], template: [("PARTS", 256)],
+            grid: (96, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[3, 2], [3, 2], [11]], outputDTypes: [.int32, .float32, .int32])
+        return (out[0], out[1], out[2])
+    }
+}
