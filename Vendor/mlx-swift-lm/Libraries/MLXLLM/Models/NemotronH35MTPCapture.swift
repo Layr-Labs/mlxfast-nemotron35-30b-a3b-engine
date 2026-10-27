@@ -23,10 +23,15 @@ final class NemotronMTPPendingSSM {
         let anchor: MLXArray, conv: MLXArray, dt: MLXArray
         let steps: Int
     }
-    static let maxSteps = 4
+    static let maxSteps = min(max(Int(
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_PENDING_STEPS"] ?? "") ?? 8, 1), 8)
+    static let baseSteps = min(4, maxSteps)
     static let requested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_PENDING_FOLD"] != "0"
+    static let warmsSteps =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_WARMUP_PENDING"] != "0"
     nonisolated(unsafe) static var qualified = false
+    nonisolated(unsafe) private(set) static var limit = 0
     static var enabled: Bool { requested && qualified }
 
     private final class Entry {
@@ -42,7 +47,7 @@ final class NemotronMTPPendingSSM {
 
     /// `state` is the replay of `pending.steps` steps of `pending` from its anchor.
     static func register(_ state: MLXArray, _ pending: Pending) {
-        guard enabled, (1 ... maxSteps).contains(pending.steps) else { return }
+        guard enabled, (1 ... limit).contains(pending.steps) else { return }
         lock.withLock {
             entries = entries.filter { $0.value.state != nil }
             entries[ObjectIdentifier(state)] = Entry(state, pending)
@@ -83,6 +88,7 @@ final class NemotronMTPPendingSSM {
         }
         let convDim = mixer.convDim
         let projectedWidth = mixer.intermediateSize + convDim + heads
+        var passed = 0
         for steps in 1 ... maxSteps {
             let pconv = MLXArray(values(steps * convDim, -2, 2), [1, steps, convDim]).asType(.bfloat16)
             let pdt = MLXArray(values(steps * heads, 0.01, 0.5), [1, steps, heads])
@@ -103,13 +109,21 @@ final class NemotronMTPPendingSSM {
                     convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: anchor,
                     projected: projected, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, pending: (pconv, pdt, steps))
-            else { return report("off (fused launch unavailable)") }
+            else {
+                if steps <= baseSteps { return report("off (fused launch unavailable)") }
+                break
+            }
             eval(reference.0, reference.1, reference.2, folded.0, folded.1, folded.2)
             guard bits(reference.0, folded.0), bits(reference.1, folded.1), bits(reference.2, folded.2)
-            else { return report("off (folded launch differs at \(steps) pending steps)") }
+            else {
+                if steps <= baseSteps { return report("off (folded launch differs at \(steps) pending steps)") }
+                break
+            }
+            passed = steps
         }
+        limit = passed
         qualified = true
-        report("on (1...\(maxSteps) pending steps bitwise equal to replay + launch)")
+        report("on (1...\(passed) pending steps bitwise equal to replay + launch)")
     }
 }
 
@@ -668,6 +682,8 @@ extension NemotronH35Model {
             heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
             eval(fused.0, fused.1, fused.2)
         }
+        NemotronHCompactSSMGated.qualifyShuffle(mixer)
+        NemotronHCompactSSMGated.qualifyRowsTail(mixer)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: compiles and checks every folded launch.
         NemotronMTPPendingSSM.qualify(mixer)
         for width in 2...8 {

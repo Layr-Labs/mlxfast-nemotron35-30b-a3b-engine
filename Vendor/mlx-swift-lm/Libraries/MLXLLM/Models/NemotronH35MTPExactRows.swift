@@ -173,6 +173,105 @@ func nemotronSwapped(_ source: String, _ swaps: [(String, String, Int)]) -> Stri
     return s
 }
 
+// MARK: Unroll by two (NEMOTRON_U2_*)
+//
+// Three more decode-window kernels get the plan-free triple FC1's exact
+// transform (NEMOTRON_MTP_FC1_UNROLL): `#pragma clang loop unroll_count(2)`
+// ahead of their main K loops. The unrolled loop runs the same iteration
+// bodies in the same order (iteration i, then i + 1, any odd last iteration
+// as before, then the unchanged tail after the loop), so every load, decode,
+// product, term order, accumulation, affine close, closing simd_sum and store
+// is the record kernel's; only the instruction stream of two consecutive
+// iterations is laid out together. Custom kernels compile in MLX's safe math
+// mode, so nothing may be reassociated across the two copies.
+// - INPROJ: the verify's Mamba in_proj + conv/dt launch (R = 3).
+// - HEAD: the verify's 131,072-row target head (R = 3 prepared, ld2/NSG form).
+// - DRAFT: the draft head's one-row routed FC1 leader (its pair dictionary).
+// Each family's twin is admitted at load only after it matched its record
+// kernel bit for bit on the real weights (`NemotronU2.qualify`). Only the
+// verify and draft launch sites select it; the stepper's prompt prefill and
+// the request prefill never reach them. The same transform measured slower
+// on the M4 for the out_proj / o_proj (FAST hoist form, +9%), shared-up,
+// fused Q/K/V, FC2 + shared-down co-launch, router and one-row multi-row QMV
+// launches, which keep their record kernels.
+
+/// `source` with the pragma ahead of each of exactly `count` occurrences of
+/// `loop`, or nil when the record text moved (the record kernel stays).
+func nemotronU2Source(_ source: String?, loop: String, count: Int) -> String? {
+    guard let source, count > 0, source.components(separatedBy: loop).count == count + 1 else { return nil }
+    return source.replacingOccurrences(of: loop, with: "#pragma clang loop unroll_count(2)\n" + loop)
+}
+
+enum NemotronU2 {
+    /// The prepared QMV main loop (crown, HF, load forms, dictionary).
+    static let qmvLoop = "for (; k < k_end; k += block_size) {\n"
+    /// The routed FC1 leader's main loops (one-row draft tail).
+    static let leaderLoop = "for (; k < K - block_size; k += block_size) {\n"
+
+    enum Family: String, CaseIterable {
+        case inProj = "INPROJ", head = "HEAD", draft = "DRAFT"
+    }
+    /// NEMOTRON_U2_<FAMILY>=0 keeps that family's record kernels.
+    static func setting(_ family: Family) -> Bool {
+        ProcessInfo.processInfo.environment["NEMOTRON_U2_" + family.rawValue] != "0"
+    }
+
+    /// Set once at load by `qualify`, before any verify or draft graph is traced.
+    nonisolated(unsafe) static var inProj = false
+    nonisolated(unsafe) static var head = false
+    nonisolated(unsafe) static var draft = false
+
+    /// The R = 3 prepared launch of an [K, N] projection takes its twin: the
+    /// 131,072-row target head once HEAD is admitted.
+    static func prepared(rows: Int, n: Int) -> Bool {
+        rows == 3 && n == 131072 && head
+    }
+
+    static func report(_ family: Family, _ message: String) {
+        FileHandle.standardError.write(Data("nemotron u2 \(family.rawValue.lowercased()): \(message)\n".utf8))
+    }
+
+    static func equal(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
+        switch a.dtype {
+        case .float32, .uint32, .int32: return (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+        default: return (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+        }
+    }
+
+    /// Admit one family: `check` runs the family's launches with the record
+    /// kernels and with the twins (the same template arguments the window
+    /// uses, so it also JITs every twin pipeline outside any timed window)
+    /// and returns (all equal, cases), or nil when nothing could run. Any
+    /// miss, a missing twin or an error keeps the record kernels.
+    static func admit(_ family: Family, _ check: () throws -> (MLXArray, Int)?) -> Bool {
+        guard setting(family) else {
+            report(family, "off (setting)")
+            return false
+        }
+        var result: (Bool, Int)? = nil
+        do {
+            result = try withError { () throws -> (Bool, Int)? in
+                guard let r = try check(), r.1 > 0 else { return nil }
+                return (r.0.item(Bool.self), r.1)
+            }
+        } catch {
+            report(family, "off (\(error))")
+            return false
+        }
+        guard let result else {
+            report(family, "off (no twin or no launch ran)")
+            return false
+        }
+        guard result.0 else {
+            report(family, "off (\(result.1) cases, a twin differs from its record kernel)")
+            return false
+        }
+        report(family, "on (\(result.1) cases bitwise equal to the record kernels)")
+        return true
+    }
+}
+
 /// The extra template argument of a decode-form twin, or none (crown kernel).
 func nemotronHalfTemplate(_ on: Bool, _ form: Int) -> [(String, any KernelTemplateArg)] {
     on ? [("HF", form)] : []
@@ -674,6 +773,138 @@ private let nemotronMambaInProjConvDtEpilogue = """
   }
 """
 
+/// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS: the in_proj launch whose epilogue takes
+/// its row's BF16 outputs from registers instead of reading them back from its
+/// own stores. `simd_sum` leaves each output's sum in every lane, so in the
+/// store loop each lane also keeps the stored value of the outputs of the row
+/// it serves in the epilogue (`nmc_y[r]`, statically indexed: the loops over
+/// the SIMD group's rows and the window positions are unrolled, and the lane's
+/// row is a compare). The epilogue picks position t's value with a select
+/// chain over the window's positions (no dynamic register indexing), so it
+/// reads no device output back and the device fence ahead of it goes. Every
+/// stored and computed value is the record kernel's.
+private let nemotronInProjStoreLoop = """
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
+      }
+    }
+  }
+"""
+private let nemotronInProjStoreLoopRegs = """
+  const int nmc_row = int(simd_lid) / R;
+  T nmc_y[R];
+  #pragma clang loop unroll(full)
+  for (int r = 0; r < R; r++) {
+    nmc_y[r] = static_cast<T>(0);
+  }
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
+      }
+      if (nmc_row == row) {
+        T hc = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(hc) ? hc : (hc > zero ? hc : zero);
+          hc = m * m;
+        }
+        nmc_y[r] = hc;
+      }
+    }
+  }
+"""
+private let nemotronMambaInProjConvDtRegsEpilogue = """
+
+  // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). Its
+  // row's BF16 outputs are in nmc_y, kept by the store loop above.
+  {
+    const int l = int(simd_lid);
+    if (l < results_per_simdgroup * R) {
+      const int row = l / R;
+      const int t = l % R;
+      const int o = out_row + row;
+      T yt = nmc_y[0];
+      #pragma clang loop unroll(full)
+      for (int s = 1; s < R; ++s) {
+        yt = t == s ? nmc_y[s] : yt;
+      }
+      if (o >= CS && o < CS + CC) {
+        const int64_t channel = int64_t(o - CS);
+        if (t < 3) {
+          padded[int64_t(t) * CC + channel] =
+              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        }
+        padded[(int64_t(t) + 3) * CC + channel] = yt;
+        float acc = 0;
+        for (int i = 0; i < 4; ++i) {
+          int64_t crow = int64_t(t) + int64_t(i);
+          T value = nmc_y[0];
+          if (crow < 3) {
+            value = oldState[crow * oldState_strides[1] + channel * oldState_strides[2]];
+          } else {
+            #pragma clang loop unroll(full)
+            for (int s = 1; s < R; ++s) {
+              value = crow - 3 == int64_t(s) ? nmc_y[s] : value;
+            }
+          }
+          acc += static_cast<float>(value)
+              * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+        }
+        T convolved = static_cast<T>(acc);
+        T xc = convolved + cb[channel * cb_strides[0]];
+        auto yc = 1 / (1 + metal::exp(metal::abs(xc)));
+        T sigmoid = xc < 0 ? yc : 1 - yc;
+        conv[int64_t(t) * CC + channel] = xc * sigmoid;
+      } else if (o >= DS && o < DS + NH) {
+        const int head = o - DS;
+        float v = static_cast<float>(yt)
+            + static_cast<float>(dtBias[int64_t(head) * dtBias_strides[0]]);
+        float sp;
+        if (metal::isnan(v)) {
+          sp = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(v, 0.0f);
+          float minval = metal::min(v, 0.0f);
+          sp = (minval == -inf || maxval == inf)
+              ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        float lo = dtLo;
+        float hi = dtHi;
+        float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+        dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+      }
+    }
+  }
+"""
+/// The record in_proj source (prepared body + epilogue) with the register store
+/// loop and epilogue, or nil when the body's store loop text is not found.
+private func nemotronInProjRegsSource() -> String? {
+    guard nemotronHeadPreparedQMVSource.components(separatedBy: nemotronInProjStoreLoop).count == 2
+    else { return nil }
+    return nemotronHeadPreparedQMVSource.replacingOccurrences(
+        of: nemotronInProjStoreLoop, with: nemotronInProjStoreLoopRegs) + nemotronMambaInProjConvDtRegsEpilogue
+}
+
 enum NemotronMambaInProjConvDt {
     /// NEMOTRON_MTP_INPROJ_CONV=0 keeps the separate conv/timestep launch.
     static let enabled =
@@ -701,6 +932,58 @@ enum NemotronMambaInProjConvDt {
             source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
     }
     static var dictAvailable: Bool { dictKernel != nil }
+    /// The two launches with the projection's main K loop unrolled by two
+    /// (`nemotronU2Source`, NEMOTRON_U2_INPROJ); the epilogue is unchanged.
+    private static let kernelU2 = nemotronU2Source(
+        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue,
+        loop: NemotronU2.qmvLoop, count: 1).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_u2",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    private static let dictKernelU2 = nemotronU2Source(
+        nemotronSBDictSource(nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue),
+        loop: NemotronU2.qmvLoop, count: 1).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_sbd_u2",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    static var u2Available: Bool { kernelU2 != nil && (dictKernel == nil || dictKernelU2 != nil) }
+
+    /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS=0 keeps the epilogue that reads the
+    /// stored outputs back behind a device fence (see `nemotronInProjRegsSource`).
+    static let regsRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_REGS"] != "0"
+    nonisolated(unsafe) private(set) static var regsVerified = false
+    private static func regsKernel(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        source.map {
+            MLXFast.metalKernel(
+                name: name,
+                inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                             "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+                outputNames: ["y", "conv", "padded", "dt"],
+                source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+        }
+    }
+    private static let kernelRegs = regsKernel("nemotron_mamba_in_proj_conv_dt_rg", nemotronInProjRegsSource())
+    private static let dictKernelRegs = regsKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_rg", nemotronSBDictSource(nemotronInProjRegsSource() ?? ""))
+    private static let kernelU2Regs = regsKernel(
+        "nemotron_mamba_in_proj_conv_dt_u2_rg",
+        nemotronU2Source(nemotronInProjRegsSource(), loop: NemotronU2.qmvLoop, count: 1))
+    private static let dictKernelU2Regs = regsKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_u2_rg",
+        nemotronU2Source(nemotronSBDictSource(nemotronInProjRegsSource() ?? ""), loop: NemotronU2.qmvLoop, count: 1))
+    /// The register-epilogue twin of each record launch, all four built.
+    private static var regsAvailable: Bool {
+        kernelRegs != nil && dictKernelRegs != nil && kernelU2Regs != nil && dictKernelU2Regs != nil
+    }
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
@@ -710,7 +993,7 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -730,7 +1013,15 @@ enum NemotronMambaInProjConvDt {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
-        let outputs = (dict != nil ? dictKernel! : kernel)(
+        let unrolled = (u2 ?? NemotronU2.inProj) ? (dict != nil ? dictKernelU2 : kernelU2) : nil
+        var chosen = unrolled ?? (dict != nil ? dictKernel! : kernel)
+        if regs ?? regsVerified {
+            // The register-epilogue twin of the same launch (same unroll, same dictionary form).
+            let twin = unrolled != nil ? (dict != nil ? dictKernelU2Regs : kernelU2Regs)
+                : (dict != nil ? dictKernelRegs : kernelRegs)
+            if let twin { chosen = twin }
+        }
+        let outputs = chosen(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
@@ -747,6 +1038,90 @@ enum NemotronMambaInProjConvDt {
             return (nemotronBitwiseOrNaN(outputs[0], reference), outputs[1], outputs[2], outputs[3])
         }
         return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+
+    /// NemotronU2 (INPROJ): the unrolled launch against the record launch on
+    /// every Mamba layer's real in_proj, conv and timestep parameters (the
+    /// window's dictionary or plain form), two seeded row sets each, all four
+    /// outputs bit for bit.
+    static func u2Check(_ model: Module) -> (MLXArray, Int)? {
+        guard u2Available else { return nil }
+        var same = MLXArray(true)
+        var cases = 0
+        let keys = MLXRandom.split(key: MLXRandom.key(0x52a1), into: 2)
+        for module in model.modules() {
+            guard let mixer = module as? NemotronHMamba2Mixer, let q = mixer.inProj as? QuantizedLinear,
+                  let convBias = mixer.conv1d.bias else { continue }
+            for key in keys {
+                let x = (MLXRandom.normal([3, 2688], key: key) * 0.5).asType(.bfloat16)
+                let state = (MLXRandom.normal([1, 3, mixer.convDim], key: key) * 0.5).asType(.bfloat16)
+                func run(_ on: Bool) -> [MLXArray]? {
+                    apply(x, q, prepared: nil, oldState: state, convWeight: mixer.conv1d.weight,
+                          convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                          convStart: mixer.intermediateSize, convDim: mixer.convDim, heads: mixer.numHeads,
+                          u2: on).map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                }
+                guard let a = run(false), let b = run(true) else { continue }
+                for (u, v) in zip(a, b) { same = logicalAnd(same, NemotronU2.equal(u, v)) }
+                eval(same)
+                cases += 1
+            }
+        }
+        return cases > 0 ? (same, cases) : nil
+    }
+
+    /// Load time, after `NemotronU2.qualify`: the register-epilogue launch
+    /// against the launch it replaces (the same unroll and dictionary form as
+    /// the verify takes) on every Mamba layer's real in_proj, conv and timestep
+    /// parameters, from the rows and from their prepared activation, two seeded
+    /// row sets and conv states each, all four outputs bit for bit. Engages only
+    /// if every case matches.
+    static func qualifyRegs(_ model: Module) {
+        regsVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp in_proj epilogue regs: \(message)\n".utf8))
+        }
+        guard regsRequested else { return report("off (setting)") }
+        guard enabled, regsAvailable else { return report("off (source not found)") }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let mixer = module as? NemotronHMamba2Mixer, let q = mixer.inProj as? QuantizedLinear,
+                          let convBias = mixer.conv1d.bias else { continue }
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x52c1 + 2 * cases + seed)), into: 2)
+                        let x = (MLXRandom.normal([3, 2688], key: keys[0]) * Float(seed == 0 ? 0.5 : 4))
+                            .asType(.bfloat16)
+                        let state = (MLXRandom.normal([1, 3, mixer.convDim], key: keys[1]) * 0.5)
+                            .asType(.bfloat16)
+                        let prepared = seed == 1 ? NemotronHeadPreparedActivation.pack(x) : nil
+                        func run(_ on: Bool) -> [MLXArray]? {
+                            apply(x, q, prepared: prepared, oldState: state, convWeight: mixer.conv1d.weight,
+                                  convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                  convStart: mixer.intermediateSize, convDim: mixer.convDim,
+                                  heads: mixer.numHeads, regs: on)
+                                .map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                        }
+                        guard let a = run(false), let b = run(true) else { same = MLXArray(false); return }
+                        for (u, v) in zip(a, b) {
+                            same = logicalAnd(same, u.dtype == .float32
+                                ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                        }
+                    }
+                    cases += 1
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        regsVerified = cases > 0 && same.item(Bool.self)
+        report(regsVerified
+            ? "on (\(cases) layers x 2 row sets: projection, conv, padded history and timestep bitwise equal)"
+            : "off (differs from the record epilogue)")
     }
 }
 
@@ -848,30 +1223,92 @@ enum NemotronHeadPreparedActivation {
             + (load != 0 ? nemotronPreparedLoadHeader + (half ? nemotronHalfDecodeThreadHeader : "") : "")
     }
 
+    nonisolated(unsafe) private static var u2Variants: [String: MLXFast.MLXFastKernel?] = [:]
+    /// The unroll-by-two twin (NEMOTRON_U2_HEAD) of the R = 3 prepared kernel
+    /// for (decode form twin, load form, NSG template, dictionary): the same
+    /// body with the pragma ahead of its main K loop, or nil. With load 0 and
+    /// no NSG the body is the crown (`project`) or HF (`projectHalf`) source.
+    static func u2Kernel(half: Bool, load: Int, nsg: Bool, dict: Bool) -> MLXFast.MLXFastKernel? {
+        let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
+            + (nsg ? "_nsg" : "") + (dict ? "_sbd" : "") + "_u2"
+        variantsLock.lock(); defer { variantsLock.unlock() }
+        if let kernel = u2Variants[name] { return kernel }
+        let body = nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)
+        let kernel = nemotronU2Source(dict ? nemotronSBDictSource(body) : body,
+                                      loop: NemotronU2.qmvLoop, count: 1).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+                outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
+        }
+        u2Variants[name] = kernel
+        return kernel
+    }
+
     /// Kernel, extra template arguments, RPS and SIMD groups for one prepared
-    /// launch of `rows` x [K, N] at the caller's RPS.
-    private static func projectLaunch(rows: Int, k: Int, n: Int, rps: Int)
+    /// launch of `rows` x [K, N] at the caller's RPS. `u2` (R = 3): the
+    /// selected kernel's unroll-by-two twin, when built.
+    private static func projectLaunch(rows: Int, k: Int, n: Int, rps: Int, u2: Bool = false)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int) {
         let (kernel, hf) = projectKernel(rows: rows, fast: k % 512 == 0)
         guard rows == 3 else { return (kernel, hf, rps, 2) }
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
-        guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
+        if u2, let twin = u2Kernel(half: !hf.isEmpty, load: load, nsg: nsg, dict: false) {
+            return (twin, hf + extra, geometry.rps, geometry.nsg)
+        }
+        guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
         return (variantKernel(half: !hf.isEmpty, load: load, nsg: nsg), hf + extra, geometry.rps, geometry.nsg)
     }
 
     /// projectLaunch's R = 3 launch with its kernel's dictionary twin, or nil.
-    private static func dictLaunch(k: Int, n: Int, rps: Int)
+    private static func dictLaunch(k: Int, n: Int, rps: Int, u2: Bool = false)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
+        if u2, let twin = u2Kernel(half: !hf.isEmpty, load: load, nsg: nsg, dict: true) {
+            return (twin, hf + extra, geometry.rps, geometry.nsg)
+        }
         guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
         return (kernel, hf + extra, geometry.rps, geometry.nsg)
+    }
+
+    /// The unroll-by-two twin of [K, N]'s R = 3 launch (dictionary or plain form) exists.
+    static func u2Available(k: Int, n: Int, dict: Bool) -> Bool {
+        let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
+        let nsg = (preparedGeometry[[k, n]]?.nsg ?? 2) != 2
+        return u2Kernel(half: !hf.isEmpty, load: loadForm(k: k, n: n), nsg: nsg, dict: dict) != nil
+    }
+
+    /// NemotronU2 (HEAD): the verify head's R = 3 prepared launch (the
+    /// dictionary or plain form the window takes) on the real 131,072-row
+    /// head, unrolled against record over three seeded row sets, bit for bit.
+    static func u2CheckHead(_ model: Module) -> (MLXArray, Int)? {
+        guard let q = model.modules().lazy.compactMap({ $0 as? QuantizedLinear })
+                  .first(where: { $0.weight.shape == [131072, 336] }),
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, q.weight.dtype == .uint32,
+              q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16
+        else { return nil }
+        let k = 2688, n = 131072
+        let dict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil && dictLaunchAvailable(k: k, n: n)
+        guard u2Available(k: k, n: n, dict: dict) else { return nil }
+        var same = MLXArray(true)
+        var cases = 0
+        for key in MLXRandom.split(key: MLXRandom.key(0x52a3), into: 3) {
+            let x = (MLXRandom.normal([3, k], key: key) * 0.5).asType(.bfloat16)
+            let rps = NemotronMultiRowQMV.headRPS(n: n)
+            let a = apply(x, q, relu2: false, rps: rps, u2: false)
+            let b = apply(x, q, relu2: false, rps: rps, u2: true)
+            same = logicalAnd(same, NemotronU2.equal(a, b))
+            eval(same)
+            cases += 1
+        }
+        return (same, cases)
     }
     static func dictLaunchAvailable(k: Int, n: Int) -> Bool {
         dictLaunch(k: k, n: n, rps: 2) != nil
@@ -1004,8 +1441,9 @@ enum NemotronHeadPreparedActivation {
         return prepared
     }
 
+    /// `u2`: the R = 3 launch's unroll-by-two twin (nil: the admitted family, `NemotronU2.prepared`).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
-                      prepared: MLXArray? = nil, sbDict: Bool = true) -> MLXArray {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
@@ -1013,14 +1451,15 @@ enum NemotronHeadPreparedActivation {
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let unroll = rows == 3 && (u2 ?? NemotronU2.prepared(rows: rows, n: n))
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
+           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps, u2: unroll) {
             return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
         }
-        let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
+        let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps, u2: unroll)
         return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
@@ -1137,6 +1576,14 @@ enum NemotronSharedUpPacking {
             outputShapes: [[3, n], [3, (n / 8 + 31) / 32, 9 * 32]],
             outputDTypes: [.bfloat16, .float32])
         return (outputs[0], outputs[1])
+    }
+
+    /// True when `unpackedActivation` would return the prepared QMV's rows for these operands.
+    static func unpackedApplies(_ x: MLXArray, up: Linear, down: Linear) -> Bool {
+        guard verified, !NemotronMoELeader.selfTest, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
+              let q = up as? QuantizedLinear, unpackedEnabled, NemotronSharedDownZSkip.covers(down)
+        else { return false }
+        return unpackedLock.withLock { unpackedOwners.contains(ObjectIdentifier(q)) }
     }
 
     /// The shared relu2 rows [3, N] that `apply` hands the zero-skip shared down on its unpacked route, or nil
@@ -1286,7 +1733,21 @@ private final class NemotronMultiRowQMVKernel: Sendable {
                 inputNames: ["w", "scales", "biases", "x", "K", "N"],
                 outputNames: ["y"], source: $0, header: halfHeader)
         }
+        // `NemotronDraftColaunch`: the R = 1 decode-form twins with one more input, `dep`, bound first and never
+        // read (same source text); it only orders the draft shared down after the routed FC1 in the eval tape.
+        kernelHalfDep = MLXFast.metalKernel(
+            name: "nemotron_multirow_qmv_affine4_gs64_hf_dep",
+            inputNames: ["dep", "w", "scales", "biases", "x", "K", "N"],
+            outputNames: ["y"], source: halfSource, header: halfHeader)
+        kernelHalfDictDep = nemotronSBDictSource(halfSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_multirow_qmv_affine4_gs64_hf_sbd_dep",
+                inputNames: ["dep", "w", "scales", "biases", "x", "K", "N"],
+                outputNames: ["y"], source: $0, header: halfHeader)
+        }
     }
+    let kernelHalfDep: MLXFast.MLXFastKernel
+    let kernelHalfDictDep: MLXFast.MLXFastKernel?
     let kernelHalf: MLXFast.MLXFastKernel
     let attentionOutputAddingHalf: MLXFast.MLXFastKernel
     /// `kernel` and `kernelHalf` reading (scale, bias) through a draft head
@@ -1436,12 +1897,36 @@ enum NemotronMultiRowQMV {
 
     private static func dispatch(_ w: MLXArray, _ scales: MLXArray, _ biases: MLXArray,
                                  _ x: MLXArray, relu2: Bool, rps: Int,
-                                 dict: NemotronSBDict.Dict? = nil) -> MLXArray {
+                                 dict: NemotronSBDict.Dict? = nil, dep: MLXArray? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = w.dim(0)
         let (kArray, nArray) = scalarPair(k, n)
         let form = NemotronMultiRowQMVKernel.r1HalfDecodeForm
         let half = rows == 1 && form != 0
         let kernels = NemotronMultiRowQMVKernel.shared
+        // `dep` (one row, decode form only; `NemotronDraftColaunch`): the selected kernel's `dep` twin.
+        if let dep, rows == 1, half {
+            if let dict {
+                if let twin = kernels.kernelHalfDictDep {
+                    return twin(
+                        [dep, w, dict.index, dict.table, x, kArray, nArray],
+                        template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
+                                   ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
+                        grid: (32, n / rps, 1),
+                        threadGroup: (32, 2, 1),
+                        outputShapes: [[rows, n]],
+                        outputDTypes: [x.dtype])[0]
+                }
+            } else {
+                return kernels.kernelHalfDep(
+                    [dep, w, scales, biases, x, kArray, nArray],
+                    template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0),
+                               ("RELU2", relu2), ("RPS", rps)] + nemotronHalfTemplate(half, form),
+                    grid: (32, n / rps, 1),
+                    threadGroup: (32, 2, 1),
+                    outputShapes: [[rows, n]],
+                    outputDTypes: [x.dtype])[0]
+            }
+        }
         // `dict` (one row only): the selected kernel's dictionary twin.
         if let dict, rows == 1, let twin = half ? kernels.kernelHalfDict : kernels.kernelDict {
             return twin(
@@ -1469,7 +1954,7 @@ enum NemotronMultiRowQMV {
     /// `sbDict`: one row of a draft head tensor reads its admitted pair
     /// dictionary (`NemotronSBDict.draftDict`); false keeps the record kernel.
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false,
-                      prepared: MLXArray? = nil, sbDict: Bool = true) -> MLXArray? {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, dep: MLXArray? = nil) -> MLXArray? {
         guard enabled, x.ndim == 2, (1...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
@@ -1487,7 +1972,8 @@ enum NemotronMultiRowQMV {
         }
         let rps = resultsPerSimdgroup(rows: x.dim(0), k: k, n: n)
         let dict = sbDict && x.dim(0) == 1 ? NemotronSBDict.draftDict(q) : nil
-        let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps, dict: dict)
+        let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps, dict: dict,
+                         dep: x.dim(0) == 1 ? dep : nil)
         guard rps != 4, NemotronMoELeader.selfTest else { return y }
         return nemotronBitwiseOrNaN(
             y, dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: 4))
@@ -1920,6 +2406,71 @@ enum NemotronMTPVerifySDPA {
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out"],
         source: source(), ensureRowContiguous: false)
 
+    /// NEMOTRON_MTP_VERIFY_SDPA_ONE_BARRIER=0 keeps sdpa_vector's aggregation (one barrier for the maxima and
+    /// exp-sums, then two per output value). Otherwise every SIMD group stores its maximum, its exp-sum and
+    /// its four partial outputs (output i in threadgroup slice i) before one barrier, and after it forms the
+    /// same factor, exp-sum and four output sums from the same operands in the same lane order (the slices
+    /// replace the reuse of one slice, so the later barriers are not needed). Used only after
+    /// `qualifyOneBarrier` found both launches bitwise equal to the aggregation they replace.
+    static let oneBarrier =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_VERIFY_SDPA_ONE_BARRIER"] != "0"
+    nonisolated(unsafe) private static var oneBarrierVerified = false
+    private static func oneBarrierSource(_ s: String) -> String? {
+        let scratch = "  threadgroup U outputs[BN * BD];\n"
+        let block = """
+          // First let's communicate the max and sum_exp
+          if (simd_lid == 0) {
+            max_scores[simd_gid] = max_score;
+            sum_exp_scores[simd_gid] = sum_exp_score;
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          max_score = max_scores[simd_lid];
+          U new_max = simd_max(max_score);
+          U factor = fast::exp(max_score - new_max);
+          sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+          // Now we need to aggregate all the outputs
+          for (int i = 0; i < v_per_thread; i++) {
+            outputs[simd_lid * BD + simd_gid] = o[i];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);
+            o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+
+        """
+        guard oneBarrier, s.components(separatedBy: scratch).count == 2,
+              s.components(separatedBy: block).count == 2 else { return nil }
+        return s.replacingOccurrences(of: scratch, with: "  threadgroup U outputs[v_per_thread * BN * BD];\n")
+            .replacingOccurrences(of: block, with: """
+              // One barrier: the maxima, the exp-sums and the four partial
+              // outputs (output i in slice i) are stored first.
+              if (simd_lid == 0) {
+                max_scores[simd_gid] = max_score;
+                sum_exp_scores[simd_gid] = sum_exp_score;
+              }
+              for (int i = 0; i < v_per_thread; i++) {
+                outputs[i * (BN * BD) + simd_lid * BD + simd_gid] = o[i];
+              }
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              max_score = max_scores[simd_lid];
+              U new_max = simd_max(max_score);
+              U factor = fast::exp(max_score - new_max);
+              sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+              for (int i = 0; i < v_per_thread; i++) {
+                o[i] = simd_sum(outputs[i * (BN * BD) + simd_gid * BD + simd_lid] * factor);
+                o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+              }
+
+            """)
+    }
+    private static let oneBarrierKernel = oneBarrierSource(source()).map {
+        MLXFast.metalKernel(
+            name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_1b",
+            inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out"],
+            source: $0, ensureRowContiguous: false)
+    }
+
     /// The launch above whose epilogue also writes the o_proj's prepared
     /// activation of the R rows (`NemotronHeadPreparedActivation.packRows`,
     /// K = 4096, PV = 16): lane 0 of each SIMD group takes its four BF16
@@ -1966,6 +2517,13 @@ enum NemotronMTPVerifySDPA {
         name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_prepared",
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
         source: source() + preparedEpilogue, ensureRowContiguous: false)
+    private static let oneBarrierPreparedKernel = oneBarrierSource(source()).map {
+        MLXFast.metalKernel(
+            name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows")
+                + "_prepared_1b",
+            inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
+            source: $0 + preparedEpilogue, ensureRowContiguous: false)
+    }
     /// The last prepared activation `rows` built, keyed by its first row.
     nonisolated(unsafe) private static var pendingPrepared: (key: ObjectIdentifier, prepared: MLXArray)?
 
@@ -1993,7 +2551,8 @@ enum NemotronMTPVerifySDPA {
     /// switches to the two-pass kernel from 1024 keys ('d'/'s' GPUs) or 4096
     /// (GQA elsewhere), so every row stays below 1024 keys.
     private static func merged(
-        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float,
+        oneBarrier: Bool? = nil
     ) -> MLXArray? {
         let rows = queries.ndim == 4 ? queries.dim(2) : 0
         guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -2003,7 +2562,8 @@ enum NemotronMTPVerifySDPA {
               values.shape == keys.shape, (rows ..< 1024).contains(keys.dim(2)),
               queries.dtype == .bfloat16, keys.dtype == .bfloat16, values.dtype == .bfloat16
         else { return nil }
-        return kernel(
+        let chosen = ((oneBarrier ?? oneBarrierVerified) ? oneBarrierKernel : nil) ?? kernel
+        return chosen(
             [queries, keys, values, scaleArray(scale)],
             template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
             grid: (32 * 1024, 1, rows), threadGroup: (1024, 1, 1),
@@ -2012,11 +2572,13 @@ enum NemotronMTPVerifySDPA {
 
     /// `merged` plus the R = 3 prepared activation from the same launch.
     private static func mergedPrepared(
-        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float,
+        oneBarrier: Bool? = nil
     ) -> (MLXArray, MLXArray)? {
         guard queries.ndim == 4, queries.dim(2) == 3,
               merged(queries, keys, values, scale) != nil else { return nil }
-        let outputs = preparedKernel(
+        let chosen = ((oneBarrier ?? oneBarrierVerified) ? oneBarrierPreparedKernel : nil) ?? preparedKernel
+        let outputs = chosen(
             [queries, keys, values, scaleArray(scale)],
             template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
             grid: (32 * 1024, 1, 3), threadGroup: (1024, 1, 1),
@@ -2133,6 +2695,73 @@ enum NemotronMTPVerifySDPA {
             ? "on (\(checked) cases bitwise equal, key loop \(unroll4 ? "unroll4" : "stock"))"
             : "off (outputs differ from the stock launches after \(checked) cases)")
         if verified { qualifyPrepared(scaleBits.sorted()) }
+        if verified { qualifyOneBarrier(scaleBits.sorted()) }
+    }
+
+    /// Load time: the one-barrier aggregation launches against the launches they replace, bit for bit, on
+    /// seeded inputs at the target's attention scales: the merged launch at R = 2...4 and the prepared launch
+    /// at R = 3 (output rows and prepared activation), key lengths across the 32-key and unroll boundaries up
+    /// to 1023, query/key scales 1 to 16. Engages only if every case matches.
+    private static func qualifyOneBarrier(_ scales: [UInt32]) {
+        oneBarrierVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp verify sdpa one barrier: \(message)\n".utf8))
+        }
+        guard oneBarrier else { return report("off (setting)") }
+        guard oneBarrierKernel != nil, oneBarrierPreparedKernel != nil else {
+            return report("off (aggregation text not found)")
+        }
+        let cases: [(rows: Int, histories: [Int])] = [
+            (3, [0, 1, 29, 30, 31, 92, 93, 94, 125, 126, 127, 254, 488, 552, 616, 1020]),
+            (2, [94, 95, 616, 1021]), (4, [92, 93, 616, 1019]),
+        ]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for bits in scales {
+                    let scale = Float(bitPattern: bits)
+                    for (rows, histories) in cases {
+                        for (i, history) in histories.enumerated() {
+                            let seed = UInt64(0x5d9e_0000 + rows * 256 + i)
+                            let (qScale, kvScale) = inputScales[i % inputScales.count]
+                            let capacity = history + rows + 37
+                            let q = MLXRandom.normal(
+                                [1, rows, 4096], dtype: .bfloat16, scale: qScale, key: MLXRandom.key(seed))
+                            let k = MLXRandom.normal(
+                                [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                                key: MLXRandom.key(seed &+ 0x100))
+                            let v = MLXRandom.normal(
+                                [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                                key: MLXRandom.key(seed &+ 0x200))
+                            let queries = q.reshaped(1, rows, 32, 128).transposed(0, 2, 1, 3)
+                            let keys = k[.ellipsis, ..<(history + rows), 0...]
+                            let values = v[.ellipsis, ..<(history + rows), 0...]
+                            guard let a = merged(queries, keys, values, scale, oneBarrier: false),
+                                  let b = merged(queries, keys, values, scale, oneBarrier: true)
+                            else { return false }
+                            var same = (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                            if rows == 3 {
+                                guard let pa = mergedPrepared(queries, keys, values, scale, oneBarrier: false),
+                                      let pb = mergedPrepared(queries, keys, values, scale, oneBarrier: true)
+                                else { return false }
+                                same = same .&& (pa.0.view(dtype: .uint16) .== pb.0.view(dtype: .uint16)).all()
+                                    .&& (pa.1.view(dtype: .uint32) .== pb.1.view(dtype: .uint32)).all()
+                            }
+                            if !same.item(Bool.self) { return false }
+                            checked += 1
+                        }
+                    }
+                }
+                return true
+            }
+            oneBarrierVerified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(oneBarrierVerified
+            ? "on (\(checked) cases bitwise equal to the stock aggregation, prepared output included at R = 3)"
+            : "off (differs from the stock aggregation after \(checked) cases)")
     }
 
     /// Load-time bit check of `mergedPrepared` (R = 3) against `merged` and
@@ -2458,7 +3087,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) static var draftVerified = false
-    nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) fileprivate static var counter: MLXArray? = nil
     nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
@@ -2615,6 +3244,172 @@ enum NemotronMTPRouterRowsSelect {
     }
 }
 
+// MARK: - Router and shared up in one launch
+//
+// In the captured verify, a MoE layer's router (`NemotronMTPRouterRowsSelect`: 128 gemv threadgroups, the last
+// ticket runs the top-six selection) and its shared-expert up projection with ReLU² (the prepared QMV the
+// zero-skip shared down reads) both read only the layer's input, and only later launches read their results.
+// One launch runs both: threadgroups y < 128 run the router body, the rest the shared up body at eight SIMD
+// groups per threadgroup instead of two (each SIMD group keeps its own rows, loads, order, simd_sum and store).
+// Each body is its kernel's source text with its threadgroup position (and the router's grid size) shadowed and
+// the router's threadgroup arrays declared once at kernel scope. `qualify` compares every layer with the two
+// separate launches bit for bit at load. The separate launches are the default; NEMOTRON_MTP_ROUTER_UP_COLAUNCH=1
+// takes the co-launch.
+enum NemotronRouterSharedUpColaunch {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_UP_COLAUNCH"] == "1"
+        && !NemotronMoELeader.selfTest
+    private static let routerThreadgroups = 128
+    private static let upSimdgroups = 8
+    private static let lock = NSLock()
+    /// Shared up projections whose layer matched the separate launches at load.
+    nonisolated(unsafe) private static var owners: Set<ObjectIdentifier> = []
+
+    private static func source(up: String) -> String {
+        let router = nemotronSwapped(
+            nemotronSwapped(nemotronMTPRouterRowsSource, [
+                ("  constexpr int TM = 4;\n", "  constexpr int TM = 1;\n", 1),
+                ("  threadgroup AccT tgp_memory[R * BN * (blockM + TM)];\n",
+                 "  threadgroup AccT* tgp_memory = nrc_tgp;\n", 1),
+            ]) + nemotronMTPRouterRowsSelectEpilogue, [
+                ("  threadgroup uint nmr_ticket[1];\n", "  threadgroup uint* nmr_ticket = nrc_ticket;\n", 1),
+                ("  threadgroup float nmr_original[R * 128];\n",
+                 "  threadgroup float* nmr_original = nrc_original;\n", 1),
+                ("  threadgroup float nmr_normalized[R * 6];\n",
+                 "  threadgroup float* nmr_normalized = nrc_normalized;\n", 1),
+            ])
+        return """
+          threadgroup float nrc_tgp[R * 8 * 2];
+          threadgroup uint nrc_ticket[1];
+          threadgroup float nrc_original[R * 128];
+          threadgroup float nrc_normalized[R * 6];
+          const uint nrc_tg = threadgroup_position_in_grid.y;
+          if (nrc_tg >= uint(RT)) {
+            const auto w = uw;
+            const auto scales = uscales;
+            const auto biases = ubiases;
+            const int K = UK;
+            const int N = UN;
+            device T* y = uy;
+            const uint3 threadgroup_position_in_grid = uint3(0, nrc_tg - uint(RT), 0);
+          \(up)
+            return;
+          }
+          {
+            const uint3 threadgroup_position_in_grid = uint3(nrc_tg, 0, 0);
+            const uint3 threadgroups_per_grid = uint3(RT, 1, 1);
+          \(router)
+          }
+          """
+    }
+
+    private static func make(_ name: String, up: String?) -> MLXFast.MLXFastKernel? {
+        guard let up else { return nil }
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: ["w", "x", "K", "N", "bias", "counter", "uw", "uscales", "ubiases", "prepared", "UK", "UN"],
+            outputNames: ["y", "indices", "weights", "uy"],
+            source: source(up: up),
+            header: NemotronHRouterSelection.sigmoidHeader + nemotronMultiRowQMVHeader,
+            ensureRowContiguous: true, mutableInputs: ["counter"])
+    }
+    private static let upBody = nemotronPreparedVariantSource(nemotronHeadPreparedQMVSource, load: 0, nsg: true)
+    private static let plainKernel = make("nemotron_router_select_shared_up_r3", up: upBody)
+    private static let dictKernel = make("nemotron_router_select_shared_up_r3_sbd", up: nemotronSBDictSource(upBody))
+
+    /// The router's (indices, weights) and the shared up's ReLU² rows [3, N] of one captured-verify MoE layer,
+    /// or nil when the layer did not qualify (the caller keeps the separate launches).
+    static func run(_ x: MLXArray, gate: NemotronHMoEGate, up: Linear, prepared: MLXArray)
+        -> (indices: MLXArray, weights: MLXArray, up: MLXArray)?
+    {
+        guard enabled, let q = up as? QuantizedLinear,
+              lock.withLock({ owners.contains(ObjectIdentifier(q)) }) else { return nil }
+        return dispatch(x, gate: gate, q: q, prepared: prepared)
+    }
+
+    private static func dispatch(_ x: MLXArray, gate: NemotronHMoEGate, q: QuantizedLinear, prepared: MLXArray)
+        -> (indices: MLXArray, weights: MLXArray, up: MLXArray)?
+    {
+        let k = 2688, n = q.weight.dim(0)
+        guard NemotronMTPRouterRowsSelect.enabled, NemotronMTPRouterRowsSelect.verified,
+              NemotronMTPRouterRowsSelect.rowsPerThreadgroup == 1,
+              let counter = NemotronMTPRouterRowsSelect.counter,
+              gate.topK == 6, gate.nGroup == 1, gate.topkGroup == 1, gate.normTopkProb,
+              gate.routedScalingFactor == 2.5,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 3, k], x.dtype == .bfloat16,
+              gate.weight.dtype == .bfloat16, gate.weight.shape == [128, k],
+              NemotronMTPRouterRows.isRowMajor(gate.weight),
+              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, biases.dtype == .bfloat16, q.scales.dtype == .bfloat16,
+              q.weight.dtype == .uint32, q.weight.shape == [n, k / 8],
+              n % (2 * upSimdgroups) == 0,
+              let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: k)
+        else { return nil }
+        // The separate shared up takes the dictionary twin exactly when this holds.
+        let dict = NemotronSBDict.enabled && NemotronHeadPreparedActivation.dictLaunchAvailable(k: k, n: n)
+            ? NemotronSBDict.dict(q) : nil
+        guard let kernel = dict != nil ? dictKernel : plainKernel else { return nil }
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(k, 128)
+        let (ukArray, unArray) = NemotronMultiRowQMV.scalarPair(k, n)
+        let upGroups = n / (2 * upSimdgroups)
+        let out = kernel(
+            [gate.weight, x, kArray, nArray, gate.eSCB, counter,
+             q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, ukArray, unArray],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", true), ("RPS", 2),
+                       ("NSG", upSimdgroups), ("RT", routerThreadgroups)],
+            grid: (32, 8 * (routerThreadgroups + upGroups), 1), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 128], [1, 3, 6], [1, 3, 6], [3, n]],
+            outputDTypes: [.bfloat16, .uint32, .float32, .bfloat16])
+        return (out[1], out[2], out[3])
+    }
+
+    /// Load time, after `NemotronMTPRouterRowsSelect.qualify` and `NemotronSBDict.prepare`: every MoE layer's
+    /// launch against the router launch and the shared up launch it replaces, bit for bit on the indices, the
+    /// weights and the ReLU² rows, over seeded rows (twice each, so the ticket reset is exercised). Any miss keeps
+    /// every layer on the separate launches.
+    static func qualify(_ model: Module) {
+        lock.withLock { owners = [] }
+        guard enabled, NemotronMTPRouterRowsSelect.verified else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron router+shared up colaunch: \(message)\n".utf8))
+        }
+        var built: Set<ObjectIdentifier> = []
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let moe = module as? NemotronHMoE, let shared = moe.sharedExperts,
+                          let q = shared.upProj as? QuantizedLinear else { continue }
+                    for seed in 0 ..< 2 {
+                        let key = MLXRandom.key(UInt64(0x7a0c + built.count * 4 + seed))
+                        let x = MLXRandom.normal([1, 3, 2688], key: key).asType(.bfloat16)
+                        let packed = NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+                        guard let fused = dispatch(x, gate: moe.gate, q: q, prepared: packed),
+                              let router = NemotronMTPRouterRowsSelect.run(x, moe.gate.weight, bias: moe.gate.eSCB)
+                        else { return false }
+                        let up = NemotronHeadPreparedActivation.apply(
+                            x.reshaped(3, 2688), q, relu2: true, rps: 2, prepared: packed)
+                        let ok = MLX.logicalAnd(MLX.logicalAnd(
+                            (fused.indices .== router.0).all(),
+                            (fused.weights.view(dtype: .uint32) .== router.1.view(dtype: .uint32)).all()),
+                            (fused.up.view(dtype: .uint16) .== up.view(dtype: .uint16)).all())
+                        eval(ok)
+                        guard ok.item(Bool.self),
+                              NemotronMTPRouterRowsSelect.counter?.item(UInt32.self) == 0 else { return false }
+                    }
+                    built.insert(ObjectIdentifier(q))
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        lock.withLock { owners = accepted ? built : [] }
+        report(accepted ? "on (\(built.count) MoE layers bitwise equal)" : "off (differs or failed)")
+    }
+}
+
 /// Put verification tokens on the native *batch* axis, keeping matrix M=1.
 /// A singleton leading weight axis prevents MLX's flatten-to-M optimization
 /// and therefore avoids qmv_wide's different accumulation. The underlying
@@ -2715,6 +3510,45 @@ enum NemotronTargetQKV {
                 + nemotronHeadPreparedQMVSource.replacingOccurrences(of: storeLine, with: storeAndCache)
                 + "\n}",
             header: nemotronMultiRowQMVHeader, mutableInputs: ["kcache", "vcache"])
+    }()
+    // NEMOTRON_MTP_FRONT_KV_DIRECT: the same prepared launch for the MTP head's
+    // post-verify rows, whose K and V tiles also store each BF16 result into the
+    // head cache's paged segment `storage` [2, pages, 2, 16, 128]: row r's token
+    // goes to slot kvdst[2 + 2r] of segment-local page kvdst[1 + 2r], at the
+    // segment write's element address (the value plane kvdst[0] elements after
+    // the key plane). The stored value is the same `h` the body writes to ky/vy.
+    // Thread 0 stores fence[0] = previous[0] + 1, the segment write's fence,
+    // before the body runs. Every other instruction is the prepared body's.
+    private static let storeAndPage = """
+        yp[r * out_vec_size + row] = h;
+                if (tile >= q_tiles) {
+                  const uint n_out = uint(out_row) + uint(row);
+                  const int page = kvdst[1 + 2 * r];
+                  if (page > 0) {
+                    const size_t target = (((size_t)page * 2 + n_out / 128) * 16
+                        + (size_t)kvdst[2 + 2 * r]) * 128 + (n_out % 128);
+                    storage[(tile < q_tiles + kv_tiles ? (size_t)0 : (size_t)uint(kvdst[0])) + target] = h;
+                  }
+                }
+        """
+    private static let pagedFence = """
+      if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+        fence[0] = previous[0] + 1;
+      }
+
+    """
+    private static let preparedWritingPagedKernel: MLXFast.MLXFastKernel = {
+        precondition(nemotronHeadPreparedQMVSource.components(separatedBy: storeLine).count == 2,
+                     "NemotronTargetQKV: prepared body store not unique")
+        return MLXFast.metalKernel(
+            name: "nemotron_target_qkv_prepared_paged_kv_affine4_gs64",
+            inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K",
+                         "storage", "kvdst", "previous"],
+            outputNames: ["qy", "ky", "vy", "fence"],
+            source: pagedFence + tilePrefix
+                + nemotronHeadPreparedQMVSource.replacingOccurrences(of: storeLine, with: storeAndPage)
+                + "\n}",
+            header: nemotronMultiRowQMVHeader, mutableInputs: ["storage"])
     }()
 
     /// Kill switch (code constant; 0 = crown kernel): decode form of the
@@ -2895,6 +3729,57 @@ enum NemotronTargetQKV {
             outputs = zip(outputs, expected).map { nemotronBitwiseOrNaN($0, $1) }
         }
         return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// `apply` for the MTP head's three post-verify rows on the prepared launch `dispatch` selects for them,
+    /// also storing their K/V rows into a paged segment: row r at slot `slots[r]` of segment-local page
+    /// `pages[r]` of `storage` ([2, pages, 2, 16, 128] BF16, the value plane `valueOffset` elements after the
+    /// key plane), the segment write's addresses. `storage` is a mutable input; `fence` (the group's write fence,
+    /// [1] int32) is bound, and the returned fence is fence + 1 from the same launch, so later reads and writes
+    /// order after the stores when it replaces the group's fence. Returns (q, k, v, fence), or nil (nothing
+    /// launched) when the shapes, dtypes, switches or the selected body do not fit.
+    static func applyWritingPaged(
+        _ x: MLXArray, query: Linear, key: Linear, value: Linear, prepared packed: MLXArray?,
+        storage: MLXArray, valueOffset: Int, pages: [Int32], slots: [Int32], fence: MLXArray
+    ) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3, x.dim(2) == 2688, x.dtype == .bfloat16,
+              NemotronMTPExecution.batchedM1, NemotronMultiRowQMV.enabled,
+              preparedEnabled, resultsPerSimdgroup(rows: 3) == 2,
+              NemotronHeadPreparedActivation.qkvLoadForm == 0,
+              NemotronHeadPreparedActivation.decodeForm(rows: 3, fast: false) == nil,
+              storage.dtype == .bfloat16, storage.ndim == 5, storage.dim(0) == 2,
+              storage.shape == [2, storage.dim(1), 2, 16, 128],
+              valueOffset == storage.dim(1) * 2 * 16 * 128, valueOffset < Int(Int32.max),
+              pages.count == 3, slots.count == 3,
+              pages.allSatisfy({ $0 > 0 && Int($0) < storage.dim(1) }),
+              slots.allSatisfy({ (0 ..< 16).contains($0) }),
+              fence.shape == [1], fence.dtype == .int32,
+              let q = buffers(query, rows: 4096), let k = buffers(key, rows: 256),
+              let v = buffers(value, rows: 256)
+        else { return nil }
+        let activations = NemotronHeadPreparedActivation.compatible(packed, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        // [value plane offset, (page, slot) x 3, pad]: eight entries keep the device address space.
+        var destination: [Int32] = [Int32(valueOffset)]
+        for r in 0 ..< 3 {
+            destination += [pages[r], slots[r]]
+        }
+        destination.append(0)
+        var outputs = preparedWritingPagedKernel(
+            q + k + v + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
+                         storage, MLXArray(destination), fence],
+            template: [("T", x.dtype), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)],
+            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 3, 4096], [1, 3, 256], [1, 3, 256], [1]],
+            outputDTypes: [x.dtype, x.dtype, x.dtype, .int32])
+        if NemotronMoELeader.selfTest {
+            let expected = dispatch(q + k + v, x, rps: 4)
+            for i in 0 ..< 3 {
+                outputs[i] = nemotronBitwiseOrNaN(outputs[i], expected[i])
+            }
+        }
+        return (outputs[0], outputs[1], outputs[2], outputs[3])
     }
 
     /// Load-time JIT of the cache-writing launch (scratch caches only).
@@ -3397,6 +4282,115 @@ enum NemotronHeadScreen {
         name: "nemotron_head_screen_partial_record2_affine2",
         inputNames: ["rec", "x", "groups", "groups2"],
         outputNames: ["scores"], source: record2PartialSource)
+
+    // The 2-bit partial pass with the upper rows two per pass. An upper row
+    // has 2 * S2 <= 16 active lanes, so lanes 16..31 take the next row with
+    // lane - 16's half-group: each lane computes the record kernel's partial
+    // for its (row, half-group) with the same statements. The closing sums
+    // keep the record kernel's per-row input: simd_sum over that row's
+    // partials in lanes 0..2 * S2 - 1 and +0.0f in every other lane
+    // (simd_shuffle_down moves the second row's partials into lanes 0..15,
+    // the lane < 16 selects zero the rest), so every score keeps its bits.
+    // The lane's 32 activations load as four 16-byte words when x is 16-byte
+    // aligned (each half converted from T as before; else the scalar loads)
+    // and its two code words as one 8-byte word (S, S2 even). Lower rows keep
+    // the record kernel's one row per pass.
+    private static let record2PairedSource: String? = {
+        var s = record2PartialSource
+        func swap(_ from: String, _ to: String) -> Bool {
+            guard s.components(separatedBy: from).count == 2 else { return false }
+            s = s.replacingOccurrences(of: from, with: to)
+            return true
+        }
+        let lanes = """
+              const int H = upper ? 2 * S2 : 2 * S;
+              const bool on = lane < H;
+              const int gi = lane >> 1;
+              const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
+              const int part = lane & 1;
+
+            """
+        let pairedLanes = """
+              constexpr bool PAIRABLE = 2 * S2 <= 16 && RPS % 2 == 0;
+              const bool paired = PAIRABLE && upper;
+              const int ln = paired ? (lane & 15) : lane;
+              const int H = upper ? 2 * S2 : 2 * S;
+              const bool on = ln < H;
+              const int gi = ln >> 1;
+              const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;
+              const int part = ln & 1;
+
+            """
+        let xLoop = """
+              _Pragma("clang loop unroll(full)")
+              for (int i = 0; i < VPL; i += 8) {
+                _Pragma("clang loop unroll(full)")
+                for (int k = 0; k < 8; k++) {
+                  const float xk = on ? float(xp[i + k]) : 0.0f;
+                  xs += xk;
+                  xv[i + k] = xk / float(1 << (2 * k));
+                }
+              }
+
+            """
+        let wideXLoop = """
+              if ((reinterpret_cast<ulong>(x) & 15) == 0) {
+                const device uint4* xq = (const device uint4*)xp;
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < VPL; i += 8) {
+                  const uint4 xw = xq[i / 8];
+                  const ushort xh[8] = {ushort(xw.x & 0xffffu), ushort(xw.x >> 16), ushort(xw.y & 0xffffu),
+                                        ushort(xw.y >> 16), ushort(xw.z & 0xffffu), ushort(xw.z >> 16),
+                                        ushort(xw.w & 0xffffu), ushort(xw.w >> 16)};
+                  _Pragma("clang loop unroll(full)")
+                  for (int k = 0; k < 8; k++) {
+                    const float xk = on ? float(as_type<T>(xh[k])) : 0.0f;
+                    xs += xk;
+                    xv[i + k] = xk / float(1 << (2 * k));
+                  }
+                }
+              } else {
+
+            """ + xLoop + "  }\n"
+        let codes = "const device uint16_t* ws = (const device uint16_t*)(rp + gi * 4 + part * 2);"
+        let wideCodes = "const uint2 cw = *((const device uint2*)(rp + gi * 4 + part * 2));\n"
+            + "      const uint ws[4] = {cw.x & 0xffffu, cw.x >> 16, cw.y & 0xffffu, cw.y >> 16};"
+        guard swap(lanes, pairedLanes), swap(xLoop, wideXLoop), swap(codes, wideCodes) else { return nil }
+        // The row loop runs to the end of the source (no newline after it).
+        let loopHead = "  _Pragma(\"clang loop unroll(full)\")\n  for (int r = 0; r < RPS; r++) {\n"
+            + "    const int row = row0 + r;\n"
+        let close = "    acc = simd_sum(acc);\n    if (lane == 0) {\n      scores[row] = acc;\n    }\n  }"
+        guard let start = s.range(of: loopHead), let end = s.range(of: close),
+              start.upperBound <= end.lowerBound, s[end.upperBound...].allSatisfy(\.isWhitespace)
+        else { return nil }
+        let body = String(s[start.upperBound..<end.lowerBound])
+        let pairedLoop = "  if (!paired) {\n" + loopHead + body + close + "\n  } else {\n"
+            + "  _Pragma(\"clang loop unroll(full)\")\n  for (int r = 0; r < RPS; r += 2) {\n"
+            + "    const int row = row0 + r + (lane >> 4);\n" + body
+            + "    const float next = simd_shuffle_down(acc, ushort(16));\n"
+            + "    const float first = simd_sum(lane < 16 ? acc : 0.0f);\n"
+            + "    const float second = simd_sum(lane < 16 ? next : 0.0f);\n"
+            + "    if (lane == 0) {\n      scores[row0 + r] = first;\n      scores[row0 + r + 1] = second;\n    }\n"
+            + "  }\n  }\n"
+        s = String(s[..<start.lowerBound]) + pairedLoop
+        return s
+    }()
+    private static let record2PairedKernel = record2PairedSource.map {
+        MLXFast.metalKernel(
+            name: "nemotron_head_screen_partial_record2_paired_affine2",
+            inputNames: ["rec", "x", "groups", "groups2"],
+            outputNames: ["scores"], source: $0)
+    }
+    /// NEMOTRON_MTP_HEAD_SCREEN_PAIRED=0 keeps the record kernel's one row per
+    /// pass for the 2-bit records.
+    static let pairedEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_PAIRED"] != "0"
+    /// The paired pass needs an upper group set of at most 8 groups, even
+    /// group counts (8-byte code words) and an even RPS.
+    static func pairable(groupCount: Int, upperGroupCount: Int?, rowsPerSimdgroup: Int) -> Bool {
+        record2PairedKernel != nil && groupCount % 2 == 0 && rowsPerSimdgroup % 2 == 0
+            && upperGroupCount.map { $0 % 2 == 0 && 2 * $0 <= 16 } ?? true
+    }
     private static let selectKernel = MLXFast.metalKernel(
         name: "nemotron_head_screen_select_affine4_gs64",
         inputNames: ["scores", "w", "scales", "biases", "x"],
@@ -3506,6 +4500,57 @@ enum NemotronHeadScreen {
         header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader,
         mutableInputs: ["counter"])
 
+    /// NEMOTRON_MTP_SCREEN_SELECT_B1=0 keeps the record fused select.
+    static let b1Enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_SELECT_B1"] != "0"
+    // The fused select with one threadgroup barrier fewer (B1). In the record,
+    // SIMD group 0 alone picks the chunk's top C partial scores, stores the ids
+    // to threadgroup memory, and every SIMD group waits at a barrier before the
+    // rescore reads them. Here every SIMD group that rescores rows (sgid * RPSG
+    // < C) runs SIMD group 0's selection itself, with the same statements on the
+    // same scores, and keeps the ids it needs in registers: at pick c, lane c
+    // keeps lane 0's id (SIMD group 0's closing pass reads them as before from
+    // cand[lane]), and the group's own rescore slots r keep it at a constant
+    // register index. The rescore and the closing pass then read the same ids,
+    // so every rescored value, kept id, best and pick are the record's. One
+    // pass of C <= 32 kept rows (C <= NSG * RPSG). Nil when the text moved.
+    private static let fusedSelectB1Source: String? = {
+        var s = fusedSelectSource
+        let swaps: [(String, String)] = [
+            ("  threadgroup int cand[C];\n",
+             "  static_assert(C <= 32 && C <= NSG * RPSG, \"one kept id per lane, one rescore pass\");\n"
+                + "  int nsb_lane_cand = 0;\n  int nsb_row_cand[RPSG];\n"),
+            ("  if (sgid == 0) {\n    float v[P1];\n", "  if (sgid * RPSG < C) {\n    float v[P1];\n"),
+            ("      if (lane == 0) cand[c] = base + mi;\n",
+             "      const int nsb_pick = base + simd_broadcast(mi, ushort(0));\n"
+                + "      if (lane == c) nsb_lane_cand = nsb_pick;\n"
+                + "      _Pragma(\"clang loop unroll(full)\")\n"
+                + "      for (int r = 0; r < RPSG; r++) {\n"
+                + "        if (c == sgid * RPSG + r) nsb_row_cand[r] = nsb_pick;\n      }\n"),
+            ("  }\n  threadgroup_barrier(mem_flags::mem_threadgroup);\n\n  const device uint8_t* wbytes",
+             "  }\n\n  const device uint8_t* wbytes"),
+            ("    for (int row = 0; row < RPSG; row++) {\n      const size_t id = size_t(cand[slot0 + row]);\n",
+             "    _Pragma(\"clang loop unroll(full)\")\n"
+                + "    for (int row = 0; row < RPSG; row++) {\n      const size_t id = size_t(nsb_row_cand[row]);\n"),
+            ("      const int id = cand[s2];\n", "      const int id = nsb_lane_cand;\n"),
+        ]
+        for (old, new) in swaps {
+            guard s.components(separatedBy: old).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        guard !s.contains(" cand["), s.components(separatedBy: "threadgroup_barrier(").count == 2 else { return nil }
+        return s
+    }()
+    private static let fusedSelectB1Kernel = fusedSelectB1Source.map {
+        MLXFast.metalKernel(
+            name: "nemotron_head_screen_select_final_b1_affine4_gs64",
+            inputNames: ["scores", "w", "scales", "biases", "x", "counter"],
+            outputNames: ["cand_ids", "cand_vals", "best_val", "best_id", "out"],
+            source: $0, header: nemotronMultiRowQMVHeader,
+            mutableInputs: ["counter"])
+    }
+    /// The B1 select serves a plan with a fused counter and at most 32 kept rows per chunk.
+    static func b1Available(keep: Int) -> Bool { fusedSelectB1Kernel != nil && keep <= 32 }
+
     /// The fused select's ticket counter: one zeroed uint32, allocated once
     /// per screen plan, which every fused dispatch returns to 0. MLX treats
     /// a mutable input as that dispatch's output, so it puts a barrier
@@ -3535,8 +4580,8 @@ enum NemotronHeadScreen {
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
-        counter: MLXArray? = nil,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        counter: MLXArray? = nil, paired: Bool = false,
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, b1: Bool = false
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
@@ -3545,8 +4590,12 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
+        let record2Kernel = paired
+            && pairable(groupCount: groupCount, upperGroupCount: upperGroups == nil ? nil : upperGroupCount,
+                        rowsPerSimdgroup: rowsPerSimdgroup)
+            ? record2PairedKernel ?? record2PartialKernel : record2PartialKernel
         let scores = (records2.map {
-            record2PartialKernel(
+            record2Kernel(
                 [$0, hidden, groups, upperGroups ?? groups], template: template,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
                 outputShapes: [[rows]], outputDTypes: [.float32])
@@ -3568,7 +4617,9 @@ enum NemotronHeadScreen {
         let selectGroups = 8
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
-            let picked = (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)(
+            let fused = (b1 && !selectHalf && b1Available(keep: keep) ? fusedSelectB1Kernel : nil)
+                ?? (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)
+            let picked = fused(
                 [scores, weight, scales, biases, hidden, counter],
                 template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", selectGroups),
                            ("NCH", chunks)] + nemotronHalfTemplate(selectHalf, selectHalfDecodeForm),

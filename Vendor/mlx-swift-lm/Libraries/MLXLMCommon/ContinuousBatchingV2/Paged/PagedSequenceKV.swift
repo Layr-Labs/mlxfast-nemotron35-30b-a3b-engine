@@ -439,6 +439,22 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             writeGeneration &+= 1
             return
         }
+        let slots = reserveWrite(n)
+        pool.writeTokens(group: groupKey, slots: slots, keys: keys, values: values)
+
+        absoluteOffset += n
+        writtenHighWater = max(writtenHighWater, absoluteOffset)
+        writeGeneration &+= 1
+        if CBv2CriticalPathCuts.selfTest, CBv2CriticalPathCuts.stridedSegmentWrite, windowSize == nil {
+            selfTestReadBack(start: absoluteOffset - n, keys: keys, values: values)
+        }
+    }
+
+    /// `write`'s checks and page reservation for `n` tokens at the frontier (past any frozen region): the
+    /// physical destination (page * pageSize + slot) of each token, in order. Moves nothing: the frontier,
+    /// high-water mark and generation advance only once the tokens are stored. Allocating the pages is
+    /// idempotent, so a caller that does not store here may still append the same tokens with `write`.
+    private func reserveWrite(_ n: Int) -> [Int32] {
         precondition(
             absoluteOffset >= frozenHighWater,
             "frozen replay chunk crosses M (\(absoluteOffset) + \(n) vs \(frozenHighWater)) "
@@ -463,14 +479,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             let physical = ensurePage(logicalPage: pos / s)
             slots.append(physical * Int32(s) + Int32(pos % s))
         }
-        pool.writeTokens(group: groupKey, slots: slots, keys: keys, values: values)
-
-        absoluteOffset += n
-        writtenHighWater = max(writtenHighWater, absoluteOffset)
-        writeGeneration &+= 1
-        if CBv2CriticalPathCuts.selfTest, CBv2CriticalPathCuts.stridedSegmentWrite, windowSize == nil {
-            selfTestReadBack(start: absoluteOffset - n, keys: keys, values: values)
-        }
+        return slots
     }
 
     /// Reserve the destination for ONE decode token and advance the
@@ -841,5 +850,163 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         table.removeAll()
         tableVersion += 1
         pool.unreserve([groupKey: reservedPages])
+    }
+}
+
+// MARK: - Direct reads (the MTP draft attention)
+
+/// The operands of one single-segment read of a row's attendable range: what `snapshot()`'s gather reads,
+/// without launching it (`PagedSequenceKV.directRead`). Key/value `i` of the range (0 ..< `count`, oldest first)
+/// is slot `(firstSlot + i) % pageSize` of local page `pages[(firstSlot + i) / pageSize]` of `storage`: the key
+/// plane element `((page * kvHeads + head) * pageSize + slot) * headDim + d`, the value plane the same plus
+/// `valueOffset` (the segment read's addressing).
+public struct CBv2PagedDirectRead {
+    /// The segment's `[2, pages, kvHeads, pageSize, headDim]` storage holding every page of the range.
+    public let storage: MLXArray
+    public let valueOffset: Int
+    /// `[pageCount]` int32: the segment-local page of each logical page of the range, in order.
+    public let pages: MLXArray
+    public let firstSlot: Int
+    public let count: Int
+    public let kvHeads: Int
+    public let headDim: Int
+    public let pageSize: Int
+    public let dtype: DType
+    /// The row's `absoluteOffset` when the operands were taken.
+    public let offset: Int
+    /// The group's write fence when the operands were taken: bind it to the reading launch so the read orders
+    /// after every prior write of the group (the edge `snapshot()`'s gather takes).
+    public let writeFence: MLXArray
+
+    public init(storage: MLXArray, valueOffset: Int, pages: MLXArray, firstSlot: Int, count: Int, kvHeads: Int,
+                headDim: Int, pageSize: Int, dtype: DType, offset: Int, writeFence: MLXArray) {
+        self.storage = storage
+        self.valueOffset = valueOffset
+        self.pages = pages
+        self.firstSlot = firstSlot
+        self.count = count
+        self.kvHeads = kvHeads
+        self.headDim = headDim
+        self.pageSize = pageSize
+        self.dtype = dtype
+        self.offset = offset
+        self.writeFence = writeFence
+    }
+}
+
+extension PagedSequenceKV {
+    /// The attendable range's direct-read operands, or nil where `snapshot()` would not be one single-segment read
+    /// (no segment layout, a range spanning segments, an empty range). Reads the row's table and the group's
+    /// state; changes nothing.
+    public func directRead() -> CBv2PagedDirectRead? {
+        let count = retainedCount
+        let start = absoluteOffset - count
+        guard count > 0, start >= baseOffset, start >= oldestValidPosition else { return nil }
+        let group = pool.group(groupKey)
+        guard let layout = group.segmentLayout else { return nil }
+        let s = pool.config.pageSize
+        guard s == group.pageSize else { return nil }
+        let lpFirst = start / s
+        let lpLast = (start + count - 1) / s
+        var local: [Int32] = []
+        local.reserveCapacity(lpLast - lpFirst + 1)
+        var segmentIndex: Int? = nil
+        for lp in lpFirst ... lpLast {
+            let idx = ringPages.map { lp % $0 } ?? lp
+            guard idx < table.count else { return nil }
+            let page = table[idx]
+            guard group.isAllocatable(page) else { return nil }
+            let index = layout.segmentIndex(page: page)
+            if let segmentIndex, segmentIndex != index { return nil }
+            segmentIndex = index
+            local.append(Int32(layout.localPage(page)))
+        }
+        guard let segmentIndex, let segment = group.segments[segmentIndex] else { return nil }
+        return CBv2PagedDirectRead(
+            storage: segment.storage, valueOffset: segment.valueOffset, pages: MLXArray(local),
+            firstSlot: start % s, count: count, kvHeads: groupKey.kvHeads, headDim: groupKey.headDim,
+            pageSize: s, dtype: group.dtype, offset: absoluteOffset, writeFence: group.writeFence)
+    }
+
+    /// After a launch that read `directRead()`'s storage, fold one element of its output into the group's write
+    /// fence: the back-edge `snapshot()`'s gather publishes, so every later write of the group orders after that
+    /// read. The fence keeps its value (`* 0` in int32).
+    public func publishDirectRead(_ output: MLXArray) {
+        guard output.size > 0 else { return }
+        let group = pool.group(groupKey)
+        let probe = output.reshaped(-1)[0]
+        group.writeFence = group.writeFence + probe.asType(group.writeFence.dtype) * 0
+    }
+}
+
+// MARK: - Direct writes (the MTP post-verify rows)
+
+/// Where a row's next `count` tokens go when a launch stores their K/V itself instead of the segment write
+/// (`PagedSequenceKV.directWrite`). Token i's key element (head, d) is the key-plane element
+/// `((pages[i] * kvHeads + head) * pageSize + slots[i]) * headDim + d` of `storage` (`pages[i]` segment-local)
+/// and its value element the same plus `valueOffset`: the segment write's addresses. Bind `writeFence` to the
+/// launch, so the stores order after every prior write and published read of the group (the edge the segment
+/// write takes), and hand the launch's successor fence to `commitDirectWrite`.
+public struct CBv2PagedDirectWrite {
+    /// The segment's `[2, pages, kvHeads, pageSize, headDim]` storage holding every destination page.
+    public let storage: MLXArray
+    public let valueOffset: Int
+    public let pages: [Int32]
+    public let slots: [Int32]
+    public let kvHeads: Int
+    public let headDim: Int
+    public let pageSize: Int
+    public let dtype: DType
+    /// The group's write fence at the reservation.
+    public let writeFence: MLXArray
+    public var count: Int { pages.count }
+    /// The row's frontier and write generation at the reservation (`commitDirectWrite` requires both).
+    let offset: Int
+    let generation: UInt64
+}
+
+extension PagedSequenceKV {
+    /// Reserve the destination of `n` tokens at the frontier with `write`'s checks and page reservation, without
+    /// dispatching anything and without moving the frontier: nil where the segment write would not be one
+    /// single-segment dispatch (no segment layout, destinations in two segments) or the pool is faulted or the
+    /// tokens fall in a frozen region. Pages it reserves stay reserved either way, as `write` would reserve them.
+    public func directWrite(_ n: Int) -> CBv2PagedDirectWrite? {
+        guard n > 0, !pool.writeValidation.isFaulted, absoluteOffset >= frozenHighWater else { return nil }
+        let group = pool.group(groupKey)
+        guard let layout = group.segmentLayout, group.pageSize == pool.config.pageSize else { return nil }
+        let reserved = reserveWrite(n)
+        var pages: [Int32] = []
+        var slots: [Int32] = []
+        var segmentIndex: Int? = nil
+        for position in reserved {
+            let page = position / Int32(group.pageSize)
+            guard group.isAllocatable(page) else { return nil }
+            let index = layout.segmentIndex(page: page)
+            if let segmentIndex, segmentIndex != index { return nil }
+            segmentIndex = index
+            pages.append(Int32(layout.localPage(page)))
+            slots.append(position % Int32(group.pageSize))
+        }
+        guard let segmentIndex, let segment = group.segments[segmentIndex] else { return nil }
+        return CBv2PagedDirectWrite(
+            storage: segment.storage, valueOffset: segment.valueOffset, pages: pages, slots: slots,
+            kvHeads: groupKey.kvHeads, headDim: groupKey.headDim, pageSize: group.pageSize, dtype: group.dtype,
+            writeFence: group.writeFence, offset: absoluteOffset, generation: writeGeneration)
+    }
+
+    /// After the launch that stored `write`'s tokens: what `write` does once its dispatch is encoded. The
+    /// frontier, high-water mark and generation advance, and the group's write fence becomes `fence` (the
+    /// launch's successor of `write.writeFence`), so every later read and write of the group orders after the
+    /// stores. Nothing may have written the row or moved the group's fence since the reservation.
+    public func commitDirectWrite(_ write: CBv2PagedDirectWrite, fence: MLXArray) {
+        let group = pool.group(groupKey)
+        precondition(
+            write.offset == absoluteOffset && write.generation == writeGeneration
+                && group.writeFence === write.writeFence,
+            "[PagedSequenceKV] direct write committed after the row or the group's fence moved")
+        absoluteOffset += write.count
+        writtenHighWater = max(writtenHighWater, absoluteOffset)
+        writeGeneration &+= 1
+        group.writeFence = fence
     }
 }
