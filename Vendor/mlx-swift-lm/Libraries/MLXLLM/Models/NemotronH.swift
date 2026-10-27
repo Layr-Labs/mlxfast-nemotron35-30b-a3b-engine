@@ -183,6 +183,10 @@ enum NemotronHResidualRMSNorm {
         outputNames: ["residual", "normalized", "prepared"],
         source: preparedSource(), ensureRowContiguous: true)
 
+    /// Measurement probe (NEMOTRON_JOIN_TWICE=0 restores one launch): every residual + RMS join in front of a
+    /// MoE layer is launched twice in a row, to price one dependent join launch on the box.
+    static let joinTwice = ProcessInfo.processInfo.environment["NEMOTRON_JOIN_TWICE"] != "0"
+
     static func applyPrepared(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray, MLXArray)?
     {
@@ -195,11 +199,21 @@ enum NemotronHResidualRMSNorm {
             type(of: norm) == RMSNorm.self,
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
-        let outputs = preparedKernel([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
+        var outputs = preparedKernel([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
+        if joinTwice {
+            // Measurement probe: the same join launched a second time, ordered after the first through a
+            // dependency on its residual output; the second launch's outputs are the ones used (same values).
+            let ordered = MLX.depends(inputs: [outputs[0], lhs], dependencies: [outputs[0]])
+            outputs = preparedKernel([ordered[1], rhs, norm.weight, UInt32(2688), norm.eps],
+                template: [("T", DType.bfloat16)],
+                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
+                outputDTypes: [.bfloat16, .bfloat16, .float32])
+        }
         if NemotronMoELeader.selfTest, let expected = apply(lhs, rhs, norm: norm) {
             return (nemotronBitwiseOrNaN(outputs[0], expected.0),
                     nemotronBitwiseOrNaN(outputs[1], expected.1), outputs[2])
