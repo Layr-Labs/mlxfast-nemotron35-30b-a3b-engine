@@ -133,6 +133,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
+        // Then the seed's dense projections through a tuned tile.
+        NemotronSeedDenseTune.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().

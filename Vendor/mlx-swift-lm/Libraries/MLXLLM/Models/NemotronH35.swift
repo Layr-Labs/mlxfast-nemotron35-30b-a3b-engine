@@ -879,3 +879,341 @@ enum NemotronSeedRetile {
             + " fc1 \(detail(0)); fc2 \(detail(1)))")
     }
 }
+
+// MARK: - Seed dense tune (S2)
+
+/// B source for the shared down's tile-major decode copy (codes as
+/// `NemotronSeedCopy`) with its tile-major BF16 scales and biases, widened to
+/// FP32 as the shared-down copy loader widens them.
+private let nemotronSeedDenseSource = #"""
+template <typename T>
+struct NemotronSeedCopySB {
+  const device uint16_t* codes;
+  const device T* scales;
+  const device T* biases;
+  int K;
+
+  METAL_FUNC void expert(const uint index, const int N) thread {
+    codes += size_t(index) * size_t(N / 128) * size_t(K) * 32;
+    scales += size_t(index) * size_t(N / 128) * size_t(K / 64) * 128;
+    biases += size_t(index) * size_t(N / 128) * size_t(K / 64) * 128;
+  }
+  METAL_FUNC float2 sb(const int n, const int g) const thread {
+    const size_t o = (size_t(n / 128) * size_t(K / 64) + size_t(g)) * 128 + size_t(n % 128);
+    return float2(float(scales[o]), float(biases[o]));
+  }
+  METAL_FUNC uint8_t byte(const int n, const int k) const thread {
+    const device uint16_t* c =
+        codes + (size_t(n / 128) * size_t(K) + size_t(k)) * 32 + size_t((n % 128) / 4);
+    const short o = short(n % 4);
+    const uint lo = (uint(c[0]) >> (4 * o)) & 0xfu;
+    const uint hi = (uint(c[32]) >> (4 * o)) & 0xfu;
+    return uint8_t(lo | (hi << 4));
+  }
+};
+"""#
+
+/// Seed-only (request prefill) dense projections through the retiled run
+/// gather (`nemotron_seed_gather_impl`) with a tile chosen once at load: each
+/// Mamba layer's input and output projections and each MoE layer's shared
+/// expert up (typed ReLU2 store) and down projections, wherever the seed runs
+/// them through their run-gather clones today (`NemotronPrefillDenseDict`,
+/// `NemotronPrefillSharedDownCopy`). A variant reads the clone's weights (the
+/// pair dictionary, or the shared down's tile-major decode copy) and keeps each
+/// output's NAX MMA sequence over k chunks 0..K/16 in order; it changes only
+/// the row-tile height BM (the launch's row descriptors), BN, BK, the
+/// SIMD-group grid and whether B passes through threadgroup memory. `tune`
+/// (load time, after the routed retile) compares each variant the role offers
+/// (`Role.offered`) with the clone bit for bit on seeded rows (every layer of
+/// the role in the first case), drops any mismatch or Metal error, times the survivors and the clone round
+/// robin as a dependent chain over every layer of the role (each launch waits
+/// for the previous one through a small elementwise launch, and the weights
+/// cycle through all layers), and adopts the fastest only if it is at least 6%
+/// faster than the clone. NEMOTRON_SEED_DENSE_TUNE=0 keeps the clones;
+/// NEMOTRON_SEED_DENSE_TUNE_FORCE=<variant> (every role) or
+/// <role>=<variant>,... adopts a variant that qualifies.
+enum NemotronSeedDenseTune {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_TUNE"] != "0"
+    static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_TUNE_FORCE"]
+
+    struct Variant: Sendable, Equatable {
+        let name: String
+        let bm: Int, bn: Int, bk: Int, wm: Int, wn: Int
+        let direct: Bool
+        var threads: Int { wm * wn * 32 }
+    }
+
+    /// The pool. Name = m + BM, then the retile's naming (ws: B through
+    /// threadgroup memory, d: B dequantized into the fragments; BN (x BK);
+    /// WM WN). The clones run m64ws64x64w22's tiling with their own loader.
+    /// Each role offers the tuner only `Role.offered`; the force switch can
+    /// name any pool variant.
+    static let variants: [Variant] = [
+        Variant(name: "m64ws64x64w22", bm: 64, bn: 64, bk: 64, wm: 2, wn: 2, direct: false),
+        Variant(name: "m64ws64x128w22", bm: 64, bn: 64, bk: 128, wm: 2, wn: 2, direct: false),
+        Variant(name: "m64ws128x64w24", bm: 64, bn: 128, bk: 64, wm: 2, wn: 4, direct: false),
+        Variant(name: "m64d64w22", bm: 64, bn: 64, bk: 64, wm: 2, wn: 2, direct: true),
+        Variant(name: "m64d128w24", bm: 64, bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "m128ws64x64w42", bm: 128, bn: 64, bk: 64, wm: 4, wn: 2, direct: false),
+        Variant(name: "m128ws64x64w22", bm: 128, bn: 64, bk: 64, wm: 2, wn: 2, direct: false),
+        Variant(name: "m128ws128x64w44", bm: 128, bn: 128, bk: 64, wm: 4, wn: 4, direct: false),
+        Variant(name: "m128ws64x128w42", bm: 128, bn: 64, bk: 128, wm: 4, wn: 2, direct: false),
+        Variant(name: "m32ws64x64w12", bm: 32, bn: 64, bk: 64, wm: 1, wn: 2, direct: false),
+        Variant(name: "m32ws128x64w14", bm: 32, bn: 128, bk: 64, wm: 1, wn: 4, direct: false),
+    ]
+
+    /// The four dense projections, named as the clones' kinds.
+    enum Role: String, CaseIterable, Sendable {
+        case inProj = "in_proj", outProj = "out_proj", up = "up_proj", down = "down_proj"
+        var relu2: Bool { self == .up }
+        /// The pool variants this role offers to the tuner: the clone's
+        /// tiling through the retile's loader, and the same with BK 128. The
+        /// shared down offers none.
+        var offered: [String] { self == .down ? [] : ["m64ws64x64w22", "m64ws64x128w22"] }
+    }
+
+    /// Fewest rows the qualify covers.
+    static let minRows = 17
+    nonisolated(unsafe) static var choices: [Role: Variant] = [:]
+    /// The target projections the choices qualified on.
+    nonisolated(unsafe) private static var owners: Set<ObjectIdentifier> = []
+
+    private static func makeKernel(copy: Bool) -> MLXFast.MLXFastKernel {
+        let make = copy ? "NemotronSeedCopySB<T> b{w, scales, biases, K};"
+            : "NemotronSeedDict<T> b{(const device uint8_t*)w, scales, biases, K};"
+        return MLXFast.metalKernel(
+            name: copy ? "nemotron_seed_dense_copy_sb" : "nemotron_seed_dense_dict",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[DIRECT_B ? 1 : BN * (BK + 16 / sizeof(T))];
+                \(make)
+                nemotron_seed_gather_impl<T, BM, BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, false>(
+                    x, (const device uint32_t*)tiles, b, tiles, y, N, K, Ws,
+                    threadgroup_position_in_grid,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            """,
+            header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource + "\n" + nemotronSeedDenseSource)
+    }
+
+    private static let dictKernel = makeKernel(copy: false)
+    private static let copyKernel = makeKernel(copy: true)
+
+    /// One variant on the clone's weights; nil wherever the clone would not run.
+    static func launch(_ v: Variant, role: Role, x: MLXArray, linear: Linear) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, let q = linear as? QuantizedLinear,
+              type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              !role.relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+              q.weight.dtype == .uint32, q.weight.ndim == 2
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 32 == 0 else { return nil }
+        let kernel: MLXFast.MLXFastKernel
+        let operands: [MLXArray]
+        if role == .down {
+            guard nOut % 128 == 0, let copy = NemotronSharedDownZSkip.copyArrays(for: linear),
+                  copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+                  copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
+                  copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
+            else { return nil }
+            (kernel, operands) = (copyKernel, [copy.codes, copy.scales, copy.biases])
+        } else {
+            guard let d = NemotronSBDict.dict(q), d.index.shape == [nOut, k / 64], d.index.dtype == .uint16,
+                  d.table.dtype == .float32
+            else { return nil }
+            (kernel, operands) = (dictKernel, [q.weight.expandedDimensions(axis: 0),
+                                               d.index.expandedDimensions(axis: 0), d.table])
+        }
+        // Row tiles of BM over the tokens, at least three descriptors (as the
+        // clones); a zero-row descriptor is skipped.
+        let used = (rows + v.bm - 1) / v.bm
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * v.bm), Int32(min(v.bm, rows - t * v.bm)), 0] : [0, 0, 0]
+        }
+        var inputs: [any ScalarOrArray] = [x.reshaped(rows, 1, k)] + operands
+        inputs += [MLXArray(desc).reshaped(count, 3), nOut, k]
+        let y = kernel(
+            inputs,
+            template: [("T", x.dtype), ("BM", v.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2)],
+            grid: (((nOut + v.bn - 1) / v.bn) * v.threads, count, 1), threadGroup: (v.threads, 1, 1),
+            outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(1, rows, nOut)
+    }
+
+    /// From the clones' `apply` (already request prefill only): the adopted
+    /// variant, only on a projection it qualified on.
+    static func apply(_ x: MLXArray, _ linear: Linear, kind: String) -> MLXArray? {
+        guard !choices.isEmpty, let role = Role(rawValue: kind), let v = choices[role],
+              owners.contains(ObjectIdentifier(linear)), x.ndim == 3, x.dim(1) >= minRows
+        else { return nil }
+        return launch(v, role: role, x: x, linear: linear)
+    }
+
+    /// The clone the seed launches today for `role`.
+    private static func incumbent(_ role: Role, x: MLXArray, linear: Linear) -> MLXArray? {
+        role == .down ? NemotronPrefillSharedDownCopy.launch(x, linear)
+            : NemotronPrefillDenseDict.launch(x, linear, relu2: role.relu2)
+    }
+
+    private static func forcedName(_ role: Role) -> String? {
+        var every: String? = nil
+        for item in (forced ?? "").split(separator: ",") {
+            let parts = item.split(separator: "=", maxSplits: 1).map(String.init)
+            if parts.count == 2, parts[0] == role.rawValue { return parts[1] }
+            if parts.count == 1 { every = parts[0] }
+        }
+        return every
+    }
+
+    static func tune(_ target: Module) {
+        choices = [:]
+        owners = []
+        let started = DispatchTime.now().uptimeNanoseconds
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron seed dense tune: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather else { return report("off (setting)") }
+        var picks: [String] = []
+        var details: [String] = []
+        for (roleIndex, role) in Role.allCases.enumerated() {
+            let admitted = role == .down ? NemotronPrefillSharedDownCopy.verified
+                : NemotronPrefillDenseDict.kinds.contains(role.rawValue)
+            let all = role == .down
+                ? target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }
+                : NemotronPrefillDenseDict.linears(target, kind: role.rawValue)
+            let pool = variants.filter { role.offered.contains($0.name) || forcedName(role) == $0.name }
+            guard admitted, !pool.isEmpty, let first = all.first as? QuantizedLinear else {
+                picks.append("\(role.rawValue) V0")
+                details.append("\(role.rawValue) off (\(admitted ? "no variant offered" : "no clone"))")
+                continue
+            }
+            let k = first.weight.dim(1) * 8
+
+            // Seeded rows (case 1 at large magnitudes); the shared down's
+            // input is ReLU2-like rows, mostly exact zeros, as its clone's qualify.
+            let cases: [MLXArray]
+            do {
+                cases = try withError { () -> [MLXArray] in
+                    let made = [488, 488, 300, 97, minRows].enumerated().map { index, rows -> MLXArray in
+                        var a = MLXRandom.normal([1, rows, k], scale: 2,
+                                                 key: MLXRandom.key(UInt64(0xde5e_0000 + 16 * roleIndex + index)))
+                        if index == 1 { a = a * 40 }
+                        if role == .down, index != 1 {
+                            a = MLX.maximum(a - 1.5, MLXArray(Float(0)))
+                            a = a * a
+                        }
+                        return a.asType(.bfloat16)
+                    }
+                    eval(made)
+                    return made
+                }
+            } catch {
+                picks.append("\(role.rawValue) V0")
+                details.append("\(role.rawValue) off (inputs: \(error))")
+                continue
+            }
+
+            // Qualify: bit for bit against the clone; any mismatch or error drops a variant.
+            var alive = pool
+            var dropped: [String] = []
+            caseLoop: for (ci, x) in cases.enumerated() {
+                for linear in (ci == 0 ? all : [first]) {
+                    let reference = try? withError { () -> MLXArray? in
+                        guard let out = incumbent(role, x: x, linear: linear) else { return nil }
+                        eval(out)
+                        return out
+                    }
+                    guard let reference = reference ?? nil else {
+                        dropped.append("clone unavailable")
+                        alive = []
+                        break caseLoop
+                    }
+                    alive = alive.filter { v in
+                        do {
+                            let same = try withError { () -> Bool in
+                                guard let out = launch(v, role: role, x: x, linear: linear) else { return false }
+                                return (out.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()
+                                    .item(Bool.self)
+                            }
+                            if !same { dropped.append("\(v.name) differs@\(ci)") }
+                            return same
+                        } catch {
+                            dropped.append("\(v.name) error")
+                            return false
+                        }
+                    }
+                    if alive.isEmpty { break caseLoop }
+                }
+            }
+
+            // Time the clone and the survivors round robin on the 488-row case
+            // as one dependent chain over every layer of the role per
+            // repetition (cold weights; each launch waits for the previous one,
+            // as in the seed); median ms per layer of 10 after 5 warm-up.
+            var choice: Variant? = nil
+            var times: [String] = []
+            if let name = forcedName(role) {
+                choice = alive.first { $0.name == name }
+            } else if !alive.isEmpty {
+                let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
+                var samples = Array(repeating: [Double](), count: candidates.count)
+                do {
+                    try withError {
+                        for rep in 0 ..< 15 {
+                            for (i, candidate) in candidates.enumerated() {
+                                let start = DispatchTime.now().uptimeNanoseconds
+                                var x = cases[0]
+                                var complete = true
+                                for linear in all {
+                                    let out = candidate.map { launch($0, role: role, x: x, linear: linear) }
+                                        ?? incumbent(role, x: x, linear: linear)
+                                    guard let y = out else {
+                                        complete = false
+                                        break
+                                    }
+                                    x = x + y[0..., 0..., ..<1] * 0
+                                }
+                                eval(x)
+                                Stream.gpu.synchronize()
+                                let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                                if rep >= 5, complete {
+                                    samples[i].append(Double(elapsed) / 1e6 / Double(all.count))
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    dropped.append("timing error")
+                }
+                if samples.allSatisfy({ $0.count == 10 }) {
+                    let medians = samples.map { $0.sorted()[$0.count / 2] }
+                    times = zip(candidates, medians).map {
+                        "\($0?.name ?? "V0") \(String(format: "%.3f", $1))"
+                    }
+                    if let best = medians.indices.dropFirst().min(by: { medians[$0] < medians[$1] }),
+                       medians[best] <= 0.94 * medians[0] {
+                        choice = candidates[best]
+                    }
+                }
+            }
+            if let choice {
+                choices[role] = choice
+                owners.formUnion(all.map { ObjectIdentifier($0) })
+            }
+            picks.append("\(role.rawValue) \(choice?.name ?? "V0")")
+            details.append("\(role.rawValue) \(alive.count)/\(pool.count) bitwise"
+                + (times.isEmpty ? "" : " [" + times.joined(separator: ", ") + "]")
+                + (dropped.isEmpty ? "" : " dropped: " + dropped.prefix(8).joined(separator: ", ")))
+        }
+        let seconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e9
+        report(picks.joined(separator: ", ")
+            + " (ms per layer, 488 rows, dependent chain over every layer, median of 10; "
+            + details.joined(separator: "; ") + String(format: "; %.1f s)", seconds))
+    }
+}
