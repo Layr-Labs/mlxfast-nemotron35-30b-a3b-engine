@@ -106,6 +106,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillCombineAdd.qualify()
         NemotronPrefillSharedRelu2.qualify(target)
         NemotronPrefillDirectFC1.qualify(target)
+        NemotronPrefillDirectFC1.qualifyDict(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
@@ -410,19 +411,36 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 copies[n] = [copy.codes, copy.scales, copy.biases]
             }
         }
+        // With `NemotronPrefillDirectFC1.dictVerified`, the request prefill's fc1 reads the bank's pair
+        // dictionary (as the decode does) instead of its BF16 scales and biases.
+        var fc1Dicts: [Int: [MLXArray]] = [:]
+        if NemotronPrefillDirectFC1.dictVerified {
+            for (name, module) in model.namedModules() {
+                let parts = name.split(separator: ".")
+                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
+                      let moe = module as? NemotronHMoE,
+                      let d = NemotronSBDict.dict(moe.switchMLP.fc1) else { continue }
+                fc1Dicts[n] = [d.index, d.table]
+            }
+        }
         var groups: [Int: [MLXArray]] = [:]
         for (key, a) in model.parameters().flattened() {
             let parts = key.split(separator: ".")
             var g = Int.max
             if parts.contains("embeddings") { g = -1 }
             if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
-            if copies[g] != nil, let s = parts.firstIndex(of: "switch_mlp"), s + 1 < parts.count,
-               parts[s + 1] == "fc2" {
-                continue
+            if let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
+                if copies[g] != nil, parts[s + 1] == "fc2" { continue }
+                if fc1Dicts[g] != nil, parts[s + 1] == "fc1", parts[s + 2] == "scales" || parts[s + 2] == "biases" {
+                    continue
+                }
             }
             groups[g, default: []].append(a)
         }
         for (g, arrays) in copies { groups[g, default: []].append(contentsOf: arrays) }
+        for (g, arrays) in fc1Dicts { groups[g, default: []].append(contentsOf: arrays) }
+        FileHandle.standardError.write(Data(
+            "nemotron target residency: \(fc1Dicts.count) MoE fc1 scales/biases replaced by their pair dictionaries\n".utf8))
         FileHandle.standardError.write(Data(
             "nemotron target residency: \(copies.count) MoE fc2 banks replaced by their decode copies\n".utf8))
         return groups.keys.sorted().map { groups[$0]! }
