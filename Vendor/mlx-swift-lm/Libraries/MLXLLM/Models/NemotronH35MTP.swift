@@ -1254,6 +1254,7 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
         let row = acceptedDrafts.asType(.int32)
         // The picked row attends the trusted prefix and post-verify rows 0...row.
         let rowHistory = paged.row.snapshot()
+        if let walk, queueConsumerWalkFirstDraft(walk: walk, row: row, history: rowHistory, requestState: requestState) { return }
         let rowLength = rowHistory.keys.dim(2)
         let rowFirst = rowLength - spec.width
         let picked = walk.flatMap {
@@ -1326,6 +1327,154 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
             roots += [ids2, out2, ownKeys, ownValues]
         }
         CBv2MTPSubmitMerge.submit(roots)
+    }
+
+    /// Same snapshot and request-state transitions as the ordinary device-picked
+    /// path. No row picker or thin producer is built. Each attention and the
+    /// first residual join walk the immutable packet at their own input reads.
+    private func queueConsumerWalkFirstDraft(
+        walk: CBv2MTPDeviceAcceptWalk.Operands, row: MLXArray,
+        history: (keys: MLXArray, values: MLXArray, offset: Int), requestState: any CBv2MTPRequestState
+    ) -> Bool {
+        let s = state(requestState)
+        guard NemotronMTPWalkDraftAttention.verified,
+              let spec = s.speculation, spec.width == 3, s.stagedInputCount == 2,
+              let paged = s.paged,
+              spec.queries.shape == [1, 32, 3, 128], spec.queries.dtype == .bfloat16,
+              spec.keys.shape == [1, 2, 3, 128], spec.values.shape == spec.keys.shape
+        else { return false }
+        let length = history.keys.dim(2)
+        guard (3 ..< 1023).contains(length) else { return false }
+        let first = length - spec.width
+        guard let out = module.finishConsumerWalkRow(
+            fusedRows: spec.fused, queries: spec.queries, keys: history.keys, values: history.values,
+            walk: walk, row: row, firstSpeculated: first)
+        else { return false }
+        let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: true))
+        // These remain genuine seed K/V rows. They are lazy on the retained-row
+        // path and are evaluated by the original append fallback when needed.
+        let keys = take(spec.keys, row, axis: 2)
+        let values = take(spec.values, row, axis: 2)
+        s.deviceFirstDraft = (ids: ids, out: out, keys: keys, values: values)
+        let seedKV = NemotronMTPLazySeedKV.enabled ? [] : [keys, values]
+        guard NemotronH35MTPDeviceSecondFront.enabled, draftLimit >= 2 else {
+            CBv2MTPSubmitMerge.submit([ids, out] + seedKV)
+            return true
+        }
+        let inputs = module.pagedDraftInputs(
+            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])))
+        s.deviceSecondInputs = (inputs: inputs, from: out)
+        var roots = [ids, out] + seedKV + inputs
+        if NemotronH35MTPDeviceSecondDraft.enabled {
+            let nextHistory = paged.row.absoluteOffset == history.offset
+                && NemotronMTPDraftMasks.reuseSnapshot ? history : paged.row.snapshot()
+            let own = module.draftKeyValues(inputs: inputs)
+            let ownKeys = own.keys.asType(nextHistory.keys.dtype)
+            let ownValues = own.values.asType(nextHistory.keys.dtype)
+            let out2 = module.finishConsumerWalkSecondDraft(
+                inputs: inputs, keys: nextHistory.keys, values: nextHistory.values,
+                own: (keys: ownKeys, values: ownValues),
+                walk: walk, row: row, firstSpeculated: nextHistory.keys.dim(2) - spec.width)
+            let ids2 = draftHead.greedy(out2, upper: s.screensUpper(firstDraft: false))
+            s.deviceSecondDraft = (ids: ids2, out: out2, keys: ownKeys, values: ownValues, from: out)
+            roots += [ids2, out2, ownKeys, ownValues]
+        }
+        CBv2MTPSubmitMerge.submit(roots)
+        return true
+    }
+
+    /// Remote-only private request-cache admission. Exercise both retained-page
+    /// readvance and real seed-K/V append fallbacks, including a later write
+    /// invalidating the generation and rollback across a physical page boundary.
+    func qualifyConsumerWalkCacheRows() -> Bool {
+        var checked = 0, retained = 0, appended = 0
+        do {
+            return try withError { () -> Bool in
+                for prefix in [15, 16, 31, 96, 488, 616] {
+                    for accepted in 0 ... 2 {
+                        for laterWrite in [false, true] {
+                            let request = makeRequestState()
+                            defer { releaseRequestState(request) }
+                            try configureRequestState(request, maximumSequenceLength: prefix + 16)
+                            let s = state(request)
+                            guard let paged = s.paged else { return false }
+                            let seed = UInt64(0x7468_8000 + prefix * 8 + accepted * 2 + (laterWrite ? 1 : 0))
+                            let random = MLXRandom.split(key: MLXRandom.key(seed), into: 5)
+                            let baseK = MLXRandom.normal([1, 2, prefix, 128], dtype: .bfloat16, key: random[0])
+                            let baseV = MLXRandom.normal([1, 2, prefix, 128], dtype: .bfloat16, key: random[1])
+                            let rowsK = MLXRandom.normal([1, 3, 2, 128], dtype: .bfloat16, key: random[2]).transposed(0, 2, 1, 3)
+                            let rowsV = MLXRandom.normal([1, 3, 2, 128], dtype: .bfloat16, key: random[3]).transposed(0, 2, 1, 3)
+                            let packet = MLXArray([Int32(11), 12, accepted >= 1 ? 11 : 21, accepted >= 2 ? 12 : 22, 13, 7])
+                            let walk = CBv2MTPDeviceAcceptWalk.Operands(packet: packet, count: 2, drafts: 0, targets: 2)
+                            let row = MLXArray([Int32(accepted)])
+                            let seedK = take(rowsK, row, axis: 2)
+                            let seedV = take(rowsV, row, axis: 2)
+                            eval(s.cache.appendTrusted(keys: baseK, values: baseV))
+                            paged.row.beginSpeculativeWrite()
+                            eval(s.cache.appendTrusted(keys: rowsK, values: rowsV))
+                            let generation = paged.row.writeGeneration
+                            // Same immutable history snapshot used by the runtime consumers.
+                            let before = paged.row.snapshot()
+                            let expectedK = concatenated([baseK, rowsK], axis: 2)
+                            let expectedV = concatenated([baseV, rowsV], axis: 2)
+                            var exact = all(before.keys.view(dtype: .uint16) .== expectedK.view(dtype: .uint16))
+                                .&& all(before.values.view(dtype: .uint16) .== expectedV.view(dtype: .uint16))
+                            let q = MLXRandom.normal([1, 3, 32, 128], dtype: .bfloat16, key: random[4])
+                                .transposed(0, 2, 1, 3)
+                            for own in [false, true] {
+                                let k = before.keys
+                                let v = before.values
+                                let ownRow: (keys: MLXArray, values: MLXArray)? = own ? (seedK, seedV) : nil
+                                let query = own ? q[0..., 0..., 0 ..< 1, 0...] : q
+                                guard let output = NemotronMTPWalkDraftAttention.attend(
+                                    queries: query, keys: k, values: v, walk: walk, row: row,
+                                    firstSpeculated: prefix, selectQuery: !own, own: ownRow,
+                                    scale: (module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.scale,
+                                    force: true) else { return false }
+                                let expected = NemotronMTPDraftSDPA.stock(
+                                    queries: own ? query : take(q, row, axis: 2), keys: k, values: v, own: ownRow,
+                                    scale: (module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.scale,
+                                    mask: NemotronMTPWalkDraftAttention.mask(
+                                        row: row, length: k.dim(2) + (own ? 1 : 0), firstSpeculated: prefix,
+                                        own: own, dtype: .bfloat16))
+                                exact = exact .&& all(output.view(dtype: .uint16) .== expected.view(dtype: .uint16))
+                            }
+                            // Complete all page readers before any transaction can free pages.
+                            eval([exact, seedK, seedV] + s.cache.innerState())
+                            if !exact.item(Bool.self) { return false }
+                            if laterWrite {
+                                eval(s.cache.appendTrusted(keys: rowsK[0..., 0..., 0 ..< 1, 0...],
+                                                           values: rowsV[0..., 0..., 0 ..< 1, 0...]))
+                            }
+                            paged.row.rollback(3 + (laterWrite ? 1 : 0) - accepted)
+                            if let roots = s.cache.readvanceTrusted(1, writtenAt: generation) {
+                                if laterWrite { return false }
+                                retained += 1
+                                eval(roots)
+                            } else {
+                                appended += 1
+                                eval(s.cache.appendTrusted(keys: seedK, values: seedV))
+                            }
+                            let after = paged.row.snapshot()
+                            var kParts = [baseK], vParts = [baseV]
+                            if accepted > 0 {
+                                kParts.append(rowsK[0..., 0..., 0 ..< accepted, 0...])
+                                vParts.append(rowsV[0..., 0..., 0 ..< accepted, 0...])
+                            }
+                            kParts.append(take(rowsK, MLXArray([Int32(accepted)]), axis: 2))
+                            vParts.append(take(rowsV, MLXArray([Int32(accepted)]), axis: 2))
+                            exact = all(after.keys.view(dtype: .uint16) .== concatenated(kParts, axis: 2).view(dtype: .uint16))
+                                .&& all(after.values.view(dtype: .uint16) .== concatenated(vParts, axis: 2).view(dtype: .uint16))
+                            eval([exact] + s.cache.innerState())
+                            if after.offset != prefix + accepted + 1 || !exact.item(Bool.self) { return false }
+                            paged.row.commitSpeculativeWrite()
+                            checked += 1
+                        }
+                    }
+                }
+                return checked == 36 && retained > 0 && appended > 0
+            }
+        } catch { return false }
     }
 
     public func noteHostAcceptedDrafts(_ accepted: Int, requestState: any CBv2MTPRequestState) {

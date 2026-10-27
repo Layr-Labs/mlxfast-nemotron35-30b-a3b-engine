@@ -727,6 +727,37 @@ final class NemotronH35MTPExpertBlock: Module {
         return self(residual + attention)
     }
 
+    /// Whether `callAsFunction(fusedRows:walk:attention:)` serves a [1, 1, 2688] BF16 attention row: the
+    /// conditions `callAsFunction(residual:attention:)` joins under, for the walked fused row.
+    func walkedTailServes(fusedRows: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands) -> Bool {
+        !NemotronMTPFirstRoundDraft.active
+            && NemotronMTPDraftTail.exactTail && NemotronMoELeader.enabled
+            && type(of: norm) == RMSNorm.self && type(of: finalNorm) == RMSNorm.self
+            && type(of: mixer) == NemotronHMoE.self && mixer.sharedExperts != nil
+            && mixer.numExpertsPerTok == 6
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && NemotronHResidualRMSNorm.walkServes(
+                fusedRows, packet: walk.packet, count: walk.count, drafts: walk.drafts, targets: walk.targets,
+                norm: norm)
+    }
+
+    /// `callAsFunction(residual:attention:)` with the residual the fused row the device accept walk selects
+    /// from `fusedRows` [1, W, 2688] (`NemotronHResidualRMSNorm.applyWalk`), so the row is not gathered first;
+    /// the same tail follows the join. Nil when it does not serve them.
+    func callAsFunction(fusedRows: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands, attention: MLXArray)
+        -> MLXArray?
+    {
+        guard walkedTailServes(fusedRows: fusedRows, walk: walk), exactTailAvailable(attention),
+              let joined = NemotronHResidualRMSNorm.applyWalk(
+                  fusedRows, attention, packet: walk.packet, count: walk.count, drafts: walk.drafts,
+                  targets: walk.targets, norm: norm)
+        else { return nil }
+        if NemotronMTPExecution.compiledMoE {
+            return oneTokenTailCache([joined.0, joined.1], mode: 2, owner: self)
+        }
+        return exactOneTokenTail(joined.0, normalized: joined.1)
+    }
+
     fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
         finalNorm(x + mixer(norm(x)))
     }
@@ -1459,5 +1490,258 @@ enum NemotronMTPDraftSDPA {
         report(verified
             ? "on (\(checked) cases bitwise equal to the stock call; key loop unroll4, one-barrier aggregation, own row in place)"
             : "off (differs from the stock call after \(checked) cases)")
+    }
+}
+
+
+// MARK: - Accept walk inside the native contiguous draft consumers
+
+extension NemotronMTPDraftSDPA {
+    /// Runtime-only twin of the complete ad9 source. Eight literal substitutions
+    /// change only the accepted Q-row address and zero/-infinity masks.
+    static func consumerWalkSource(own: Bool) -> String? {
+        var s = source(own: own)
+        let swaps: [(String, String)] = [
+            ("const int mask_kv_seq_stride = fmask_shape[3] > 1 ? int(fmask_strides[3]) : 0;",
+             """
+             int walked = 0;
+             if (simd_lid == 0) {
+                 const int64_t walk_step = packet_strides[0];
+                 while (walked < params[0] && packet[(params[2] + walked) * walk_step] == packet[(params[1] + walked) * walk_step]) {
+                     ++walked;
+                 }
+             }
+             walked = simd_broadcast(walked, ushort(0));
+             const int walk_last = walked + params[3];
+             const int walk_qrow = SELECT_Q ? walked : 0;
+             """),
+            ("queries + q_batch_head_idx * queries_strides[1]\n",
+             "queries + q_batch_head_idx * queries_strides[1] + walk_qrow * queries_strides[2]\n"),
+            ("auto fm = fmask + simd_gid * mask_kv_seq_stride;", ""),
+            ("mk[u] = fm[u * BN * mask_kv_seq_stride];",
+             "mk[u] = (i + u * BN <= walk_last || (OWN && i + u * BN == L)) ? T(0.0f) : T(-INFINITY);"),
+            ("fm += 4 * BN * mask_kv_seq_stride;", ""),
+            ("bool use_key = (fm[0] >= Limits<T>::finite_min);",
+             "const T walk_mask = (i <= walk_last || (OWN && i == L)) ? T(0.0f) : T(-INFINITY);\n    bool use_key = (walk_mask >= Limits<T>::finite_min);"),
+            ("score += static_cast<U>(fm[0]);", "score += static_cast<U>(walk_mask);"),
+            ("fm += BN * mask_kv_seq_stride;", ""),
+        ]
+        for (old, new) in swaps {
+            guard s.components(separatedBy: old).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        guard !s.contains("fmask"), !s.contains("fm["), !s.contains("fm +="), !s.contains("mask_kv_seq_stride")
+        else { return nil }
+        return s
+    }
+}
+
+extension NemotronH35MTPModule {
+    /// Both attention and its residual RMS join consume the same immutable walk.
+    /// Nil before building either launch unless the complete pair serves the row.
+    func finishConsumerWalkRow(
+        fusedRows: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray,
+        walk: CBv2MTPDeviceAcceptWalk.Operands, row: MLXArray, firstSpeculated: Int
+    ) -> MLXArray? {
+        let block = layers[0] as! NemotronH35MTPAttentionBlock
+        let expert = layers[1] as! NemotronH35MTPExpertBlock
+        guard Self.deviceDraftJoin, expert.walkedTailServes(fusedRows: fusedRows, walk: walk),
+              let output = NemotronMTPWalkDraftAttention.attend(
+                  queries: queries, keys: keys, values: values, walk: walk, row: row,
+                  firstSpeculated: firstSpeculated, selectQuery: true, own: nil, scale: block.mixer.scale)
+        else { return nil }
+        let attention = nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), block.mixer.wo)
+        return expert(fusedRows: fusedRows, walk: walk, attention: attention)
+    }
+
+    func finishConsumerWalkSecondDraft(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray),
+        walk: CBv2MTPDeviceAcceptWalk.Operands, row: MLXArray, firstSpeculated: Int
+    ) -> MLXArray {
+        let block = layers[0] as! NemotronH35MTPAttentionBlock
+        let queries = inputs[2].reshaped(1, 1, block.mixer.numHeads, block.mixer.headDim)
+            .transposed(0, 2, 1, 3).asType(keys.dtype)
+        if let output = NemotronMTPWalkDraftAttention.attend(
+            queries: queries, keys: keys, values: values, walk: walk, row: row,
+            firstSpeculated: firstSpeculated, selectQuery: false, own: own, scale: block.mixer.scale) {
+            let attention = nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), block.mixer.wo)
+            return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
+        }
+        return maskedSecondDraft(
+            inputs: inputs, historyKeys: keys, historyValues: values, own: own,
+            mask: NemotronMTPWalkDraftAttention.mask(
+                row: row, length: keys.dim(2) + 1, firstSpeculated: firstSpeculated,
+                own: true, dtype: keys.dtype))
+    }
+}
+
+/// Selected pending a6's consumer-walk mechanism adapted to the complete
+/// highest's CONTIGUOUS native U4 / one-barrier / separate-own-row source.
+/// No page-pointer, direct-write owner API, producer, or retile removal is imported.
+enum NemotronMTPWalkDraftAttention {
+    static let enabled = NemotronMTPDraftRowPick.enabled && NemotronMTPDraftSDPA.enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_CONSUMER_WALK"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+    private static let kernel = NemotronMTPDraftSDPA.consumerWalkSource(own: false).map {
+        MLXFast.metalKernel(name: "nemotron_mtp_consumer_walk_u4_1b",
+            inputNames: ["queries", "keys", "values", "packet", "params", "scale"],
+            outputNames: ["out"], source: $0, ensureRowContiguous: false)
+    }
+    private static let ownKernel = NemotronMTPDraftSDPA.consumerWalkSource(own: true).map {
+        MLXFast.metalKernel(name: "nemotron_mtp_consumer_walk_own_u4_1b",
+            inputNames: ["queries", "keys", "values", "packet", "params", "scale", "own_keys", "own_values"],
+            outputNames: ["out"], source: $0, ensureRowContiguous: false)
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
+    private static func scaleArray(_ scale: Float) -> MLXArray {
+        lock.lock(); defer { lock.unlock() }
+        if let cached = scales[scale.bitPattern] { return cached }
+        let array = MLXArray(scale)
+        scales[scale.bitPattern] = array
+        return array
+    }
+
+    static func serves(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands,
+        firstSpeculated: Int, selectQuery: Bool
+    ) -> Bool {
+        enabled && walk.count == 2 && walk.drafts >= 0 && walk.targets >= 0
+            && walk.packet.ndim == 1 && walk.packet.dtype == .int32
+            && walk.drafts + walk.count <= walk.packet.dim(0) && walk.targets + walk.count <= walk.packet.dim(0)
+            && queries.shape == [1, 32, selectQuery ? 3 : 1, 128]
+            && queries.dtype == .bfloat16 && queries.strides[3] == 1
+            && keys.ndim == 4 && keys.dim(0) == 1 && keys.dim(1) == 2 && keys.dim(3) == 128
+            && values.shape == keys.shape && keys.dtype == .bfloat16 && values.dtype == .bfloat16
+            && keys.strides[3] == 1 && values.strides[3] == 1
+            && (3 ..< 1023).contains(keys.dim(2)) && firstSpeculated >= 0
+            && firstSpeculated + 3 == keys.dim(2)
+    }
+
+    /// `row` is the original lazy acceptedDrafts value: used only for the
+    /// inherited observer and real fallback, never an input to these kernels.
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands,
+        row: MLXArray, firstSpeculated: Int, selectQuery: Bool,
+        own: (keys: MLXArray, values: MLXArray)?, scale: Float, force: Bool = false
+    ) -> MLXArray? {
+        guard force || verified, NemotronMTPDraftSDPA.verified,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              row.shape == [1], row.dtype == .int32,
+              serves(queries: queries, keys: keys, values: values, walk: walk,
+                     firstSpeculated: firstSpeculated, selectQuery: selectQuery),
+              let selected = own == nil ? kernel : ownKernel
+        else { return nil }
+        if let own {
+            guard own.keys.shape == [1, 2, 1, 128], own.values.shape == [1, 2, 1, 128],
+                  own.keys.dtype == .bfloat16, own.values.dtype == .bfloat16,
+                  own.keys.strides[3] == 1, own.values.strides[3] == 1 else { return nil }
+        }
+        let params = MLXArray([Int32(walk.count), Int32(walk.drafts), Int32(walk.targets), Int32(firstSpeculated)])
+        let inputs = [queries, keys, values, walk.packet, params, scaleArray(scale)]
+            + (own.map { [$0.keys, $0.values] } ?? [])
+        let output = selected(inputs,
+            template: [("T", DType.bfloat16), ("D", 128), ("V", 128),
+                       ("SELECT_Q", selectQuery), ("OWN", own != nil)],
+            grid: (32 * 1024, 1, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[1, 32, 1, 128]], outputDTypes: [.bfloat16])[0]
+        guard NemotronMoELeader.selfTest else { return output }
+        return nemotronBitwiseOrNaN(output, NemotronMTPDraftSDPA.stock(
+            queries: selectQuery ? take(queries, row, axis: 2) : queries,
+            keys: keys, values: values, own: own, scale: scale,
+            mask: mask(row: row, length: keys.dim(2) + (own == nil ? 0 : 1),
+                       firstSpeculated: firstSpeculated, own: own != nil, dtype: keys.dtype)))
+    }
+
+    static func mask(row: MLXArray, length: Int, firstSpeculated: Int, own: Bool, dtype: DType) -> MLXArray {
+        let position = MLXArray(Int32(0) ..< Int32(length))
+        let keep = own
+            ? (position .<= (row + Int32(firstSpeculated))) .|| (position .== Int32(length - 1))
+            : (position .<= (row + Int32(firstSpeculated)))
+        return which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+            .asType(dtype).reshaped(1, 1, 1, length)
+    }
+
+    /// Written admission only, executed by official remote validation. Both
+    /// attentions and the actual expert norm's walked residual join are checked
+    /// against the ORIGINAL row pick + native attention + original join.
+    static func qualify(_ block: NemotronH35MTPAttentionBlock, norm: RMSNorm, cacheCheck: () -> Bool) {
+        verified = false
+        guard enabled, NemotronMTPDraftSDPA.verified, NemotronHResidualRMSNorm.walkKernelAvailable else { return }
+        var checked = 0, joins = 0
+        do {
+            let matched = try withError { () -> Bool in
+                let lengths = [3, 4, 15, 16, 17, 31, 32, 33, 64, 97, 127, 128, 129,
+                               255, 256, 257, 488, 552, 600, 616, 617, 1000, 1022]
+                for (index, length) in lengths.enumerated() {
+                    let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x776b_0000 + index)), into: 6)
+                    let magnitude = Float([1, 4, 16][index % 3])
+                    let fused = MLXRandom.normal([1, 3, 2688], dtype: .bfloat16, key: key[0])
+                    let attention = MLXRandom.normal([1, 1, 2688], dtype: .bfloat16, key: key[5])
+                    let q = MLXRandom.normal([1, 3, 32, 128], dtype: .bfloat16, scale: magnitude, key: key[1])
+                        .transposed(0, 2, 1, 3)
+                    let k = MLXRandom.normal([1, 2, length + 1, 128], dtype: .bfloat16, scale: magnitude, key: key[2])
+                    let v = MLXRandom.normal([1, 2, length + 1, 128], dtype: .bfloat16, key: key[3])
+                    for accepted in 0 ... 2 {
+                        var host: [Int32] = [11, 12, accepted >= 1 ? 11 : 21, accepted >= 2 ? 12 : 22, 13, 7]
+                        if index % 2 != 0 { host += [7, 7, 7, 7, 7] }
+                        let packet = MLXArray(host)
+                        let strided = stacked([packet, MLXArray.zeros(packet.shape, dtype: .int32)], axis: 1)[0..., 0]
+                        let walk = CBv2MTPDeviceAcceptWalk.Operands(
+                            packet: index % 3 == 0 ? strided : packet, count: 2, drafts: 0, targets: 2)
+                        let row = MLXArray([Int32(accepted)])
+                        let rowsK = k[0..., 0..., (length - 3) ..< length, 0...]
+                        let rowsV = v[0..., 0..., (length - 3) ..< length, 0...]
+                        guard let original = NemotronMTPDraftRowPick.pick(
+                            walk: walk, fused: fused, queries: q, keys: rowsK, values: rowsV,
+                            firstSpeculated: length - 3, length: length, dtype: .bfloat16, force: true),
+                              let joined = NemotronHResidualRMSNorm.apply(original.fused, attention, norm: norm),
+                              let walkedJoin = NemotronHResidualRMSNorm.applyWalk(
+                                  fused, attention, packet: walk.packet, count: 2, drafts: 0, targets: 2, norm: norm)
+                        else { return false }
+                        var ok = all(walkedJoin.0.view(dtype: .uint16) .== joined.0.view(dtype: .uint16))
+                            .&& all(walkedJoin.1.view(dtype: .uint16) .== joined.1.view(dtype: .uint16))
+                            .&& all(take(rowsK, row, axis: 2).view(dtype: .uint16) .== original.keys.view(dtype: .uint16))
+                            .&& all(take(rowsV, row, axis: 2).view(dtype: .uint16) .== original.values.view(dtype: .uint16))
+                        joins += 1
+                        for own in [false, true] {
+                            let n = length + (own ? 1 : 0)
+                            let keys = k[0..., 0..., 0 ..< length, 0...]
+                            let values = v[0..., 0..., 0 ..< length, 0...]
+                            let ownRow: (keys: MLXArray, values: MLXArray)? = own
+                                ? (k[0..., 0..., length ..< n, 0...], v[0..., 0..., length ..< n, 0...]) : nil
+                            let selectedQ = own ? q[0..., 0..., 1 ..< 2, 0...] : original.queries
+                            guard let expected = NemotronMTPDraftSDPA.attend(
+                                queries: selectedQ, keys: keys, values: values, own: ownRow,
+                                scale: block.mixer.scale, mask: own ? original.second : original.first)
+                            else { return false }
+                            for copied in [false, true] {
+                                let sourceQ = own ? q[0..., 0..., 1 ..< 2, 0...] : q
+                                guard let output = attend(
+                                    queries: copied ? MLX.contiguous(sourceQ) : sourceQ,
+                                    keys: keys, values: values, walk: walk, row: row, firstSpeculated: length - 3,
+                                    selectQuery: !own, own: ownRow.map {
+                                        (keys: copied ? MLX.contiguous($0.keys) : $0.keys,
+                                         values: copied ? MLX.contiguous($0.values) : $0.values)
+                                    }, scale: block.mixer.scale, force: true)
+                                else { return false }
+                                ok = ok .&& all(output.view(dtype: .uint16) .== expected.view(dtype: .uint16))
+                                if [3, 32, 488, 616].contains(length) {
+                                    let projected = nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), block.mixer.wo)
+                                    let reference = nemotronR1Linear(expected.transposed(0, 2, 1, 3).reshaped(1, 1, -1), block.mixer.wo)
+                                    ok = ok .&& all(projected.view(dtype: .uint16) .== reference.view(dtype: .uint16))
+                                }
+                                checked += 1
+                            }
+                        }
+                        if !ok.item(Bool.self) { return false }
+                    }
+                }
+                return checked == 276 && joins == 69
+            }
+            verified = matched && cacheCheck()
+        } catch { verified = false }
+        FileHandle.standardError.write(Data(
+            "nemotron mtp consumer walk: \(verified ? "on" : "off") (\(checked) attention / \(joins) join cases)\n".utf8))
     }
 }
