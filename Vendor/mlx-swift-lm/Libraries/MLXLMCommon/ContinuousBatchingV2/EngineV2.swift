@@ -120,8 +120,9 @@ public enum CBv2EngineInitHooks {
 public final class EngineV2: CBv2Engine, @unchecked Sendable {
     /// See `init`: commit one trivial operation when an engine is built.
     static let wakeOnInit = ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_WAKE"] != "0"
-    /// See `init`: CPU threads kept busy for a few milliseconds when an engine is built.
-    static let spinMillis = Int(ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_SPIN"] ?? "") ?? 40
+    /// See `init`: CPU threads kept busy for a few milliseconds when an engine is built
+    /// (off by default; NEMOTRON_ENGINE_SPIN=<ms> turns it on, 40 was the earlier default).
+    static let spinMillis = Int(ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_SPIN"] ?? "") ?? 0
     static let spinThreads = 4
     private let loop: EngineLoopV2
     private let admission: AdmissionV2
@@ -236,7 +237,7 @@ public final class EngineV2: CBv2Engine, @unchecked Sendable {
         // `spinThreads` threads keep integer units busy for `spinMillis`
         // milliseconds while the GPU wakes and the first prefill chunks are
         // built; they touch no shared state and end on their own deadline.
-        // NEMOTRON_ENGINE_SPIN=0 skips them.
+        // Off unless NEMOTRON_ENGINE_SPIN sets a positive duration.
         if Self.spinMillis > 0 {
             let deadline = DispatchTime.now().uptimeNanoseconds + UInt64(Self.spinMillis) * 1_000_000
             for _ in 0 ..< Self.spinThreads {
