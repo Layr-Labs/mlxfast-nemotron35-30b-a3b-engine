@@ -781,6 +781,8 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpTail8: MLXFast.MLXFastKernel?
     let tripleGateUpDict: MLXFast.MLXFastKernel?
     let tripleGateUpTail8Dict: MLXFast.MLXFastKernel?
+    /// Native R3 dictionary FC1: next full K tile is read before the current dot.
+    let tripleGateUpLanePipeline: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -877,6 +879,16 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpLanePipeline = nmlFC1LanePipelineSource(tripleSource)
+            .flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_lane_pipeline_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader + nmlFC1LanePipelineHeader)
         }
     }
 }
@@ -1279,7 +1291,10 @@ enum NemotronMoELeader {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
         let nsg = (bank.n / rps) % fc1SimdGroups == 0 ? fc1SimdGroups : 2
-        let activation = kernel(
+        let selected = tail8 && useDict && rps == 4 && nsg == 1
+            && NemotronFC1LanePipeline.covers(bank, dict!)
+            ? (kernels.tripleGateUpLanePipeline ?? kernel) : kernel
+        let activation = selected(
             useDict
                 ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
                 : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
@@ -2779,6 +2794,10 @@ enum NemotronSharedDownZSkip {
     static var copyArrays: [MLXArray] {
         lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
     }
+    /// The verified copy of `down` (a target layer's shared down projection), if any.
+    static func copyArrays(for down: Linear) -> (codes: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        lock.withLock { copies[ObjectIdentifier(down)].map { ($0.codes, $0.scales, $0.biases) } }
+    }
 
     private static func admissible(_ q: QuantizedLinear) -> Bool {
         type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
@@ -3408,6 +3427,242 @@ inline void nml_qdot_triple(
 }
 """
 
+// Native R3 FC1 software pipeline. Each lane reads the next FULL tile's
+// immutable codes and affine coefficients before consuming this tile's prepared
+// activation. Current/next registers add no barrier, launch or weight format.
+// The original half decode, per-output K order and guarded 128-value tail stay
+// intact. More live registers can hurt occupancy; qualification proves values,
+// while only the official paired measurement can establish a speed benefit.
+private let nmlFC1LanePipelineHeader = """
+template <int ROWS>
+inline float3 nml_fc1_lane_dot(
+    uint word, const thread float* x0, const thread float* x1,
+    const thread float* x2, float scale, float bias,
+    float sum0, float sum1, float sum2) {
+  float accum0 = 0;
+  float accum1 = 0;
+  float accum2 = 0;
+  for (int i = 0; i < 2; i++) {
+    const uint w2 = word;
+    const ushort q = ushort(word >> (16 * i));
+    const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+    const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+    const float a = float(h0[i % 2]);
+    const float b1 = float(h1[i % 2]);
+    const float c = float(half(ushort(q & 0x0f00)));
+    const float d = float(half(ushort(q & 0xf000)));
+    accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b1 + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+    if (ROWS > 1) {
+      accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b1 + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+    }
+    if (ROWS > 2) {
+      accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b1 + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+    }
+  }
+  float3 value = float3(0);
+  value.x = scale * accum0 + sum0 * bias;
+  if (ROWS > 1) { value.y = scale * accum1 + sum1 * bias; }
+  if (ROWS > 2) { value.z = scale * accum2 + sum2 * bias; }
+  return value;
+}
+"""
+
+/// Text-only derivation of the three full-block walks; never edits their tails.
+/// A missing or repeated anchor refuses this optional kernel, keeping the base.
+private func nmlFC1LanePipelineSource(_ source: String) -> String? {
+    let begin = "    for (; k < K - block_size; k += block_size) {\n"
+    let tail = "    const int remaining = clamp("
+    guard source.components(separatedBy: begin).count == 4,
+          source.components(separatedBy: tail).count == 4 else { return nil }
+    let loads = """
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+"""
+    let calls: [(String, String)] = [
+        ("        result[r] += nml_qdot<U, values_per_thread, R == 3>(wl, x_thread, s, b, sum);",
+         "        result[r] += nml_fc1_lane_dot<1>(wv[r], x_thread, x_thread, x_thread, sv[r], bv[r], sum, sum, sum).x;"),
+        ("""
+        U value0, value1, value2;
+        nml_qdot_triple<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, x2_thread, s, b, sum0, sum1, sum2,
+            values_per_thread, value0, value1, value2);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+""", """
+        const float3 value = nml_fc1_lane_dot<3>(wv[r], x0_thread, x1_thread, x2_thread,
+            sv[r], bv[r], sum0, sum1, sum2);
+        result0[r] += value.x;
+        result1[r] += value.y;
+        result2[r] += value.z;
+"""),
+        ("""
+        U value0, value1;
+        nml_qdot_pair<U, values_per_thread, R == 3>(
+            wl, x0_thread, x1_thread, s, b, sum0, sum1, values_per_thread, value0, value1);
+        result0[r] += value0;
+        result1[r] += value1;
+""", """
+        const float3 value = nml_fc1_lane_dot<2>(wv[r], x0_thread, x1_thread, x1_thread,
+            sv[r], bv[r], sum0, sum1, sum1);
+        result0[r] += value.x;
+        result1[r] += value.y;
+"""),
+    ]
+    let prologue = """
+    thread uint wv[results_per_simdgroup], wn[results_per_simdgroup];
+    thread U sv[results_per_simdgroup], bv[results_per_simdgroup];
+    thread U sn[results_per_simdgroup], bn[results_per_simdgroup];
+    for (int row = 0; row < results_per_simdgroup; row++) {
+      wv[row] = *((const device uint*)(ws + row * in_vec_size_w));
+      sv[row] = sc[row * in_vec_size_g];
+      bv[row] = bs[row * in_vec_size_g];
+    }
+"""
+    let prefetch = """
+      // Do not prefetch the partial tail: its inactive lanes have no codes.
+      const bool hasNext = (k + block_size < K - block_size);
+      if (hasNext) {
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          wn[row] = *((const device uint*)(ws + block_size / 2 + row * in_vec_size_w));
+          sn[row] = sc[block_size / group_size + row * in_vec_size_g];
+          bn[row] = bs[block_size / group_size + row * in_vec_size_g];
+        }
+      }
+"""
+    let rotate = """
+      if (hasNext) {
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          wv[row] = wn[row];
+          sv[row] = sn[row];
+          bv[row] = bn[row];
+        }
+      }
+"""
+    var s = source
+    var cursor = s.startIndex
+    for (old, new) in calls {
+        guard let start = s.range(of: begin, range: cursor..<s.endIndex),
+              let end = s.range(of: tail, range: start.upperBound..<s.endIndex)
+        else { return nil }
+        let original = String(s[start.lowerBound..<end.lowerBound])
+        guard original.components(separatedBy: loads).count == 2,
+              original.components(separatedBy: old).count == 2,
+              original.hasSuffix("    }\n") else { return nil }
+        var body = original.replacingOccurrences(of: loads, with: "")
+            .replacingOccurrences(of: old, with: new)
+        body = prologue + "\n" + body.replacingOccurrences(of: begin, with: begin + prefetch + "\n")
+        body.removeLast("    }\n".count)
+        body += rotate + "\n    }\n"
+        let offset = s.distance(from: s.startIndex, to: start.lowerBound)
+        s.replaceSubrange(start.lowerBound..<end.lowerBound, with: body)
+        let changedStart = s.index(s.startIndex, offsetBy: offset)
+        guard let next = s.range(of: tail, range: changedStart..<s.endIndex) else { return nil }
+        cursor = next.upperBound
+    }
+    return "  static_assert(K == 2688 && R == 3 && RPS == 4, \"native FC1 pipeline\");\n  constexpr int group_size = 64;\n" + s
+}
+
+enum NemotronFC1LanePipeline {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_LANE_PIPELINE"] != "0"
+    private struct Admission {
+        let weight: MLXArray
+        let index: MLXArray
+        let table: MLXArray
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var admitted: [ObjectIdentifier: Admission] = [:]
+
+    static func covers(_ bank: NemotronMoELeader.Bank, _ dict: NemotronSBDict.Dict) -> Bool {
+        guard enabled else { return false }
+        return lock.withLock {
+            guard let a = admitted[ObjectIdentifier(bank.weight)] else { return false }
+            return a.weight === bank.weight && a.index === dict.index && a.table === dict.table
+        }
+    }
+
+    /// Private load-time buffers only, before request graphs are traced. Direct
+    /// base and candidate calls share the same prepared rows and real bank. All
+    /// 128 experts are covered, with singleton/pair/triple ownership, dense,
+    /// zero, sparse and tail-only rows, and both exact ReLU2 store modes.
+    static func qualify(_ model: Module) {
+        lock.withLock { admitted = [:] }
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard enabled, NemotronMoELeader.enabled, NemotronMoELeader.fc1Tail8,
+              NemotronMoELeader.elideUnreadPlan, NemotronMoELeader.fuseBalancePlan,
+              NemotronMoELeader.tripleGateUp, NemotronMoELeader.fc1Results == 4,
+              NemotronMoELeader.fc1SimdGroups == 1,
+              Device.defaultDevice().deviceType == .gpu,
+              let reference = kernels.tripleGateUpTail8Dict,
+              let candidate = kernels.tripleGateUpLanePipeline else { return }
+        var built: [ObjectIdentifier: Admission] = [:]
+        var tried = 0
+        for module in model.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                  let bank = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                  bank.weight.shape == [128, 1856, 336],
+                  bank.scales.shape == [128, 1856, 42],
+                  bank.biases.shape == bank.scales.shape,
+                  let dict = NemotronSBDict.dict(moe.switchMLP.fc1),
+                  dict.index.shape == bank.scales.shape, dict.index.dtype == .uint16,
+                  dict.table.ndim == 2, dict.table.dim(1) == 2, dict.table.dtype == .float32,
+                  built[ObjectIdentifier(bank.weight)] == nil else { continue }
+            tried += 1
+            var same = false
+            do {
+                same = try withError { () -> Bool in
+                    for group in 0..<22 {
+                        var routes: [UInt32] = []
+                        for row in 0..<3 {
+                            let offset = group % 3 == 2 ? 0 : (group % 3 == 1 && row < 2 ? 0 : row * 43)
+                            for slot in 0..<6 { routes.append(UInt32((group * 6 + slot + offset) % 128)) }
+                        }
+                        let inds = MLXArray(routes)
+                        var values = [Float](repeating: 0, count: 3 * 2688)
+                        for i in values.indices {
+                            let k = i % 2688
+                            let value = Float((i * 17 + group * 13) % 37 - 18) / 64
+                            switch group % 4 {
+                            case 0: values[i] = value
+                            case 1: values[i] = k >= 2560 ? value : 0
+                            case 2: values[i] = k % 61 == 0 ? value * 8 : 0
+                            default: break
+                            }
+                        }
+                        let x = MLXArray(values).reshaped([3, 2688]).asType(.bfloat16)
+                        let prepared = NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+                        for relu2 in [false, true] {
+                            func run(_ kernel: MLXFast.MLXFastKernel) -> MLXArray {
+                                kernel([NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict.index),
+                                        dict.table, prepared, inds],
+                                    template: [("T", DType.bfloat16), ("R", 3), ("TOPK", 6),
+                                               ("K", 2688), ("N", 1856), ("XSLOT", false),
+                                               ("RELU2", relu2), ("RPS", 4)],
+                                    grid: (32, 464, 18), threadGroup: (32, 1, 1),
+                                    outputShapes: [[18, 1856]], outputDTypes: [.bfloat16])[0]
+                            }
+                            let a = run(reference), b = run(candidate)
+                            guard (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all().item(Bool.self)
+                            else { return false }
+                        }
+                    }
+                    return true
+                }
+            } catch { same = false }
+            if same {
+                built[ObjectIdentifier(bank.weight)] = Admission(weight: bank.weight, index: dict.index, table: dict.table)
+            }
+        }
+        lock.withLock { admitted = built }
+        FileHandle.standardError.write(Data(
+            "nemotron FC1 lane pipeline: \(built.count)/\(tried) real banks admitted bitwise; RPS4/NSG1, guarded tail unchanged\n".utf8))
+    }
+}
+
 // MARK: - Exact (scale, bias) pair dictionary for the R = 3 verify QMVs
 //
 // The pinned checkpoint's affine4/gs64 groups carry a BF16 scale and a BF16
@@ -3633,6 +3888,25 @@ enum NemotronSBDict {
     /// Every admitted draft-head index and table (decode-only backing for the head's residency set).
     static var draftArrays: [MLXArray] {
         lock.withLock { draftDicts.values.flatMap { [$0.index, $0.table] } }
+    }
+
+    /// `arrays` without the scales and biases of the head's routed banks that have an admitted dictionary: the
+    /// head's routed experts run only one-row draft steps, whose dictionary twin binds the bank's codes, index
+    /// and table, so those scales and biases are not decode backing. NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY=1
+    /// keeps them.
+    static func withoutDictBankMetadata(_ arrays: [MLXArray], module: Module) -> [MLXArray] {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY"] != "1" else { return arrays }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, draftDict(linear) != nil else { continue }
+            for (key, a) in linear.parameters().flattened() where key == "scales" || key == "biases" {
+                skip.insert(ObjectIdentifier(a))
+            }
+        }
+        let kept = arrays.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(arrays.count - kept.count) dictionary bank scale/bias arrays left out\n".utf8))
+        return kept
     }
 
     /// The admitted routed-bank indices (for `NemotronBankBinding.warm`: addressed from their base).

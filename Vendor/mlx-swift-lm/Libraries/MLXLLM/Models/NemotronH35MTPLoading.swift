@@ -88,6 +88,7 @@ extension NemotronH35MTPAssistant {
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        NemotronFC1LanePipeline.qualify(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
@@ -109,6 +110,8 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillDirectFC1.qualifyDict(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
+        NemotronPrefillSharedDownCopy.qualify(target)
+        NemotronPrefillDenseDict.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
         NemotronPrefillDtxDecay4.qualify()
         NemotronPrefillScanExp.qualify()
@@ -371,6 +374,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
+    /// Backing first read after the request's first verify (the head's routed experts with
+    /// `NemotronMTPFirstRoundDraft`), requested on the target queue after the extras.
+    let lateSets: [any MTLResidencySet]
     /// With target sets, the per-layer copy sets are requested on the target queue right after the extras, each
     /// marking its layer ready when its request returns, instead of at the first verify graph.
     static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
@@ -401,9 +407,6 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// With `NemotronPrefillFC2Copy` verified, a MoE layer's routed fc2 bank is replaced in its group by
     /// that layer's decode copy (codes, pair index, pair table): the request prefill reads the copy, the
     /// decode reads the copy, and nothing in the request reads the bank.
-    /// NEMOTRON_RESIDENCY_SPLIT_EXPERTS=0 keeps one set per backbone layer.
-    static let splitExpertGroups = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_SPLIT_EXPERTS"] != "0"
-
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
         var copies: [Int: [MLXArray]] = [:]
         if NemotronPrefillFC2Copy.verified {
@@ -427,34 +430,64 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 fc1Dicts[n] = [d.index, d.table]
             }
         }
-        // With `splitExpertGroups` a MoE layer's group is three consecutive sets in the order the request
-        // prefill reads them: the layer's own small arrays (router, shared expert, norms), its routed fc1
-        // (bank words and their scale/bias form), then its routed fc2 (the decode copy when verified).
-        let split = Self.splitExpertGroups
-        func key(_ layer: Int, _ part: Int) -> Int { split ? 3 * layer + part : layer }
-        var groups: [Int: [MLXArray]] = [:]
-        for (path, a) in model.parameters().flattened() {
-            let parts = path.split(separator: ".")
-            var g = Int.max
-            var layer: Int? = nil
-            if parts.contains("embeddings") { g = split ? -3 : -1 }
-            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) {
-                layer = n
-                g = key(n, 0)
+        // With `NemotronPrefillSharedDownCopy.verified`, the request prefill's shared down reads the layer's
+        // shared-down decode copy (as the verify does) instead of the dense weights.
+        var sharedCopies: [Int: [MLXArray]] = [:]
+        if NemotronPrefillSharedDownCopy.verified {
+            for (name, module) in model.namedModules() {
+                let parts = name.split(separator: ".")
+                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
+                      let moe = module as? NemotronHMoE, let down = moe.sharedExperts?.downProj,
+                      let c = NemotronSharedDownZSkip.copyArrays(for: down) else { continue }
+                sharedCopies[n] = [c.codes, c.scales, c.biases]
             }
-            if let n = layer, let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
-                if parts[s + 1] == "fc2" {
-                    if copies[n] != nil { continue }
-                    g = key(n, 2)
-                } else if parts[s + 1] == "fc1" {
-                    if fc1Dicts[n] != nil, parts[s + 2] == "scales" || parts[s + 2] == "biases" { continue }
-                    g = key(n, 1)
+        }
+        // With a `NemotronPrefillDenseDict` kind admitted, the request prefill reads that kind's pair dictionaries
+        // (as the verify does) instead of its BF16 scales and biases.
+        var denseDicts: [Int: [MLXArray]] = [:]
+        var denseMetadata = Set<ObjectIdentifier>()
+        for (name, module) in model.namedModules() {
+            let parts = name.split(separator: ".")
+            guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) else { continue }
+            var dense: [(String, Linear)] = []
+            if let mamba = module as? NemotronHMamba2Mixer {
+                dense = [("in_proj", mamba.inProj), ("out_proj", mamba.outProj)]
+            } else if let moe = module as? NemotronHMoE, let up = moe.sharedExperts?.upProj {
+                dense = [("up_proj", up)]
+            }
+            for (kind, linear) in dense where NemotronPrefillDenseDict.kinds.contains(kind) {
+                guard let q = linear as? QuantizedLinear, let d = NemotronSBDict.dict(q), let b = q.biases else { continue }
+                denseDicts[n, default: []] += [d.index, d.table]
+                denseMetadata.formUnion([ObjectIdentifier(q.scales), ObjectIdentifier(b)])
+            }
+        }
+        var groups: [Int: [MLXArray]] = [:]
+        for (key, a) in model.parameters().flattened() {
+            let parts = key.split(separator: ".")
+            var g = Int.max
+            if parts.contains("embeddings") { g = -1 }
+            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
+            if denseMetadata.contains(ObjectIdentifier(a)) { continue }
+            if sharedCopies[g] != nil, let s = parts.firstIndex(of: "shared_experts"), s + 1 < parts.count,
+               parts[s + 1] == "down_proj" {
+                continue
+            }
+            if let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
+                if copies[g] != nil, parts[s + 1] == "fc2" { continue }
+                if fc1Dicts[g] != nil, parts[s + 1] == "fc1", parts[s + 2] == "scales" || parts[s + 2] == "biases" {
+                    continue
                 }
             }
             groups[g, default: []].append(a)
         }
-        for (n, arrays) in copies { groups[key(n, 2), default: []].append(contentsOf: arrays) }
-        for (n, arrays) in fc1Dicts { groups[key(n, 1), default: []].append(contentsOf: arrays) }
+        for (g, arrays) in copies { groups[g, default: []].append(contentsOf: arrays) }
+        for (g, arrays) in fc1Dicts { groups[g, default: []].append(contentsOf: arrays) }
+        for (g, arrays) in sharedCopies { groups[g, default: []].append(contentsOf: arrays) }
+        for (g, arrays) in denseDicts { groups[g, default: []].append(contentsOf: arrays) }
+        FileHandle.standardError.write(Data(
+            "nemotron target residency: \(denseMetadata.count) dense scale/bias arrays replaced by their pair dictionaries\n".utf8))
+        FileHandle.standardError.write(Data(
+            "nemotron target residency: \(sharedCopies.count) MoE shared down projections replaced by their decode copies\n".utf8))
         FileHandle.standardError.write(Data(
             "nemotron target residency: \(fc1Dicts.count) MoE fc1 scales/biases replaced by their pair dictionaries\n".utf8))
         FileHandle.standardError.write(Data(
@@ -483,12 +516,16 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     }
 
     init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier], target: [[MLXArray]],
-          extras: [MLXArray]) {
+          extras: [MLXArray], late: [MLXArray] = []) {
         guard Self.enabled, let device = MTLCreateSystemDefaultDevice() else { return nil }
         let targetSets = Self.targetEnabled ? Self.makeTargetSets(device, target) : []
-        let extraSets = Self.extrasEnabled && !extras.isEmpty ? Self.makeTargetSets(device, [extras]) : []
+        let lateSets = Self.extrasEnabled && !late.isEmpty ? Self.makeTargetSets(device, [late]) : []
+        // Without a late set the banks go back with the extras (requested before the decode).
+        let extraArrays = lateSets.isEmpty ? extras + late : extras
+        let extraSets = Self.extrasEnabled && !extraArrays.isEmpty ? Self.makeTargetSets(device, [extraArrays]) : []
+        self.lateSets = lateSets
         FileHandle.standardError.write(Data(
-            "nemotron target residency: \(targetSets.count) sets, decode extras: \(extraSets.count) set\n".utf8))
+            "nemotron target residency: \(targetSets.count) sets, decode extras: \(extraSets.count) set, late: \(lateSets.count) set\n".utf8))
         self.targetSets = targetSets
         self.extraSets = extraSets
         let cut = min(Self.seedLayers, layers.count)
@@ -520,7 +557,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         self.owners = owners
         self.cut = cut
         if Self.lockMode != "0" {
-            let locked = Self.lockPages(Self.lockMode == "targets" ? targetSets : targetSets + extraSets + sets)
+            let locked = Self.lockPages(Self.lockMode == "targets" ? targetSets : targetSets + extraSets + lateSets + sets)
             FileHandle.standardError.write(Data(
                 "nemotron residency mlock: \(locked.0) buffers, \(locked.1 >> 20) MiB\n".utf8))
         }
@@ -530,9 +567,14 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         let owner: NemotronDecodeResidency
         private var decoded = false
         private var finished = false
+        private var rounds = 0
+        /// The request's CPU keep-busy (`NemotronCPUWarm`), from the lease's begin (the seed) to round 4.
+        private let warm = NemotronCPUWarm.enabled ? NemotronCPUWarm() : nil
         init(_ owner: NemotronDecodeResidency) { self.owner = owner }
         func beginDecode() {
             guard !finished else { return }
+            rounds += 1
+            if rounds > NemotronCPUWarm.rounds { warm?.stop() }
             if !decoded {
                 decoded = true
                 for (i, set) in (owner.copiesEnqueued ? [] : owner.decodeSets).enumerated() {
@@ -544,6 +586,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         func finish() {
             guard !finished else { return }
             finished = true
+            warm?.stopAndJoin()
+            NemotronMTPFirstRoundDraft.ready()
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
                 // The requests stay standing; the next lease requests the same sets again.
@@ -552,7 +596,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 return
             }
             owner.targetQueue.sync {
-                for set in owner.targetSets + owner.extraSets { set.endResidency() }
+                for set in owner.targetSets + owner.extraSets + owner.lateSets { set.endResidency() }
             }
             owner.queue.sync {
                 owner.seedSet.endResidency()
@@ -598,7 +642,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         copiesEnqueued = false
         let copiesInTarget = NemotronPrefillFC2Copy.verified && !targetSets.isEmpty
         guard !targetSets.isEmpty else {
-            for set in extraSets { targetQueue.async { set.requestResidency() } }
+            for set in extraSets + lateSets { targetQueue.async { set.requestResidency() } }
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
@@ -614,6 +658,14 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             NemotronZSkip.markCopyReady(ready)
         }
         for set in extraSets { targetQueue.async { set.requestResidency() } }
+        if !lateSets.isEmpty {
+            NemotronMTPFirstRoundDraft.begin()
+            let late = lateSets
+            targetQueue.async {
+                for set in late { set.requestResidency() }
+                NemotronMTPFirstRoundDraft.ready()
+            }
+        }
         if Self.copiesAfterExtras {
             copiesEnqueued = true
             for (i, set) in decodeSets.enumerated() {
@@ -637,4 +689,46 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Measurement entry 2 of this tree.
 
-// Measurement entry 2 of this tree.
+/// A request's CPU keep-busy (terrapinelf's `8e4dac9d`, carried unchanged). The host builds the first decode
+/// rounds right after the seed, a phase in which it mostly waits on the GPU; after an idle period the CPU then
+/// builds those rounds at a lowered clock, and the GPU waits for their command buffers. From the MTP lease's
+/// begin (the request's seed) until the fourth decode round begins, or the lease finishes if sooner, two
+/// user-interactive threads stay busy so that the cores that build the first rounds run at speed. Nothing runs
+/// between requests, and no value changes. NEMOTRON_MTP_CPU_WARM=0 disables it.
+final class NemotronCPUWarm: @unchecked Sendable {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_CPU_WARM"] != "0"
+    /// Decode rounds covered after the seed.
+    static let rounds = 3
+    private static let threads = 2
+    private let lock = NSLock()
+    private var stopped = false
+    private let exited = DispatchGroup()
+
+    init() {
+        for i in 0 ..< Self.threads {
+            exited.enter()
+            let thread = Thread { [self] in
+                while !self.isStopped {}
+                self.exited.leave()
+            }
+            thread.qualityOfService = .userInteractive
+            thread.name = "nemotron.cpu-warm.\(i)"
+            thread.start()
+        }
+    }
+
+    private var isStopped: Bool { lock.withLock { stopped } }
+
+    /// Idempotent and non-blocking: the threads leave their loops at their next check.
+    func stop() {
+        lock.withLock { stopped = true }
+    }
+
+    /// `stop`, then wait until both threads have left their loops (the lease's finish).
+    func stopAndJoin() {
+        stop()
+        exited.wait()
+    }
+}
+
+// Second measurement of t102.
