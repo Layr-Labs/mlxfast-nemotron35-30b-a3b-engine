@@ -682,6 +682,11 @@ enum NemotronMambaInProjConvDt {
     /// same projection and poisons the outputs with NaN on any bit difference.
     static let check =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_CONV_CHECK"] == "1"
+    /// Projection outputs per SIMD group of the fused launch (two SIMD groups per
+    /// threadgroup). Only the output-to-SIMD-group map moves: every output keeps its
+    /// lane split, K order, qdot and closing simd_sum, and the conv/timestep epilogue
+    /// reads the same stored values. NEMOTRON_MTP_INPROJ_RPS=2 restores two.
+    static let rps = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_RPS"] ?? "") ?? 1
 
     private static let kernel = MLXFast.metalKernel(
         name: "nemotron_mamba_in_proj_conv_dt",
@@ -735,9 +740,9 @@ enum NemotronMambaInProjConvDt {
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
-                       ("RPS", 2), ("CS", convStart), ("CC", convDim),
+                       ("RPS", Self.rps), ("CS", convStart), ("CC", convDim),
                        ("DS", convStart + convDim), ("NH", heads)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+            grid: (32, n / Self.rps, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
@@ -804,7 +809,12 @@ enum NemotronHeadPreparedActivation {
     static let fastLoadForm = 0
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
-    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
+    /// [4096, 2688] (the Mamba out_proj and the attention o_proj): one output per SIMD group;
+    /// NEMOTRON_MTP_OUT_PROJ_RPS=2 restores two.
+    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [
+        [2688, 131072]: (rps: 2, nsg: 8),
+        [4096, 2688]: (rps: Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_OUT_PROJ_RPS"] ?? "") ?? 1, nsg: 2),
+    ]
     static func loadForm(k: Int, n: Int) -> Int {
         loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
     }
