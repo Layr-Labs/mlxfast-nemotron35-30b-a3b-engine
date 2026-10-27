@@ -4399,11 +4399,122 @@ enum NemotronHeadScreen {
         return counter
     }
 
+    /// The existing 2-bit partial pass also writes the complete exact PV8
+    /// activation once. The first336 physical lanes own its336 valid chunks;
+    /// scores are unchanged. No CTA reads another CTA's writes in this launch.
+    static let preparedRescoreEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_PREPARED_RESCORE"] != "0"
+    private static let screenPrepareEpilogue = """
+
+      {
+        const int owner = (int(threadgroup_position_in_grid.y) * NSG
+            + int(simdgroup_index_in_threadgroup)) * 32 + int(thread_index_in_simdgroup);
+        if (owner < 336) {
+          const int offset = owner * 8;
+          const int base = (owner / 32) * 288 + owner % 32;
+          float total = 0.0f;
+          for (int i = 0; i < 8; i += 4) {
+            const float a = float(x[offset + i]);
+            const float b = float(x[offset + i + 1]);
+            const float c = float(x[offset + i + 2]);
+            const float d = float(x[offset + i + 3]);
+            total += a + b + c + d;
+            prepared[base + i * 32] = a;
+            prepared[base + (i + 1) * 32] = b / 16.0f;
+            prepared[base + (i + 2) * 32] = c / 256.0f;
+            prepared[base + (i + 3) * 32] = d / 4096.0f;
+          }
+          prepared[base + 8 * 32] = total;
+        }
+      }
+    """
+    private static let screenPrepareKernel = MLXFast.metalKernel(
+        name: "nemotron_screen_partial_record2_prepared_rescore",
+        inputNames: ["rec", "x", "groups", "groups2"], outputNames: ["scores", "prepared"],
+        source: record2PartialSource + screenPrepareEpilogue)
+    private static let screenPreparePairedKernel = record2PairedSource.map {
+        MLXFast.metalKernel(name: "nemotron_screen_partial_record2_paired_prepared_rescore",
+            inputNames: ["rec", "x", "groups", "groups2"], outputNames: ["scores", "prepared"],
+            source: $0 + screenPrepareEpilogue)
+    }
+    private static let screenPreparedHeader = nemotronMultiRowQMVHeader + """
+
+    template <typename U>
+    inline U nmr_screen_prepared(const device float* p, int offset, thread U* values) {
+      const int chunk = offset / 8;
+      const int base = (chunk / 32) * 288 + chunk % 32;
+      for (int i = 0; i < 8; i++) values[i] = U(p[base + i * 32]);
+      return U(p[base + 8 * 32]);
+    }
+    """
+    private static let screenPreparedSelectSource: String? = {
+        guard var source = fusedSelectB1Source else { return nil }
+        let full = "sum = nmr_load_vector<T, U, values_per_thread>(xp, x_thread);"
+        let tail = "sum = nmr_load_vector_safe<T, U, values_per_thread>(xp, x_thread, remaining);"
+        let count = source.components(separatedBy: full).count - 1
+            + source.components(separatedBy: tail).count - 1
+        guard count == 2 else { return nil }
+        let read = "sum = nmr_screen_prepared<U>(prepared, k + lane * values_per_thread, x_thread);"
+        source = source.replacingOccurrences(of: full, with: read)
+            .replacingOccurrences(of: tail, with: read)
+        return source
+    }()
+    private static let screenPreparedSelectKernel = screenPreparedSelectSource.map {
+        MLXFast.metalKernel(name: "nemotron_screen_select_final_b1_prepared_rescore",
+            inputNames: ["scores", "w", "scales", "biases", "x", "counter", "prepared"],
+            outputNames: ["cand_ids", "cand_vals", "best_val", "best_id", "out"],
+            source: $0, header: screenPreparedHeader, mutableInputs: ["counter"])
+    }
+    static var preparedRescoreAvailable: Bool {
+        preparedRescoreEnabled && screenPreparePairedKernel != nil && screenPreparedSelectKernel != nil
+            && selectHalfDecodeForm == 0
+    }
+    static func liveScreenPrepared(_ x: MLXArray) -> MLXArray {
+        // Original PV8 padding is16 unwritten/unconsumed chunks, not data.
+        x.reshaped([11, 9, 32]).transposed(0, 2, 1).reshaped([352, 9])[0..<336, 0...]
+    }
+    private static func preparedRescore(
+        _ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
+        upperGroups: MLXArray?, upperGroupCount: Int, records2: MLXArray?,
+        counter: MLXArray?, paired: Bool, rowsPerSimdgroup: Int, simdgroups: Int, b1: Bool
+    ) -> Result? {
+        guard preparedRescoreAvailable, b1, b1Available(keep: keep),
+              hidden.shape == [1, 1, 2688], hidden.dtype == .bfloat16,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              rowsPerSimdgroup == 8, simdgroups == 2,
+              let records2, let counter, let select = screenPreparedSelectKernel else { return nil }
+        let paired = paired && pairable(groupCount: groupCount,
+            upperGroupCount: upperGroups == nil ? nil : upperGroupCount, rowsPerSimdgroup: rowsPerSimdgroup)
+        let produce = paired ? (screenPreparePairedKernel ?? screenPrepareKernel) : screenPrepareKernel
+        let rows = upperGroups == nil ? Self.rows : headRows
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup), ("NSG", simdgroups),
+            ("LO", Self.rows), ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
+        let partial = produce([records2, hidden, groups, upperGroups ?? groups], template: template,
+            grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+            outputShapes: [[rows], [1, 11, 288]], outputDTypes: [.float32, .float32])
+        let chunks = rows / chunk
+        let picked = select([partial[0], weight, scales, biases, hidden, counter, partial[1]],
+            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", 8), ("NCH", chunks)],
+            grid: (32, 8 * chunks, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[chunks * keep], [chunks * keep], [chunks], [chunks], [1]],
+            outputDTypes: [.int32, .float32, .float32, .int32, .int32])
+        return Result(id: picked[4], scores: partial[0], candidateIds: picked[0], candidateValues: picked[1],
+            prepared: partial[1])
+    }
+
     struct Result {
         let id: MLXArray
         let scores: MLXArray
         let candidateIds: MLXArray
         let candidateValues: MLXArray
+        let prepared: MLXArray?
+        init(id: MLXArray, scores: MLXArray, candidateIds: MLXArray, candidateValues: MLXArray,
+             prepared: MLXArray? = nil) {
+            self.id = id; self.scores = scores; self.candidateIds = candidateIds
+            self.candidateValues = candidateValues; self.prepared = prepared
+        }
     }
 
     /// hidden [1, 1, 2688] bf16; the head arrays are the full shared head.
@@ -4419,8 +4530,14 @@ enum NemotronHeadScreen {
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
         counter: MLXArray? = nil, paired: Bool = false,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, b1: Bool = false
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, b1: Bool = false,
+        preparedRescore: Bool = false
     ) -> Result {
+        if preparedRescore, let result = Self.preparedRescore(
+            hidden, weight: weight, scales: scales, biases: biases, groups: groups,
+            groupCount: groupCount, chunk: chunk, keep: keep, upperGroups: upperGroups,
+            upperGroupCount: upperGroupCount, records2: records2, counter: counter, paired: paired,
+            rowsPerSimdgroup: rowsPerSimdgroup, simdgroups: simdgroups, b1: b1) { return result }
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
             ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),

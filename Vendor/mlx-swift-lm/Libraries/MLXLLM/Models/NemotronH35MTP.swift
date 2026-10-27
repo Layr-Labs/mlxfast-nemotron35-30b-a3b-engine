@@ -58,6 +58,7 @@ private final class NemotronMTPDraftHead {
         /// The fused select with one barrier fewer (`NemotronHeadScreen`'s B1
         /// select), set once its ids and kept values matched the record's.
         var b1 = false
+        var preparedRescore = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -84,7 +85,8 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records, records2: screen.records2,
-            counter: screen.counter, paired: screen.paired, b1: screen.b1)
+            counter: screen.counter, paired: screen.paired, b1: screen.b1,
+            preparedRescore: screen.preparedRescore)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -554,6 +556,69 @@ private final class NemotronMTPDraftHead {
                     b1Note = "off (\(error))"
                 }
             }
+        }
+        // Official-only admission: original plan's counter, scores, kept
+        // rows, rescored values and final id must stay exact. Independent
+        // old/new counters preserve production's mutable-input ordering.
+        if plan.records2 != nil, plan.counter != nil, plan.b1,
+           NemotronHeadScreen.preparedRescoreAvailable {
+            var cases = 0
+            do {
+                plan.preparedRescore = try withError { () -> Bool in
+                    let oldCounter = NemotronHeadScreen.makeCounter()
+                    let newCounter = NemotronHeadScreen.makeCounter()
+                    var expected: [NemotronHeadScreen.Result] = []
+                    var queued: [NemotronHeadScreen.Result] = []
+                    func same(_ a: NemotronHeadScreen.Result, _ b: NemotronHeadScreen.Result) -> Bool {
+                        guard let prepared = b.prepared else { return false }
+                        return NemotronU2.equal(a.id, b.id).item(Bool.self)
+                            && NemotronU2.equal(a.scores, b.scores).item(Bool.self)
+                            && NemotronU2.equal(a.candidateIds, b.candidateIds).item(Bool.self)
+                            && NemotronU2.equal(a.candidateValues, b.candidateValues).item(Bool.self)
+                            && prepared.shape == [1, 11, 288]
+                    }
+                    for kind in 0..<8 {
+                        let raw = MLXRandom.normal([k], key: MLXRandom.key(UInt64(0xbc90 + kind)))
+                        let values: MLXArray
+                        switch kind {
+                        case 0: values = MLXArray.zeros([k], dtype: .bfloat16)
+                        case 1: values = MLXArray((0..<k).map { $0 % 2 == 0 ? Float.zero : -Float.zero }).asType(.bfloat16)
+                        case 2: values = (raw * Float(1e-30)).asType(.bfloat16)
+                        case 3: values = (raw * Float(1e16)).asType(.bfloat16)
+                        case 4: values = (raw * 4).asType(.bfloat16)
+                        case 5: values = raw.round().asType(.bfloat16)
+                        default: values = raw.asType(.bfloat16)
+                        }
+                        let padding = concatenated([MLXArray.zeros([1], dtype: .bfloat16), values], axis: 0)
+                        let x = (kind == 7 ? padding[1..<(k + 1)] : values).reshaped([1, 1, k])
+                        let stockPrepared = NemotronHeadPreparedActivation.pack(x.reshaped([1, k]))
+                        for half in plan.upperGroups == nil ? [false] : [false, true] {
+                            for paired in plan.paired ? [false, true] : [false] {
+                                func screened(_ prepared: Bool) -> NemotronHeadScreen.Result {
+                                    NemotronHeadScreen.run(x, weight: plan.weight, scales: plan.scales,
+                                        biases: plan.biases, groups: plan.groups, groupCount: groupCount,
+                                        chunk: chunk, keep: keep, upperGroups: half ? plan.upperGroups : nil,
+                                        upperGroupCount: half ? plan.upperGroupCount : 0,
+                                        records2: plan.records2, counter: prepared ? newCounter : oldCounter,
+                                        paired: paired, b1: true, preparedRescore: prepared)
+                                }
+                                let old = screened(false), new = screened(true)
+                                guard same(old, new), let prepared = new.prepared,
+                                      NemotronU2.equal(
+                                        NemotronHeadScreen.liveScreenPrepared(prepared),
+                                        NemotronHeadScreen.liveScreenPrepared(stockPrepared)).item(Bool.self)
+                                else { return false }
+                                expected.append(old); queued.append(screened(true))
+                                cases += 1
+                            }
+                        }
+                    }
+                    eval(queued.flatMap { [$0.id, $0.scores, $0.candidateIds, $0.candidateValues] })
+                    for (a, b) in zip(expected, queued) where !same(a, b) { return false }
+                    return cases > 0 && oldCounter.item(UInt32.self) == 0 && newCounter.item(UInt32.self) == 0
+                }
+            } catch { plan.preparedRescore = false }
+            report("prepared rescore \(plan.preparedRescore ? "on" : "off") (\(cases) full score/id/value/live-prepared cases; queued counter checks)")
         }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
