@@ -540,19 +540,22 @@ private func nmlTail8Source(_ source: String) -> String? {
 }
 
 /// The triple FC1 with its three main K loops (one, two and three routed
-/// rows) unrolled by two (NEMOTRON_MTP_FC1_UNROLL): `#pragma clang loop
-/// unroll_count(2)` ahead of each `for (; k < K - block_size; ...)`. The
+/// rows) unrolled `count` times (NEMOTRON_MTP_FC1_UNROLL, count 2;
+/// NEMOTRON_MTP_FC1_UNROLL4, count 4): `#pragma clang loop
+/// unroll_count(<count>)` ahead of each `for (; k < K - block_size; ...)`. The
 /// unrolled loop runs the same block bodies in the same order (block k, then
-/// block k + 256, with the tail block after the loop as before), so every
-/// load, product, term order, accumulation, affine close, closing simd_sum
-/// and store is the record's; only the instruction stream of two consecutive
-/// blocks is laid out together. Applied to the triple source before the
-/// tail-8, prepared and dictionary transforms; nil when the record text has
-/// moved (the record kernels stay).
-private func nmlFC1UnrollSource(_ source: String) -> String? {
+/// block k + 256, and so on, with the tail block after the loop as before), so
+/// every load, product, term order, accumulation, affine close, closing
+/// simd_sum and store is the record's; only the instruction stream of
+/// consecutive blocks is laid out together. Applied to a routed gather
+/// source (plan-free or plan-based triple FC1) before the tail-8, prepared,
+/// dictionary and plan transforms; nil when the record text has moved (the
+/// record kernels stay).
+private func nmlFC1UnrollSource(_ source: String, count: Int = 2) -> String? {
     let loop = "    for (; k < K - block_size; k += block_size) {\n"
     guard source.components(separatedBy: loop).count == 4 else { return nil }
-    return source.replacingOccurrences(of: loop, with: "    #pragma clang loop unroll_count(2)\n" + loop)
+    return source.replacingOccurrences(
+        of: loop, with: "    #pragma clang loop unroll_count(\(count))\n" + loop)
 }
 
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
@@ -803,6 +806,19 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpTail8Unrolled: MLXFast.MLXFastKernel?
     let tripleGateUpDictUnrolled: MLXFast.MLXFastKernel?
     let tripleGateUpTail8DictUnrolled: MLXFast.MLXFastKernel?
+    /// The same four plan-free kernels with the loops unrolled by four
+    /// (nmlFC1UnrollSource(count: 4); NEMOTRON_MTP_FC1_UNROLL4).
+    let tripleGateUpUnrolled4: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8Unrolled4: MLXFast.MLXFastKernel?
+    let tripleGateUpDictUnrolled4: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8DictUnrolled4: MLXFast.MLXFastKernel?
+    /// The four plan-based triple FC1 kernels — the same three-branch routed
+    /// gather with the FC2 balance-plan emission appended — unrolled by two
+    /// (NEMOTRON_MTP_QMM_UNROLL).
+    let tripleGateUpAndPlanUnrolled: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlanTail8Unrolled: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlanDictUnrolled: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlanTail8DictUnrolled: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -935,6 +951,81 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_sbd_u2",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        // The same four plan-free kernels from the same source with the main
+        // loops unrolled four times.
+        let unrolled4Source = nmlFC1UnrollSource(tripleSource, count: 4)
+        tripleGateUpUnrolled4 = unrolled4Source
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_u4",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8Unrolled4 = unrolled4Source.flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_u4",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpDictUnrolled4 = unrolled4Source
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_sbd_u4",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8DictUnrolled4 = unrolled4Source.flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_sbd_u4",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        // The plan-based twins: the same unrolled triple source, then the
+        // unchanged balance-plan emission (it reads `inds` only).
+        tripleGateUpAndPlanUnrolled = unrolledSource
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .map(nmlFC1WithBalancePlanSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_u2_with_pair_fc2_plan",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpAndPlanTail8Unrolled = unrolledSource.flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .map(nmlFC1WithBalancePlanSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_u2_with_pair_fc2_plan",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpAndPlanDictUnrolled = unrolledSource
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_u2_with_pair_fc2_plan_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpAndPlanTail8DictUnrolled = unrolledSource.flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_u2_with_pair_fc2_plan_sbd",
+                inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
     }
@@ -1257,6 +1348,22 @@ enum NemotronMoELeader {
     static let fc1Unroll =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_UNROLL"] != "0"
     nonisolated(unsafe) private(set) static var fc1UnrollQualified = false
+    /// The same plan-free triple FC1 with the loops unrolled by four
+    /// (nmlFC1UnrollSource(count: 4)); =0 keeps the record (or x2) loops.
+    /// Selected, over the x2 kernel, only after `qualifyFC1Unroll4` found it
+    /// bit for bit equal to the record kernel on the same real weights.
+    static let fc1Unroll4 =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_UNROLL4"] != "0"
+    nonisolated(unsafe) private(set) static var fc1Unroll4Qualified = false
+    /// The plan-based triple FC1 — the same three-branch routed gather that
+    /// also writes the FC2 balance plan — with its main K loops unrolled by two
+    /// (nmlFC1UnrollSource); =0 keeps the record loops. Selected only after
+    /// `qualifyFC1PlanUnroll` found the unrolled kernel and its plan bit for
+    /// bit equal to the record kernel on the real weights of every routed FC1
+    /// bank.
+    static let fc1PlanUnroll =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMM_UNROLL"] == "1"
+    nonisolated(unsafe) private(set) static var fc1PlanUnrollQualified = false
     /// The same constant tail for the R != 3 (draft tail) leader and weighted
     /// kernels, through production-only kernel copies.
     static let leaderTail8 =
@@ -1280,27 +1387,41 @@ enum NemotronMoELeader {
 
     static func applyWithBalancePlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
     ) -> (activation: MLXArray, plan: MLXArray)? {
         guard fuseBalancePlan, preparedGateUp,
               x.shape == [3, 2688], x.dtype == .bfloat16,
               inds.shape == [18], inds.dtype == .uint32,
-              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
-              let kernel = (tripleGateUp
-                  ? (fc1Tail8 ? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlanTail8 : nil)
-                      ?? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlan : nil)
-                  ?? NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
+              bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
         else { return nil }
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        // The plan-based three-branch gather the record selects, and whether it
+        // is the constant 8-value tail form (the unrolled twin keeps the form).
+        let planTail8 = tripleGateUp && fc1Tail8 ? kernels.tripleGateUpAndPlanTail8 : nil
+        let planTriple = tripleGateUp ? (planTail8 ?? kernels.tripleGateUpAndPlan) : nil
+        guard let kernel = planTriple ?? kernels.gateUpAndPlan else { return nil }
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = leaderResultsPerSimdgroup(rows: 3)
         // The selected triple kernel's dictionary twin, when `dict` is given.
-        let kernels = NemotronMoELeaderPreparedKernels.shared
         let twin = dict == nil || !tripleGateUp ? nil
             : (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
                 ? kernels.tripleGateUpAndPlanTail8Dict
                 : (kernels.tripleGateUpAndPlan != nil ? kernels.tripleGateUpAndPlanDict : nil))
-        let result = (twin != nil && dict != nil ? twin! : kernel)(
+        let launch = twin ?? kernel
+        // The unrolled plan twin of the kernel `launch` names, when qualified;
+        // a missing twin leaves the record kernel in place.
+        let planUnrolled = unroll ?? (fc1PlanUnroll && fc1PlanUnrollQualified)
+        let unrolledTwin = !planUnrolled || planTriple == nil ? nil
+            : (twin != nil
+                ? (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+                    ? kernels.tripleGateUpAndPlanTail8DictUnrolled
+                    : kernels.tripleGateUpAndPlanDictUnrolled)
+                : (planTail8 != nil
+                    ? kernels.tripleGateUpAndPlanTail8Unrolled
+                    : kernels.tripleGateUpAndPlanUnrolled))
+        let chosen = unrolledTwin ?? launch
+        let result = chosen(
             twin != nil && dict != nil
                 ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
                 : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
@@ -1324,11 +1445,16 @@ enum NemotronMoELeader {
     static let elideUnreadPlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_PLAN_ELIDE"] != "0"
 
-    /// unroll: the unrolled main loops (nil: `fc1Unroll` once qualified); the
-    /// record kernel stands in whenever its unrolled twin is missing.
+    /// Which main-K-loop variant of the plan-free triple FC1 to launch: the
+    /// record loops, the x2 unroll (NEMOTRON_MTP_FC1_UNROLL) or the x4 unroll
+    /// (NEMOTRON_MTP_FC1_UNROLL4). nil selects the widest qualified variant.
+    enum FC1Unroll: Equatable { case record, two, four }
+
+    /// unroll: the main-K-loop variant (nil: x4 once qualified, else x2, else
+    /// record); the record kernel stands in whenever a twin is missing.
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: FC1Unroll? = nil
     ) -> MLXArray? {
         let kernels = NemotronMoELeaderPreparedKernels.shared
         guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
@@ -1344,12 +1470,22 @@ enum NemotronMoELeader {
             ? (tail8 ? kernels.tripleGateUpTail8Dict : kernels.tripleGateUpDict)
             : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
         else { return nil }
-        let unrolled = unroll ?? (fc1Unroll && fc1UnrollQualified)
-        let kernel = (unrolled
-            ? (useDict
+        let level = unroll ?? (fc1Unroll4 && fc1Unroll4Qualified
+            ? .four : (fc1Unroll && fc1UnrollQualified ? .two : .record))
+        let twin: MLXFast.MLXFastKernel?
+        switch level {
+        case .four:
+            twin = useDict
+                ? (tail8 ? kernels.tripleGateUpTail8DictUnrolled4 : kernels.tripleGateUpDictUnrolled4)
+                : (tail8 ? kernels.tripleGateUpTail8Unrolled4 : kernels.tripleGateUpUnrolled4)
+        case .two:
+            twin = useDict
                 ? (tail8 ? kernels.tripleGateUpTail8DictUnrolled : kernels.tripleGateUpDictUnrolled)
-                : (tail8 ? kernels.tripleGateUpTail8Unrolled : kernels.tripleGateUpUnrolled))
-            : nil) ?? record
+                : (tail8 ? kernels.tripleGateUpTail8Unrolled : kernels.tripleGateUpUnrolled)
+        case .record:
+            twin = nil
+        }
+        let kernel = twin ?? record
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
@@ -1409,9 +1545,9 @@ enum NemotronMoELeader {
                 let inds = MLXArray(route)
                 for relu2 in [false, true] {
                     guard let a = applyTripleWithoutPlan(
-                              x, inds, bank: up, relu2: relu2, prepared: nil, dict: dict, unroll: false),
+                              x, inds, bank: up, relu2: relu2, prepared: nil, dict: dict, unroll: .record),
                           let b = applyTripleWithoutPlan(
-                              x, inds, bank: up, relu2: relu2, prepared: nil, dict: dict, unroll: true)
+                              x, inds, bank: up, relu2: relu2, prepared: nil, dict: dict, unroll: .two)
                     else { continue }
                     same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
                     ran = true
@@ -1427,6 +1563,149 @@ enum NemotronMoELeader {
         fc1UnrollQualified = true
         FileHandle.standardError.write(Data(
             "nemotron fc1 unroll on: \(layers) routed FC1 banks, plan-free triple FC1 bitwise equal to the record kernel\n".utf8))
+    }
+
+    /// Load time, after `qualifyFC1Unroll`: the same four plan-free triple FC1
+    /// kernels with the main K loops unrolled four times against the record
+    /// kernel, bit for bit, on the same real weights and the same routes (one
+    /// expert all three rows, one expert two rows, the rest one row each, both
+    /// ReLU2 forms). Any difference, or a missing twin, keeps the record
+    /// kernel and the x2 unroll.
+    static func qualifyFC1Unroll4(_ model: Module) {
+        guard enabled else { return }
+        guard fc1Unroll4 else {
+            FileHandle.standardError.write(Data("nemotron fc1 unroll4: off (setting)\n".utf8))
+            return
+        }
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard kernels.tripleGateUpUnrolled4 != nil, kernels.tripleGateUpTail8Unrolled4 != nil,
+              kernels.tripleGateUpDictUnrolled4 != nil, kernels.tripleGateUpTail8DictUnrolled4 != nil
+        else {
+            FileHandle.standardError.write(
+                Data("nemotron fc1 unroll4 off: the record main loop moved, no unrolled kernel\n".utf8))
+            return
+        }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5bd4), into: 2)
+        let routes: [[UInt32]] = [
+            [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127],
+            [96, 30, 1, 65, 127, 33, 65, 2, 96, 40, 12, 7, 33, 96, 9, 19, 64, 65],
+        ]
+        var same = MLXArray(true)
+        var forms = 0
+        for module in model.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                  let up = bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                  up.weight.shape == [128, 1856, 336] else { continue }
+            let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(moe.switchMLP.fc1) : nil
+            // Both instantiations the decode round can launch: the plain one and,
+            // when the bank has a pair dictionary, the dictionary one.
+            let dictionaries = dict == nil ? [NemotronSBDict.Dict?.none] : [dict, nil]
+            for d in dictionaries {
+                var ran = false
+                for (r, route) in routes.enumerated() {
+                    let x = (MLXRandom.normal([3, 2688], key: keys[r]) * 0.5).asType(.bfloat16)
+                    let inds = MLXArray(route)
+                    for relu2 in [false, true] {
+                        guard let a = applyTripleWithoutPlan(
+                                  x, inds, bank: up, relu2: relu2, prepared: nil, dict: d, unroll: .record),
+                              let b = applyTripleWithoutPlan(
+                                  x, inds, bank: up, relu2: relu2, prepared: nil, dict: d, unroll: .four)
+                        else { continue }
+                        same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                        ran = true
+                    }
+                }
+                if ran { forms += 1 }
+            }
+        }
+        guard forms > 0, same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "nemotron fc1 unroll4 off: \(forms > 0 ? "differs from the record kernel" : "no routed FC1 bank ran")\n".utf8))
+            return
+        }
+        fc1Unroll4Qualified = true
+        FileHandle.standardError.write(Data(
+            "nemotron fc1 unroll4 on: \(forms) routed FC1 bank forms, plan-free triple FC1 unroll_count(4) bitwise equal to the record kernel\n".utf8))
+    }
+
+    /// Load time, after the pair dictionaries: the plan-based triple FC1 (the
+    /// same three-branch routed gather that also writes the FC2 balance plan)
+    /// with its main K loops unrolled by two, against the record plan kernel,
+    /// both outputs bit for bit, on the real weights of every routed FC1 bank.
+    /// The routes give one expert all three rows (the third-row branch), one
+    /// expert two rows (the paired branch) and the other experts one row each
+    /// (the one-row branch), in both ReLU2 forms and both the plain and the
+    /// pair-dictionary instantiations. Any difference, or a missing twin,
+    /// keeps the record kernel.
+    static func qualifyFC1PlanUnroll(_ model: Module) {
+        guard enabled else { return }
+        guard fc1PlanUnroll else {
+            FileHandle.standardError.write(Data("nemotron qmm unroll: off (setting)\n".utf8))
+            return
+        }
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard kernels.tripleGateUpAndPlanUnrolled != nil,
+              kernels.tripleGateUpAndPlanTail8Unrolled != nil,
+              kernels.tripleGateUpAndPlanDictUnrolled != nil,
+              kernels.tripleGateUpAndPlanTail8DictUnrolled != nil
+        else {
+            FileHandle.standardError.write(
+                Data("nemotron qmm unroll off: the record main loop moved, no unrolled kernel\n".utf8))
+            return
+        }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5bd4), into: 2)
+        let routes: [[UInt32]] = [
+            [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127],
+            [96, 30, 1, 65, 127, 33, 65, 2, 96, 40, 12, 7, 33, 96, 9, 19, 64, 65],
+        ]
+        var same = MLXArray(true)
+        var forms = 0
+        var dictForms = 0
+        for module in model.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                  let up = bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                  up.weight.shape == [128, 1856, 336] else { continue }
+            let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(moe.switchMLP.fc1) : nil
+            // Both instantiations the decode round can launch: the plain one and,
+            // when the bank has a pair dictionary, the dictionary one.
+            let dictionaries = dict == nil ? [NemotronSBDict.Dict?.none] : [dict, nil]
+            for d in dictionaries {
+                var ran = false
+                for (r, route) in routes.enumerated() {
+                    let x = (MLXRandom.normal([3, 2688], key: keys[r]) * 0.5).asType(.bfloat16)
+                    let inds = MLXArray(route)
+                    for relu2 in [false, true] {
+                        guard let a = applyWithBalancePlan(
+                                  x, inds, bank: up, relu2: relu2, prepared: nil, dict: d, unroll: false),
+                              let b = applyWithBalancePlan(
+                                  x, inds, bank: up, relu2: relu2, prepared: nil, dict: d, unroll: true)
+                        else { continue }
+                        same = logicalAnd(same, logicalAnd(
+                            (a.activation.view(dtype: .uint16) .== b.activation.view(dtype: .uint16)).all(),
+                            (a.plan .== b.plan).all()))
+                        ran = true
+                    }
+                }
+                if ran {
+                    forms += 1
+                    if d != nil { dictForms += 1 }
+                }
+            }
+        }
+        guard forms > 0, same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "nemotron qmm unroll off: \(forms > 0 ? "differs from the record kernel" : "no routed FC1 bank ran")\n".utf8))
+            return
+        }
+        fc1PlanUnrollQualified = true
+        let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+        let line = "nemotron qmm unroll on: \(forms) routed FC1 bank forms "
+            + "(\(dictForms) pair-dictionary), plan-based triple FC1 x2 "
+            + "[\(tail8 ? "plan-tail8" : "plan")], activation and balance plan "
+            + "bitwise equal to the record kernel\n"
+        FileHandle.standardError.write(Data(line.utf8))
     }
 
     /// Same leader pairs as apply(), with separate FP32 products and the
