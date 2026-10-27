@@ -131,6 +131,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
         NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPDraftSDPA.qualifyNarrow(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
@@ -271,6 +272,11 @@ extension NemotronH35MTPAssistant {
         // branch), then every shallower width.
         var rounds = [(depth, min(2, depth + 1)), (depth, depth + 1), (depth, 1)]
         for k in (1..<depth).reversed() { rounds += [(k, k + 1), (k, 1)] }
+        if depth == 2, NemotronMTPPendingSSM.warmsSteps, NemotronMTPPendingSSM.enabled {
+            rounds += [(depth, depth + 1)]
+                + Array(repeating: (depth, 1), count: NemotronMTPPendingSSM.limit + 1)
+                + [(depth, depth + 1)]
+        }
         for (k, confirmed) in rounds {
             var tokens = seed, hidden = carry
             var drafts: [MLXArray] = []

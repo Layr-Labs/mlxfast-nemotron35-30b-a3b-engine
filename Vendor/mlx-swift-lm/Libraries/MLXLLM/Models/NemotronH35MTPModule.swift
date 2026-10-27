@@ -1129,6 +1129,8 @@ enum NemotronMTPFrontRowsQKV {
 enum NemotronMTPDraftSDPA {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SDPA"] != "0"
     nonisolated(unsafe) private(set) static var verified = false
+    private static let narrowEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SDPA_NARROW_PREFETCH"] != "0"
+    nonisolated(unsafe) private static var narrowVerified = false
 
     private static let source = """
       // One query row (head tid.x) over N keys: the history keys [0, L) and, with OWN, the draft's own row as
@@ -1314,6 +1316,38 @@ enum NemotronMTPDraftSDPA {
         inputNames: ["queries", "keys", "values", "fmask", "scale", "own_keys", "own_values"],
         outputNames: ["out"], source: source(own: true), ensureRowContiguous: false)
 
+    /// Keep prefetched BF16 words narrow until each FP32 arithmetic consumer.
+    /// Source-level live payload is smaller; compiler registers/packing and speed
+    /// are unknown. The original U4 source, kernels and admission remain intact.
+    private static func narrowSource(own: Bool) -> String? {
+        guard narrowEnabled else { return nil }
+        var text = source(own: own)
+        let edits = [
+            ("U kk[4][qk_per_thread];", "T kk[4][qk_per_thread];"),
+            ("U vv[4][v_per_thread];", "T vv[4][v_per_thread];"),
+            ("score += q[j] * kk[u][j];", "score += q[j] * static_cast<U>(kk[u][j]);"),
+            ("o[j] = o[j] * factor + exp_score * vv[u][j];",
+             "o[j] = o[j] * factor + exp_score * static_cast<U>(vv[u][j]);")
+        ]
+        for (needle, replacement) in edits {
+            guard text.components(separatedBy: needle).count == 2 else { return nil }
+            text = text.replacingOccurrences(of: needle, with: replacement)
+        }
+        return text
+    }
+    private static let narrowKernel = narrowSource(own: false).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_draft_sdpa_u4_1b_narrow_prefetch",
+            inputNames: ["queries", "keys", "values", "fmask", "scale"], outputNames: ["out"],
+            source: $0, ensureRowContiguous: false)
+    }
+    private static let narrowOwnKernel = narrowSource(own: true).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_draft_sdpa_own_u4_1b_narrow_prefetch",
+            inputNames: ["queries", "keys", "values", "fmask", "scale", "own_keys", "own_values"],
+            outputNames: ["out"], source: $0, ensureRowContiguous: false)
+    }
+
     nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
     private static let lock = NSLock()
     private static func scaleArray(_ scale: Float) -> MLXArray {
@@ -1345,12 +1379,12 @@ enum NemotronMTPDraftSDPA {
         scale: Float, mask: MLXArray
     ) -> MLXArray? {
         guard verified else { return nil }
-        return launch(queries: queries, keys: keys, values: values, own: own, scale: scale, mask: mask)
+        return launch(queries: queries, keys: keys, values: values, own: own, scale: scale, mask: mask, narrow: narrowVerified)
     }
 
     private static func launch(
         queries: MLXArray, keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray)?,
-        scale: Float, mask: MLXArray
+        scale: Float, mask: MLXArray, narrow: Bool = false
     ) -> MLXArray? {
         let length = keys.ndim == 4 ? keys.dim(2) : 0
         let n = length + (own == nil ? 0 : 1)
@@ -1369,7 +1403,11 @@ enum NemotronMTPDraftSDPA {
         }
         let inputs = [queries, keys, values, mask, scaleArray(scale)]
             + (own.map { [$0.keys, $0.values] } ?? [])
-        let out = (own == nil ? kernel : ownKernel)(
+        let selected = narrow
+            ? (own == nil ? narrowKernel : narrowOwnKernel)
+            : Optional(own == nil ? kernel : ownKernel)
+        guard let selected else { return nil }
+        let out = selected(
             inputs, template: [("T", DType.bfloat16), ("D", 128), ("V", 128), ("OWN", own != nil)],
             grid: (32 * 1024, 1, 1), threadGroup: (1024, 1, 1),
             outputShapes: [[1, 32, 1, 128]], outputDTypes: [.bfloat16])[0]
@@ -1458,6 +1496,85 @@ enum NemotronMTPDraftSDPA {
         }
         report(verified
             ? "on (\(checked) cases bitwise equal to the stock call; key loop unroll4, one-barrier aggregation, own row in place)"
+            : "off (differs from the stock call after \(checked) cases)")
+    }
+
+    /// Independent admission of the narrow twin, after the original U4 gate.
+    static func qualifyNarrow(_ block: NemotronH35MTPAttentionBlock) {
+        narrowVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft sdpa narrow prefetch: \(message)\n".utf8))
+        }
+        guard enabled, narrowEnabled, verified, narrowKernel != nil, narrowOwnKernel != nil
+        else { return report("off (setting, source form or original admission)") }
+        let mixer = block.mixer
+        guard mixer.numHeads == 32, mixer.numKeyValueHeads == 2, mixer.headDim == 128
+        else { return report("off (the head attention is not 32 x 2 x 128)") }
+        let scale = mixer.scale
+        let lengths = [1, 2, 7, 8, 31, 32, 33, 63, 64, 65, 95, 96, 97, 98, 127, 128, 129, 130, 131, 255, 256,
+                       257, 488, 489, 490, 491, 552, 600, 616, 617, 700, 1000, 1021, 1022]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for own in [false, true] {
+                    for (i, length) in lengths.enumerated() {
+                        let n = length + (own ? 1 : 0)
+                        guard n < 1024 else { continue }
+                        let seed = UInt64(0xd5d9_0000 + (own ? 4096 : 0) + i)
+                        let (qScale, kvScale) = inputScales[i % inputScales.count]
+                        let keys5 = MLXRandom.split(key: MLXRandom.key(seed), into: 6)
+                        let q = MLXRandom.normal([1, 4096], dtype: .bfloat16, scale: qScale, key: keys5[0])
+                        let queries = q.reshaped(1, 1, 32, 128).transposed(0, 2, 1, 3)
+                        let capacity = length + 37
+                        let kBuffer = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale, key: keys5[1])
+                        let vBuffer = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale, key: keys5[2])
+                        // Odd cases: slices of a longer buffer; even: contiguous copies.
+                        var keys = kBuffer[.ellipsis, ..<length, 0...]
+                        var values = vBuffer[.ellipsis, ..<length, 0...]
+                        if i % 2 == 0 {
+                            keys = MLX.contiguous(keys)
+                            values = MLX.contiguous(values)
+                        }
+                        let ownRow: (keys: MLXArray, values: MLXArray)? = own
+                            ? (MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: keys5[3])
+                                .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3),
+                               MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: keys5[4])
+                                .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3))
+                            : nil
+                        // Kept: positions below length - tail (and the own row); every fifth case also drops
+                        // scattered keys.
+                        let tail = min(i % 4, length - 1)
+                        let position = MLXArray(Int32(0) ..< Int32(n))
+                        var keep = position .< Int32(length - tail)
+                        if own { keep = keep .|| (position .== Int32(length)) }
+                        if i % 5 == 4 {
+                            let drop = MLXRandom.uniform(Float(0) ..< 1, [n], key: keys5[5]) .< MLXArray(Float(0.2))
+                            keep = keep .&& (logicalNot(drop) .|| (position .== Int32(0)))
+                        }
+                        let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                            .asType(.bfloat16).reshaped(1, 1, 1, n)
+                        guard let out = launch(
+                            queries: queries, keys: keys, values: values, own: ownRow, scale: scale, mask: mask, narrow: true)
+                        else { return false }
+                        let expected = stock(
+                            queries: queries, keys: keys, values: values, own: ownRow, scale: scale, mask: mask)
+                        if !(out.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all().item(Bool.self) {
+                            return false
+                        }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            narrowVerified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(narrowVerified
+            ? "on (\(checked) cases bitwise equal to the stock call; BF16 prefetch until FP32 consumers; original U4/order/barrier/own row)"
             : "off (differs from the stock call after \(checked) cases)")
     }
 }
