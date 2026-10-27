@@ -552,3 +552,143 @@ package func cbv2TopTwoRowsPacketWarm(logitsDType: DType) {
     guard let warmed = cbv2TopTwoRowsPacket(logits, window: window) else { return }
     eval(warmed.ids, warmed.values, warmed.packet)
 }
+
+// MARK: - Native B=1 policy packet graph
+
+/// The graph caches only a stateless function. Every invocation supplies both
+/// logits and the current window; no array, request, draft id, weight or state
+/// is captured. Admission builds and replays the same graph with changed data.
+/// It retains the original partial/finalize kernels and their reduction order.
+/// CBV2_MTP_TOP2_GRAPH=0 retains the original per-call graph construction.
+private enum CBv2TopTwoPacketGraph {
+    struct Key: Hashable {
+        let rows: Int
+        let vocabulary: Int
+        let shuffled: Bool
+    }
+    typealias Function = @Sendable ([MLXArray]) -> [MLXArray]
+    static let enabled = ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_GRAPH"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var functions: [Key: Function] = [:]
+
+    static func lookup(_ key: Key) -> Function? {
+        lock.withLock { functions[key] }
+    }
+
+    static func publish(_ replacement: [Key: Function]) {
+        // Release compiler objects outside our metadata lock.
+        let retired = lock.withLock { () -> [Key: Function] in
+            let old = functions
+            functions = replacement
+            return old
+        }
+        withExtendedLifetime(retired) {}
+    }
+
+    static func make(shuffled: Bool) -> Function {
+        compile { (arrays: [MLXArray]) -> [MLXArray] in
+            guard let packet = cbv2TopTwoRowsPacket(
+                arrays[0], window: arrays[1], shuffle: shuffled)
+            else { return [] }
+            return [packet.ids, packet.values, packet.packet]
+        }
+    }
+}
+
+/// Only the native single-request R=2...4 dense BF16 case uses a graph
+/// admitted at load. Non-dense views and every unsupported shape retain the
+/// original function. This wrapper is selected only by Nemotron's provider.
+package func cbv2TopTwoRowsPacketCompiled(
+    _ logits: MLXArray, window: MLXArray
+) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+    guard CBv2TopTwoPacketGraph.enabled, CBv2MTPTopTwoPacket.enabled,
+        !CBv2MTPTopTwoPacket.selfTest,
+        Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+        logits.ndim == 3, logits.dim(0) == 1, (2...4).contains(logits.dim(1)),
+        logits.dtype == .bfloat16, logits.strides[2] == 1,
+        logits.strides[1] == logits.dim(2),
+        window.ndim == 2, window.shape == [1, logits.dim(1)], window.dtype == .int32,
+        window.strides[1] == 1, window.strides[0] == window.dim(1),
+        let function = CBv2TopTwoPacketGraph.lookup(.init(
+            rows: logits.dim(1), vocabulary: logits.dim(2),
+            shuffled: CBv2MTPTopTwoShuffle.verified))
+    else { return cbv2TopTwoRowsPacket(logits, window: window) }
+    let arrays = function([logits, window])
+    guard arrays.count == 3 else { return cbv2TopTwoRowsPacket(logits, window: window) }
+    return (arrays[0], arrays[1], arrays[2])
+}
+
+/// Remote load-time only: each exact shape/function is traced once, then used
+/// repeatedly with changed logits AND windows. Compare ids, FP32 value bits
+/// and the complete packet with the unchanged two-kernel function. Keep both
+/// outputs alive until comparison, so graph invocations cannot bind a previous
+/// window or overwrite another invocation. Publication is all-or-nothing.
+package func cbv2TopTwoPacketGraphQualify(vocabulary: Int) {
+    CBv2TopTwoPacketGraph.publish([:])
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 mtp top2 graph: \(message)\n".utf8))
+    }
+    guard CBv2TopTwoPacketGraph.enabled, CBv2MTPTopTwoPacket.enabled,
+        !CBv2MTPTopTwoPacket.selfTest, vocabulary >= 2,
+        Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+    else { return report("off (setting or device)") }
+    let shuffled = CBv2MTPTopTwoShuffle.verified
+    var admitted: [CBv2TopTwoPacketGraph.Key: CBv2TopTwoPacketGraph.Function] = [:]
+    var cases = 0
+    do {
+        let matches = try withError { () -> Bool in
+            for vocab in [64, 5003, vocabulary] {
+                for rows in 2...4 {
+                    let function = CBv2TopTwoPacketGraph.make(shuffled: shuffled)
+                    for kind in 0..<6 {
+                        var references: [(MLXArray, MLXArray, MLXArray)] = []
+                        var replays: [[MLXArray]] = []
+                        for replay in 0..<2 {
+                            let key = MLXRandom.key(UInt64(
+                                0x7b90_0000 + vocab * 128 + rows * 32 + kind * 2 + replay))
+                            var logits = MLXRandom.normal([1, rows, vocab], key: key) * 3
+                            switch kind {
+                            case 1: logits = round(logits)
+                            case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)),
+                                                   MLXArray(Float.nan), logits)
+                            case 3:
+                                logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                                    which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                            case 4: logits = which(abs(logits) .< MLXArray(Float(1)),
+                                                   MLXArray(Float(-0.0)), round(logits))
+                            case 5: logits = MLXArray.zeros([1, rows, vocab]) + MLXArray(Float(replay))
+                            default: break
+                            }
+                            let typed = logits.asType(.bfloat16)
+                            // Every column changes between the two live invocations.
+                            let window = MLXArray((0..<rows).map {
+                                Int32(($0 + kind + replay) % vocab)
+                            }).reshaped([1, rows])
+                            guard let reference = cbv2TopTwoRowsPacket(
+                                typed, window: window, shuffle: shuffled)
+                            else { return false }
+                            references.append((reference.ids, reference.values, reference.packet))
+                            replays.append(function([typed, window]))
+                        }
+                        for replay in 0..<2 {
+                            let a = references[replay], b = replays[replay]
+                            guard b.count == 3 else { return false }
+                            let same = (a.0 .== b[0]).all()
+                                .&& (a.1.view(dtype: .uint32) .== b[1].view(dtype: .uint32)).all()
+                                .&& (a.2 .== b[2]).all()
+                            if !same.item(Bool.self) { return false }
+                            cases += 1
+                        }
+                    }
+                    if vocab == vocabulary {
+                        admitted[.init(rows: rows, vocabulary: vocab, shuffled: shuffled)] = function
+                    }
+                }
+            }
+            return true
+        }
+        guard matches, admitted.count == 3 else { return report("off (replay differs)") }
+        CBv2TopTwoPacketGraph.publish(admitted)
+    } catch { return report("off (\(error))") }
+    report("on (\(cases) changed-input replays; original reductions and packet)")
+}

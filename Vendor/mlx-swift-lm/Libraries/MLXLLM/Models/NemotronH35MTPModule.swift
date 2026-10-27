@@ -1000,7 +1000,7 @@ extension NemotronH35Model: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
         -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
     {
-        cbv2TopTwoRowsPacket(logits, window: window)
+        cbv2TopTwoRowsPacketCompiled(logits, window: window)
     }
 }
 
