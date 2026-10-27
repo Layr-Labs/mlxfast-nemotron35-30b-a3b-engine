@@ -119,6 +119,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillScanDecaySkip.qualify()
         NemotronPrefillScanDecayGemm.qualify()
         NemotronPrefillStateGemm.qualify()
+        NemotronPrefillSeedI32.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -602,3 +603,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
 
 // Measurement entry 2 of this tree.
+
+// Measurement 4 of e0c81d92 (854f665).
