@@ -508,7 +508,8 @@ extension NemotronHMamba2Mixer {
                              nemotronBitwiseOrNaN(fused.2, reference.finalState))
                 }
             }
-            return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
+            let preparedOut = NemotronWeightPrefetch.after(fused.1, touching: q.weight, anchor: convolution)
+            return [nemotronMTPLinearRows(fused.0, outProj, prepared: preparedOut),
                     padded, convolution, dt, fused.2]
         }
         let result = nemotronMTPSSMCompact(
@@ -715,5 +716,36 @@ extension NemotronH35Model {
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
+    }
+}
+
+/// NEMOTRON_MTP_PREFETCH=0 turns it off. Otherwise a launch that reads `weight` once (into the GPU's last-level cache) and
+/// writes nothing the decode reads, made a dependency of the next projection's operand so MLX encodes
+/// it beside the launch that produces that operand.
+enum NemotronWeightPrefetch {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFETCH"] != "0"
+    static let threads = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFETCH_THREADS"] ?? "") ?? 16384
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_weight_prefetch",
+        inputNames: ["w", "anchor"], outputNames: ["sink"],
+        source: """
+          const uint gid = thread_position_in_grid.x;
+          const uint total = threads_per_grid.x;
+          const device uint4* w4 = (const device uint4*)w;
+          uint4 acc = uint4(0);
+          for (uint i = gid; i < uint(NV); i += total) acc ^= w4[i];
+          const uint v = acc.x ^ acc.y ^ acc.z ^ acc.w;
+          if (v == 0x9e3779b9u) sink[0] = v + uint(anchor[0] != 0);
+          """)
+
+    /// `anchor`: an array the previous launch writes, bound (not read on the hot path) so the prefetch
+    /// is encoded after that launch's barrier, beside the launch that consumes `anchor`.
+    static func after(_ operand: MLXArray, touching weight: MLXArray, anchor: MLXArray) -> MLXArray {
+        guard enabled, weight.nbytes % 16 == 0 else { return operand }
+        let frac = Double(ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFETCH_FRAC"] ?? "") ?? 1.0
+        let sink = kernel([weight, anchor], template: [("NV", Int(Double(weight.nbytes / 16) * frac))],
+                          grid: (threads, 1, 1), threadGroup: (256, 1, 1),
+                          outputShapes: [[1]], outputDTypes: [.uint32])[0]
+        return depends(input: operand, dependencies: [sink])
     }
 }
