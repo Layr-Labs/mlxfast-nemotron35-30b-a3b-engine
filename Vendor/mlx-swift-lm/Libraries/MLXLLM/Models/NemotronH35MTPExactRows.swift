@@ -301,6 +301,70 @@ func nemotronPreparedVariantSource(_ base: String, load: Int, nsg: Bool) -> Stri
     return s
 }
 
+// NEMOTRON_MTP_QMV_BF16_ACT: BF16-activation twins of the verify's dense R = 3
+// prepared launches. A lane's 8 (FAST: 16) values of row r in a row block come
+// from one (two) 16-byte loads of the BF16 row and are prepared in registers
+// with the expressions, in the order, of `nmr_load_vector` (the prepare
+// kernel) and of the joins' prepared epilogues: x, x / 16, x / 256, x / 4096
+// (exact power-of-two divides) and the chunk total `sum = 0`, then
+// `sum += x0 + x1 + x2 + x3` per group of four, in FP32. Each FP32 operand is
+// the value the prepared buffer holds, so every product is the same.
+let nemotronBF16ActHeader = """
+template <typename T, typename U, int values_per_thread>
+inline U nmr_load_vector_bf16(const device T* x, thread U* x_thread) {
+  thread T xv[values_per_thread];
+  for (int c = 0; c < values_per_thread; c += 8) {
+    const uint4 v = *((const device uint4*)(x + c));
+    xv[c] = as_type<T>(ushort(v.x));
+    xv[c + 1] = as_type<T>(ushort(v.x >> 16));
+    xv[c + 2] = as_type<T>(ushort(v.y));
+    xv[c + 3] = as_type<T>(ushort(v.y >> 16));
+    xv[c + 4] = as_type<T>(ushort(v.z));
+    xv[c + 5] = as_type<T>(ushort(v.z >> 16));
+    xv[c + 6] = as_type<T>(ushort(v.w));
+    xv[c + 7] = as_type<T>(ushort(v.w >> 16));
+  }
+  U sum = 0;
+  for (int i = 0; i < values_per_thread; i += 4) {
+    sum += U(xv[i]) + U(xv[i + 1]) + U(xv[i + 2]) + U(xv[i + 3]);
+    x_thread[i] = xv[i];
+    x_thread[i + 1] = xv[i + 1] / 16.0f;
+    x_thread[i + 2] = xv[i + 2] / 256.0f;
+    x_thread[i + 3] = xv[i + 3] / 4096.0f;
+  }
+  return sum;
+}
+"""
+
+/// The BF16-activation twin of a prepared-QMV body: input `x` [R, K] BF16
+/// replaces `prepared`, and the main loop's and the K tail's activation loads
+/// become `nmr_load_vector_bf16` on row r's block (the tail keeps its
+/// `remaining > 0` guard, so lanes past K read nothing). Decode, load form,
+/// geometry, affine close and epilogue keep the body's text. Nil when the
+/// body's prepared loads are not exactly the expected text.
+func nemotronPreparedBF16Source(_ source: String) -> String? {
+    func prepared(_ indent: String) -> String {
+        indent + "const int base = (r * tiles + k / block_size) * (values_per_thread + 1) * 32 + simd_lid;\n"
+            + indent + "sum[r] = prepared[base + values_per_thread * 32];\n"
+            + indent + "for (int v = 0; v < values_per_thread; v++) x_thread[r][v] = prepared[base + v * 32];\n"
+    }
+    func bf16(_ indent: String) -> String {
+        indent + "sum[r] = nmr_load_vector_bf16<T, U, values_per_thread>(xp + r * in_vec_size + k, x_thread[r]);\n"
+    }
+    var s = source
+    for (old, new) in [
+        ("const int tiles = (in_vec_size / values_per_thread + 31) / 32;",
+         "const device T* xp = x + simd_lid * values_per_thread;"),
+        (prepared("      "), bf16("      ")),  // main loop
+        (prepared("        "), bf16("        ")),  // K tail (FAST false)
+    ] {
+        guard s.components(separatedBy: old).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    guard !s.contains("prepared"), !s.contains("tiles") else { return nil }
+    return s
+}
+
 private let nemotronMultiRowQMVCrownSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
@@ -701,16 +765,61 @@ enum NemotronMambaInProjConvDt {
             source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
     }
     static var dictAvailable: Bool { dictKernel != nil }
+    /// The dictionary launch reading the three rows' BF16 activation `x`
+    /// instead of their prepared activation: `nemotronPreparedBF16Source` of
+    /// the same body and epilogue, then `nemotronSBDictSource`. Its inputs are
+    /// row-contiguous (the default): `x` is read by address, the cache and
+    /// conv operands through their strides as before.
+    private static let bf16Kernel = nemotronPreparedBF16Source(
+        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue)
+        .flatMap(nemotronSBDictSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_sbd_bf16",
+            inputNames: ["w", "scales", "biases", "x", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader + nemotronBF16ActHeader)
+    }
+    /// NEMOTRON_MTP_QMV_BF16_INPROJ=0 (or NEMOTRON_MTP_QMV_BF16_ACT=0) keeps
+    /// the dictionary launch on the prepared activation.
+    static let bf16Enabled = NemotronHeadPreparedActivation.bf16Enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_BF16_INPROJ"] != "0"
+    nonisolated(unsafe) private static var bf16Verified = false
+
+    /// The BF16 twin against the dictionary launch (`bf16Qualify`, all four
+    /// outputs) on the first Mamba layer's in_proj, conv weights and timestep
+    /// bias with a seeded conv state, before any verify graph is traced.
+    static func qualifyBF16(_ target: Module) {
+        bf16Verified = false
+        var runs: [(MLXArray, Bool) -> [MLXArray]?] = []
+        if dictAvailable, bf16Kernel != nil,
+           let mixer = target.modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first,
+           let q = mixer.inProj as? QuantizedLinear, NemotronSBDict.dict(q) != nil,
+           let convBias = mixer.conv1d.bias {
+            let state = (MLXRandom.normal([1, 3, mixer.convDim], key: MLXRandom.key(0xbfaf)) * 0.5)
+                .asType(.bfloat16)
+            runs.append { x, twin in
+                apply(x, q, prepared: nil, oldState: state, convWeight: mixer.conv1d.weight,
+                      convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                      convStart: mixer.intermediateSize, convDim: mixer.convDim,
+                      heads: mixer.numHeads, bf16: twin)
+                    .map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+            }
+        }
+        bf16Verified = NemotronHeadPreparedActivation.bf16Qualify(
+            "in_proj", enabled: bf16Enabled, k: 2688, runs)
+    }
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
     /// timestep [1, 3, heads], or nil for any other shape.
+    /// `bf16`: the dictionary launch's BF16 twin (nil: as admitted at load).
     static func apply(
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, bf16: Bool? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -726,12 +835,15 @@ enum NemotronMambaInProjConvDt {
               dtBias.shape == [heads], [DType.bfloat16, .float32].contains(dtBias.dtype)
         else { return nil }
         let pv = 8
-        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: k)
-            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
-        let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
-        let outputs = (dict != nil ? dictKernel! : kernel)(
-            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
+        // The BF16 twin reads x itself: no prepared activation is consumed.
+        let twin = dict != nil && (bf16 ?? bf16Verified) ? bf16Kernel : nil
+        let packed: MLXArray? = twin != nil ? nil
+            : NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: k)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        let outputs = (twin ?? (dict != nil ? dictKernel! : kernel))(
+            [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed ?? x, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
@@ -843,6 +955,24 @@ enum NemotronHeadPreparedActivation {
         dictVariants[name] = kernel
         return kernel
     }
+    /// The BF16-activation twin of `dictKernel` (`nemotronPreparedBF16Source`
+    /// of the same variant body, then `nemotronSBDictSource`), or nil.
+    static func bf16DictKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel? {
+        let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
+            + (nsg ? "_nsg" : "") + "_sbd_bf16"
+        variantsLock.lock(); defer { variantsLock.unlock() }
+        if let kernel = dictVariants[name] { return kernel }
+        let kernel = nemotronPreparedBF16Source(nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg))
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["w", "scales", "biases", "x", "K", "N"],
+                outputNames: ["y"], source: $0,
+                header: variantHeader(half: half, load: load) + nemotronBF16ActHeader)
+        }
+        dictVariants[name] = kernel
+        return kernel
+    }
     static func variantHeader(half: Bool, load: Int) -> String {
         nemotronMultiRowQMVHeader + (half ? nemotronHalfDecodeHeader : "")
             + (load != 0 ? nemotronPreparedLoadHeader + (half ? nemotronHalfDecodeThreadHeader : "") : "")
@@ -863,15 +993,67 @@ enum NemotronHeadPreparedActivation {
     }
 
     /// projectLaunch's R = 3 launch with its kernel's dictionary twin, or nil.
-    private static func dictLaunch(k: Int, n: Int, rps: Int)
+    /// `bf16`: that dictionary kernel's BF16-activation twin instead (same
+    /// decode form, load form, template list, RPS and SIMD groups).
+    private static func dictLaunch(k: Int, n: Int, rps: Int, bf16: Bool = false)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
-        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
+        guard let kernel = bf16 ? bf16DictKernel(half: !hf.isEmpty, load: load, nsg: nsg)
+                : dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
         return (kernel, hf + extra, geometry.rps, geometry.nsg)
+    }
+
+    /// NEMOTRON_MTP_QMV_BF16_ACT=0 keeps every verify launch on its prepared
+    /// activation; each BF16 twin also has its own switch. A twin reads the
+    /// three rows' BF16 activation only after its load check matched the
+    /// prepared launch bit for bit.
+    static let bf16Enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_BF16_ACT"] != "0"
+    /// NEMOTRON_MTP_QMV_BF16_LMHEAD=0 keeps the LM head [2688, 131072] on its
+    /// prepared activation.
+    static let bf16HeadEnabled = bf16Enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_BF16_LMHEAD"] != "0"
+    nonisolated(unsafe) private static var bf16Head = false
+    /// NEMOTRON_MTP_QMV_BF16_OUTPROJ=0 keeps the Mamba out_proj and attention
+    /// o_proj [4096, 2688] on their prepared activation.
+    static let bf16ProjectionEnabled = bf16Enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_BF16_OUTPROJ"] != "0"
+    nonisolated(unsafe) private static var bf16Projection = false
+    /// NEMOTRON_MTP_QMV_BF16_SHUP=0 keeps the shared-expert up + ReLU2
+    /// [2688, 3712] on its prepared activation.
+    static let bf16SharedUpEnabled = bf16Enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_BF16_SHUP"] != "0"
+    nonisolated(unsafe) private static var bf16SharedUp = false
+    /// The [K, N, ReLU2] dictionary launches whose BF16 twin was admitted at load.
+    static func bf16Route(k: Int, n: Int, relu2: Bool) -> Bool {
+        switch (k, n, relu2) {
+        case (2688, 131072, false): return bf16Head
+        case (4096, 2688, false): return bf16Projection
+        case (2688, 3712, true): return bf16SharedUp
+        default: return false
+        }
+    }
+
+    /// The BF16 twin of the R = 3 dictionary launch `apply` / `projectPrepared`
+    /// make for `q` at `rps`, on the rows `x` (3 * K BF16, row-contiguous) in
+    /// place of their prepared activation; nil when it cannot run.
+    private static func bf16Launch(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int)
+        -> MLXArray? {
+        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        guard x.dtype == .bfloat16, x.size == 3 * k, NemotronSBDict.enabled,
+              let d = NemotronSBDict.dict(q),
+              case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps, bf16: true)
+        else { return nil }
+        let args = NemotronMultiRowQMV.scalarPair(k, n)
+        return kernel([q.weight, d.index, d.table, x, args.0, args.1],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
+                       ("RELU2", relu2), ("RPS", launchRPS)] + hf,
+            grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
+            outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
     }
     static func dictLaunchAvailable(k: Int, n: Int) -> Bool {
         dictLaunch(k: k, n: n, rps: 2) != nil
@@ -924,8 +1106,15 @@ enum NemotronHeadPreparedActivation {
     }
 
     /// `applyRows`'s projection of an already prepared R = 3 activation.
-    static func projectPrepared(_ packed: MLXArray, _ q: QuantizedLinear) -> MLXArray {
+    /// `rows`: the same three rows in BF16 (3 * K, row-contiguous), read by
+    /// the launch's BF16 twin where admitted (`bf16` nil: as admitted at load).
+    static func projectPrepared(_ packed: MLXArray, _ q: QuantizedLinear,
+                                rows: MLXArray? = nil, bf16: Bool? = nil) -> MLXArray {
         let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+        if let rows, bf16 ?? bf16Route(k: k, n: n, relu2: false),
+           let y = bf16Launch(rows, q, relu2: false, rps: 2) {
+            return y
+        }
         let packed = [packed]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
@@ -1004,9 +1193,14 @@ enum NemotronHeadPreparedActivation {
         return prepared
     }
 
+    /// `bf16`: the dictionary launch's BF16 twin on `x` (nil: as admitted at load).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
-                      prepared: MLXArray? = nil, sbDict: Bool = true) -> MLXArray {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, bf16: Bool? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
+        if sbDict, rows == 3, bf16 ?? bf16Route(k: k, n: n, relu2: relu2),
+           let y = bf16Launch(x, q, relu2: relu2, rps: rps) {
+            return y
+        }
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
             ?? prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
@@ -1025,6 +1219,133 @@ enum NemotronHeadPreparedActivation {
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+    }
+
+    /// Seeded rows [3, K] for the BF16 twins' load checks (case 0 ... 3):
+    /// normal rows at three scales; exact +0 and -0 entries; large values, a
+    /// row of -0 and BF16 subnormals.
+    static func bf16CheckRows(_ k: Int, _ c: Int) -> MLXArray {
+        let x = MLXRandom.normal([3, k], key: MLXRandom.key(UInt64(0xbfa0 + c)))
+        switch c {
+        case 0: return (x * 0.5).asType(.bfloat16)
+        case 1:
+            return which(abs(x) .< MLXArray(Float(0.2)), MLXArray(Float(-0.0)),
+                which(abs(x) .< MLXArray(Float(0.4)), MLXArray(Float(0)), x * 4)).asType(.bfloat16)
+        case 2: return (x / 64).asType(.bfloat16)
+        default:
+            var bits = [UInt16](repeating: 0, count: k)
+            for i in 0 ..< k {
+                let magnitude = UInt16((i * 37) % 127 + 1)
+                bits[i] = i % 4 == 0 ? magnitude | 0x8000 : magnitude
+            }
+            let subnormal = MLXArray(bits, [1, k]).view(dtype: .bfloat16)
+            let odd = MLXArray((0 ..< k).map { $0 % 2 == 1 }, [1, k])
+            return concatenated([
+                (x[0 ..< 1] * 300).asType(.bfloat16),
+                MLXArray([UInt16](repeating: 0x8000, count: k), [1, k]).view(dtype: .bfloat16),
+                which(odd, subnormal, (x[2 ..< 3] * 0.5).asType(.bfloat16)),
+            ], axis: 0)
+        }
+    }
+
+    /// Load check of one BF16 twin, before any verify graph is traced or
+    /// warmed: each `run(x, twin)` (one per real weight checked) on the four
+    /// seeded row sets, the twin's outputs against the prepared launch's, bit
+    /// for bit. True only if every output matched; a twin that cannot run, or
+    /// an MLX error, keeps it off. Reports `name` on stderr. The launches use
+    /// the live template values, so the twin's pipeline is also built here.
+    static func bf16Qualify(_ name: String, enabled: Bool, k: Int,
+                            _ runs: [(MLXArray, Bool) -> [MLXArray]?]) -> Bool {
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp qmv bf16 \(name): \(message)\n".utf8))
+        }
+        guard enabled else { report("off (setting)"); return false }
+        guard !runs.isEmpty else { report("off (no dictionary launch)"); return false }
+        var cases = 0
+        do {
+            let same = try withError { () -> Bool? in
+                var ok = MLXArray(true)
+                for run in runs {
+                    for c in 0 ..< 4 {
+                        let x = bf16CheckRows(k, c)
+                        guard let reference = run(x, false), let twin = run(x, true),
+                              reference.count == twin.count else { return nil }
+                        for (a, b) in zip(reference, twin) {
+                            let bits: DType = a.dtype == .float32 ? .uint32 : .uint16
+                            ok = logicalAnd(ok, (a.view(dtype: bits) .== b.view(dtype: bits)).all())
+                        }
+                        cases += 1
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+            guard let same else { report("off (the twin cannot run)"); return false }
+            report(same ? "on (\(cases) cases bitwise equal)" : "off (differs from the prepared launch)")
+            return same
+        } catch {
+            report("off (\(error))")
+            return false
+        }
+    }
+
+    /// The LM head's BF16 twin against its prepared launch (`bf16Qualify`)
+    /// on the loaded head.
+    static func qualifyBF16Head(_ target: Module) {
+        bf16Head = false
+        let head = target.modules().lazy.compactMap { $0 as? QuantizedLinear }
+            .first { $0.weight.shape == [131072, 336] && NemotronSBDict.dict($0) != nil }
+        let rps = NemotronMultiRowQMV.headRPS(n: 131072)
+        var runs: [(MLXArray, Bool) -> [MLXArray]?] = []
+        if let q = head {
+            runs.append { x, twin in
+                twin ? bf16Launch(x, q, relu2: false, rps: rps).map { [$0] }
+                    : [apply(x, q, relu2: false, rps: rps, bf16: false)]
+            }
+        }
+        bf16Head = bf16Qualify("lm head", enabled: bf16HeadEnabled, k: 2688, runs)
+    }
+
+    /// The [4096, 2688] BF16 twin against its prepared launch (`bf16Qualify`)
+    /// on the first Mamba layer's out_proj (through `apply`, as the gated norm's
+    /// consumer) and the first attention layer's o_proj (through
+    /// `projectPrepared`, as the verify SDPA's consumer); both must match.
+    static func qualifyBF16Projection(_ target: Module) {
+        bf16Projection = false
+        let modules = target.modules()
+        func dictLinear(_ linear: Linear?) -> QuantizedLinear? {
+            guard let q = linear as? QuantizedLinear, NemotronSBDict.dict(q) != nil else { return nil }
+            return q
+        }
+        let out = modules.lazy.compactMap { $0 as? NemotronHMamba2Mixer }.first.flatMap { dictLinear($0.outProj) }
+        let wo = modules.lazy.compactMap { $0 as? NemotronHAttention }.first.flatMap { dictLinear($0.wo) }
+        var runs: [(MLXArray, Bool) -> [MLXArray]?] = []
+        if let out, let wo {
+            runs.append { x, twin in
+                twin ? bf16Launch(x, out, relu2: false, rps: 2).map { [$0] }
+                    : [apply(x, out, relu2: false, rps: 2, bf16: false)]
+            }
+            runs.append { x, twin in
+                twin ? bf16Launch(x, wo, relu2: false, rps: 2).map { [$0] }
+                    : [projectPrepared(pack(x), wo, bf16: false)]
+            }
+        }
+        bf16Projection = bf16Qualify("out_proj / o_proj", enabled: bf16ProjectionEnabled, k: 4096, runs)
+    }
+
+    /// The shared-expert up + ReLU2 BF16 twin against its prepared launch
+    /// (`bf16Qualify`) on the first MoE layer's shared up.
+    static func qualifyBF16SharedUp(_ target: Module) {
+        bf16SharedUp = false
+        let up = target.modules().lazy.compactMap { ($0 as? NemotronHMoE)?.sharedExperts }.first
+            .flatMap { $0.upProj as? QuantizedLinear }
+        var runs: [(MLXArray, Bool) -> [MLXArray]?] = []
+        if let up, NemotronSBDict.dict(up) != nil {
+            runs.append { x, twin in
+                twin ? bf16Launch(x, up, relu2: true, rps: 2).map { [$0] }
+                    : [apply(x, up, relu2: true, rps: 2, bf16: false)]
+            }
+        }
+        bf16SharedUp = bf16Qualify("shared up", enabled: bf16SharedUpEnabled, k: 2688, runs)
     }
 }
 
@@ -1587,9 +1908,12 @@ enum NemotronMultiRowQMVRowInputs {
     /// Returns [R, N], bitwise equal to NemotronMultiRowQMV.apply on the
     /// [R, K] stack of the same rows, or nil wherever that call would not
     /// take the multi-row kernel.
-    /// `prepared`: the rows' prepared activation when their producer wrote
-    /// it (the verify SDPA launch), used where the rows would be prepared.
-    static func apply(_ rows: [MLXArray], _ q: QuantizedLinear, prepared: MLXArray? = nil) -> MLXArray? {
+    /// `pending`: the rows' prepared activation when their producer wrote
+    /// it (the verify SDPA launch), used where the rows would be prepared,
+    /// with the rows' contiguous BF16 buffer for the projection's BF16 twin.
+    static func apply(_ rows: [MLXArray], _ q: QuantizedLinear,
+                      pending: (prepared: MLXArray, rows: MLXArray)? = nil) -> MLXArray? {
+        let prepared = pending?.prepared
         guard NemotronMultiRowQMV.enabled, NemotronMTPExecution.batchedM1,
               (2...8).contains(rows.count),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
@@ -1602,7 +1926,7 @@ enum NemotronMultiRowQMVRowInputs {
         else { return nil }
         if NemotronMultiRowQMV.narrowEnabled, rows.count == 3, n >= 2688 {
             if let prepared, k == 4096, prepared.shape == [3, 8, 17 * 32], prepared.dtype == .float32 {
-                return NemotronHeadPreparedActivation.projectPrepared(prepared, q)
+                return NemotronHeadPreparedActivation.projectPrepared(prepared, q, rows: pending?.rows)
             }
             return NemotronHeadPreparedActivation.applyRows(rows, q)
         }
@@ -1640,7 +1964,7 @@ enum NemotronMTPAttentionDirect {
         guard let q = wo as? QuantizedLinear,
               rows.allSatisfy({ $0.ndim == 4 && $0.dim(0) == 1 && $0.dim(2) == 1 }),
               let direct = NemotronMultiRowQMVRowInputs.apply(
-                  rows, q, prepared: NemotronMTPVerifySDPA.takePrepared(rows))
+                  rows, q, pending: NemotronMTPVerifySDPA.takePrepared(rows))
         else { return original() }
         var y = direct.reshaped(1, length, q.weight.dim(0))
         if let bias = q.bias { y = y + bias }
@@ -1966,15 +2290,18 @@ enum NemotronMTPVerifySDPA {
         name: (unroll4 ? "nemotron_mtp_verify_sdpa_rows_unroll4" : "nemotron_mtp_verify_sdpa_rows") + "_prepared",
         inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
         source: source() + preparedEpilogue, ensureRowContiguous: false)
-    /// The last prepared activation `rows` built, keyed by its first row.
-    nonisolated(unsafe) private static var pendingPrepared: (key: ObjectIdentifier, prepared: MLXArray)?
+    /// The last prepared activation `rows` built, keyed by its first row,
+    /// with the launch's BF16 output [3, 32, 128] the rows are views of.
+    nonisolated(unsafe) private static var pendingPrepared:
+        (key: ObjectIdentifier, prepared: MLXArray, out: MLXArray)?
 
-    /// The prepared activation `rows` built with these rows, once.
-    static func takePrepared(_ rows: [MLXArray]) -> MLXArray? {
+    /// The prepared activation `rows` built with these rows, once, and the
+    /// same three rows in one row-contiguous BF16 buffer (3 x 4096 values).
+    static func takePrepared(_ rows: [MLXArray]) -> (prepared: MLXArray, rows: MLXArray)? {
         guard let pending = pendingPrepared, rows.count == 3, pending.key == ObjectIdentifier(rows[0])
         else { return nil }
         pendingPrepared = nil
-        return pending.prepared
+        return (pending.prepared, pending.out)
     }
 
     nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
@@ -2054,7 +2381,7 @@ enum NemotronMTPVerifySDPA {
         guard verified else { return nil }
         if preparedVerified, let (out, prepared) = mergedPrepared(queries, keys, values, scale) {
             let outputs = split(out)
-            pendingPrepared = (ObjectIdentifier(outputs[0]), prepared)
+            pendingPrepared = (ObjectIdentifier(outputs[0]), prepared, out)
             guard NemotronMoELeader.selfTest else { return outputs }
             return zip(outputs, stock(queries, keys, values, scale)).map { nemotronBitwiseOrNaN($0, $1) }
         }
