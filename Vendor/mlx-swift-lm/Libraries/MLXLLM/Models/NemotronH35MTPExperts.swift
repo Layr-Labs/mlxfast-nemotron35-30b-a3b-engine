@@ -1170,12 +1170,12 @@ enum NemotronMoELeader {
     }
 
     /// Geometry of the plan-free triple FC1: one SIMD group per threadgroup
-    /// with four outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
-    /// 2 and the leader's narrow two restore the base's threadgroups). Only
-    /// the output-to-SIMD-group map moves: every output keeps its lane split,
-    /// K order, qdot and closing simd_sum.
+    /// with two outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
+    /// NEMOTRON_MTP_FC1_RPS=4 restores the record's four outputs per SIMD
+    /// group). Only the output-to-SIMD-group map moves: every output keeps
+    /// its lane split, K order, qdot and closing simd_sum.
     static let fc1SimdGroups = max(1, Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_NSG"] ?? "") ?? 1)
-    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 4
+    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 2
     static let preparedGateUp = true
     static let fuseBalancePlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
@@ -2999,11 +2999,18 @@ enum NemotronFC2SharedColaunch {
         return copy.dict ? dictKernel : plainKernel
     }
 
+    /// SIMD groups per co-launch threadgroup: 32 (1,024 threads) gives every SIMD group one of the 32
+    /// lane partials (LPS 1) and four of the tile's 128 closing sums, with the same lane-to-chunk map,
+    /// partial order and closing simd_sum as the separate slot / shared-down kernels, which keep
+    /// `NemotronZSkip.sgs` (16); `prepare` checks the co-launch against them bit for bit on every layer.
+    /// NEMOTRON_MTP_COLAUNCH_SGS=16 restores the record's 512-thread threadgroups.
+    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH_SGS"] ?? "") == 16 ? 16 : 32
+
     private static func dispatch(
         _ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
         _ copy: NemotronZSkip.Copy, _ sx: MLXArray, _ shared: NemotronSharedDownZSkip.Copy, _ sinds: MLXArray
     ) -> (MLXArray, MLXArray) {
-        let sgs = NemotronZSkip.sgs
+        let sgs = Self.sgs
         let outputs = kernel(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores,

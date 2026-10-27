@@ -702,6 +702,14 @@ enum NemotronMambaInProjConvDt {
     }
     static var dictAvailable: Bool { dictKernel != nil }
 
+    /// Outputs per SIMD group: 4 (half the record's SIMD groups; each loads the prepared activation
+    /// block once for four in_proj rows; the epilogue lanes are l < RPS * R of the same simdgroup).
+    /// Every output keeps its lane split, block order, qdot and closing simd_sum, and every channel's
+    /// epilogue reads back the outputs its own simdgroup stored. NEMOTRON_MTP_INPROJ_RPS=2 restores
+    /// the record's two.
+    static let resultsPerSimdgroup =
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_RPS"] ?? "") == 2 ? 2 : 4
+
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
@@ -718,7 +726,7 @@ enum NemotronMambaInProjConvDt {
               q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
               q.weight.dtype == .uint32, q.weight.ndim == 2, q.weight.dim(1) * 8 == k,
               q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16,
-              n == convStart + convDim + heads, n % 4 == 0,
+              n == convStart + convDim + heads, n % (2 * resultsPerSimdgroup) == 0,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               oldState.shape == [1, 3, convDim], oldState.dtype == .bfloat16,
               convWeight.shape == [convDim, 4, 1], convWeight.dtype == .bfloat16,
@@ -735,9 +743,9 @@ enum NemotronMambaInProjConvDt {
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
-                       ("RPS", 2), ("CS", convStart), ("CC", convDim),
+                       ("RPS", resultsPerSimdgroup), ("CS", convStart), ("CC", convDim),
                        ("DS", convStart + convDim), ("NH", heads)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+            grid: (32, n / resultsPerSimdgroup, 1), threadGroup: (32, 2, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
@@ -804,7 +812,12 @@ enum NemotronHeadPreparedActivation {
     static let fastLoadForm = 0
     static let qkvLoadForm = 0
     static let loadFormOverrides: [[Int]: Int] = [[2688, 131072]: 2, [4096, 2688]: 2]
-    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (rps: 2, nsg: 8)]
+    /// The verify LM head ([2688, 131072], the ld2 nsg twin) at four outputs per SIMD group: half the
+    /// record's SIMD groups (NSG 8 kept), each loading the prepared activation block once for four rows.
+    /// Only the row -> SIMD-group map moves; every output keeps its lane split, block order, qdot and
+    /// closing simd_sum. NEMOTRON_MTP_LMHEAD_RPS=2 restores the record's two.
+    static let preparedGeometry: [[Int]: (rps: Int, nsg: Int)] = [[2688, 131072]: (
+        rps: ProcessInfo.processInfo.environment["NEMOTRON_MTP_LMHEAD_RPS"] == "2" ? 2 : 4, nsg: 8)]
     static func loadForm(k: Int, n: Int) -> Int {
         loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
     }
@@ -848,6 +861,15 @@ enum NemotronHeadPreparedActivation {
             + (load != 0 ? nemotronPreparedLoadHeader + (half ? nemotronHalfDecodeThreadHeader : "") : "")
     }
 
+    /// The verify's out_proj / o_proj launches ([K, N] = [4096, 2688], the hf_ld2 twin) at four outputs
+    /// per SIMD group: half the record's SIMD groups (NSG 2), each loading the prepared activation block
+    /// once for four rows. Only the row -> SIMD-group map moves; every output keeps its lane split,
+    /// block order, qdot and closing simd_sum. NEMOTRON_MTP_OUTPROJ_RPS=2 restores the record's two.
+    static let outProjFourRows = ProcessInfo.processInfo.environment["NEMOTRON_MTP_OUTPROJ_RPS"] != "2"
+    static func outProjGeometry(k: Int, n: Int) -> (rps: Int, nsg: Int)? {
+        outProjFourRows && k == 4096 && n == 2688 ? (rps: 4, nsg: 2) : nil
+    }
+
     /// Kernel, extra template arguments, RPS and SIMD groups for one prepared
     /// launch of `rows` x [K, N] at the caller's RPS.
     private static func projectLaunch(rows: Int, k: Int, n: Int, rps: Int)
@@ -855,7 +877,7 @@ enum NemotronHeadPreparedActivation {
         let (kernel, hf) = projectKernel(rows: rows, fast: k % 512 == 0)
         guard rows == 3 else { return (kernel, hf, rps, 2) }
         let load = loadForm(k: k, n: n)
-        let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
+        let geometry = outProjGeometry(k: k, n: n) ?? preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
@@ -867,7 +889,7 @@ enum NemotronHeadPreparedActivation {
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
-        let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
+        let geometry = outProjGeometry(k: k, n: n) ?? preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
         guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
@@ -1076,6 +1098,13 @@ enum NemotronSharedUpPacking {
     nonisolated(unsafe) private static var verified = false
     private static let unpackedEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_UNPACKED"] != "0"
+    /// Outputs per SIMD group of the unpacked shared up+relu2 launch ([K, N] = [2688, 3712], the crown
+    /// prepared QMV twin): 4, half the record's SIMD groups (NSG 2), each loading the prepared activation
+    /// block once for four rows. Only the row -> SIMD-group map moves; every output keeps its lane split,
+    /// block order, qdot, closing simd_sum and relu2 store. `prepareUnpacked` checks this launch against
+    /// the packing kernel bit for bit. NEMOTRON_MTP_SHARED_UP_RPS=2 restores the record's two.
+    static let unpackedRPS =
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_UP_RPS"] ?? "") == 2 ? 2 : 4
     private static let unpackedLock = NSLock()
     nonisolated(unsafe) private static var unpackedOwners: Set<ObjectIdentifier> = []
     private static let kernel = MLXFast.metalKernel(
@@ -1147,7 +1176,7 @@ enum NemotronSharedUpPacking {
               let q = up as? QuantizedLinear, unpackedEnabled, NemotronSharedDownZSkip.covers(down),
               unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) })
         else { return nil }
-        return NemotronHeadPreparedActivation.apply(x.reshaped(3, x.dim(2)), q, relu2: true, rps: 2,
+        return NemotronHeadPreparedActivation.apply(x.reshaped(3, x.dim(2)), q, relu2: true, rps: unpackedRPS,
                                                     prepared: prepared)
     }
 
@@ -1160,7 +1189,8 @@ enum NemotronSharedUpPacking {
         let fused: (MLXArray, MLXArray?)
         if unpackedEnabled, NemotronSharedDownZSkip.covers(down),
            unpackedLock.withLock({ unpackedOwners.contains(ObjectIdentifier(q)) }) {
-            fused = (NemotronHeadPreparedActivation.apply(rows, q, relu2: true, rps: 2, prepared: prepared), nil)
+            fused = (NemotronHeadPreparedActivation.apply(rows, q, relu2: true, rps: unpackedRPS,
+                                                          prepared: prepared), nil)
         } else {
             guard let packed = dispatch(rows, q, prepared: prepared) else { return nil }
             fused = (packed.0, packed.1)
@@ -1197,7 +1227,8 @@ enum NemotronSharedUpPacking {
                     let zero = MLXArray.zeros([3, k], dtype: .bfloat16)
                     for x in [dense, zero] {
                         guard let old = dispatch(x, q, prepared: nil) else { return false }
-                        let new = NemotronHeadPreparedActivation.apply(x, q, relu2: true, rps: 2, prepared: nil)
+                        let new = NemotronHeadPreparedActivation.apply(x, q, relu2: true, rps: unpackedRPS,
+                                                                       prepared: nil)
                         guard (old.0.view(dtype: .uint16) .== new.view(dtype: .uint16)).all().item(Bool.self)
                         else { return false }
                     }
