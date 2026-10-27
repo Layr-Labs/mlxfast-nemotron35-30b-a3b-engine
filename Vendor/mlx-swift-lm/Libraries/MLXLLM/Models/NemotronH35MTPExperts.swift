@@ -4534,5 +4534,6 @@ extension NemotronU2 {
         inProj = admit(.inProj) { NemotronMambaInProjConvDt.u2Check(target) }
         self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }
         draft = admit(.draft) { draftCheck(head) }
+        sharedUp = admit(.sharedUp) { NemotronHeadPreparedActivation.u2CheckSharedUp(target) }
     }
 }
