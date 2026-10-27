@@ -151,34 +151,71 @@ enum NemotronHResidualRMSNorm {
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         precondition(source.components(separatedBy: product).count == 2)
-        let s = source.replacingOccurrences(of: scratch,
-            with: scratch + "\nthreadgroup T rounded[2688];")
-            .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+        guard joinShuffle else {
+            let s = source.replacingOccurrences(of: scratch,
+                with: scratch + "\nthreadgroup T rounded[2688];")
+                .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+                .replacingOccurrences(of: product, with: product
+                    + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+            return s + """
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (lid < 336) {
+                    const int chunk = int(lid);
+                    float values[8];
+                    float total = 0;
+                    for (int i = 0; i < 8; i += 4) {
+                        total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
+                            + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
+                        values[i] = rounded[chunk * 8 + i];
+                        values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
+                        values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
+                        values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
+                    }
+                    const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
+                    for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
+                    prepared[base + 8 * 32] = total;
+                }
+                """
+        }
+        // Chunk c (values 8c ..< 8c + 8) is lanes 2c and 2c + 1 of one SIMD group: each lane keeps its four
+        // rounded values, reads its partner's through simd_shuffle_xor, and the pair writes the chunk's nine
+        // words (the even lane its four, the total; the odd lane its four) with the same expressions and order.
+        let s = source.replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
             .replacingOccurrences(of: product, with: product
-                + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
+                + "\nnormalized[offset + i] = value;\nnmj_r[i] = value;")
+            .replacingOccurrences(of: "float thread_x[n_reads];", with: "float thread_x[n_reads];\nT nmj_r[n_reads];")
+        precondition(s.contains("T nmj_r[n_reads];"))
         return s + """
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (lid < 336) {
-                const int chunk = int(lid);
-                float values[8];
-                float total = 0;
-                for (int i = 0; i < 8; i += 4) {
-                    total += float(rounded[chunk * 8 + i]) + float(rounded[chunk * 8 + i + 1])
-                        + float(rounded[chunk * 8 + i + 2]) + float(rounded[chunk * 8 + i + 3]);
-                    values[i] = rounded[chunk * 8 + i];
-                    values[i + 1] = rounded[chunk * 8 + i + 1] / 16.0f;
-                    values[i + 2] = rounded[chunk * 8 + i + 2] / 256.0f;
-                    values[i + 3] = rounded[chunk * 8 + i + 3] / 4096.0f;
-                }
+            {
+                const bool odd = (lid & 1u) != 0;
+                T other[4];
+                for (int i = 0; i < 4; i++) other[i] = as_type<T>(simd_shuffle_xor(as_type<ushort>(nmj_r[i]), ushort(1)));
+                const int chunk = int(lid >> 1);
                 const int base = (int(gid) * 11 + chunk / 32) * 9 * 32 + chunk % 32;
-                for (int i = 0; i < 8; i++) prepared[base + i * 32] = values[i];
-                prepared[base + 8 * 32] = total;
+                if (!odd) {
+                    float total = 0;
+                    total += float(nmj_r[0]) + float(nmj_r[1]) + float(nmj_r[2]) + float(nmj_r[3]);
+                    total += float(other[0]) + float(other[1]) + float(other[2]) + float(other[3]);
+                    prepared[base + 0 * 32] = float(nmj_r[0]);
+                    prepared[base + 1 * 32] = float(nmj_r[1]) / 16.0f;
+                    prepared[base + 2 * 32] = float(nmj_r[2]) / 256.0f;
+                    prepared[base + 3 * 32] = float(nmj_r[3]) / 4096.0f;
+                    prepared[base + 8 * 32] = total;
+                } else {
+                    prepared[base + 4 * 32] = float(nmj_r[0]);
+                    prepared[base + 5 * 32] = float(nmj_r[1]) / 16.0f;
+                    prepared[base + 6 * 32] = float(nmj_r[2]) / 256.0f;
+                    prepared[base + 7 * 32] = float(nmj_r[3]) / 4096.0f;
+                }
             }
             """
     }
+    /// NEMOTRON_MTP_JOIN_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
+    static let joinShuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOIN_SHUFFLE"] != "0"
     private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_rms_prepared_moe_bf16",
+        name: joinShuffle ? "nemotron_h_residual_rms_prepared_moe_bf16_sh" : "nemotron_h_residual_rms_prepared_moe_bf16",
         inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: preparedSource(), ensureRowContiguous: true)
@@ -236,7 +273,7 @@ enum NemotronHResidualRMSNorm {
             .replacingOccurrences(of: store, with: "")
     }
     private static let sumPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_sum_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_residual_sum_rms_prepared_bf16_sh" : "nemotron_h_residual_sum_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumPreparedSource(), ensureRowContiguous: true)
@@ -262,12 +299,12 @@ enum NemotronHResidualRMSNorm {
             """)
     }
     private static let sumProductsPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_residual_products_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_residual_products_rms_prepared_bf16_sh" : "nemotron_h_residual_products_rms_prepared_bf16",
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
         source: sumProductsPreparedSource(), ensureRowContiguous: true)
     private static let normPreparedKernel = MLXFast.metalKernel(
-        name: "nemotron_h_rms_prepared_bf16",
+        name: joinShuffle ? "nemotron_h_rms_prepared_bf16_sh" : "nemotron_h_rms_prepared_bf16",
         inputNames: ["lhs", "weight", "axis_size", "eps"],
         outputNames: ["normalized", "prepared"],
         source: normPreparedSource(), ensureRowContiguous: true)
@@ -5452,7 +5489,8 @@ class NemotronHSwitchMLP: Module {
             // Seed only: fc1 reads the token rows directly; `xs` stays lazy.
             y = activated
         } else if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
-            let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
+            let activated = NemotronSeedRetile.fc1Plain(xs, q, tiles: tiles)
+                ?? nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
             y = activated
         } else {
             y = gather(fc1, xs)
@@ -5470,6 +5508,9 @@ class NemotronHSwitchMLP: Module {
         if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
            let fromCopy = NemotronPrefillFC2Copy.apply(y, q, tiles: tiles) {
             y = fromCopy
+        } else if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
+                  let retiled = NemotronSeedRetile.fc2Plain(y, q, tiles: tiles) {
+            y = retiled
         } else {
             y = gather(fc2, y)
         }
@@ -5926,7 +5967,7 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
 
 /// `nemotronCountingSort` through the chunk-parallel kernel, plus
 /// order / k; nil outside its shapes (n <= 3072, experts a multiple of 32).
-private func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
+func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
     -> (order: MLXArray, inverse: MLXArray, sorted: MLXArray, tiles: NemotronHRunTiles,
         orderK: MLXArray)?
 {
@@ -6253,7 +6294,7 @@ private func nemotronWarmUpPrefillKernels(
 /// that the stock affine_gather_qmm_rhs_nax uses, followed by its run-aligned
 /// clone. Output stores add a typed ReLU2 specialization; the remaining
 /// declarations retain the stock math. Unused declarations are dropped.
-private let nemotronRunGatherHeader = #"""
+let nemotronRunGatherHeader = #"""
 // Subset of the MLX JIT preamble that stock affine_gather_qmm_rhs_nax is
 // compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Only the
 // output stores add the typed ReLU2 specialization; unused declarations are dropped.
@@ -7751,10 +7792,10 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, tiles: tiles)
+        return NemotronSeedRetile.fc2Copy(x, lin, tiles: tiles) ?? launch(x, lin, tiles: tiles)
     }
 
-    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
               let copy = NemotronZSkip.copy(for: lin), copy.dict
@@ -8422,11 +8463,12 @@ const device T* xn = x;
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
                       tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
+        return NemotronSeedRetile.fc1Routed(x, lin, rows: rows, tiles: tiles, dict: dictVerified)
+            ?? launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
     }
 
-    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
-                               tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
+                       tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
         guard let kernel, NemotronHPrefillX5.runGather,
               lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
