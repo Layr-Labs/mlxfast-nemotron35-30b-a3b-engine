@@ -107,6 +107,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillSharedRelu2.qualify(target)
         NemotronPrefillDirectFC1.qualify(target)
         NemotronPrefillDirectFC1.qualifyDict(target)
+        NemotronSeedHeadDict.qualify(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)

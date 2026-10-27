@@ -729,7 +729,7 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
-        case .lastPositionLogits: return (logits(last), hidden)
+        case .lastPositionLogits: return (NemotronSeedHeadDict.apply(last, lmHead) ?? logits(last), hidden)
         }
     }
 }
