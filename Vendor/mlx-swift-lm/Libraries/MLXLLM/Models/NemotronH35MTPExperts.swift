@@ -1170,12 +1170,12 @@ enum NemotronMoELeader {
     }
 
     /// Geometry of the plan-free triple FC1: one SIMD group per threadgroup
-    /// with four outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
-    /// 2 and the leader's narrow two restore the base's threadgroups). Only
-    /// the output-to-SIMD-group map moves: every output keeps its lane split,
-    /// K order, qdot and closing simd_sum.
+    /// with two outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
+    /// NEMOTRON_MTP_FC1_RPS=4 restores the record's four outputs per SIMD
+    /// group). Only the output-to-SIMD-group map moves: every output keeps
+    /// its lane split, K order, qdot and closing simd_sum.
     static let fc1SimdGroups = max(1, Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_NSG"] ?? "") ?? 1)
-    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 4
+    static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 2
     static let preparedGateUp = true
     static let fuseBalancePlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
@@ -2393,11 +2393,11 @@ enum NemotronZSkip {
     /// re-checks every layer) if the tiled kernel misses a bit check.
     nonisolated(unsafe) fileprivate static var tiled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TILED"] != "0"
-    /// SIMD groups per slot-kernel threadgroup: 16 halves each thread's lane
-    /// partials (two instead of four) with the same lane-to-chunk map, so every
+    /// SIMD groups per slot-kernel threadgroup: 8 (256-thread threadgroups,
+    /// four lane partials per thread) with the same lane-to-chunk map, so every
     /// partial, its order and the closing reduction are unchanged.
-    /// NEMOTRON_MTP_ZSKIP_SGS=8 keeps the base's 256-thread threadgroups.
-    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 8 ? 8 : 16
+    /// NEMOTRON_MTP_ZSKIP_SGS=16 restores the record's 512-thread threadgroups.
+    static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 16 ? 16 : 8
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
     /// also falls back to the original slot kernel (and re-checks every layer)
     /// if the staged one misses a bit check.
