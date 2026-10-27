@@ -94,6 +94,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
+        NemotronRouterSharedUpColaunch.qualify(target)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -732,3 +733,5 @@ final class NemotronCPUWarm: @unchecked Sendable {
 }
 
 // Measurement entry of the carried 3f932e3c tree.
+
+// Measurement 3 of t131.
