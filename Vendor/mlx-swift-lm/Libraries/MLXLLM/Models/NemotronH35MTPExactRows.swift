@@ -1535,6 +1535,156 @@ func nemotronR1Linear(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     return nemotronBitwiseOrNaN(out, linear(x))
 }
 
+extension NemotronMultiRowQMV {
+    /// One row of `q` through the R = 1 twin `dispatch` selects, reading
+    /// (scale, bias) through `dict` (the tensor's `NemotronSBDict`), at the
+    /// stock four outputs per SIMD group. nil when the shape is not the stock
+    /// qmv / qmv_fast one.
+    static func dictRow(_ x: MLXArray, _ q: QuantizedLinear, dict: NemotronSBDict.Dict) -> MLXArray? {
+        guard enabled, draftDictAvailable, x.ndim == 2, x.dim(0) == 1, x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, q.scales.dtype == x.dtype, biases.dtype == x.dtype,
+              q.weight.ndim == 2, q.weight.dtype == .uint32,
+              dict.index.shape == q.scales.shape, dict.index.dtype == .uint16,
+              dict.table.dtype == .float32
+        else { return nil }
+        let k = x.dim(1), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
+        return dispatch(q.weight, q.scales, biases, x, relu2: false, rps: 4, dict: dict)
+    }
+}
+
+/// Seed target head only: move each lane's input widening, three nibble
+/// rescalings per four values and ordered partial sum out of the 16,384
+/// output threadgroups. One 336-thread preparation produces the same lane
+/// operands once; the R = 1 HF2 dictionary QMV consumes them in the original
+/// K order at the original four outputs / SIMD group and two SIMD groups / TG.
+/// No activation cache: the packed array is a local lazy graph dependency.
+enum NemotronSeedHeadPrepared {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_HEAD_PREPARED"] != "0"
+    private static let kernel = nemotronSBDictSource(
+        NemotronHeadPreparedActivation.preparedHalfSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_seed_head_prepared_r1_hf2_sbd",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y"], source: $0,
+            header: NemotronHeadPreparedActivation.preparedHalfHeader)
+    }
+
+    static func launch(_ x: MLXArray, _ q: QuantizedLinear,
+                       dict: NemotronSBDict.Dict) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              type(of: q) == QuantizedLinear.self, q.bias == nil,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.weight.dtype == .uint32, q.weight.shape == [131072, 336],
+              q.scales.dtype == .bfloat16, q.scales.shape == [131072, 42],
+              let biases = q.biases, biases.dtype == .bfloat16, biases.shape == q.scales.shape,
+              dict.index.dtype == .uint16, dict.index.shape == q.scales.shape,
+              dict.table.dtype == .float32, let kernel
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(1, 2688), pv: 8)
+        let args = NemotronMultiRowQMV.scalarPair(2688, 131072)
+        return kernel([q.weight, dict.index, dict.table, packed, args.0, args.1],
+            template: [("T", DType.bfloat16), ("R", 1), ("FAST", false),
+                       ("RELU2", false), ("RPS", 4), ("HF", 2)],
+            grid: (32, 131072 / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, 131072]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
+/// Seed only (request prefill, `NemotronHPrefillX5.active`): the target head's
+/// one-row logits (`logits(last)` of the sampling prefill chunk) through the
+/// R = 1 multi-row qmv twin reading the head's `NemotronSBDict` pair
+/// dictionary (uint16 index + FP32 pair table, 11 MB) instead of the stock qmv
+/// reading its BF16 scales and biases (22 MB). With prepared reuse enabled,
+/// one small prepare precedes the projection and amortizes input arithmetic;
+/// without it the imported route remains one projection. Both twins keep the
+/// stock per-row body, lane split, block order and simd_sum, and the
+/// table holds the exact FP32 widenings of the BF16 pairs. `qualify` compares
+/// it with `head(x)` bit for bit on the loaded head; only then does the seed
+/// use it. NEMOTRON_SEED_HEAD_DICT=0 keeps the stock call.
+enum NemotronSeedHeadDict {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_HEAD_DICT"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// `head(x)` for x: [1, 1, K] inside the request prefill; nil otherwise.
+    static func apply(_ x: MLXArray, _ head: Linear?) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active, let head, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1
+        else { return nil }
+        guard let y = launch(x, head) else { return nil }
+        guard NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(y, head(x))
+    }
+
+    private static func launch(_ x: MLXArray, _ head: Linear,
+                               reusePrepared: Bool = true) -> MLXArray? {
+        guard type(of: head) == QuantizedLinear.self, let q = head as? QuantizedLinear,
+              let d = NemotronSBDict.dict(q) else { return nil }
+        if reusePrepared && NemotronSeedHeadPrepared.enabled {
+            return NemotronSeedHeadPrepared.launch(x, q, dict: d)
+        }
+        guard let y = NemotronMultiRowQMV.dictRow(x.reshaped(1, x.dim(-1)), q, dict: d)
+        else { return nil }
+        return y.reshaped(1, 1, q.weight.dim(0))
+    }
+
+    /// Load time, after `NemotronSBDict.prepare`: the head must have a pair
+    /// dictionary in its scales' shape whose table decodes to the scales' and
+    /// biases' raw BF16 words, and the twin must equal `head(x)` bit for bit
+    /// on seeded rows of several scales.
+    static func qualify(_ target: NemotronHModel) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron seed head dict: \(message)\n".utf8))
+        }
+        guard enabled, NemotronSBDict.enabled else { return report("off (setting)") }
+        var checked = 0
+        defer {
+            if NemotronSeedHeadPrepared.enabled {
+                precondition(verified && checked == 6,
+                    "seed prepared R1 head qualification refused; no unchanged-fallback score")
+            }
+        }
+        guard let head = target.lmHead, type(of: head) == QuantizedLinear.self,
+              let q = head as? QuantizedLinear, let biases = q.biases
+        else { return report("off (no quantized head)") }
+        guard let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape,
+              d.index.dtype == .uint16, d.table.dtype == .float32
+        else { return report("off (no pair dictionary for the head)") }
+        do {
+            let matches = try withError { () -> Bool in
+                // Raw words: every group's table entry is the head's (scale, bias) BF16 pair.
+                let pairs = take(d.table, d.index.reshaped(-1).asType(.int32), axis: 0)
+                let words = stacked([q.scales.reshaped(-1).asType(.float32),
+                                     biases.reshaped(-1).asType(.float32)], axis: 1)
+                guard (pairs.view(dtype: .uint32) .== words.view(dtype: .uint32)).all().item(Bool.self)
+                else { return false }
+                let width = q.weight.dim(1) * 8
+                for (index, scale) in [Float(1), 0.25, 4, 16, 1, 0.05].enumerated() {
+                    let x = MLXRandom.normal([1, 1, width], scale: scale,
+                                             key: MLXRandom.key(UInt64(0x5eed_d1c7 + index)))
+                        .asType(.bfloat16)
+                    guard let twin = launch(x, head) else { return false }
+                    let stock = head(x)
+                    guard let raw = launch(x, head, reusePrepared: false),
+                          twin.shape == stock.shape, raw.shape == stock.shape,
+                          (raw.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all().item(Bool.self),
+                          (twin.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all().item(Bool.self)
+                    else { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            report("off (\(error))")
+        }
+        report(verified ? "on (dictionary raw words, raw R1 and prepared R1 equal to stock, \(checked) cases)"
+                        : "off (differs from the stock head after \(checked) cases)")
+    }
+}
+
 /// Self-test select: `y` where it is bitwise equal to `expected`, else NaN
 /// everywhere, so the token gate fails loudly on any difference.
 func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {
@@ -2012,11 +2162,12 @@ enum NemotronMTPVerifySDPA {
 
     /// `merged` plus the R = 3 prepared activation from the same launch.
     private static func mergedPrepared(
-        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float
+        _ queries: MLXArray, _ keys: MLXArray, _ values: MLXArray, _ scale: Float,
+        batchReduction: Bool? = nil
     ) -> (MLXArray, MLXArray)? {
         guard queries.ndim == 4, queries.dim(2) == 3,
               merged(queries, keys, values, scale) != nil else { return nil }
-        let outputs = preparedKernel(
+        let outputs = ((batchReduction ?? batchedReductionVerified) ? batchedReductionKernel : preparedKernel)(
             [queries, keys, values, scaleArray(scale)],
             template: [("T", DType.bfloat16), ("D", 128), ("V", 128)],
             grid: (32 * 1024, 1, 3), threadGroup: (1024, 1, 1),
@@ -2165,7 +2316,7 @@ enum NemotronMTPVerifySDPA {
                         let keys = k[.ellipsis, ..<(history + 3), 0...]
                         let values = v[.ellipsis, ..<(history + 3), 0...]
                         guard let out = merged(queries, keys, values, scale),
-                              let (fusedOut, prepared) = mergedPrepared(queries, keys, values, scale)
+                              let (fusedOut, prepared) = mergedPrepared(queries, keys, values, scale, batchReduction: false)
                         else { return false }
                         let expected = NemotronHeadPreparedActivation.packRows(split(out), k: 4096)
                         let same = (fusedOut.view(dtype: .uint16) .== out.view(dtype: .uint16)).all()
@@ -3589,5 +3740,92 @@ enum NemotronHeadScreen {
             grid: (32, 1, 1), threadGroup: (32, 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
+    }
+}
+
+// Four independent feature planes replace repeated reuse of one transpose
+// scratch plane. All per-feature SIMD sums and arithmetic remain unchanged.
+extension NemotronMTPVerifySDPA {
+    static let batchedReductionEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_SDPA_BATCHED_OUTPUT_TRANSPOSE"] != "0"
+    nonisolated(unsafe) private static var batchedReductionVerified = false
+
+    private static func batchedReductionSource() -> String {
+        let oldLoop = "  for (int i = 0; i < v_per_thread; i++) {\n"
+            + "    outputs[simd_lid * BD + simd_gid] = o[i];\n"
+            + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "    o[i] = simd_sum(outputs[simd_gid * BD + simd_lid] * factor);\n"
+            + "    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);\n"
+            + "    threadgroup_barrier(mem_flags::mem_threadgroup);\n  }\n"
+        let newLoop = "  for (int i = 0; i < v_per_thread; i++) {\n"
+            + "    outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];\n  }\n"
+            + "  threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "  for (int i = 0; i < v_per_thread; i++) {\n"
+            + "    o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid] * factor);\n"
+            + "    o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);\n  }\n"
+        return nemotronSwapped(source(), [
+            ("  threadgroup U outputs[BN * BD];\n",
+             "  threadgroup U outputs[v_per_thread * BN * BD];\n", 1),
+            (oldLoop, newLoop, 1),
+        ]) + preparedEpilogue
+    }
+    private static let batchedReductionKernel = MLXFast.metalKernel(
+        name: "nemotron_verify_sdpa_batched_output_transpose",
+        inputNames: ["queries", "keys", "values", "scale"], outputNames: ["out", "prepared"],
+        source: batchedReductionSource(), ensureRowContiguous: false)
+
+    /// Remote-only load admission. The old producer and its downstream
+    /// projection remain the reference. No activation/request state is added.
+    static func qualifyBatchedReduction(_ target: Module) throws {
+        batchedReductionVerified = false
+        guard batchedReductionEnabled else { return }
+        guard enabled, verified, preparedEnabled, preparedVerified,
+              NemotronMTPAttentionDirect.enabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { throw NemotronH35MTPError.invalidArtifact("SDPA batched reduction prerequisites unavailable") }
+        let owners = target.modules().compactMap { $0 as? NemotronHAttention }
+            .filter { $0.numHeads == 32 && $0.numKeyValueHeads == 2 && $0.headDim == 128 }
+        guard !owners.isEmpty else {
+            throw NemotronH35MTPError.invalidArtifact("SDPA batched reduction native owners unavailable")
+        }
+        var checked = 0
+        try withError { () -> Void in
+            for (layer, owner) in owners.enumerated() {
+                guard type(of: owner.wo) == QuantizedLinear.self, let q = owner.wo as? QuantizedLinear,
+                      q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+                      q.weight.dtype == .uint32, q.weight.shape == [2688, 512],
+                      q.scales.dtype == .bfloat16, q.biases?.dtype == .bfloat16
+                else { throw NemotronH35MTPError.invalidArtifact("SDPA batched reduction output bank unsupported") }
+                for (i, history) in [0, 31, 94, 127, 488, 616, 1020].enumerated() {
+                    let seed = UInt64(0x5d9d_0000 + layer * 256 + i)
+                    let qScale: Float = [1, 4, 16][i % 3]
+                    let kvScale: Float = [1, 4, 8][i % 3]
+                    let capacity = history + 3 + 37
+                    let queries = MLXRandom.normal([1, 3, 4096], dtype: .bfloat16, scale: qScale,
+                        key: MLXRandom.key(seed)).reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+                    let k = MLXRandom.normal([1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                        key: MLXRandom.key(seed &+ 0x100))
+                    let v = MLXRandom.normal([1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale,
+                        key: MLXRandom.key(seed &+ 0x200))
+                    let keys = k[.ellipsis, ..<(history + 3), 0...]
+                    let values = v[.ellipsis, ..<(history + 3), 0...]
+                    guard let old = mergedPrepared(queries, keys, values, owner.scale, batchReduction: false),
+                          let new = mergedPrepared(queries, keys, values, owner.scale, batchReduction: true)
+                    else { throw NemotronH35MTPError.invalidArtifact("SDPA batched reduction supported launch refused") }
+                    let oldProjection = NemotronHeadPreparedActivation.projectPrepared(old.1, q)
+                    let newProjection = NemotronHeadPreparedActivation.projectPrepared(new.1, q)
+                    let equal = (old.0.view(dtype: .uint16) .== new.0.view(dtype: .uint16)).all()
+                        .&& (old.1.view(dtype: .uint32) .== new.1.view(dtype: .uint32)).all()
+                        .&& (oldProjection.view(dtype: .uint16) .== newProjection.view(dtype: .uint16)).all()
+                    guard equal.item(Bool.self) else {
+                        throw NemotronH35MTPError.invalidArtifact("SDPA batched reduction producer/consumer differs")
+                    }
+                    checked += 1
+                }
+            }
+        }
+        batchedReductionVerified = true
+        FileHandle.standardError.write(Data(
+            "nemotron SDPA batched output transpose: qualified \(owners.count) owners, \(checked) cases\n".utf8))
     }
 }
