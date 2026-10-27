@@ -1,3 +1,4 @@
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -20,6 +21,7 @@ final class NemotronH35MTPGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
         let usesPrepared: Bool
+        let parameterState: [MLXArray]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
@@ -47,6 +49,8 @@ final class NemotronH35MTPGraphCache {
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
         var identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
             + (parameters ?? []).map(ObjectIdentifier.init))
+        let constantState = NemotronFC1ConstantDictionary.compilationState(owner.switchMLP.fc1)
+        identity += constantState.map(ObjectIdentifier.init)
         let joins = residual != nil && nextNorm != nil
         if let nextNorm, joins {
             identity += [ObjectIdentifier(nextNorm), ObjectIdentifier(nextNorm.weight)]
@@ -58,7 +62,7 @@ final class NemotronH35MTPGraphCache {
         let current = lock.withLock { () -> Entry in
             calls += 1
             if let entry = entries[slot], entry.identity == identity { return entry }
-            let state = (parameters ?? owner.innerState()) + (joins ? [nextNorm!.weight] : [])
+            let state = (parameters ?? owner.innerState()) + (joins ? [nextNorm!.weight] : []) + constantState
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 let outputs = owner.mtpForwardRowsUncompiledOutputs(arrays[0],
@@ -71,7 +75,8 @@ final class NemotronH35MTPGraphCache {
                 }
                 return [joined.0, joined.1, joined.2]
             }
-            let replacement = Entry(identity: identity, usesPrepared: usesPrepared, function: function)
+            let replacement = Entry(identity: identity, usesPrepared: usesPrepared,
+                parameterState: state, function: function)
             retired = entries[slot]
             entries[slot] = replacement
             generations += 1
@@ -792,17 +797,23 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpAndPlanTail8: MLXFast.MLXFastKernel?
     /// The two triple FC1 kernels reading (scale, bias) through `NemotronSBDict`.
     let tripleGateUpAndPlanDict: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlanDictConstant: MLXFast.MLXFastKernel?
     let tripleGateUpAndPlanTail8Dict: MLXFast.MLXFastKernel?
+    let tripleGateUpAndPlanTail8DictConstant: MLXFast.MLXFastKernel?
     let tripleGateUp: MLXFast.MLXFastKernel?
     let tripleGateUpTail8: MLXFast.MLXFastKernel?
     let tripleGateUpDict: MLXFast.MLXFastKernel?
+    let tripleGateUpDictConstant: MLXFast.MLXFastKernel?
     let tripleGateUpTail8Dict: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8DictConstant: MLXFast.MLXFastKernel?
     /// The four plan-free triple FC1 kernels with their main K loops unrolled
     /// by two (nmlFC1UnrollSource; NEMOTRON_MTP_FC1_UNROLL).
     let tripleGateUpUnrolled: MLXFast.MLXFastKernel?
     let tripleGateUpTail8Unrolled: MLXFast.MLXFastKernel?
     let tripleGateUpDictUnrolled: MLXFast.MLXFastKernel?
+    let tripleGateUpDictUnrolledConstant: MLXFast.MLXFastKernel?
     let tripleGateUpTail8DictUnrolled: MLXFast.MLXFastKernel?
+    let tripleGateUpTail8DictUnrolledConstant: MLXFast.MLXFastKernel?
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -859,6 +870,14 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 outputNames: ["y", "plan"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
+        tripleGateUpAndPlanDictConstant = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_with_pair_fc2_plan_sbd_constant",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "pairView"],
+                outputNames: ["y", "plan"], source: NemotronFC1ConstantDictionary.source($0),
+                header: header + nemotronMoETripleDecodeHeader)
+        }
         tripleGateUpAndPlanTail8Dict = nmlTail8Source(tripleSource)
             .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
             .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
@@ -866,6 +885,15 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y", "plan"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpAndPlanTail8DictConstant = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .map(nmlFC1WithBalancePlanSource).flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_with_pair_fc2_plan_sbd_constant",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "pairView"],
+                outputNames: ["y", "plan"], source: NemotronFC1ConstantDictionary.source($0),
                 header: header + nemotronMoETripleDecodeHeader)
         }
         tripleGateUp = nmlPreparedSource(tripleSource, pointers: triplePointers).map {
@@ -891,6 +919,14 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
+        tripleGateUpDictConstant = nmlPreparedSource(tripleSource, pointers: triplePointers)
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_sbd_constant",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "pairView"],
+                outputNames: ["y"], source: NemotronFC1ConstantDictionary.source($0),
+                header: header + nemotronMoETripleDecodeHeader)
+        }
         tripleGateUpTail8Dict = nmlTail8Source(tripleSource)
             .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
             .flatMap(nemotronSBDictSource).map {
@@ -898,6 +934,15 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_sbd",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8DictConstant = nmlTail8Source(tripleSource)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_sbd_constant",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "pairView"],
+                outputNames: ["y"], source: NemotronFC1ConstantDictionary.source($0),
                 header: header + nemotronMoETripleDecodeHeader)
         }
         // The same four plan-free kernels from the unrolled main loops (the
@@ -928,6 +973,15 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
         }
+        tripleGateUpDictUnrolledConstant = unrolledSource
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_sbd_u2_constant",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "pairView"],
+                outputNames: ["y"], source: NemotronFC1ConstantDictionary.source($0),
+                header: header + nemotronMoETripleDecodeHeader)
+        }
         tripleGateUpTail8DictUnrolled = unrolledSource.flatMap(nmlTail8Source)
             .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
             .flatMap(nemotronSBDictSource).map {
@@ -935,6 +989,15 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 name: "nemotron_moe_triple_prepared_fc1_tail8_sbd_u2",
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0,
+                header: header + nemotronMoETripleDecodeHeader)
+        }
+        tripleGateUpTail8DictUnrolledConstant = unrolledSource.flatMap(nmlTail8Source)
+            .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+            .flatMap(nemotronSBDictSource).map {
+            MLXFast.metalKernel(
+                name: "nemotron_moe_triple_prepared_fc1_tail8_sbd_u2_constant",
+                inputNames: ["w", "scales", "biases", "prepared", "inds", "pairView"],
+                outputNames: ["y"], source: NemotronFC1ConstantDictionary.source($0),
                 header: header + nemotronMoETripleDecodeHeader)
         }
     }
@@ -1280,14 +1343,16 @@ enum NemotronMoELeader {
 
     static func applyWithBalancePlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, constantDict: Bool? = nil,
+        qualificationTail8: Bool? = nil
     ) -> (activation: MLXArray, plan: MLXArray)? {
+        let tail8 = qualificationTail8 ?? fc1Tail8
         guard fuseBalancePlan, preparedGateUp,
               x.shape == [3, 2688], x.dtype == .bfloat16,
               inds.shape == [18], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856,
               let kernel = (tripleGateUp
-                  ? (fc1Tail8 ? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlanTail8 : nil)
+                  ? (tail8 ? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlanTail8 : nil)
                       ?? NemotronMoELeaderPreparedKernels.shared.tripleGateUpAndPlan : nil)
                   ?? NemotronMoELeaderPreparedKernels.shared.gateUpAndPlan
         else { return nil }
@@ -1297,12 +1362,19 @@ enum NemotronMoELeader {
         // The selected triple kernel's dictionary twin, when `dict` is given.
         let kernels = NemotronMoELeaderPreparedKernels.shared
         let twin = dict == nil || !tripleGateUp ? nil
-            : (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+            : (tail8 && kernels.tripleGateUpAndPlanTail8 != nil
                 ? kernels.tripleGateUpAndPlanTail8Dict
                 : (kernels.tripleGateUpAndPlan != nil ? kernels.tripleGateUpAndPlanDict : nil))
-        let result = (twin != nil && dict != nil ? twin! : kernel)(
+        let constant = twin != nil && dict != nil && NemotronFC1ConstantDictionary.selected(constantDict, full: dict!.table)
+        let constantKernel = tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+            ? kernels.tripleGateUpAndPlanTail8DictConstant : kernels.tripleGateUpAndPlanDictConstant
+        let alias = constant ? NemotronFC1ConstantDictionary.view(dict!.table) : nil
+        guard !constant || (constantKernel != nil && alias != nil) else {
+            preconditionFailure("NEMOTRON_FC1_CONSTANT_DICT selected plan binding unavailable")
+        }
+        let result = (constant ? constantKernel! : (twin != nil && dict != nil ? twin! : kernel))(
             twin != nil && dict != nil
-                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds] + (alias.map { [$0] } ?? [])
                 : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
                    NemotronBankBinding.bind(bank.biases), packed, inds],
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
@@ -1328,7 +1400,8 @@ enum NemotronMoELeader {
     /// record kernel stands in whenever its unrolled twin is missing.
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil,
+        constantDict: Bool? = nil, qualificationTail8: Bool? = nil
     ) -> MLXArray? {
         let kernels = NemotronMoELeaderPreparedKernels.shared
         guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
@@ -1336,7 +1409,7 @@ enum NemotronMoELeader {
               inds.shape == [18], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
         else { return nil }
-        let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+        let tail8 = (qualificationTail8 ?? fc1Tail8) && kernels.tripleGateUpAndPlanTail8 != nil
         guard tail8 || kernels.tripleGateUpAndPlan != nil else { return nil }
         let useDict = dict != nil
             && (tail8 ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
@@ -1354,9 +1427,20 @@ enum NemotronMoELeader {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
         let nsg = (bank.n / rps) % fc1SimdGroups == 0 ? fc1SimdGroups : 2
-        let activation = kernel(
+        let constant = useDict && NemotronFC1ConstantDictionary.selected(constantDict, full: dict!.table)
+        let usedUnrolled = unrolled && (useDict
+            ? (tail8 ? kernels.tripleGateUpTail8DictUnrolled : kernels.tripleGateUpDictUnrolled)
+            : (tail8 ? kernels.tripleGateUpTail8Unrolled : kernels.tripleGateUpUnrolled)) != nil
+        let constantKernel = usedUnrolled
+            ? (tail8 ? kernels.tripleGateUpTail8DictUnrolledConstant : kernels.tripleGateUpDictUnrolledConstant)
+            : (tail8 ? kernels.tripleGateUpTail8DictConstant : kernels.tripleGateUpDictConstant)
+        let alias = constant ? NemotronFC1ConstantDictionary.view(dict!.table) : nil
+        guard !constant || (constantKernel != nil && alias != nil) else {
+            preconditionFailure("NEMOTRON_FC1_CONSTANT_DICT selected plan-free binding unavailable")
+        }
+        let activation = (constant ? constantKernel! : kernel)(
             useDict
-                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
+                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds] + (alias.map { [$0] } ?? [])
                 : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
                    NemotronBankBinding.bind(bank.biases), packed, inds],
             template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
@@ -4411,5 +4495,204 @@ enum NemotronSBDict {
         }
         eval(Array(same.values))
         return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
+    }
+}
+
+/// Immutable model-table bindings only. A view is never admitted from its
+/// logical extent: the full allocation is checked before any constant read.
+/// Every consumer still binds the original full table at its original input
+/// position, then appends this alias, preserving encoder accounting.
+enum NemotronFC1ConstantDictionary {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_CONSTANT_DICT"] != "0"
+    private struct Binding {
+        let full: MLXArray
+        let view: MLXArray
+        let qualified: Bool
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var bindings: [ObjectIdentifier: Binding] = [:]
+
+    static func source(_ source: String) -> String {
+        let old = "  const device float2* sbt = (const device float2*)biases;"
+        precondition(source.components(separatedBy: old).count == 2,
+            "NEMOTRON_FC1_CONSTANT_DICT source seam")
+        return source.replacingOccurrences(of: old,
+            with: "  const constant float2* sbt = (const constant float2*)pairView;")
+    }
+
+    static func selected(_ force: Bool?, full: MLXArray) -> Bool {
+        if let force { return force }
+        guard enabled else { return false }
+        return lock.withLock {
+            guard let entry = bindings[ObjectIdentifier(full)], entry.full === full else { return false }
+            return entry.qualified
+        }
+    }
+
+    /// Trace safe: no evaluation, pointer query or request data. Entries keep
+    /// both original immutable wrappers alive and reject wrapper-ID reuse.
+    static func view(_ full: MLXArray) -> MLXArray? {
+        lock.withLock {
+            guard let entry = bindings[ObjectIdentifier(full)], entry.full === full else { return nil }
+            return entry.view
+        }
+    }
+
+    /// These model-owned arrays participate in the actual MoE recipe's state
+    /// and identity before tracing, including the original full table first.
+    static func compilationState(_ owner: SwitchLinear) -> [MLXArray] {
+        guard enabled, let dict = NemotronSBDict.dict(owner), selected(nil, full: dict.table) else { return [] }
+        guard let alias = view(dict.table) else {
+            preconditionFailure("NEMOTRON_FC1_CONSTANT_DICT unqualified model table")
+        }
+        return [dict.table, alias]
+    }
+
+    private static let reader = MLXFast.metalKernel(
+        name: "nemotron_fc1_constant_dictionary_full_range",
+        inputNames: ["full", "pairView"], outputNames: ["out"], source: """
+          const uint i = thread_position_in_grid.x;
+          if (i >= uint(full_shape[0])) return;
+          const constant float2* table = (const constant float2*)pairView;
+          const float2 pair = table[i];
+          out[2 * i] = pair.x;
+          out[2 * i + 1] = pair.y;
+        """)
+
+    private static let deviceReader = MLXFast.metalKernel(
+        name: "nemotron_fc1_device_dictionary_full_range",
+        inputNames: ["full"], outputNames: ["out"], source: """
+          const uint i = thread_position_in_grid.x;
+          if (i >= uint(full_shape[0])) return;
+          const device float2* table = (const device float2*)full;
+          const float2 pair = table[i];
+          out[2 * i] = pair.x;
+          out[2 * i + 1] = pair.y;
+        """)
+
+    private static func read(_ full: MLXArray, _ view: MLXArray) -> MLXArray {
+        // Full input is deliberately first, even though only its shape is
+        // read by the shader: host accounting still binds the full array.
+        reader([full, view], grid: (full.dim(0), 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [full.shape], outputDTypes: [.float32])[0]
+    }
+
+    private static func validate(_ full: MLXArray, _ view: MLXArray) throws {
+        guard full.dtype == .float32, full.ndim == 2, full.dim(1) == 2,
+              full.dim(0) >= 4, full.dim(0) <= 65536,
+              view.dtype == .float32, view.shape == [2],
+              let f = try full.evaluatedBufferInfo(), let v = try view.evaluatedBufferInfo(),
+              f.isRowContiguous, v.isRowContiguous, f.dataOffset == 0, v.dataOffset == 0,
+              f.dataElements == full.size, v.dataElements == 2,
+              f.allocatedBytes == v.allocatedBytes, f.allocatedBytes >= full.nbytes,
+              let fp = mlx_array_data_float32(full.ctx), let vp = mlx_array_data_float32(view.ctx),
+              fp == vp, UInt(bitPattern: UnsafeRawPointer(fp)) % 8 == 0 else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT full/view allocation proof refused")
+        }
+    }
+
+    /// Load-only admission; never entered by compiled/eager serving traces.
+    static func qualify(_ model: Module) throws {
+        guard enabled, NemotronSBDict.enabled, NemotronMoELeader.enabled,
+              NemotronMoELeader.preparedGateUp, NemotronMoELeader.tripleGateUp,
+              NemotronMoELeader.fuseBalancePlan,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu else { return }
+        let kernels = NemotronMoELeaderPreparedKernels.shared
+        guard kernels.tripleGateUpAndPlanDictConstant != nil,
+              kernels.tripleGateUpAndPlanTail8DictConstant != nil,
+              kernels.tripleGateUpDictConstant != nil, kernels.tripleGateUpTail8DictConstant != nil,
+              kernels.tripleGateUpDictUnrolledConstant != nil,
+              kernels.tripleGateUpTail8DictUnrolledConstant != nil else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT native source unavailable")
+        }
+        let routes: [[UInt32]] = [
+            [3,17,42,77,100,121,17,5,64,90,3,11,3,8,50,66,101,127],
+            [96,30,1,65,127,33,65,2,96,40,12,7,33,96,9,19,64,65],
+        ]
+        var layers = 0, pairs = 0, comparisons = 0
+        var admitted: [MLXArray] = []
+        try withError { () -> Void in
+            for module in model.modules() {
+                guard let moe = module as? NemotronHMoE else { continue }
+                guard let dict = NemotronSBDict.dict(moe.switchMLP.fc1),
+                      let bank = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                      bank.weight.shape == [128,1856,336], dict.index.dtype == .uint16,
+                      dict.index.shape == bank.scales.shape,
+                      dict.table.dtype == .float32, dict.table.ndim == 2, dict.table.dim(1) == 2,
+                      dict.table.dim(0) >= 4, dict.table.dim(0) <= 65536,
+                      Int(dict.index.max().item(UInt16.self)) < dict.table.dim(0) else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT native owner/index proof refused")
+                }
+                let full = dict.table
+                let alias = full[0, 0..<2].reshaped(2)
+                eval(full, alias)
+                try validate(full, alias)
+                // Global retention precedes even the qualification readers.
+                lock.withLock { bindings[ObjectIdentifier(full)] = Binding(full: full, view: alias, qualified: false) }
+                let direct = read(full, alias)
+                let reference = deviceReader([full], grid: (full.dim(0), 1, 1),
+                    threadGroup: (256, 1, 1), outputShapes: [full.shape], outputDTypes: [.float32])[0]
+                guard (direct.view(dtype: .uint32) .== reference.view(dtype: .uint32)).all().item(Bool.self),
+                      (reference.view(dtype: .uint32) .== full.view(dtype: .uint32)).all().item(Bool.self) else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT full-range words differ")
+                }
+                // Exercise both wrappers as explicit compiled parameter state,
+                // without scalar folding or an implicit tiny materialization.
+                let compiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [[full, alias]]) { _ in
+                    [read(full, alias)]
+                }
+                guard let replayed = compiled([]).first else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT compiled reader unavailable")
+                }
+                guard (replayed.view(dtype: .uint32) .== full.view(dtype: .uint32)).all().item(Bool.self) else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT compiled full-range words differ")
+                }
+                try validate(full, alias)
+                for (index, route) in routes.enumerated() {
+                    let x = (MLXRandom.normal([3,2688], key: MLXRandom.key(UInt64(0xc01d + index))) * 0.5).asType(.bfloat16)
+                    let inds = MLXArray(route)
+                    for relu2 in [false, true] {
+                      for tail8 in [false, true] {
+                        guard let old = NemotronMoELeader.applyWithBalancePlan(x, inds, bank: bank,
+                                  relu2: relu2, prepared: nil, dict: dict, constantDict: false, qualificationTail8: tail8),
+                              let new = NemotronMoELeader.applyWithBalancePlan(x, inds, bank: bank,
+                                  relu2: relu2, prepared: nil, dict: dict, constantDict: true, qualificationTail8: tail8),
+                              (old.activation.view(dtype: .uint16) .== new.activation.view(dtype: .uint16)).all().item(Bool.self),
+                              (old.plan .== new.plan).all().item(Bool.self) else {
+                            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT FC1/plan differs")
+                        }
+                        comparisons += 1
+                        if NemotronMoELeader.elideUnreadPlan {
+                            for unroll in [false, true] {
+                                guard let old = NemotronMoELeader.applyTripleWithoutPlan(x, inds, bank: bank,
+                                          relu2: relu2, prepared: nil, dict: dict, unroll: unroll, constantDict: false, qualificationTail8: tail8),
+                                      let new = NemotronMoELeader.applyTripleWithoutPlan(x, inds, bank: bank,
+                                          relu2: relu2, prepared: nil, dict: dict, unroll: unroll, constantDict: true, qualificationTail8: tail8),
+                                      (old.view(dtype: .uint16) .== new.view(dtype: .uint16)).all().item(Bool.self) else {
+                                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT plan-free FC1 differs")
+                                }
+                                comparisons += 1
+                            }
+                        }
+                      }
+                    }
+                }
+                pairs += full.dim(0)
+                layers += 1
+                admitted.append(full)
+            }
+        }
+        guard layers > 0, layers == model.modules().filter({ $0 is NemotronHMoE }).count else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_FC1_CONSTANT_DICT incomplete native inventory")
+        }
+        lock.withLock {
+            for full in admitted {
+                guard let entry = bindings[ObjectIdentifier(full)], entry.full === full else {
+                    preconditionFailure("NEMOTRON_FC1_CONSTANT_DICT admission identity changed")
+                }
+                bindings[ObjectIdentifier(full)] = Binding(full: full, view: entry.view, qualified: true)
+            }
+        }
+        FileHandle.standardError.write(Data("nemotron FC1 constant dictionary: qualified \(layers) owners, \(pairs) pairs, \(comparisons) FC1 comparisons; original full inputs retained\n".utf8))
     }
 }
