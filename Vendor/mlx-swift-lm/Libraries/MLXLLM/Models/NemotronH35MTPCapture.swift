@@ -630,8 +630,15 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
         precondition(positionIds == nil)
         if let fused = cbv2HiddenCapturedFused(
             tokens, caches: caches, recurrentState: recurrentState) {
-            let output = lmHead.map { nemotronMTPHeadRows(fused.hidden, $0, prepared: fused.prepared) }
+            var output = lmHead.map { nemotronMTPHeadRows(fused.hidden, $0, prepared: fused.prepared) }
                 ?? nemotronMTPMapRows(fused.hidden) { logits($0) }
+            if NemotronMTPHeadTwice.enabled, let lmHead {
+                // The same head launch again, ordered after the first; consumers wait for it.
+                let again = nemotronMTPHeadRows(
+                    depends(input: fused.hidden, dependencies: [output]), lmHead,
+                    prepared: fused.prepared.map { depends(input: $0, dependencies: [output]) })
+                output = depends(input: output, dependencies: [again])
+            }
             return (output, fused.hidden)
         }
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState, captureMTP: true)
@@ -716,4 +723,10 @@ extension NemotronH35Model {
         roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
     }
+}
+
+/// Runs the captured verify's head launch a second time after the first.
+/// NEMOTRON_MTP_HEAD_TWICE=0 turns it off.
+enum NemotronMTPHeadTwice {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_TWICE"] != "0"
 }
