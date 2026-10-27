@@ -1307,6 +1307,22 @@ enum NemotronSeedEarlyCommit {
     }
 }
 
+/// Seed-only (request prefill): more early submissions inside the first two
+/// layers, so the first heavy GPU work is committed while the host still
+/// builds them: layer 0 (Mamba) after its conv/dt and scan inputs and after
+/// its scan window outputs (before out_proj); layer 1 (the first MoE block)
+/// after its router and counting sort (before the routed fc1 gather) and
+/// after the routed fc1 gather. They are not recorded as prefill chunks (the
+/// chunk waits are unchanged). Evaluation order only; every value is
+/// unchanged. NEMOTRON_SEED_EARLY_COMMIT_MID=0 skips them.
+enum NemotronSeedEarlyCommitMid {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_EARLY_COMMIT_MID"] != "0"
+
+    static func applies(layer: Int, modelLayerIndex: Int, rows: Int) -> Bool {
+        enabled && modelLayerIndex == layer && rows > 8 && NemotronHPrefillX5.requestPrefill
+    }
+}
+
 /// Seed-only: a fresh request's first scan window computes
 /// `next + lastDecay * (+0.0)` (a [b, h, 1, 1] multiply, then a broadcast
 /// add) through `stateUpdate` with the zero-stride +0.0 state, i.e. the same
@@ -2159,7 +2175,8 @@ func nemotronSSMAttn(
     x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
     dt: MLXArray, dtBias: MLXArray, state: MLXArray?,
     timeStepLimit: (Float, Float),
-    prepared: (dtA: MLXArray, dtx: MLXArray, bF32: MLXArray?)? = nil
+    prepared: (dtA: MLXArray, dtx: MLXArray, bF32: MLXArray?)? = nil,
+    earlyCommit: Bool = false
 ) -> (MLXArray, MLXArray) {
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
@@ -2181,6 +2198,10 @@ func nemotronSSMAttn(
     // Seed only: every window's exp(cumsum(dtA)) in one launch.
     let windowCumExp: MLXArray? = NemotronHPrefillX5.active && b == 1
         ? NemotronPrefillScanExp.applyScanExp(dtA, step: step) : nil
+    // `NemotronSeedEarlyCommitMid`: the conv/dt launch and the scan inputs.
+    if earlyCommit {
+        asyncEval([windowCumExp ?? dtA, dtx] + (prepared?.bF32.map { [$0] } ?? []))
+    }
     // The fused epilogue needs every window on the windowOut path below,
     // whose dtype conditions hold for an fp32 state and fp32 dtA.
     let fuseEpilogue = NemotronHPrefillX5.ssmEpilogue && NemotronHPrefillX5.active && d == 128 && dh % 32 == 0
@@ -4852,11 +4873,13 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let C = convSplits[2].reshaped(
             batch, convOutput.dim(1), numGroups, ssmStateSize)
         let dtArray = dt.reshaped(batch, dt.dim(1), numHeads)
+        let midCommit = NemotronSeedEarlyCommitMid.applies(
+            layer: 0, modelLayerIndex: modelLayerIndex, rows: hiddenStates.dim(1))
         let (y, nextState) = convOutput.dim(1) > 1
             ? nemotronSSMAttn(
                 x: hidden, ALog: aLog, B: B, C: C, D: D, dt: dtArray,
                 dtBias: dtBias, state: ssmState, timeStepLimit: timeStepLimit,
-                prepared: front.map { (dtA: $0.2, dtx: $0.3, bF32: $0.4) })
+                prepared: front.map { (dtA: $0.2, dtx: $0.3, bF32: $0.4) }, earlyCommit: midCommit)
             : nemotronDecodeSSM(
             hiddenStates: hidden,
             ALog: aLog,
@@ -4868,6 +4891,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             state: ssmState
                 ?? MLXArray.zeros([batch, numHeads, headDim, ssmStateSize], dtype: .float32),
             timeStepLimit: timeStepLimit)
+        // `NemotronSeedEarlyCommitMid`: the scan window outputs, before out_proj.
+        if midCommit { asyncEval(y) }
         let nextSSMState = nextState.asType(.float32)
 
         for (row, evaluation) in recurrentState.enumerated() {
@@ -5401,7 +5426,7 @@ class NemotronHSwitchMLP: Module {
     /// MoE block's `y + addend` in the combine launch; `added` says whether it
     /// was applied.
     func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, addend: MLXArray?,
-                            join: (residual: MLXArray, norm: RMSNorm)? = nil)
+                            join: (residual: MLXArray, norm: RMSNorm)? = nil, earlyCommit: Bool = false)
         -> (out: MLXArray, added: Bool, normalized: MLXArray?)? {
         let k = indices.dim(-1)
         guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
@@ -5440,6 +5465,10 @@ class NemotronHSwitchMLP: Module {
             }
             return lin(input, idx, sortedIndices: true)
         }
+        // `NemotronSeedEarlyCommitMid`: the router and the counting sort, before the fc1 gather.
+        if earlyCommit {
+            asyncEval([order, inverse, idx] + (orderK.map { [$0] } ?? []) + (runTiles.map { [$0.tiles] } ?? []))
+        }
         var y: MLXArray
         if let tiles = runTiles, let rowsK = orderK, let q = fc1 as? QuantizedSwitchLinear,
             let activated = NemotronPrefillDirectFC1.apply(
@@ -5462,6 +5491,8 @@ class NemotronHSwitchMLP: Module {
                 y = relu2(y)
             }
         }
+        // `NemotronSeedEarlyCommitMid`: the routed fc1 gather.
+        if earlyCommit { asyncEval(y) }
         if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
            let fromCopy = NemotronPrefillFC2Copy.apply(y, q, tiles: tiles) {
             y = fromCopy
@@ -8402,7 +8433,7 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     /// applies the block's residual add and that norm
     /// (`NemotronPrefillMoEJoin`): `out` is then the residual and
     /// `normalized` the norm's output.
-    func cbv2Forward(_ x: MLXArray, join: (residual: MLXArray, norm: RMSNorm)?)
+    func cbv2Forward(_ x: MLXArray, join: (residual: MLXArray, norm: RMSNorm)?, earlyCommit: Bool = false)
         -> (out: MLXArray, normalized: MLXArray?)
     {
         let (inds, scores) = gate(x)
@@ -8411,7 +8442,8 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
             ? sharedExperts.map { $0(x) } : nil
         var y: MLXArray
         var added = false
-        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared, join: join) {
+        if let fused = switchMLP.fusedSortedCombine(
+            x, inds, scores, addend: shared, join: join, earlyCommit: earlyCommit) {
             if let normalized = fused.normalized { return (fused.out, normalized) }
             y = fused.out
             added = fused.added
@@ -8529,7 +8561,10 @@ private class NemotronHBlock: Module {
             } else {
                 // Request prefill: the combine launch also takes this block's
                 // join with the next norm (`NemotronPrefillMoEJoin`).
-                let result = moe.cbv2Forward(hidden, join: nextNorm.map { (residual: x, norm: $0) })
+                let result = moe.cbv2Forward(
+                    hidden, join: nextNorm.map { (residual: x, norm: $0) },
+                    earlyCommit: NemotronSeedEarlyCommitMid.applies(
+                        layer: 1, modelLayerIndex: modelLayerIndex, rows: hidden.dim(1)))
                 if let normalized = result.normalized { return (result.out, normalized, nil) }
                 output = result.out
             }
