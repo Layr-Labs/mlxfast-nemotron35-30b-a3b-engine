@@ -442,6 +442,27 @@ private final class NemotronH35MTPDraftFrontCache {
     }
 }
 
+/// The head's routed banks (fc1 bank words with their pair dictionary, the fc2 copy) get their own residency
+/// set, requested after the decode extras (`NemotronDecodeResidency.lateSets`). The request's first-round drafts
+/// (the draft steps before its first verify) that are built while that request has not returned run the head's
+/// block without its routed experts (the shared expert alone), so the first verify does not wait for the banks'
+/// mapping; every later draft is the base's. Drafts only propose: the target verifies every token, so only
+/// those first-round drafts' acceptance can change. Outside a lease the banks count as ready.
+/// NEMOTRON_MTP_FIRST_ROUND_SHARED=0 keeps the routed experts (and the banks in the head and extras sets).
+enum NemotronMTPFirstRoundDraft {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FIRST_ROUND_SHARED"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var pending = false
+    /// Set by `NemotronH35MTPAssistant.draftStep` around a first-round head step.
+    nonisolated(unsafe) static var firstRound = false
+    /// A first-round head step while the lease's late set has not returned: the block skips its routed experts.
+    static var active: Bool { enabled && firstRound && lock.withLock { pending } }
+    /// The lease's begin, before its late set is enqueued.
+    static func begin() { lock.withLock { pending = true } }
+    /// The late set's request returned (or the lease finished).
+    static func ready() { lock.withLock { pending = false } }
+}
+
 final class NemotronH35MTPExpertBlock: Module {
     @ModuleInfo(key: "norm") var norm: RMSNorm
     @ModuleInfo(key: "mixer") var mixer: NemotronHMoE
@@ -455,6 +476,7 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if NemotronMTPFirstRoundDraft.active { return sharedOnlyTail(x) }
         if NemotronMTPExecution.compiledMoE,
            x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1 {
             return oneTokenTailCache([x], mode: exactTailAvailable(x) ? 1 : 0, owner: self)
@@ -464,6 +486,7 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     func callAsFunction(residual: MLXArray, attention: MLXArray) -> MLXArray {
+        if NemotronMTPFirstRoundDraft.active { return sharedOnlyTail(residual + attention) }
         if exactTailAvailable(residual), attention.shape == residual.shape,
            let joined = NemotronHResidualRMSNorm.apply(residual, attention, norm: norm) {
             if NemotronMTPExecution.compiledMoE {
@@ -476,6 +499,13 @@ final class NemotronH35MTPExpertBlock: Module {
 
     fileprivate func uncompiledOneTokenTail(_ x: MLXArray) -> MLXArray {
         finalNorm(x + mixer(norm(x)))
+    }
+
+    /// The block without its routed experts, for the request's first-round drafts
+    /// (`NemotronMTPFirstRoundDraft`): the shared expert alone.
+    private func sharedOnlyTail(_ x: MLXArray) -> MLXArray {
+        guard let shared = mixer.sharedExperts else { return finalNorm(x) }
+        return finalNorm(x + shared(norm(x)))
     }
 
     private func exactTailAvailable(_ x: MLXArray) -> Bool {
