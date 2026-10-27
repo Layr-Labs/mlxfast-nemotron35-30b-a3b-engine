@@ -7092,6 +7092,8 @@ func nemotronRunGather(
 enum NemotronPrefillFC2Copy {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY"] != "0"
     nonisolated(unsafe) static var verified = false
+    /// Columns per threadgroup (each of the two SIMD groups across N takes half).
+    static let columns = Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY_BN"] ?? "") ?? 64
 
     private static let header: String = nemotronRunGatherHeader + "\n" + #"""
 // Nemotron: the run gather reading the routed fc2 tile-major decode copy
@@ -7363,11 +7365,12 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
               copy.scales.shape == [experts, nOut / 128, k / 64, 128], copy.scales.dtype == .uint16,
               copy.biases.dtype == .float32
         else { return nil }
+        let bn = Self.columns
         return kernel(
             [x, copy.codes, copy.scales, copy.biases, tiles.tiles, nOut, k],
-            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", bn), ("BK", 64),
                        ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", false)],
-            grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+            grid: (((nOut + bn - 1) / bn) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }
 
@@ -7438,6 +7441,140 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 /// dispatch of the current run gather. `qualify` compares it with
 /// `nemotronRunGather` on `xs` bit for bit on the target's first MoE fc1
 /// with seeded inputs and routes. NEMOTRON_PREFILL_DIRECT_FC1=0 keeps `xs`.
+private let nemotronQuantizedBlockLoaderDictSource = #"""
+// The bank loader reading each group's (scale, bias) through the pair
+// dictionary: `scales` is the uint16 pair index (the scales' layout) and
+// `biases` the FP32 pair table (exact BF16 widenings), so `scale` and `bias`
+// are the bank's BF16 values and the dequantized block is the stock one.
+template <
+    typename T,
+    short BROWS,
+    short BCOLS,
+    short dst_ld,
+    short reduction_dim,
+    short tgp_size,
+    short group_size,
+    short bits>
+struct QuantizedBlockLoaderDict {
+  static_assert(
+      BCOLS <= group_size,
+      "The group size should be larger than the columns");
+  static_assert(
+      group_size % BCOLS == 0,
+      "The group size should be divisible by the columns");
+  static_assert(
+      bits == 2 || bits == 3 || bits == 4 || bits == 5 || bits == 6 ||
+          bits == 8,
+      "Template undefined for bits not in {2, 3, 4, 5, 6, 8}");
+
+  MLX_MTL_CONST short pack_factor = get_pack_factor<bits, 8>();
+  MLX_MTL_CONST short bytes_per_pack = get_bytes_per_pack<bits>();
+  MLX_MTL_CONST short BCOLS_PACKED = BCOLS / pack_factor;
+  MLX_MTL_CONST short n_reads =
+      (BCOLS_PACKED * BROWS < tgp_size) ? 1 : (BCOLS_PACKED * BROWS) / tgp_size;
+  MLX_MTL_CONST short group_steps = group_size / BCOLS;
+
+  const int src_ld;
+  const int tile_stride;
+  short group_step_cnt;
+  const int group_stride;
+
+  const short thread_idx;
+  const short bi;
+  const short bj;
+
+  threadgroup T* dst;
+  const device uint8_t* src;
+  const device uint16_t* scales;
+  const device float* biases;
+
+  QuantizedBlockLoaderDict(
+      const device uint8_t* src_,
+      const device uint16_t* scales_,
+      const device float* biases_,
+      const int src_ld_,
+      threadgroup T* dst_,
+      ushort simd_group_id [[simdgroup_index_in_threadgroup]],
+      ushort simd_lane_id [[thread_index_in_simdgroup]]) thread
+      : src_ld(src_ld_),
+        tile_stride(
+            reduction_dim ? BCOLS_PACKED* bytes_per_pack
+                          : BROWS * src_ld * bytes_per_pack / pack_factor),
+        group_step_cnt(0),
+        group_stride(BROWS* src_ld / group_size),
+        thread_idx(simd_group_id * 32 + simd_lane_id),
+        bi(n_reads* thread_idx / BCOLS_PACKED),
+        bj((n_reads * thread_idx) % BCOLS_PACKED),
+        dst(dst_ + bi * dst_ld + bj * pack_factor),
+        src(src_ + bi * src_ld * bytes_per_pack / pack_factor +
+            bj * bytes_per_pack),
+        scales(scales_ + bi * src_ld / group_size),
+        biases(biases_) {}
+
+  void load_unsafe() const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    const uint pair = uint(*scales);
+    T scale = static_cast<T>(biases[2 * pair]);
+    T bias = static_cast<T>(biases[2 * pair + 1]);
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          src + i * bytes_per_pack, scale, bias, dst + i * pack_factor);
+    }
+  }
+
+  void load_safe(short2 src_tile_dim) const thread {
+    if (BCOLS_PACKED * BROWS < tgp_size && bi >= BROWS) {
+      return;
+    }
+
+    if (reduction_dim == 1 && bi >= src_tile_dim.x) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+
+    if (reduction_dim == 0 && bi >= src_tile_dim.y) {
+      for (int i = 0; i < n_reads * pack_factor; i++) {
+        dst[i] = T(0);
+      }
+      return;
+    }
+
+    const uint pair = uint(*scales);
+    T scale = static_cast<T>(biases[2 * pair]);
+    T bias = static_cast<T>(biases[2 * pair + 1]);
+    for (int i = 0; i < n_reads; i++) {
+      dequantize<T, pack_factor, bits>(
+          (device uint8_t*)(src + i * bytes_per_pack),
+          scale,
+          bias,
+          dst + i * pack_factor);
+    }
+  }
+
+  void next() thread {
+    src += tile_stride;
+    if (reduction_dim == 1) {
+      if (group_steps > 1) {
+        group_step_cnt++;
+        if (group_step_cnt == group_steps) {
+          group_step_cnt = 0;
+          scales++;
+        }
+      } else {
+        scales++;
+      }
+    } else {
+      scales += group_stride;
+    }
+  }
+};
+"""#
+
 enum NemotronPrefillDirectFC1 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_DIRECT_FC1"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -7520,6 +7657,58 @@ const device T* xn = x;
         return source
     }()
 
+    /// `header` with the pair-dictionary loader: the scales and biases operands
+    /// become the fc1 bank's `NemotronSBDict` index and FP32 pair table.
+    private static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
+        var h = source
+        func swap(_ old: String, _ new: String) -> Bool {
+            guard h.components(separatedBy: old).count == 2 else { return false }
+            h = h.replacingOccurrences(of: old, with: new)
+            return true
+        }
+        let edits: [(String, String)] = [
+            ("template <typename Tile, typename T>\nMETAL_FUNC void nemotron_load_routed(", nemotronQuantizedBlockLoaderDictSource
+                + "\ntemplate <typename Tile, typename T>\nMETAL_FUNC void nemotron_load_routed("),
+            ("METAL_FUNC void nemotron_gather_qmm_runs_direct_impl(",
+             "METAL_FUNC void nemotron_gather_qmm_runs_direct_dict_impl("),
+            ("    const device T* scales,\n    const device T* biases,\n",
+             "    const device uint16_t* scales,\n    const device float* biases,\n"),
+            ("  using loader_w_t = QuantizedBlockLoader<", "  using loader_w_t = QuantizedBlockLoaderDict<"),
+            ("  biases += y_col_long * K_g;\n", ""),
+            ("      biases + index * stride_s,\n", "      biases,\n"),
+        ]
+        for (old, new) in edits {
+            guard swap(old, new) else { return nil }
+        }
+        return h
+    }
+
+    private static let dictKernel: MLXFast.MLXFastKernel? = NemotronPrefillDirectFC1.dictHeader.map { header in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_direct_input_dict",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+                    nemotron_gather_qmm_runs_direct_dict_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, routed_rows, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                } else {
+                    nemotron_gather_qmm_runs_direct_dict_impl<T, GS, BITS, BM, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, routed_rows, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+                }
+            """,
+            header: header)
+    }
+    /// Set by `qualifyDict`: the dictionary kernel is used for every MoE fc1 with a dictionary.
+    nonisolated(unsafe) static var dictVerified = false
+
     private static let kernel: MLXFast.MLXFastKernel? = NemotronPrefillDirectFC1.header.map { header in
         MLXFast.metalKernel(
             name: "nemotron_gather_qmm_runs_direct_input",
@@ -7550,11 +7739,11 @@ const device T* xn = x;
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
                       tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, rows: rows, tiles: tiles)
+        return launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
     }
 
     private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
-                               tiles: NemotronHRunTiles) -> MLXArray? {
+                               tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
         guard let kernel, NemotronHPrefillX5.runGather,
               lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
@@ -7571,6 +7760,15 @@ const device T* xn = x;
               ops.weight.dim(2) * 8 == k, k % 64 == 0,
               ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
         else { return nil }
+        if useDict, let dictKernel, let d = NemotronSBDict.dict(lin), d.index.shape == ops.scales.shape,
+           d.index.dtype == .uint16, d.table.dtype == .float32 {
+            return dictKernel(
+                [x, ops.weight, d.index, d.table, tiles.tiles, rows, nOut, k],
+                template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
+                           ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", k % 64 == 0), ("RELU2", true)],
+                grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+        }
         return kernel(
             [x, ops.weight, ops.scales, biases, tiles.tiles, rows, nOut, k],
             template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", 64),
@@ -7624,6 +7822,65 @@ const device T* xn = x;
         }
         report(verified ? "on (\(checked) cases bitwise equal)"
                         : "off (outputs differ from the expanded-row run gather after \(checked) cases)")
+    }
+}
+
+extension NemotronPrefillDirectFC1 {
+    /// NEMOTRON_PREFILL_FC1_DICT=0 keeps the fc1 bank's BF16 scales and biases.
+    static let dictEnabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC1_DICT"] != "0"
+
+    /// Load time, after `qualify`: every MoE fc1 must have a pair dictionary; then the dictionary
+    /// kernel must equal the bank kernel bit for bit on seeded routes and inputs (every MoE layer in
+    /// the first case). Only then does the request prefill's fc1 read the dictionary, and the decode
+    /// residency map it in place of the bank's scales and biases.
+    static func qualifyDict(_ target: Module) {
+        dictVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill fc1 dict: \(message)\n".utf8))
+        }
+        guard dictEnabled, verified, NemotronSBDict.enabled else { return report("off (setting)") }
+        let moes = target.modules().compactMap { $0 as? NemotronHMoE }
+        guard dictKernel != nil else { return report("off (direct gather source not as expected)") }
+        guard let moe = moes.first, moes.allSatisfy({ m in
+            guard let lin = m.switchMLP.fc1 as? QuantizedSwitchLinear, let d = NemotronSBDict.dict(lin) else {
+                return false
+            }
+            return d.index.shape == lin.nemotronGatherOperands(for: .bfloat16).scales.shape
+                && d.index.dtype == .uint16 && d.table.dtype == .float32
+        }) else { return report("off (not every MoE fc1 has a pair dictionary)") }
+        let experts = moe.switchMLP.numExperts, k = moe.numExpertsPerTok
+        let width = moe.switchMLP.inputDims
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, (tokens, skew)) in [(488, Float(2)), (488, 0), (488, 9), (300, 4), (97, 1)].enumerated() {
+                    let seed = UInt64(0xfc1d_0000 + index)
+                    let logits = MLXRandom.normal([tokens, experts], key: MLXRandom.key(seed))
+                        + skew * MLXRandom.normal([1, experts], key: MLXRandom.key(seed + 1))
+                    let flat = argSort(-logits, axis: -1)[0..., ..<k].asType(.uint32).flattened()
+                    guard let sorted = nemotronCountingSortChunked(flat, experts: experts, k: k) else {
+                        return false
+                    }
+                    let x = MLXRandom.normal([1, tokens, width], scale: 2, key: MLXRandom.key(seed + 2))
+                        .asType(.bfloat16).reshaped(tokens, 1, width)
+                    for m in (index == 0 ? moes : [moe]) {
+                        guard let lin = m.switchMLP.fc1 as? QuantizedSwitchLinear,
+                              let bank = launch(x, lin, rows: sorted.orderK, tiles: sorted.tiles),
+                              let dict = launch(x, lin, rows: sorted.orderK, tiles: sorted.tiles, useDict: true)
+                        else { return false }
+                        let same = (dict.view(dtype: .uint16) .== bank.view(dtype: .uint16)).all()
+                        if !same.item(Bool.self) { return false }
+                    }
+                    checked += 1
+                }
+                return true
+            }
+            dictVerified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(dictVerified ? "on (\(checked) cases bitwise equal, every MoE layer in the first)"
+                            : "off (outputs differ from the bank kernel after \(checked) cases)")
     }
 }
 
