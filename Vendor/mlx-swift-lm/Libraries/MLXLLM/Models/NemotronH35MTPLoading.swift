@@ -90,10 +90,15 @@ extension NemotronH35MTPAssistant {
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronZSkip.qualifySimdStage()
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
+        NemotronMTPRouterRowsSelect.qualifyReg(target: target)
+        NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronRouterSharedUpColaunch.qualify(target)
+        NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -732,3 +737,5 @@ final class NemotronCPUWarm: @unchecked Sendable {
 }
 
 // Measurement entry of the carried 3f932e3c tree.
+
+// Measurement entry 2 of this tree.
