@@ -2,7 +2,43 @@
 //
 // Target-authoritative scoring strategies for one known MTP draft chain.
 
+import Foundation
 import MLX
+
+/// The rectangular verify window's columns (`[B, 1]` each, the seed first), published while the target's
+/// captured forward and the acceptance packet are built, so their launches can read the tokens from the columns
+/// instead of from the window concatenated out of them; when every reader does, the window is never launched.
+/// A reader matches the window it is handed by identity. NEMOTRON_MTP_ENTRY_IDS3=0 keeps the target's entry on
+/// the window; CBV2_MTP_PACKET_COLUMNS=0 the packet (`CBv2MTPTopTwoPacketColumns`); with both, nothing is
+/// published.
+public enum CBv2MTPVerifyWindowColumns {
+    public static let entryEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ENTRY_IDS3"] != "0"
+    static var enabled: Bool { entryEnabled || CBv2MTPTopTwoPacketColumns.enabled }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var published: (window: MLXArray, columns: [MLXArray], sources: [MLXArray])?
+
+    /// `sources`: the drafter's own token arrays the draft columns were reshaped from (columns 1...k, in
+    /// order), or empty.
+    static func publish(window: MLXArray, columns: [MLXArray], sources: [MLXArray] = []) {
+        guard enabled else { return }
+        lock.withLock { published = (window, columns, sources) }
+    }
+
+    static func clear() {
+        lock.withLock { published = nil }
+    }
+
+    /// The columns `window` was concatenated from, while `window` is the verify window being built.
+    public static func columns(of window: MLXArray) -> [MLXArray]? {
+        lock.withLock { published.flatMap { $0.window === window ? $0.columns : nil } }
+    }
+
+    /// The drafter's token arrays behind draft columns 1...k of `window` (the arrays its `draftStep` returned),
+    /// while `window` is the verify window being built; nil when they were not published.
+    public static func sources(of window: MLXArray) -> [MLXArray]? {
+        lock.withLock { published.flatMap { $0.window === window && !$0.sources.isEmpty ? $0.sources : nil } }
+    }
+}
 
 extension EngineLoopV2 {
 
@@ -28,7 +64,8 @@ extension EngineLoopV2 {
     /// and per-request RNG stream — exact for the output distribution at
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
-        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
+        columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
+        draftSources: [MLXArray] = []
     ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
@@ -234,6 +271,12 @@ extension EngineLoopV2 {
                 }
             }
             let tokens = concatenated(columns, axis: 1)
+            // The target's entry and the acceptance packet may read the columns
+            // themselves; then nothing reads the window and it is never launched.
+            CBv2MTPVerifyWindowColumns.publish(
+                window: tokens, columns: columns,
+                sources: draftSources.count == columns.count - 1 ? draftSources : [])
+            defer { CBv2MTPVerifyWindowColumns.clear() }
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
