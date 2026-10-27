@@ -17,6 +17,7 @@
 #
 # Environment:
 #   MLXFAST_BUILD_CACHE_DIR   cache root (default ~/.cache/mlxfast-engine-build); the box owns it
+#   MLXFAST_BUILD_CACHE_KEEP  complete key dirs to keep (default 8; integer values below 1 clamp to 1)
 #
 # The artefacts are verified by sha256 on restore against the MANIFEST the save
 # wrote; any mismatch is a miss, never a partial restore.
@@ -26,6 +27,15 @@ cd "${ROOT_DIR}"
 log() { printf 'build-cache.sh: %s\n' "$*"; }
 die() { printf 'build-cache.sh: %s\n' "$*" >&2; exit 2; }
 CACHE_ROOT="${MLXFAST_BUILD_CACHE_DIR:-${HOME}/.cache/mlxfast-engine-build}"
+KEEP="${MLXFAST_BUILD_CACHE_KEEP:-8}"
+if [[ ! "${KEEP}" =~ ^-?[0-9]+$ ]]; then
+  KEEP=8
+elif [[ "${KEEP}" == -* ]]; then
+  KEEP=1
+else
+  KEEP="$(printf '%s\n' "${KEEP}" | sed 's/^0*//')"
+  [[ -n "${KEEP}" ]] || KEEP=1
+fi
 ARTEFACTS=(
   ".build-worker/release/bench-worker"
   ".build-worker/release/mlx.metallib"
@@ -33,6 +43,60 @@ ARTEFACTS=(
 )
 sha256_of_file() { shasum -a 256 -- "$1" | cut -d ' ' -f 1; }
 sha256_of_stdin() { shasum -a 256 | cut -d ' ' -f 1; }
+mtime_of_dir() {
+  perl -e 'my @s = stat shift; exit 1 unless @s; print $s[9]' -- "$1" 2>/dev/null
+}
+prune_cache() {
+  local entry base mtime i oldest oldest_mtime active remove_count failed_count keep_others kept
+  local -a paths mtimes
+
+  if ! find -H "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d -name '*.tmp.*' -mmin +1440 -exec rm -rf -- {} +; then
+    log "prune warning: could not remove one or more stale temporary dirs; ignored"
+  fi
+
+  paths=(); mtimes=()
+  for entry in "${CACHE_ROOT}"/*; do
+    [[ -d "${entry}" ]] || continue
+    base="${entry##*/}"
+    [[ "${base}" =~ ^[0-9a-f]{64}$ ]] || continue
+    [[ "${base}" == "${key}" ]] && continue
+    if ! mtime="$(mtime_of_dir "${entry}")" || [[ ! "${mtime}" =~ ^[0-9]+$ ]]; then
+      log "prune warning: could not read mtime for ${base}; ignored"
+      continue
+    fi
+    paths+=("${entry}")
+    mtimes+=("${mtime}")
+  done
+
+  active=${#paths[@]}
+  if [[ ${#KEEP} -gt 9 ]]; then
+    keep_others=${active}
+  else
+    keep_others=$((KEEP - 1))
+  fi
+  remove_count=0
+  failed_count=0
+  while [[ ${active} -gt ${keep_others} ]]; do
+    oldest=-1; oldest_mtime=0
+    for ((i = 0; i < ${#paths[@]}; i++)); do
+      [[ -n "${paths[i]:-}" ]] || continue
+      if [[ ${oldest} -lt 0 || ${mtimes[i]} -lt ${oldest_mtime} ]]; then
+        oldest=${i}; oldest_mtime=${mtimes[i]}
+      fi
+    done
+    [[ ${oldest} -ge 0 ]] || break
+    if rm -rf -- "${paths[oldest]}"; then
+      remove_count=$((remove_count + 1))
+    else
+      log "prune warning: could not remove ${paths[oldest]##*/}; ignored"
+      failed_count=$((failed_count + 1))
+    fi
+    paths[oldest]=''
+    active=$((active - 1))
+  done
+  kept=$((1 + active + failed_count))
+  log "pruned ${remove_count} old cache entries (kept ${kept})"
+}
 content_key() {
   local paths rel blob
   # Vendor/mlx-swift-lm is a VENDORED TREE, so the fork's sources are hashed
@@ -73,6 +137,7 @@ case "${1:-}" in
       [[ "$(sha256_of_file "${dir}/${a}")" == "${want}" ]] || { log "miss: ${a} in the cache does not match its manifest; refusing a partial restore"; exit 1; }
     done
     for a in "${ARTEFACTS[@]}"; do mkdir -p "$(dirname "${a}")"; cp -p "${dir}/${a}" "${a}"; done
+    touch "${dir}"
     log "hit: restored ${#ARTEFACTS[@]} artefacts for key ${key:0:12}"
     ;;
   save)
@@ -83,6 +148,7 @@ case "${1:-}" in
     for a in "${ARTEFACTS[@]}"; do mkdir -p "${tmp}/$(dirname "${a}")"; cp -p "${a}" "${tmp}/${a}"; printf '%s %s\n' "${a}" "$(sha256_of_file "${a}")" >> "${tmp}/MANIFEST"; done
     rm -rf "${dir}"; mv "${tmp}" "${dir}"
     log "saved ${#ARTEFACTS[@]} artefacts under key ${key:0:12} in ${CACHE_ROOT}"
+    prune_cache || log "prune warning: unexpected error; ignored"
     ;;
   *) die "usage: tools/build-cache.sh key|restore|save" ;;
 esac
