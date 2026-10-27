@@ -107,6 +107,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillSharedRelu2.qualify(target)
         NemotronPrefillDirectFC1.qualify(target)
         NemotronPrefillDirectFC1.qualifyDict(target)
+        NemotronSeedHeadDict.qualify(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
@@ -121,6 +122,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillScanDecayGemm.qualify()
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
+        NemotronHSeedX.qualify(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().

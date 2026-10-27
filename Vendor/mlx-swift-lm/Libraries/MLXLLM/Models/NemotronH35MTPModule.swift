@@ -724,13 +724,51 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
         NemotronHPrefillX5.requestPrefill = true
-        defer { NemotronHPrefillX5.requestPrefill = false }
+        CBv2FullSequenceKV.seedFirstWrite = NemotronHSeedX.kvVerified
+        defer {
+            NemotronHPrefillX5.requestPrefill = false
+            CBv2FullSequenceKV.seedFirstWrite = false
+        }
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
         case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
-        case .lastPositionLogits: return (logits(last), hidden)
+        case .lastPositionLogits: return (NemotronSeedHeadDict.apply(last, lmHead) ?? logits(last), hidden)
         }
+    }
+}
+
+extension NemotronHSeedX {
+    /// The attention caches' first write is one concatenate of the projected
+    /// rows and the zero slack (no whole-storage rewrite). Values are the
+    /// stored ones either way; NEMOTRON_MTP_SEEDX_KV=0 keeps the slice update.
+    static let kvEnabled = enabled
+        && ProcessInfo.processInfo.environment["NEMOTRON_MTP_SEEDX_KV"] != "0"
+    nonisolated(unsafe) static var kvVerified = false
+
+    /// The concatenated first write raw-word against the stock zero storage +
+    /// slice update, at the seed's [1, 2, 488, 128] into 744 rows, for every
+    /// bf16 word pattern (random 16-bit words, NaN payloads included), with a
+    /// contiguous and a transposed (projection-layout) update.
+    static func qualifyKV() {
+        kvVerified = false
+        guard kvEnabled else { return report("kv", "off (setting)") }
+        do {
+            let matches = try withError { () -> Bool in
+                let words = MLXRandom.randInt(0 ..< Int32(65536), [1, 488, 2, 128], key: MLXRandom.key(0x5eed_0040))
+                    .asType(.uint16).view(dtype: .bfloat16)
+                for update in [words.transposed(0, 2, 1, 3), words.transposed(0, 2, 1, 3).contiguous()] {
+                    let (first, stock) = CBv2FullSequenceKV.seedFirstWriteCheck(update, capacity: 744)
+                    if !sameWords(first, stock) { return false }
+                }
+                return true
+            }
+            kvVerified = matches
+        } catch {
+            return report("kv", "off (\(error))")
+        }
+        report("kv", kvVerified ? "on (raw-word equal to zero storage + slice update at [1, 2, 488, 128] into 744)"
+                                : "off (differs from zero storage + slice update)")
     }
 }
 

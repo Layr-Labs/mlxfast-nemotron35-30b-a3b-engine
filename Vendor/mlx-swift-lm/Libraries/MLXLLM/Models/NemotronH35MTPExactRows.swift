@@ -1535,6 +1535,103 @@ func nemotronR1Linear(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     return nemotronBitwiseOrNaN(out, linear(x))
 }
 
+extension NemotronMultiRowQMV {
+    /// One row of `q` through the R = 1 twin `dispatch` selects, reading
+    /// (scale, bias) through `dict` (the tensor's `NemotronSBDict`), at the
+    /// stock four outputs per SIMD group. nil when the shape is not the stock
+    /// qmv / qmv_fast one.
+    static func dictRow(_ x: MLXArray, _ q: QuantizedLinear, dict: NemotronSBDict.Dict) -> MLXArray? {
+        guard enabled, draftDictAvailable, x.ndim == 2, x.dim(0) == 1, x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, q.scales.dtype == x.dtype, biases.dtype == x.dtype,
+              q.weight.ndim == 2, q.weight.dtype == .uint32,
+              dict.index.shape == q.scales.shape, dict.index.dtype == .uint16,
+              dict.table.dtype == .float32
+        else { return nil }
+        let k = x.dim(1), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
+        return dispatch(q.weight, q.scales, biases, x, relu2: false, rps: 4, dict: dict)
+    }
+}
+
+/// Seed only (request prefill, `NemotronHPrefillX5.active`): the target head's
+/// one-row logits (`logits(last)` of the sampling prefill chunk) through the
+/// R = 1 multi-row qmv twin reading the head's `NemotronSBDict` pair
+/// dictionary (uint16 index + FP32 pair table, 11 MB) instead of the stock qmv
+/// reading its BF16 scales and biases (22 MB). One launch either way; the twin
+/// keeps the stock per-row body, lane split, block order and simd_sum, and the
+/// table holds the exact FP32 widenings of the BF16 pairs. `qualify` compares
+/// it with `head(x)` bit for bit on the loaded head; only then does the seed
+/// use it. NEMOTRON_SEED_HEAD_DICT=0 keeps the stock call.
+enum NemotronSeedHeadDict {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_HEAD_DICT"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// `head(x)` for x: [1, 1, K] inside the request prefill; nil otherwise.
+    static func apply(_ x: MLXArray, _ head: Linear?) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active, let head, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1
+        else { return nil }
+        guard let y = launch(x, head) else { return nil }
+        guard NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(y, head(x))
+    }
+
+    private static func launch(_ x: MLXArray, _ head: Linear) -> MLXArray? {
+        guard type(of: head) == QuantizedLinear.self, let q = head as? QuantizedLinear,
+              let d = NemotronSBDict.dict(q),
+              let y = NemotronMultiRowQMV.dictRow(x.reshaped(1, x.dim(-1)), q, dict: d)
+        else { return nil }
+        return y.reshaped(1, 1, q.weight.dim(0))
+    }
+
+    /// Load time, after `NemotronSBDict.prepare`: the head must have a pair
+    /// dictionary in its scales' shape whose table decodes to the scales' and
+    /// biases' raw BF16 words, and the twin must equal `head(x)` bit for bit
+    /// on seeded rows of several scales.
+    static func qualify(_ target: NemotronHModel) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron seed head dict: \(message)\n".utf8))
+        }
+        guard enabled, NemotronSBDict.enabled else { return report("off (setting)") }
+        guard let head = target.lmHead, type(of: head) == QuantizedLinear.self,
+              let q = head as? QuantizedLinear, let biases = q.biases
+        else { return report("off (no quantized head)") }
+        guard let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape,
+              d.index.dtype == .uint16, d.table.dtype == .float32
+        else { return report("off (no pair dictionary for the head)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                // Raw words: every group's table entry is the head's (scale, bias) BF16 pair.
+                let pairs = take(d.table, d.index.reshaped(-1).asType(.int32), axis: 0)
+                let words = stacked([q.scales.reshaped(-1).asType(.float32),
+                                     biases.reshaped(-1).asType(.float32)], axis: 1)
+                guard (pairs.view(dtype: .uint32) .== words.view(dtype: .uint32)).all().item(Bool.self)
+                else { return false }
+                let width = q.weight.dim(1) * 8
+                for (index, scale) in [Float(1), 0.25, 4, 16, 1, 0.05].enumerated() {
+                    let x = MLXRandom.normal([1, 1, width], scale: scale,
+                                             key: MLXRandom.key(UInt64(0x5eed_d1c7 + index)))
+                        .asType(.bfloat16)
+                    guard let twin = launch(x, head) else { return false }
+                    let stock = head(x)
+                    guard twin.shape == stock.shape,
+                          (twin.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all().item(Bool.self)
+                    else { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (raw words equal, \(checked) cases bitwise equal)"
+                        : "off (differs from the stock head after \(checked) cases)")
+    }
+}
+
 /// Self-test select: `y` where it is bitwise equal to `expected`, else NaN
 /// everywhere, so the token gate fails loudly on any difference.
 func nemotronBitwiseOrNaN(_ y: MLXArray, _ expected: MLXArray) -> MLXArray {

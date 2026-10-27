@@ -1307,6 +1307,101 @@ enum NemotronSeedEarlyCommit {
     }
 }
 
+// MARK: - Seed-only cuts (seedx)
+
+/// Seed-only cuts (request prefill, `NemotronHPrefillX5.active`): each runs
+/// only after its load-time raw-word check against the code it replaces, at
+/// the seed's shapes, and falls back to the record path on any mismatch or
+/// error. NEMOTRON_MTP_SEEDX=0 keeps the record path for every item;
+/// NEMOTRON_MTP_SEEDX_<ITEM>=0 keeps it for one item.
+enum NemotronHSeedX {
+    private static let environment = ProcessInfo.processInfo.environment
+    static let enabled = environment["NEMOTRON_MTP_SEEDX"] != "0"
+    private static func item(_ name: String) -> Bool {
+        enabled && environment["NEMOTRON_MTP_SEEDX_" + name] != "0"
+    }
+
+    /// The last block's residual add and norm_f join its launch.
+    static let joinEnabled = item("JOIN")
+    nonisolated(unsafe) static var joinVerified = false
+
+    /// The draft head's priming reuses the prompt's embedding rows.
+    static let primeEnabled = item("PRIME")
+    nonisolated(unsafe) static var primeVerified = false
+    /// The request prefill's inputs and their embedding rows, for priming.
+    nonisolated(unsafe) static var seedEmbedding: (inputs: MLXArray, rows: MLXArray)?
+    nonisolated(unsafe) private static var primeReported = false
+    /// One stderr line the first time priming takes the kept rows.
+    static func reportPrimeEngaged(_ rows: Int) {
+        guard !primeReported else { return }
+        primeReported = true
+        report("prime", "engaged (\(rows) kept embedding rows)")
+    }
+
+    static func report(_ item: String, _ message: String) {
+        FileHandle.standardError.write(Data("nemotron seedx \(item): \(message)\n".utf8))
+    }
+
+    /// Raw-word equality of two 16-bit arrays of the same shape and dtype.
+    static func sameWords(_ a: MLXArray, _ b: MLXArray) -> Bool {
+        guard a.shape == b.shape, a.dtype == b.dtype, a.dtype.size == 2 else { return false }
+        return (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all().item(Bool.self)
+    }
+
+    /// Load-time checks, in the order the seed runs them.
+    static func qualify(_ target: Module) {
+        qualifyJoin((target as? NemotronHModel)?.seedXNormF)
+        qualifyKV()
+        qualifyPrime(target as? NemotronHModel)
+    }
+
+    /// The target's embedding rows of a prompt, shifted by one, raw-word
+    /// against the draft head's own embedding of the shifted ids, at the
+    /// seed's 488 tokens.
+    static func qualifyPrime(_ target: NemotronHModel?) {
+        primeVerified = false
+        guard primeEnabled else { return report("prime", "off (setting)") }
+        guard let target else { return report("prime", "off (no target)") }
+        do {
+            let matches = try withError { () -> Bool in
+                let ids = MLXRandom.randInt(
+                    0 ..< Int32(target.vocabularySize), [1, 488], key: MLXRandom.key(0x5eed_0030))
+                    .asType(.int32)
+                let rows = target.seedXEmbeddings(ids)[0..., 1 ..< 488, 0...]
+                return sameWords(rows, target.mtpEmbedding(ids[0..., 1 ..< 488]))
+            }
+            primeVerified = matches
+        } catch {
+            return report("prime", "off (\(error))")
+        }
+        report("prime", primeVerified ? "on (raw-word equal to the draft embedding of 487 ids)"
+                                      : "off (differs from the draft embedding)")
+    }
+
+    /// The residual + RMSNorm join launch with norm_f raw-word against the
+    /// stock add and norm_f at the seed's [1, 488, 2688].
+    static func qualifyJoin(_ normF: RMSNorm?) {
+        joinVerified = false
+        guard joinEnabled else { return report("join", "off (setting)") }
+        guard let normF else { return report("join", "off (no norm_f)") }
+        do {
+            let matches = try withError { () -> Bool in
+                let x = MLXRandom.normal([1, 488, 2688], key: MLXRandom.key(0x5eed_0020)).asType(.bfloat16)
+                let out = (MLXRandom.normal([1, 488, 2688], key: MLXRandom.key(0x5eed_0021)) * 0.25)
+                    .asType(.bfloat16)
+                guard let joined = NemotronHResidualRMSNorm.apply(x, out, norm: normF) else { return false }
+                let summed = x + out
+                return sameWords(joined.0, summed) && sameWords(joined.1, normF(summed))
+            }
+            joinVerified = matches
+        } catch {
+            return report("join", "off (\(error))")
+        }
+        report("join", joinVerified ? "on (raw-word equal to stock add + norm_f at [1, 488, 2688])"
+                                    : "off (differs from stock add + norm_f)")
+    }
+}
+
 /// Seed-only: a fresh request's first scan window computes
 /// `next + lastDecay * (+0.0)` (a [b, h, 1, 1] multiply, then a broadcast
 /// add) through `stateUpdate` with the zero-stride +0.0 state, i.e. the same
@@ -8722,6 +8817,14 @@ private class NemotronHBackbone: Module {
             : nil
         defer { observation?.end() }
         var hidden = embeddings(inputs)
+        // Seed only: keep the prompt's embedding rows for the draft head's
+        // priming, which otherwise gathers the same rows again. The stash
+        // lives until the next forward or until priming takes it.
+        NemotronHSeedX.seedEmbedding = nil
+        if NemotronHSeedX.primeVerified, NemotronHPrefillX5.active, !captureMTP,
+           inputs.dim(0) == 1, inputs.dim(1) > 1 {
+            NemotronHSeedX.seedEmbedding = (inputs, hidden)
+        }
         var preparedNorm: MLXArray? = nil
         var preparedActivation: MLXArray? = nil
         var attentionIndex = 0
@@ -8751,8 +8854,15 @@ private class NemotronHBackbone: Module {
                 && !(prefillChunks && NemotronPrefillBoundaryJoin.verified && NemotronHPrefillX5.active)
             let submitsEarly = earlyEvalInterval > 0 && next < layers.count
                 && next % earlyEvalInterval == 0
+            // Seed only: the last block hands norm_f down like every other
+            // block hands its next norm: a MoE last block takes it into its
+            // combine launch (`NemotronPrefillMoEJoin`, whose check covers
+            // norm_f), any other block into the residual + norm join.
+            let lastJoin = next == layers.count && !captureMTP
+                && NemotronHSeedX.joinVerified && NemotronHPrefillX5.active
             let nextNorm = next < layers.count && !suppressedNorm
-                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+                && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm
+                : (lastJoin ? normF : nil)
             let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
@@ -8799,7 +8909,9 @@ private class NemotronHBackbone: Module {
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
-        return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
+        // `preparedNorm` after the last block is norm_f's output from the
+        // joined launch; it is nil whenever that join did not run.
+        return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : (preparedNorm ?? normF(hidden))
     }
 
     /// Captured verify forward ([1, 3] window) with one join launch per
@@ -9197,6 +9309,13 @@ public class NemotronHModel:
             !key.contains("e_score_correction_bias") && !key.contains("A_log")
         }
     }
+}
+
+extension NemotronHModel {
+    /// The backbone's final norm, for `NemotronHSeedX.qualifyJoin`.
+    var seedXNormF: RMSNorm { backbone.normF }
+    /// The backbone's embedding of `ids`, for `NemotronHSeedX.qualifyPrime`.
+    func seedXEmbeddings(_ ids: MLXArray) -> MLXArray { backbone.embeddings(ids) }
 }
 
 extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
