@@ -2347,7 +2347,7 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
 // through the same `part` array twice (low tile, then high tile), so each output's closing simd_sum sees the
 // same 32 lane partials in the same lanes, and the store is unchanged. Every output therefore carries the bits
 // of the tile-major kernel.
-private let nemotronZSkipWideBodySource = """
+private let nemotronZSkipWideBodyRecordSource = """
     constexpr int OT = 128;
     constexpr int LPS = 32 / SGS;
     constexpr int chunks = K / 8;
@@ -2555,6 +2555,11 @@ private let nemotronZSkipWideBodySource = """
 
 /// The (scale, bias) bits of a lane's four outputs of group `gi` in tile 2W + h from the tile-major BF16 arrays
 /// (the tiled kernel's loads and shifts). Bit moves only.
+// The production closing schedule; the entire original body remains the reference.
+private let nemotronZSkipWideBodySource = NemotronWidePhaseArena.enabled
+    ? NemotronWidePhaseArena.replacingClosing(nemotronZSkipWideBodyRecordSource)
+    : nemotronZSkipWideBodyRecordSource
+
 private let nemotronZSkipWidePlainSetup = """
     const device T* sq = sk + tb * groups * OT + 4 * lid;
     const device T* bq = bk + tb * groups * OT + 4 * lid;
@@ -2579,7 +2584,8 @@ private let nemotronZSkipWidePlainSetup = """
 /// ones. Grid x: N / 256 + 1 threadgroups (N % 256 == 128); threadgroups past the tail tile return at once (a
 /// co-launch's grid is the tile-major body's N / 128). Nil when the narrow source no longer has the expected
 /// statements.
-private func nemotronZSkipWideSource(narrow: String, store: String) -> String? {
+private func nemotronZSkipWideSource(narrow: String, store: String,
+                                    body: String = nemotronZSkipWideBodySource) -> String? {
     let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
     let slot = "  const int slot = int(threadgroup_position_in_grid.y);\n"
     let grid = "int(threadgroup_position_in_grid.x)"
@@ -2589,7 +2595,7 @@ private func nemotronZSkipWideSource(narrow: String, store: String) -> String? {
     let tailBody = narrow.replacingOccurrences(of: arrays, with: "")
         .replacingOccurrences(of: slot, with: "")
         .replacingOccurrences(of: grid, with: "(N / 128 - 1)")
-    let wideBody = nemotronZSkipWideBodySource
+    let wideBody = body
         .replacingOccurrences(of: "  NMW_SB_SETUP\n", with: nemotronZSkipWidePlainSetup)
         .replacingOccurrences(of: "  NMW_STORE\n", with: "          " + store + "\n")
     guard !wideBody.contains("NMW_") else { return nil }
@@ -3203,7 +3209,7 @@ enum NemotronSharedDownZSkip {
         MLXFast.metalKernel(
             name: "nemotron_zskip_shared_down_wide",
             inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"],
-            source: source,
+            source: NemotronWidePhaseArena.allocatingSeparate(source),
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
@@ -3560,7 +3566,7 @@ enum NemotronFC2SharedColaunch {
         guard let fc2, let shared, let source = source(fc2: fc2, shared: shared) else { return nil }
         return MLXFast.metalKernel(
             name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"],
-            outputNames: ["prod", "shared_y"], source: source,
+            outputNames: ["prod", "shared_y"], source: NemotronWidePhaseArena.allocatingColaunch(source),
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
@@ -4411,5 +4417,175 @@ enum NemotronSBDict {
         }
         eval(Array(same.values))
         return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
+    }
+}
+
+/// Wide shared-down only: two compact partial planes share a 32-KiB arena
+/// with the activation stage. One lifetime barrier replaces the old reuse
+/// barrier; low reduction can proceed while high partials are published.
+enum NemotronWidePhaseArena {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_WIDE_PHASE_ARENA"] != "0"
+    private static let marker = "// NEMOTRON_PHASE_ARENA\n"
+    private static let originalClosing = """
+    for (int hf = 0; hf < 2; hf++) {
+      if (hf == 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int ll = 0; ll < LPS; ll++) {
+          const int l = sg + SGS * ll;
+          for (int o = 0; o < 4; o++) {
+            part[l * PS + 4 * lid + o] = rh[4 * ll + o];
+          }
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      const int n0 = (2 * wt + hf) * OT;
+      for (int q = 0; q < OT / SGS; q++) {
+        const int n = sg * (OT / SGS) + q;
+        const U r = simd_sum(part[lid * PS + n]);
+        if (lid == 0) {
+          const T h = nml_store<T, false>(r);
+  NMW_STORE
+        }
+      }
+    }
+"""
+    private static let phaseClosing = """
+    // Barrier A: low partials published, all activation/mask reads finished.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float* nmw_high = part + 32 * 128;
+    for (int ll = 0; ll < LPS; ll++) {
+      const int l = sg + SGS * ll;
+      for (int o = 0; o < 4; o++) {
+        nmw_high[l * 128 + ((4 * lid + o + l) & 127)] = rh[4 * ll + o];
+      }
+    }
+    // High writes may overlap low reduction: the two planes are disjoint.
+    for (int hf = 0; hf < 2; hf++) {
+      if (hf == 1) {
+        // Barrier B publishes high partials before any high reader.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const int n0 = (2 * wt + hf) * OT;
+      const threadgroup float* nmw_plane = hf == 0 ? part : nmw_high;
+      for (int q = 0; q < OT / SGS; q++) {
+        const int n = sg * (OT / SGS) + q;
+        const U r = simd_sum(nmw_plane[lid * 128 + ((n + lid) & 127)]);
+        if (lid == 0) {
+          const T h = nml_store<T, false>(r);
+  NMW_STORE
+        }
+      }
+    }
+"""
+    static func replacingClosing(_ record: String) -> String {
+        precondition(record.components(separatedBy: originalClosing).count == 2,
+                     "wide phase arena exact original closing")
+        var source = record.replacingOccurrences(of: originalClosing, with: phaseClosing)
+        let store = "part[l * PS + 4 * lid + o] = p[o];"
+        precondition(source.components(separatedBy: store).count == 2,
+                     "wide phase arena unique low partial store")
+        source = source.replacingOccurrences(of: store,
+            with: "part[l * 128 + ((4 * lid + o + l) & 127)] = p[o];")
+        return marker + source
+    }
+
+    /// The source is still abstract at co-launch composition time. Allocate
+    /// its arena only at the final kernel constructor, preserving all seams.
+    static func allocatingSeparate(_ source: String) -> String {
+        guard source.contains(marker) else { return source }
+        let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
+        precondition(source.components(separatedBy: arrays).count == 2,
+                     "wide phase arena separate allocation")
+        let arena = """
+  static_assert(sizeof(T) == 2 && K <= 3712, "wide phase arena native activation extent");
+  threadgroup float nmw_arena[8192];
+  threadgroup float* part = nmw_arena;
+  threadgroup T* xsh = (threadgroup T*)(nmw_arena + 32 * 129);
+  threadgroup uchar* cmask = (threadgroup uchar*)(xsh + K);
+"""
+        return source.replacingOccurrences(of: arrays, with: arena + "\n")
+    }
+    static func allocatingColaunch(_ source: String) -> String {
+        guard source.contains(marker) else { return source }
+        let arrays = "threadgroup float nmc_part[32 * (128 + 1)];\n"
+            + "threadgroup T nmc_xsh[KS > KF ? KS : KF];\n"
+            + "threadgroup uchar nmc_cmask[(KS > KF ? KS : KF) / 8];\n"
+        precondition(source.components(separatedBy: arrays).count == 2,
+                     "wide phase arena co-launch allocation")
+        let arena = """
+static_assert(sizeof(T) == 2 && KS <= 3712 && KF <= 3712, "wide phase arena native co-launch extent");
+threadgroup float nmc_arena[8192];
+threadgroup float* nmc_part = nmc_arena;
+threadgroup T* nmc_xsh = (threadgroup T*)(nmc_arena + 32 * 129);
+threadgroup uchar* nmc_cmask = (threadgroup uchar*)(nmc_xsh + (KS > KF ? KS : KF));
+"""
+        return source.replacingOccurrences(of: arrays, with: arena + "\n")
+    }
+
+    fileprivate static let recordSharedSource = NemotronSharedDownZSkip.source.flatMap {
+        nemotronZSkipWideSource(narrow: $0, store: "shared_y[slot * N + n0 + n] = h;",
+                               body: nemotronZSkipWideBodyRecordSource)
+    }
+    fileprivate static let recordSharedKernel = recordSharedSource.map {
+        MLXFast.metalKernel(name: "nemotron_wide_phase_record_shared",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    static func qualify(_ model: Module) throws {
+        guard enabled else { return }
+        try NemotronFC2SharedColaunch.qualifyPhaseArena(model)
+    }
+}
+
+extension NemotronFC2SharedColaunch {
+    private static let phaseRecordPlain = make("nemotron_wide_phase_record_plain",
+        fc2: nemotronZSkipTiledFastSource, shared: NemotronWidePhaseArena.recordSharedSource)
+    private static let phaseRecordDict = make("nemotron_wide_phase_record_dict",
+        fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource), shared: NemotronWidePhaseArena.recordSharedSource)
+
+    /// Default native path must engage the new wide source for every target
+    /// owner. Compare original wide kernels and both co-launch outputs on
+    /// real banks, dense/sparse/signed-zero/tail and realistic-density rows.
+    fileprivate static func qualifyPhaseArena(_ model: Module) throws {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              NemotronSharedDownZSkip.wideEnabled,
+              let plain = phaseRecordPlain, let dict = phaseRecordDict,
+              let recordShared = NemotronWidePhaseArena.recordSharedKernel
+        else { throw NemotronH35MTPError.invalidArtifact("wide phase arena native reference unavailable") }
+        let owners = model.modules().compactMap { $0 as? NemotronHMoE }
+        guard !owners.isEmpty else {
+            throw NemotronH35MTPError.invalidArtifact("wide phase arena no target owners")
+        }
+        var checked = 0
+        try withError { () -> Void in
+            for (i, owner) in owners.enumerated() {
+                guard let down = owner.sharedExperts?.downProj,
+                      let copy = NemotronZSkip.copy(for: owner.switchMLP.fc2),
+                      let shared = sharedCopy(down), shared.0.wide,
+                      lock.withLock({ pairs[ObjectIdentifier(owner.switchMLP.fc2)] == ObjectIdentifier(down) }),
+                      let candidate = kernel(for: copy, shared: shared.0),
+                      let candidateShared = NemotronSharedDownZSkip.kernel(for: shared.0)
+                else { throw NemotronH35MTPError.invalidArtifact("wide phase arena all-bank native admission refused") }
+                let cases = seededCases(seed: i, realistic: true)
+                for (x, sx) in cases.rows {
+                    let a = dispatch(copy.dict ? dict : plain, x, cases.inds, cases.scores,
+                                     copy, sx, shared.0, shared.1)
+                    let b = dispatch(candidate, x, cases.inds, cases.scores, copy, sx, shared.0, shared.1)
+                    let c = NemotronSharedDownZSkip.dispatch(sx, shared.0, shared.1, recordShared)
+                    let d = NemotronSharedDownZSkip.dispatch(sx, shared.0, shared.1, candidateShared)
+                    let same = logicalAnd(logicalAnd(
+                        (a.0.view(dtype: .uint32) .== b.0.view(dtype: .uint32)).all(),
+                        (a.1.view(dtype: .uint16) .== b.1.view(dtype: .uint16)).all()),
+                        (c.view(dtype: .uint16) .== d.view(dtype: .uint16)).all())
+                    guard same.item(Bool.self) else {
+                        throw NemotronH35MTPError.invalidArtifact("wide phase arena differs from original wide outputs")
+                    }
+                    checked += 1
+                }
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "nemotron wide phase arena: \(owners.count) native owners, \(checked) standalone/co-launch cases bitwise equal\n".utf8))
     }
 }

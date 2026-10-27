@@ -84,6 +84,7 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
+        try NemotronWidePhaseArena.qualify(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
