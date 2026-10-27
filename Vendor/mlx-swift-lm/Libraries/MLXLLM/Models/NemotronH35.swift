@@ -546,6 +546,16 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        // Wider grid: WM stays 1 or 2 (SM % 16 at BM 32), BN / WN a multiple of 32,
+        // KPT and Ws (<= 32 KiB) inside the loader's limits, <= 256 threads.
+        Variant(name: "d32w11", bn: 32, bk: 64, wm: 1, wn: 1, direct: true),
+        Variant(name: "d64w21", bn: 64, bk: 64, wm: 2, wn: 1, direct: true),
+        Variant(name: "d128w22", bn: 128, bk: 64, wm: 2, wn: 2, direct: true),
+        Variant(name: "d256w18", bn: 256, bk: 64, wm: 1, wn: 8, direct: true),
+        Variant(name: "d256w24", bn: 256, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "ws32x64w11", bn: 32, bk: 64, wm: 1, wn: 1, direct: false),
+        Variant(name: "ws64x64w21", bn: 64, bk: 64, wm: 2, wn: 1, direct: false),
+        Variant(name: "ws128x64w22", bn: 128, bk: 64, wm: 2, wn: 2, direct: false),
     ]
 
     enum Source: String, Sendable { case bank, dict, copy }
