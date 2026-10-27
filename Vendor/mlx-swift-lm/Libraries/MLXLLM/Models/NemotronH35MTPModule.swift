@@ -15,6 +15,104 @@ enum NemotronMTPDraftTail {
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
     static let oneLaunchRouter = enabled("NEMOTRON_MTP_DRAFT_ROUTER_FUSED")
+    static let sharedEarly = enabled("NEMOTRON_MTP_DRAFT_SD_EARLY")
+}
+
+/// Draft encode order. In each draft step the head's routed fc2 (zero-skip slot kernel) and its shared-expert
+/// down (R = 1 multi-row QMV) do not depend on each other. The default graph (record, and t131's shared-early
+/// `depends` form) encodes {shared up, router} | {shared down, FC1} | {fc2}. Here the fc2 binds the shared up
+/// rows and the shared down binds the FC1 rows (one extra input each, never read), and the join binds `shared`
+/// before the products, so MLX encodes {router, shared up} | {FC1} | {shared down, fc2}: the router leads its
+/// interval and the FC1 runs alone. Every kernel body is the default graph's source text, so every output is
+/// bitwise the same; `qualify` checks it on the head's real weights at load and keeps the default graph on any
+/// difference. NEMOTRON_DRAFT_COLAUNCH=0 keeps it too.
+enum NemotronDraftColaunch {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_COLAUNCH"] != "0"
+    nonisolated(unsafe) private(set) static var active = false
+
+    /// Load time, after `NemotronZSkip.prepareDraft` and before any draft graph is traced: the draft tail in
+    /// this order against the default graph, bit for bit, on seeded rows through the head's real weights
+    /// (router, FC1, fc2 copy, shared up/down, join), plus the fc2, shared-down and join twins alone on seeded
+    /// relu2 rows over a density sweep. Any miss leaves the default graph.
+    static func qualify(_ head: Module) {
+        active = false
+        guard requested, !NemotronMoELeader.selfTest,
+              Device.defaultDevice().deviceType == .gpu,
+              let block = head.modules().compactMap({ $0 as? NemotronH35MTPExpertBlock }).first,
+              NemotronMTPDraftTail.exactTail, NemotronZSkip.draftDepAvailable(block.mixer.switchMLP.fc2),
+              let shared = block.mixer.sharedExperts
+        else {
+            if requested {
+                FileHandle.standardError.write(Data("nemotron draft colaunch off: not applicable\n".utf8))
+            }
+            return
+        }
+        var same = MLXArray(true)
+        var cases = 0
+        // Whole tail through the real weights.
+        for seed in 0 ..< 6 {
+            let key = MLXRandom.key(UInt64(0xdc01 + seed))
+            let x = (MLXRandom.normal([1, 1, 2688], key: key) * Float(seed < 3 ? 1 : 4)).asType(.bfloat16)
+            let a = block.exactOneTokenTail(x, normalized: nil, ordered: false)
+            let b = block.exactOneTokenTail(x, normalized: nil, ordered: true)
+            same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+            cases += 1
+        }
+        // The fc2, shared-down and join twins alone, seeded relu2-like rows, densities 0 ... 100%.
+        let fc2 = block.mixer.switchMLP.fc2
+        for (i, density) in [Float(0), 0.1, 0.47, 0.83, 1].enumerated() {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xdc11 + i)), into: 5)
+            func relu2Rows(_ shape: [Int], _ k: MLXArray) -> MLXArray {
+                let v = MLXRandom.normal(shape, key: k) * Float(0.25)
+                let keep = MLXRandom.uniform(Float(0) ..< 1, shape, key: MLXRandom.split(key: k, into: 2)[1])
+                    .< MLXArray(density)
+                return which(keep, v * v, MLXArray(Float(i % 2 == 0 ? 0 : -0.0))).asType(.bfloat16)
+            }
+            let act = relu2Rows([6, 1856], keys[0])
+            let sx = relu2Rows([1, 3712], keys[1])
+            var routes: [UInt32] = [5, 33, 64, 90, 101, 127]
+            for j in routes.indices { routes[j] = (routes[j] + UInt32(7 * i)) % 128 }
+            let inds = MLXArray(routes)
+            let scores = MLXRandom.uniform(Float(0.01) ..< 0.5, [6], key: keys[2])
+            guard let p0 = NemotronZSkip.draftProducts(act, inds, scores, owner: fc2),
+                  let p1 = NemotronZSkip.draftProducts(act, inds, scores, owner: fc2, dep: sx),
+                  let q = shared.downProj as? QuantizedLinear,
+                  let s0 = NemotronMultiRowQMV.apply(sx, q),
+                  let s1 = shared.draftDown(sx, dep: act)
+            else {
+                FileHandle.standardError.write(Data("nemotron draft colaunch off: a twin is unavailable\n".utf8))
+                return
+            }
+            let lhs = MLXRandom.normal([1, 1, 2688], key: keys[3]).asType(.bfloat16)
+            let s0r = s0.reshaped(1, 1, 2688)
+            guard let j0 = NemotronHResidualRMSNorm.applySum(lhs, p0, shared: s0r, norm: block.finalNorm),
+                  let j1 = NemotronHResidualRMSNorm.applySum(lhs, p0, shared: s0r, norm: block.finalNorm,
+                                                              sharedFirst: true)
+            else { return }
+            same = logicalAnd(same, logicalAnd(
+                (p0.view(dtype: .uint32) .== p1.view(dtype: .uint32)).all(),
+                (s0r.view(dtype: .uint16) .== s1.view(dtype: .uint16)).all()))
+            same = logicalAnd(same, logicalAnd(
+                (j0.0.view(dtype: .uint16) .== j1.0.view(dtype: .uint16)).all(),
+                (j0.1.view(dtype: .uint16) .== j1.1.view(dtype: .uint16)).all()))
+            cases += 1
+        }
+        var ok = false
+        do {
+            try withError { ok = same.item(Bool.self) }
+        } catch {
+            FileHandle.standardError.write(Data("nemotron draft colaunch off: \(error)\n".utf8))
+            return
+        }
+        guard ok else {
+            FileHandle.standardError.write(Data(
+                "nemotron draft colaunch off: the draft tail differs from the default graph\n".utf8))
+            return
+        }
+        active = true
+        FileHandle.standardError.write(Data(
+            "nemotron draft colaunch on: \(cases) cases bit-identical\n".utf8))
+    }
 }
 
 enum NemotronMTPFrontNorms {
@@ -65,10 +163,11 @@ enum NemotronMTPFrontNorms {
             }
             """
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_bf16",
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_bf16_1b" : "nemotron_mtp_front_norms_concat_bf16",
         inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
         outputNames: ["out"],
-        source: source, ensureRowContiguous: true)
+        source: NemotronHResidualRMSNorm.oneBarrierSource(source), ensureRowContiguous: true)
 
     /// The same launch also emitting eh_proj's prepared K=5376 activation
     /// (the lane-coalesced FP32 buffer `nemotron_head_prepare_activation`
@@ -110,10 +209,119 @@ enum NemotronMTPFrontNorms {
 """)
     }
     private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_prepared_bf16",
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_prepared_bf16_1b" : "nemotron_mtp_front_norms_concat_prepared_bf16",
         inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
         outputNames: ["out", "prepared"],
-        source: preparedSource(), ensureRowContiguous: true)
+        source: NemotronHResidualRMSNorm.oneBarrierSource(preparedSource()), ensureRowContiguous: true)
+
+    /// NEMOTRON_MTP_FRONT_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
+    /// Otherwise chunk c of a half (values 8c ..< 8c + 8) is lanes 2c and 2c + 1 of one SIMD group: each lane
+    /// keeps its four rounded outputs, reads its partner's through simd_shuffle_xor, and the pair writes the
+    /// chunk's nine words (the even lane its four and the total, the odd lane its four) with the same
+    /// expressions and order. Used only after `qualifyShuffle` found it bitwise equal to the copy form.
+    static let shuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_SHUFFLE"] != "0"
+    nonisolated(unsafe) private static var shuffleVerified = false
+    private static func preparedShuffleSource() -> String {
+        let decl = "float thread_x[n_reads];"
+        let store = "    out[target + i] = weight[lid * n_reads + i]\n"
+            + "        * static_cast<T>(thread_x[i] * local_inv_mean[0]);\n}"
+        precondition(source.components(separatedBy: decl).count == 2)
+        precondition(source.components(separatedBy: store).count == 2)
+        return source.replacingOccurrences(of: decl, with: decl + "\nT nmf_r[n_reads];")
+            .replacingOccurrences(of: store, with: """
+                T value = weight[lid * n_reads + i]
+                    * static_cast<T>(thread_x[i] * local_inv_mean[0]);
+                out[target + i] = value;
+                nmf_r[i] = value;
+            }
+            {
+                const bool odd = (lid & 1u) != 0;
+                T other[4];
+                for (int i = 0; i < 4; i++) {
+                    other[i] = as_type<T>(simd_shuffle_xor(as_type<ushort>(nmf_r[i]), ushort(1)));
+                }
+                const int chunk = (second ? 336 : 0) + int(lid >> 1);
+                const int base = (int(row) * 21 + chunk / 32) * 9 * 32 + chunk % 32;
+                if (!odd) {
+                    float total = 0;
+                    total += float(nmf_r[0]) + float(nmf_r[1]) + float(nmf_r[2]) + float(nmf_r[3]);
+                    total += float(other[0]) + float(other[1]) + float(other[2]) + float(other[3]);
+                    if (NG) total += 1.0f;
+                    prepared[base + 0 * 32] = float(nmf_r[0]);
+                    prepared[base + 1 * 32] = float(nmf_r[1]) / 16.0f;
+                    prepared[base + 2 * 32] = float(nmf_r[2]) / 256.0f;
+                    prepared[base + 3 * 32] = float(nmf_r[3]) / 4096.0f;
+                    prepared[base + 8 * 32] = total;
+                } else {
+                    prepared[base + 4 * 32] = float(nmf_r[0]);
+                    prepared[base + 5 * 32] = float(nmf_r[1]) / 16.0f;
+                    prepared[base + 6 * 32] = float(nmf_r[2]) / 256.0f;
+                    prepared[base + 7 * 32] = float(nmf_r[3]) / 4096.0f;
+                }
+            }
+""")
+    }
+    private static let shuffleKernel = MLXFast.metalKernel(
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_prepared_bf16_sh_1b" : "nemotron_mtp_front_norms_concat_prepared_bf16_sh",
+        inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
+        outputNames: ["out", "prepared"],
+        source: NemotronHResidualRMSNorm.oneBarrierSource(preparedShuffleSource()), ensureRowContiguous: true)
+
+    /// Load time: the shuffle-form launch against the copy-form launch, bit for bit in the joined rows and in
+    /// eh_proj's prepared activation, on seeded rows with the head's own norms at R = 1 ... 4. Admits the
+    /// shuffle form only if every case matches.
+    static func qualifyShuffle(_ block: NemotronH35MTPAttentionBlock) {
+        shuffleVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp front norms shuffle: \(message)\n".utf8))
+        }
+        guard shuffle else { return report("off (setting)") }
+        var ok = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for rows in 1 ... 4 {
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7f50 + 8 * rows + seed)), into: 2)
+                        let embedding = (MLXRandom.normal([1, rows, 2688], key: keys[0]) * Float(1 + 3 * seed))
+                            .asType(.bfloat16)
+                        let hidden = (MLXRandom.normal([1, rows, 2688], key: keys[1]) * Float(4 - 3 * seed))
+                            .asType(.bfloat16)
+                        guard let a = launch(embedding: embedding, hidden: hidden, enorm: block.embeddingNorm,
+                                             hnorm: block.hiddenNorm, shuffled: false),
+                              let b = launch(embedding: embedding, hidden: hidden, enorm: block.embeddingNorm,
+                                             hnorm: block.hiddenNorm, shuffled: true)
+                        else { ok = MLXArray(false); return }
+                        ok = ok .&& (a.0.view(dtype: .uint16) .== b.0.view(dtype: .uint16)).all()
+                            .&& (a.1.view(dtype: .uint32) .== b.1.view(dtype: .uint32)).all()
+                        cases += 1
+                    }
+                }
+                eval(ok)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        shuffleVerified = ok.item(Bool.self)
+        report(shuffleVerified ? "on (\(cases) cases bitwise equal to the copy form at R = 1 ... 4)"
+               : "off (differs from the copy form)")
+    }
+
+    /// The prepared front-norms launch in the copy or the shuffle form.
+    private static func launch(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm,
+                               shuffled: Bool) -> (MLXArray, MLXArray)? {
+        guard eligible(embedding: embedding, hidden: hidden, enorm: enorm, hnorm: hnorm) != nil else { return nil }
+        let rows = embedding.dim(1)
+        let (a, e, h) = scalars(enorm.eps, hnorm.eps)
+        let outputs = (shuffled ? shuffleKernel : preparedKernel)(
+            [embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
+            template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
+            grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
 
     /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
     static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
@@ -125,7 +333,8 @@ enum NemotronMTPFrontNorms {
         else { return nil }
         let rows = embedding.dim(1)
         let (a, e, h) = scalars(enorm.eps, hnorm.eps)
-        let outputs = preparedKernel([embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
+        let outputs = (shuffleVerified ? shuffleKernel : preparedKernel)(
+            [embedding, hidden, enorm.weight, hnorm.weight, a, e, h],
             template: [("T", DType.bfloat16), ("NG", NemotronMTPDraftJoins.negativeFront)],
             grid: (672 * 2 * rows, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [[1, rows, 5376], [rows, 21, 9 * 32]], outputDTypes: [.bfloat16, .float32])
@@ -294,9 +503,7 @@ final class NemotronH35MTPAttentionBlock: Module {
     func maskedRowOutput(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries.asType(keys.dtype), keys: keys, values: values,
-            scale: mixer.scale, mask: .array(mask))
+        let output = maskedAttention(queries: queries, keys: keys, values: values, mask: mask)
         let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
         return fused + nemotronR1Linear(merged, mixer.wo)
     }
@@ -304,11 +511,56 @@ final class NemotronH35MTPAttentionBlock: Module {
     func maskedRowParts(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> (MLXArray, MLXArray) {
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries.asType(keys.dtype), keys: keys, values: values,
-            scale: mixer.scale, mask: .array(mask))
+        let output = maskedAttention(queries: queries, keys: keys, values: values, mask: mask)
         let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
         return (fused, nemotronR1Linear(merged, mixer.wo))
+    }
+
+    /// A draft row's attention over the head cache `keys` / `values` (and, for the second draft, its `own`
+    /// K/V row appended as the last key) with an additive mask: the one-launch twin
+    /// (`NemotronMTPDraftSDPA`) once qualified, else the stock call (on the appended copies).
+    /// `maskedRowOutput` / `maskedRowParts` reading the head cache pages in place (`read`, from
+    /// `NemotronMTPDraftSDPA.directRead`); nil when the paged launch does not serve them (the caller then takes
+    /// the snapshot's copy).
+    func maskedRowOutput(
+        fused: MLXArray, queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV, mask: MLXArray
+    ) -> MLXArray? {
+        maskedRowParts(fused: fused, queries: queries, read: read, row: row, mask: mask).map { $0.0 + $0.1 }
+    }
+
+    func maskedRowParts(
+        fused: MLXArray, queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV, mask: MLXArray
+    ) -> (MLXArray, MLXArray)? {
+        guard let output = NemotronMTPDraftSDPA.attendPaged(
+            queries: queries.asType(read.dtype), read: read, row: row, scale: mixer.scale, mask: mask)
+        else { return nil }
+        let merged = output.transposed(0, 2, 1, 3).reshaped(1, 1, -1)
+        return (fused, nemotronR1Linear(merged, mixer.wo))
+    }
+
+    /// `maskedDraftAttention` over the head cache pages in place plus the draft's `own` row as the last key; nil
+    /// when the paged launch does not serve them.
+    func maskedDraftAttention(
+        inputs: [MLXArray], read: CBv2PagedDirectRead, row: PagedSequenceKV,
+        own: (keys: MLXArray, values: MLXArray), mask: MLXArray
+    ) -> MLXArray? {
+        let queries = inputs[2].reshaped(1, 1, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+            .asType(read.dtype)
+        guard let output = NemotronMTPDraftSDPA.attendPaged(
+            queries: queries, read: read, row: row, own: own, scale: mixer.scale, mask: mask)
+        else { return nil }
+        return nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), mixer.wo)
+    }
+
+    private func maskedAttention(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray)? = nil,
+        mask: MLXArray
+    ) -> MLXArray {
+        let queries = queries.asType(keys.dtype)
+        return NemotronMTPDraftSDPA.attend(
+            queries: queries, keys: keys, values: values, own: own, scale: mixer.scale, mask: mask)
+            ?? NemotronMTPDraftSDPA.stock(
+                queries: queries, keys: keys, values: values, own: own, scale: mixer.scale, mask: mask)
     }
 
     /// The draft row's own K/V, [1, kvHeads, 1, headDim], from `pagedDraftInputs`.
@@ -326,6 +578,17 @@ final class NemotronH35MTPAttentionBlock: Module {
             .asType(keys.dtype)
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: keys, values: values, scale: mixer.scale, mask: .array(mask))
+        return nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), mixer.wo)
+    }
+
+    /// `maskedDraftAttention` over the history `keys` / `values` with the draft's `own` K/V row as the last
+    /// key: the stock call takes `concatenated([keys, own])`, the qualified twin reads the row in place.
+    func maskedDraftAttention(
+        inputs: [MLXArray], keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray),
+        mask: MLXArray
+    ) -> MLXArray {
+        let queries = inputs[2].reshaped(1, 1, mixer.numHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let output = maskedAttention(queries: queries, keys: keys, values: values, own: own, mask: mask)
         return nemotronR1Linear(output.transposed(0, 2, 1, 3).reshaped(1, 1, -1), mixer.wo)
     }
 
@@ -517,18 +780,36 @@ final class NemotronH35MTPExpertBlock: Module {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
-    fileprivate func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?) -> MLXArray {
+    /// `ordered`: the `NemotronDraftColaunch` graph (nil: when qualified; false: the t71 graph).
+    func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?, ordered: Bool? = nil) -> MLXArray {
         let h = normalized ?? norm(x)
         let gate = mixer.gate
         let fused = NemotronMTPDraftTail.oneLaunchRouter && gate.topK == 6 && gate.nGroup == 1
             && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
             ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
         let (indices, scores) = fused ?? gate(h)
+        // `NemotronDraftColaunch`: the same kernels and arithmetic; only the eval tape's encode order changes.
+        if ordered ?? NemotronDraftColaunch.active, let sharedExperts = mixer.sharedExperts,
+           NemotronZSkip.draftDepAvailable(mixer.switchMLP.fc2),
+           let sx = sharedExperts.draftUpActivation(h) {
+            var fc1: MLXArray? = nil
+            if let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
+                   h, indices, scores, mixer.switchMLP, products: true,
+                   draftDep: sx, activation: { fc1 = $0 }),
+               routed.shape == [6 * 2688], let fc1,
+               let shared = sharedExperts.draftDown(sx, dep: fc1),
+               let joined = NemotronHResidualRMSNorm.applySum(
+                   x, routed, shared: shared, norm: finalNorm, sharedFirst: true) {
+                return joined.1
+            }
+        }
+        // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
+        let early = NemotronMTPDraftTail.sharedEarly ? mixer.sharedExperts.map { $0(h) } : nil
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP, products: true)
+                h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
-        let shared = sharedExperts(h)
+        let shared = early ?? sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
             return joined.1
         }
@@ -668,6 +949,26 @@ final class NemotronH35MTPModule: Module {
             inputs: inputs, keys: keys, values: values, mask: mask)
         return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
     }
+    /// `maskedSecondDraft` over the history K/V plus the draft's `own` row as the last key, without building
+    /// the appended copies when the one-launch draft attention qualified (`NemotronMTPDraftSDPA`).
+    func maskedSecondDraft(
+        inputs: [MLXArray], historyKeys: MLXArray, historyValues: MLXArray,
+        own: (keys: MLXArray, values: MLXArray), mask: MLXArray
+    ) -> MLXArray {
+        let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedDraftAttention(
+            inputs: inputs, keys: historyKeys, values: historyValues, own: own, mask: mask)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
+    }
+    /// `maskedSecondDraft` reading the head cache pages in place (`NemotronMTPDraftSDPA.directRead`); nil when
+    /// the paged launch does not serve them (the caller then takes the snapshot's copy).
+    func maskedSecondDraft(
+        inputs: [MLXArray], read: CBv2PagedDirectRead, row: PagedSequenceKV,
+        own: (keys: MLXArray, values: MLXArray), mask: MLXArray
+    ) -> MLXArray? {
+        guard let attention = (layers[0] as! NemotronH35MTPAttentionBlock).maskedDraftAttention(
+            inputs: inputs, read: read, row: row, own: own, mask: mask) else { return nil }
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
+    }
     func pagedForward(inputs: [MLXArray], cache: any CBv2AttendingLayerCache) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
             inputs: inputs, cache: cache)
@@ -709,6 +1010,22 @@ final class NemotronH35MTPModule: Module {
         }
         let (residual, attention) = block.maskedRowParts(
             fused: fused, queries: queries, keys: keys, values: values, mask: mask)
+        precondition(residual.ndim == 3 && residual.dim(0) == 1 && residual.dim(1) == 1)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(residual: residual, attention: attention)
+    }
+
+    /// `finishMaskedRow` reading the head cache pages in place (`NemotronMTPDraftSDPA.directRead`); nil when the
+    /// paged launch does not serve them (the caller then takes the snapshot's copy).
+    func finishMaskedRow(
+        fused: MLXArray, queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV, mask: MLXArray
+    ) -> MLXArray? {
+        let block = layers[0] as! NemotronH35MTPAttentionBlock
+        guard Self.deviceDraftJoin else {
+            return block.maskedRowOutput(fused: fused, queries: queries, read: read, row: row, mask: mask)
+                .map { finishPagedAttentionRow($0) }
+        }
+        guard let (residual, attention) = block.maskedRowParts(
+            fused: fused, queries: queries, read: read, row: row, mask: mask) else { return nil }
         precondition(residual.ndim == 3 && residual.dim(0) == 1 && residual.dim(1) == 1)
         return (layers[1] as! NemotronH35MTPExpertBlock)(residual: residual, attention: attention)
     }
@@ -846,5 +1163,585 @@ enum NemotronMTPFrontRowsQKV {
         report(verified
             ? "on (q, k, v bitwise equal to the three launches in \(cases.count) cases at R = 3, 4)"
             : "off (q, k or v differs from the three launches)")
+    }
+}
+
+// MARK: - Draft attention in one launch per draft step
+
+/// The draft steps' attention (`maskedRowOutput` / `maskedRowParts` for the first draft, `maskedDraftAttention`
+/// for the second): one query row over the head cache with an additive float mask, which the stock call runs as
+/// the one-pass `sdpa_vector` (1024 threads per query head; below 1024 keys every device takes that kernel).
+/// This launch is that kernel's text with its function constants folded to the draft call's values (float
+/// mask, not causal, no sinks) and its scalar arguments taken from the inputs' shapes and strides, with three
+/// changes that move no arithmetic:
+/// - Key loop: each SIMD group issues the mask, K and V loads of its next four keys (i, i + 32, i + 64,
+///   i + 96) first, then forms their four scores (the same per-lane products and `simd_sum`) and applies the
+///   same masked online-softmax updates in key order; the remainder runs the stock loop.
+/// - Aggregation: every SIMD group stores its maximum, exp-sum and all four partial outputs (output i in its
+///   own threadgroup slice) before one barrier; then the same factor, exp-sum and output sums are formed. The
+///   stock text uses one barrier for the maxima and two per output value.
+/// - The second draft's own K/V row (`OWN`): key L (the last) is read from the draft's own [1, 2, 1, 128]
+///   projections instead of from a copy of the history with that row appended, so the two concatenations
+///   (one copy each of K and V history) are not built.
+/// Used only after `qualify` found every output bitwise equal to the stock call on seeded inputs.
+/// NEMOTRON_MTP_DRAFT_SDPA=0 keeps the stock call (and the concatenations).
+enum NemotronMTPDraftSDPA {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SDPA"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+
+    private static let source = """
+      // One query row (head tid.x) over N keys: the history keys [0, L) and, with OWN, the draft's own row as
+      // key L. Below this prologue the text is sdpa_vector's with the draft call's function constants.
+      constexpr int BN = 32;
+      constexpr int BD = 32;
+      constexpr int qk_per_thread = D / BD;
+      constexpr int v_per_thread = V / BD;
+      typedef float U;
+      const uint3 tid = threadgroup_position_in_grid;
+      const uint simd_gid = simdgroup_index_in_threadgroup;
+      const uint simd_lid = thread_index_in_simdgroup;
+      const int L = keys_shape[2];
+      const int N = OWN ? L + 1 : L;
+      const int gqa_factor = int(threadgroups_per_grid.x) / keys_shape[1];
+      const int mask_kv_seq_stride = fmask_shape[3] > 1 ? int(fmask_strides[3]) : 0;
+      int inner_k_stride = BN * int(keys_strides[2]);
+      int inner_v_stride = BN * int(values_strides[2]);
+
+      thread U q[qk_per_thread];
+      thread U k[qk_per_thread];
+      thread U o[v_per_thread];
+
+      threadgroup U outputs[v_per_thread * BN * BD];
+      threadgroup U max_scores[BN];
+      threadgroup U sum_exp_scores[BN];
+
+      const int q_batch_head_idx = tid.x;
+      const int kv_head_idx = q_batch_head_idx / gqa_factor;
+      const int o_offset = q_batch_head_idx;
+      const device T* qp = queries + q_batch_head_idx * queries_strides[1]
+          + simd_lid * qk_per_thread * queries_strides[3];
+      keys += kv_head_idx * keys_strides[1] + simd_gid * keys_strides[2] + simd_lid * qk_per_thread;
+      values += kv_head_idx * values_strides[1] + simd_gid * values_strides[2] + simd_lid * v_per_thread;
+      const device T* own_kp = OWN_KEYS;
+      const device T* own_vp = OWN_VALUES;
+      auto fm = fmask + simd_gid * mask_kv_seq_stride;
+
+      out += o_offset * V + simd_gid * v_per_thread;
+
+      // Read the query and 0 the output accumulator
+      for (int i = 0; i < qk_per_thread; i++) {
+        q[i] = static_cast<U>(scale) * qp[i * queries_strides[3]];
+      }
+      for (int i = 0; i < v_per_thread; i++) {
+        o[i] = 0;
+      }
+
+      U max_score = Limits<U>::finite_min;
+      U sum_exp_score = 0;
+
+      // Four keys per step: their mask, K and V loads first, then the per-key
+      // updates in key order with the stock statements.
+      int i = simd_gid;
+      for (; i + 3 * BN < N; i += 4 * BN) {
+        T mk[4];
+        U kk[4][qk_per_thread];
+        U vv[4][v_per_thread];
+        for (int u = 0; u < 4; u++) {
+          mk[u] = fm[u * BN * mask_kv_seq_stride];
+          const bool own = OWN && i + u * BN == L;
+          const device T* kp = own ? own_kp : keys + u * inner_k_stride;
+          const device T* vp = own ? own_vp : values + u * inner_v_stride;
+          for (int j = 0; j < qk_per_thread; j++) {
+            kk[u][j] = kp[j];
+          }
+          for (int j = 0; j < v_per_thread; j++) {
+            vv[u][j] = vp[j];
+          }
+        }
+        U key_scores[4];
+        for (int u = 0; u < 4; u++) {
+          U score = 0;
+          for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * kk[u][j];
+          }
+          key_scores[u] = simd_sum(score);
+        }
+        for (int u = 0; u < 4; u++) {
+          if (mk[u] >= Limits<T>::finite_min) {
+            U score = key_scores[u];
+            score += static_cast<U>(mk[u]);
+
+            U new_max = max(max_score, score);
+            U factor = fast::exp(max_score - new_max);
+            U exp_score = fast::exp(score - new_max);
+
+            max_score = new_max;
+            sum_exp_score = sum_exp_score * factor + exp_score;
+
+            for (int j = 0; j < v_per_thread; j++) {
+              o[j] = o[j] * factor + exp_score * vv[u][j];
+            }
+          }
+        }
+        keys += 4 * inner_k_stride;
+        values += 4 * inner_v_stride;
+        fm += 4 * BN * mask_kv_seq_stride;
+      }
+      for (; i < N; i += BN) {
+        bool use_key = (fm[0] >= Limits<T>::finite_min);
+        if (use_key) {
+          const device T* kp = (OWN && i == L) ? own_kp : keys;
+          const device T* vp = (OWN && i == L) ? own_vp : values;
+          // Read the key
+          for (int j = 0; j < qk_per_thread; j++) {
+            k[j] = kp[j];
+          }
+
+          // Compute the i-th score
+          U score = 0;
+          for (int j = 0; j < qk_per_thread; j++) {
+            score += q[j] * k[j];
+          }
+          score = simd_sum(score);
+          score += static_cast<U>(fm[0]);
+
+          // Update the accumulators
+          U new_max = max(max_score, score);
+          U factor = fast::exp(max_score - new_max);
+          U exp_score = fast::exp(score - new_max);
+
+          max_score = new_max;
+          sum_exp_score = sum_exp_score * factor + exp_score;
+
+          // Update the output accumulator
+          for (int j = 0; j < v_per_thread; j++) {
+            o[j] = o[j] * factor + exp_score * vp[j];
+          }
+        }
+
+        // Move the pointers to the next kv
+        keys += inner_k_stride;
+        values += inner_v_stride;
+        fm += BN * mask_kv_seq_stride;
+      }
+
+      // Every SIMD group's maximum, exp-sum and four partial outputs (output i
+      // in slice i, transposed as the stock store), then one barrier.
+      if (simd_lid == 0) {
+        max_scores[simd_gid] = max_score;
+        sum_exp_scores[simd_gid] = sum_exp_score;
+      }
+      for (int i = 0; i < v_per_thread; i++) {
+        outputs[i * BN * BD + simd_lid * BD + simd_gid] = o[i];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      max_score = max_scores[simd_lid];
+      U new_max = simd_max(max_score);
+      U factor = fast::exp(max_score - new_max);
+      sum_exp_score = simd_sum(sum_exp_scores[simd_lid] * factor);
+
+      // Now we need to aggregate all the outputs
+      for (int i = 0; i < v_per_thread; i++) {
+        o[i] = simd_sum(outputs[i * BN * BD + simd_gid * BD + simd_lid] * factor);
+        o[i] = sum_exp_score == 0 ? o[i] : (o[i] / sum_exp_score);
+      }
+
+      // And write the output
+      if (simd_lid == 0) {
+        for (int i = 0; i < v_per_thread; i++) {
+          out[i] = static_cast<T>(o[i]);
+        }
+      }
+      """
+
+    private static func source(own: Bool) -> String {
+        own ? source
+            .replacingOccurrences(of: "OWN_KEYS", with:
+                "own_keys + kv_head_idx * own_keys_strides[1] + simd_lid * qk_per_thread")
+            .replacingOccurrences(of: "OWN_VALUES", with:
+                "own_values + kv_head_idx * own_values_strides[1] + simd_lid * v_per_thread")
+            : source
+            .replacingOccurrences(of: "OWN_KEYS", with: "nullptr")
+            .replacingOccurrences(of: "OWN_VALUES", with: "nullptr")
+    }
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_draft_sdpa_u4_1b",
+        inputNames: ["queries", "keys", "values", "fmask", "scale"], outputNames: ["out"],
+        source: source(own: false), ensureRowContiguous: false)
+    private static let ownKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_draft_sdpa_own_u4_1b",
+        inputNames: ["queries", "keys", "values", "fmask", "scale", "own_keys", "own_values"],
+        outputNames: ["out"], source: source(own: true), ensureRowContiguous: false)
+
+    nonisolated(unsafe) private static var scales: [UInt32: MLXArray] = [:]
+    private static let lock = NSLock()
+    private static func scaleArray(_ scale: Float) -> MLXArray {
+        lock.lock(); defer { lock.unlock() }
+        if let array = scales[scale.bitPattern] { return array }
+        let array = MLXArray(scale)
+        scales[scale.bitPattern] = array
+        return array
+    }
+
+    /// The stock call this launch replaces: `own` (keys, values) appended to the history first.
+    static func stock(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray)?,
+        scale: Float, mask: MLXArray
+    ) -> MLXArray {
+        MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: own.map { concatenated([keys, $0.keys], axis: 2) } ?? keys,
+            values: own.map { concatenated([values, $0.values], axis: 2) } ?? values,
+            scale: scale, mask: .array(mask))
+    }
+
+    /// queries [1, 32, 1, 128] (any strides), keys / values the history [1, 2, L, 128] (head dim contiguous),
+    /// `own` the second draft's own row [1, 2, 1, 128] (key L), mask [1, 1, 1, N] with N = L (+ 1 with
+    /// `own`), all BF16. Returns the attention [1, 32, 1, 128], bitwise the stock call's; nil until `qualify`
+    /// passed or outside these shapes (every N here is below 1024, where the stock call is one-pass).
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray)? = nil,
+        scale: Float, mask: MLXArray
+    ) -> MLXArray? {
+        guard verified else { return nil }
+        return launch(queries: queries, keys: keys, values: values, own: own, scale: scale, mask: mask)
+    }
+
+    private static func launch(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray)?,
+        scale: Float, mask: MLXArray
+    ) -> MLXArray? {
+        let length = keys.ndim == 4 ? keys.dim(2) : 0
+        let n = length + (own == nil ? 0 : 1)
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              queries.shape == [1, 32, 1, 128], queries.dtype == .bfloat16,
+              keys.ndim == 4, keys.dim(0) == 1, keys.dim(1) == 2, keys.dim(3) == 128, length > 0,
+              keys.dtype == .bfloat16, values.shape == keys.shape, values.dtype == .bfloat16,
+              keys.strides[3] == 1, values.strides[3] == 1,
+              (1 ..< 1024).contains(n), mask.shape == [1, 1, 1, n], mask.dtype == .bfloat16
+        else { return nil }
+        if let own {
+            guard own.keys.shape == [1, 2, 1, 128], own.values.shape == [1, 2, 1, 128],
+                  own.keys.dtype == .bfloat16, own.values.dtype == .bfloat16,
+                  own.keys.strides[3] == 1, own.values.strides[3] == 1
+            else { return nil }
+        }
+        let inputs = [queries, keys, values, mask, scaleArray(scale)]
+            + (own.map { [$0.keys, $0.values] } ?? [])
+        let out = (own == nil ? kernel : ownKernel)(
+            inputs, template: [("T", DType.bfloat16), ("D", 128), ("V", 128), ("OWN", own != nil)],
+            grid: (32 * 1024, 1, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[1, 32, 1, 128]], outputDTypes: [.bfloat16])[0]
+        guard NemotronMoELeader.selfTest else { return out }
+        return nemotronBitwiseOrNaN(
+            out, stock(queries: queries, keys: keys, values: values, own: own, scale: scale, mask: mask))
+    }
+
+    /// Load time, before any draft graph is traced: the launch against the stock call at the head's attention
+    /// scale on seeded inputs laid out as the draft passes them (the transposed Q row, history slices of a
+    /// longer cache buffer and contiguous gathers, the own row as the transposed K/V projection), key counts
+    /// across the 32-key and four-key-step boundaries up to 1023, query and key scales 1 to 16, masks with a
+    /// -inf tail (and the own row kept) as the drafts build them plus scattered -inf keys. Engages only if
+    /// every output is bitwise equal; an MLX error keeps the stock call.
+    static func qualify(_ block: NemotronH35MTPAttentionBlock) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft sdpa: \(message)\n".utf8))
+        }
+        guard enabled else { return report("off (setting)") }
+        let mixer = block.mixer
+        guard mixer.numHeads == 32, mixer.numKeyValueHeads == 2, mixer.headDim == 128
+        else { return report("off (the head attention is not 32 x 2 x 128)") }
+        let scale = mixer.scale
+        let lengths = [1, 2, 7, 8, 31, 32, 33, 63, 64, 65, 95, 96, 97, 98, 127, 128, 129, 130, 131, 255, 256,
+                       257, 488, 489, 490, 491, 552, 600, 616, 617, 700, 1000, 1021, 1022]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for own in [false, true] {
+                    for (i, length) in lengths.enumerated() {
+                        let n = length + (own ? 1 : 0)
+                        guard n < 1024 else { continue }
+                        let seed = UInt64(0xd5d9_0000 + (own ? 4096 : 0) + i)
+                        let (qScale, kvScale) = inputScales[i % inputScales.count]
+                        let keys5 = MLXRandom.split(key: MLXRandom.key(seed), into: 6)
+                        let q = MLXRandom.normal([1, 4096], dtype: .bfloat16, scale: qScale, key: keys5[0])
+                        let queries = q.reshaped(1, 1, 32, 128).transposed(0, 2, 1, 3)
+                        let capacity = length + 37
+                        let kBuffer = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale, key: keys5[1])
+                        let vBuffer = MLXRandom.normal(
+                            [1, 2, capacity, 128], dtype: .bfloat16, scale: kvScale, key: keys5[2])
+                        // Odd cases: slices of a longer buffer; even: contiguous copies.
+                        var keys = kBuffer[.ellipsis, ..<length, 0...]
+                        var values = vBuffer[.ellipsis, ..<length, 0...]
+                        if i % 2 == 0 {
+                            keys = MLX.contiguous(keys)
+                            values = MLX.contiguous(values)
+                        }
+                        let ownRow: (keys: MLXArray, values: MLXArray)? = own
+                            ? (MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: keys5[3])
+                                .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3),
+                               MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: keys5[4])
+                                .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3))
+                            : nil
+                        // Kept: positions below length - tail (and the own row); every fifth case also drops
+                        // scattered keys.
+                        let tail = min(i % 4, length - 1)
+                        let position = MLXArray(Int32(0) ..< Int32(n))
+                        var keep = position .< Int32(length - tail)
+                        if own { keep = keep .|| (position .== Int32(length)) }
+                        if i % 5 == 4 {
+                            let drop = MLXRandom.uniform(Float(0) ..< 1, [n], key: keys5[5]) .< MLXArray(Float(0.2))
+                            keep = keep .&& (logicalNot(drop) .|| (position .== Int32(0)))
+                        }
+                        let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                            .asType(.bfloat16).reshaped(1, 1, 1, n)
+                        guard let out = launch(
+                            queries: queries, keys: keys, values: values, own: ownRow, scale: scale, mask: mask)
+                        else { return false }
+                        let expected = stock(
+                            queries: queries, keys: keys, values: values, own: ownRow, scale: scale, mask: mask)
+                        if !(out.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all().item(Bool.self) {
+                            return false
+                        }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified
+            ? "on (\(checked) cases bitwise equal to the stock call; key loop unroll4, one-barrier aggregation, own row in place)"
+            : "off (differs from the stock call after \(checked) cases)")
+    }
+}
+
+// MARK: - Draft attention reading the head cache pages in place
+
+/// The draft attention launch (`NemotronMTPDraftSDPA`) reading the head cache's keys and values from its paged
+/// storage in place (`PagedSequenceKV.directRead`) instead of from `snapshot()`'s gathered copy, so the gather
+/// launch (`cbv2_segment_read_output`) is not run. Key i of the history is slot (first_slot + i) % PS of local page
+/// pages[(first_slot + i) / PS], read at the segment read's element addresses; everything else is the launch's
+/// text (same key order per SIMD group, scores, mask, online-softmax updates, one-barrier aggregation, own row).
+/// The group's write fence is bound to the launch (the read orders after every prior write, as the gather's
+/// does), and one element of the output is folded back into it (`publishDirectRead`), so every later write orders
+/// after the read. Used only after `qualifyPaged` found it bitwise equal to the contiguous launch on seeded paged
+/// storage. NEMOTRON_MTP_DRAFT_SDPA_PAGED=0 keeps the gather and the contiguous launch.
+extension NemotronMTPDraftSDPA {
+    static let pagedEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SDPA_PAGED"] != "0"
+    nonisolated(unsafe) private(set) static var pagedVerified = false
+
+    private static let pagedSource: String? = {
+        var s = source
+        let swaps: [(String, String)] = [
+            ("const int L = keys_shape[2];\n",
+             "const int L = prm[0];\nconst int first_slot = prm[1];\nconst size_t vbase = size_t(uint(prm[2]));\n"),
+            ("const int gqa_factor = int(threadgroups_per_grid.x) / keys_shape[1];\n",
+             "const int gqa_factor = int(threadgroups_per_grid.x) / KVH;\n"),
+            ("int inner_k_stride = BN * int(keys_strides[2]);\nint inner_v_stride = BN * int(values_strides[2]);\n", ""),
+            ("keys += kv_head_idx * keys_strides[1] + simd_gid * keys_strides[2] + simd_lid * qk_per_thread;\n"
+                + "values += kv_head_idx * values_strides[1] + simd_gid * values_strides[2] + simd_lid * v_per_thread;\n",
+             "// Key i: slot (first_slot + i) % PS of local page pages[(first_slot + i) / PS], the segment read's\n"
+                + "// element address; the value plane starts vbase elements later.\n"
+                + "auto nmp_at = [&](int key) -> size_t {\n"
+                + "  const int off = first_slot + key;\n"
+                + "  return ((size_t(pages[off / PS]) * KVH + kv_head_idx) * PS + size_t(off % PS)) * D;\n"
+                + "};\n"
+                + "const device T* kst = storage + simd_lid * qk_per_thread;\n"
+                + "const device T* vst = storage + vbase + simd_lid * v_per_thread;\n"),
+            ("    const device T* kp = own ? own_kp : keys + u * inner_k_stride;\n"
+                + "    const device T* vp = own ? own_vp : values + u * inner_v_stride;\n",
+             "    const size_t at = own ? 0 : nmp_at(i + u * BN);\n"
+                + "    const device T* kp = own ? own_kp : kst + at;\n"
+                + "    const device T* vp = own ? own_vp : vst + at;\n"),
+            ("  keys += 4 * inner_k_stride;\n  values += 4 * inner_v_stride;\n", ""),
+            ("    const device T* kp = (OWN && i == L) ? own_kp : keys;\n"
+                + "    const device T* vp = (OWN && i == L) ? own_vp : values;\n",
+             "    const size_t at = (OWN && i == L) ? 0 : nmp_at(i);\n"
+                + "    const device T* kp = (OWN && i == L) ? own_kp : kst + at;\n"
+                + "    const device T* vp = (OWN && i == L) ? own_vp : vst + at;\n"),
+            ("  keys += inner_k_stride;\n  values += inner_v_stride;\n", ""),
+        ]
+        for (old, new) in swaps {
+            guard s.components(separatedBy: old).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        guard !s.contains("keys_"), !s.contains("values_"), !s.contains("inner_") else { return nil }
+        return s
+    }()
+    private static func pagedSource(own: Bool) -> String? {
+        pagedSource.map { s in
+            own ? s
+                .replacingOccurrences(of: "OWN_KEYS", with:
+                    "own_keys + kv_head_idx * own_keys_strides[1] + simd_lid * qk_per_thread")
+                .replacingOccurrences(of: "OWN_VALUES", with:
+                    "own_values + kv_head_idx * own_values_strides[1] + simd_lid * v_per_thread")
+                : s
+                .replacingOccurrences(of: "OWN_KEYS", with: "nullptr")
+                .replacingOccurrences(of: "OWN_VALUES", with: "nullptr")
+        }
+    }
+    private static let pagedKernel = pagedSource(own: false).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_draft_sdpa_paged_u4_1b",
+            inputNames: ["queries", "storage", "pages", "prm", "fmask", "scale", "fence"], outputNames: ["out"],
+            source: $0, ensureRowContiguous: false)
+    }
+    private static let pagedOwnKernel = pagedSource(own: true).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_draft_sdpa_paged_own_u4_1b",
+            inputNames: ["queries", "storage", "pages", "prm", "fmask", "scale", "fence", "own_keys", "own_values"],
+            outputNames: ["out"], source: $0, ensureRowContiguous: false)
+    }
+
+    /// `row.directRead()` when the paged launch is qualified and serves its range (BF16, 2 x 128 heads, 16-slot
+    /// pages, fewer than 1023 keys so the second draft's own row still stays below 1024), else nil (the caller
+    /// keeps `snapshot()` and the contiguous launch).
+    static func directRead(_ row: PagedSequenceKV) -> CBv2PagedDirectRead? {
+        guard pagedEnabled, pagedVerified, verified, let read = row.directRead() else { return nil }
+        return servesPaged(read) ? read : nil
+    }
+
+    private static func servesPaged(_ read: CBv2PagedDirectRead) -> Bool {
+        read.dtype == .bfloat16 && read.kvHeads == 2 && read.headDim == 128 && read.pageSize == 16
+            && (1 ..< 1023).contains(read.count) && read.firstSlot >= 0 && read.firstSlot < 16
+            && read.valueOffset > 0 && read.valueOffset < Int(Int32.max)
+            && read.storage.dtype == .bfloat16 && read.storage.ndim == 5
+            && read.storage.shape == [2, read.storage.dim(1), 2, 16, 128]
+            && read.valueOffset == read.storage.dim(1) * 2 * 16 * 128
+            && read.pages.dtype == .int32 && read.pages.ndim == 1
+            && read.pages.dim(0) == (read.firstSlot + read.count + 15) / 16
+    }
+
+    /// The attention of `attend` over the history `read` names (and the `own` row as key `read.count`), read from
+    /// the pages in place; the read's back-edge is published on `row`. Nil outside the qualified shapes.
+    static func attendPaged(
+        queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV?,
+        own: (keys: MLXArray, values: MLXArray)? = nil, scale: Float, mask: MLXArray
+    ) -> MLXArray? {
+        guard pagedVerified, let out = launchPaged(
+            queries: queries, read: read, own: own, scale: scale, mask: mask) else { return nil }
+        row?.publishDirectRead(out)
+        return out
+    }
+
+    private static func launchPaged(
+        queries: MLXArray, read: CBv2PagedDirectRead, own: (keys: MLXArray, values: MLXArray)?,
+        scale: Float, mask: MLXArray
+    ) -> MLXArray? {
+        let n = read.count + (own == nil ? 0 : 1)
+        guard pagedEnabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              servesPaged(read), queries.shape == [1, 32, 1, 128], queries.dtype == .bfloat16,
+              (1 ..< 1024).contains(n), mask.shape == [1, 1, 1, n], mask.dtype == .bfloat16,
+              let kernel = own == nil ? pagedKernel : pagedOwnKernel
+        else { return nil }
+        if let own {
+            guard own.keys.shape == [1, 2, 1, 128], own.values.shape == [1, 2, 1, 128],
+                  own.keys.dtype == .bfloat16, own.values.dtype == .bfloat16,
+                  own.keys.strides[3] == 1, own.values.strides[3] == 1
+            else { return nil }
+        }
+        let prm = MLXArray([Int32(read.count), Int32(read.firstSlot), Int32(read.valueOffset)])
+        let inputs = [queries, read.storage, read.pages, prm, mask, scaleArray(scale), read.writeFence]
+            + (own.map { [$0.keys, $0.values] } ?? [])
+        return kernel(
+            inputs, template: [("T", DType.bfloat16), ("D", 128), ("V", 128), ("OWN", own != nil),
+                               ("KVH", 2), ("PS", 16)],
+            grid: (32 * 1024, 1, 1), threadGroup: (1024, 1, 1),
+            outputShapes: [[1, 32, 1, 128]], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// Load time, after `qualify`: the paged launch against the contiguous launch on the same keys, bit for bit,
+    /// on seeded paged storage laid out as the head cache's segment ([2, pages, 2, 16, 128] BF16): scattered local
+    /// page lists, first slots 0 ... 15, key counts across the 32-key, four-key-step and 16-slot page boundaries up to
+    /// 1022, query and key scales 1 to 16, masks as the drafts build them plus scattered -inf keys, with and
+    /// without the own row. The contiguous launch reads the gathered copy of the same elements. Engages only if
+    /// every output is bitwise equal; an MLX error keeps the gather.
+    static func qualifyPaged(_ block: NemotronH35MTPAttentionBlock) {
+        pagedVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft sdpa paged: \(message)\n".utf8))
+        }
+        guard pagedEnabled else { return report("off (setting)") }
+        guard verified else { return report("off (the contiguous draft launch is off)") }
+        guard pagedKernel != nil, pagedOwnKernel != nil else { return report("off (the launch text moved)") }
+        let scale = block.mixer.scale
+        let counts = [1, 2, 15, 16, 17, 31, 32, 33, 64, 97, 127, 128, 129, 255, 256, 257, 488, 489, 552, 600, 616,
+                      617, 1000, 1021, 1022]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for own in [false, true] {
+                    for (i, count) in counts.enumerated() {
+                        let n = count + (own ? 1 : 0)
+                        guard n < 1024 else { continue }
+                        let seed = UInt64(0xd5da_0000 + (own ? 4096 : 0) + i)
+                        let keys5 = MLXRandom.split(key: MLXRandom.key(seed), into: 7)
+                        let (qScale, kvScale) = inputScales[i % inputScales.count]
+                        let firstSlot = (i * 5) % 16
+                        let pageCount = (firstSlot + count + 15) / 16
+                        // A segment with spare pages; the range's pages are a scattered permutation (never page 0).
+                        let segmentPages = pageCount + 9
+                        let storage = MLXRandom.normal(
+                            [2, segmentPages, 2, 16, 128], dtype: .bfloat16, scale: kvScale, key: keys5[0])
+                        let order = argSort(MLXRandom.uniform(Float(0) ..< 1, [segmentPages - 1], key: keys5[1]))
+                        let local = (order[..<pageCount] + Int32(1)).asType(.int32)
+                        let read = CBv2PagedDirectRead(
+                            storage: storage, valueOffset: segmentPages * 2 * 16 * 128, pages: local,
+                            firstSlot: firstSlot, count: count, kvHeads: 2, headDim: 128, pageSize: 16,
+                            dtype: .bfloat16, offset: count, writeFence: MLXArray.zeros([1], dtype: .int32))
+                        // The gathered copy of the same elements: [1, 2, count, 128] per plane.
+                        func gathered(_ plane: Int) -> MLXArray {
+                            take(storage[plane], local, axis: 0)
+                                .transposed(1, 0, 2, 3)
+                                .reshaped(2, pageCount * 16, 128)[0..., firstSlot ..< (firstSlot + count), 0...]
+                                .expandedDimensions(axis: 0)
+                        }
+                        let keys = MLX.contiguous(gathered(0))
+                        let values = MLX.contiguous(gathered(1))
+                        let q = MLXRandom.normal([1, 4096], dtype: .bfloat16, scale: qScale, key: keys5[2])
+                        let queries = q.reshaped(1, 1, 32, 128).transposed(0, 2, 1, 3)
+                        let ownRow: (keys: MLXArray, values: MLXArray)? = own
+                            ? (MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: keys5[3])
+                                .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3),
+                               MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: keys5[4])
+                                .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3))
+                            : nil
+                        let tail = min(i % 4, count - 1)
+                        let position = MLXArray(Int32(0) ..< Int32(n))
+                        var keep = position .< Int32(count - tail)
+                        if own { keep = keep .|| (position .== Int32(count)) }
+                        if i % 5 == 4 {
+                            let drop = MLXRandom.uniform(Float(0) ..< 1, [n], key: keys5[5]) .< MLXArray(Float(0.2))
+                            keep = keep .&& (logicalNot(drop) .|| (position .== Int32(0)))
+                        }
+                        let mask = which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity))
+                            .asType(.bfloat16).reshaped(1, 1, 1, n)
+                        guard let paged = launchPaged(
+                                  queries: queries, read: read, own: ownRow, scale: scale, mask: mask),
+                              let expected = attend(
+                                  queries: queries, keys: keys, values: values, own: ownRow, scale: scale, mask: mask)
+                        else { return false }
+                        if !(paged.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all().item(Bool.self) {
+                            return false
+                        }
+                        checked += 1
+                    }
+                }
+                return true
+            }
+            pagedVerified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(pagedVerified
+            ? "on (\(checked) cases bitwise equal to the contiguous launch on the gathered pages)"
+            : "off (differs from the contiguous launch after \(checked) cases)")
     }
 }
