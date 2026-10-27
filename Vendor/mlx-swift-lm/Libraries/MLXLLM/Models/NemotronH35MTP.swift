@@ -48,6 +48,7 @@ private final class NemotronMTPDraftHead {
         /// once the plan's rescore and pick checks pass on them; when set,
         /// neither `records` nor `packed` is built.
         var records2: MLXArray? = nil
+        var banks: NemotronHeadScreen.Banks? = nil
         /// Ticket counter of the fused select + final launch
         /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
         /// two-launch path bitwise.
@@ -62,7 +63,7 @@ private final class NemotronMTPDraftHead {
     var decodeResidencyArrays: [MLXArray] {
         guard let screen else { return [] }
         return [screen.groups] + [screen.upperGroups, screen.packed, screen.records, screen.records2]
-            .compactMap { $0 }
+            .compactMap { $0 } + (screen.banks?.arrays ?? [])
     }
 
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
@@ -78,7 +79,7 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records, records2: screen.records2,
-            counter: screen.counter)
+            counter: screen.counter, banks: screen.banks)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -155,6 +156,7 @@ private final class NemotronMTPDraftHead {
         // Weight-only importance per K-group: sum over the group's columns of
         // gamma[c]^2 * ||W[:, c]||^2 over the scored rows.
         let g = gamma.asType(.float32)
+        var screenColumnEnergy: [Int: MLXArray] = [:]
         func selectGroups(_ rowRange: Range<Int>, count: Int) -> [Int] {
             var columns = MLXArray.zeros([k], dtype: .float32)
             for start in stride(from: rowRange.lowerBound, to: rowRange.upperBound, by: 8192) {
@@ -164,6 +166,7 @@ private final class NemotronMTPDraftHead {
                 columns = columns + (d * d).sum(axis: 0)
                 eval(columns)
             }
+            screenColumnEnergy[rowRange.lowerBound] = columns
             let importance = (columns * g * g).reshaped(NemotronHeadScreen.groupsPerRow, 64)
                 .sum(axis: 1).asArray(Float.self)
             // Whole aligned 64-byte pairs (groups 2p, 2p + 1; rows are 1344 =
@@ -426,6 +429,95 @@ private final class NemotronMTPDraftHead {
                 fusedNote = "off (fused id differs)"
             }
         }
+        // Preserve the current 2-bit packed screen at a fixed four-bank
+        // budget. Every bank is qualified against the original head rescore;
+        // Unsupported layouts retain the inherited plan. The supported pinned
+        // layout must qualify, so an official run cannot measure a silent
+        // static fallback in place of the proposed mechanism.
+        let bankRequired = environment["NEMOTRON_MTP_SCREEN_BANKS"] != "0" && bits == 2
+            && groupCount == 16 && upper?.count == 6 && plan.records2 != nil
+        var bankNote = "off"
+        if environment["NEMOTRON_MTP_SCREEN_BANKS"] != "0", bits == 2, plan.records2 != nil,
+           let lowerEnergy = screenColumnEnergy[0], let upperEnergy = screenColumnEnergy[rows] {
+            do {
+                let qualified = try withError { () -> NemotronHeadScreen.Banks? in
+                    guard let banks = NemotronHeadScreen.makeBanks(
+                        weight: head.weight, scales: head.scales, biases: biases,
+                        groups: selected, upperGroups: upper, lowerEnergy: lowerEnergy,
+                        upperEnergy: upperEnergy, gamma: g)
+                    else { return nil }
+                    var seed: UInt64 = 0x7A91_40C8_B235_6DEF
+                    for test in 0..<8 {
+                        let t = (0..<k).map { c -> Float in
+                            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                            let z = (Float(seed >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                            return test < 4 || (c / 128 + test) % 4 == 0 ? z : z * 0.05
+                        }
+                        let x = (MLXArray(t) * g).asType(.bfloat16).reshaped(1, 1, k)
+                        for full in [true, false] {
+                          // Force each record offset during qualification, then
+                          // exercise the actual device selector as well.
+                          for forced in -1..<4 {
+                            let override: MLXArray? = forced < 0 ? nil
+                                : MLXArray([UInt32(forced), UInt32(forced)])
+                            let result = NemotronHeadScreen.run(
+                                x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                                upperGroups: full ? plan.upperGroups : nil, upperGroupCount: upperCount,
+                                records2: plan.records2, banks: banks, bankOverride: override)
+                            if forced >= 0 {
+                                let words = NemotronHeadScreen.rows * 5 * (groupCount + upperCount)
+                                let reference = NemotronHeadScreen.run(
+                                    x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                    groups: banks.groups[(forced * groupCount)..<((forced + 1) * groupCount)],
+                                    groupCount: groupCount, chunk: chunk, keep: keep,
+                                    upperGroups: full ? banks.upperGroups[
+                                        (forced * upperCount)..<((forced + 1) * upperCount)] : nil,
+                                    upperGroupCount: upperCount,
+                                    records2: banks.records[(forced * words)..<((forced + 1) * words)])
+                                let same = (result.scores.view(dtype: .uint32)
+                                    .== reference.scores.view(dtype: .uint32)).all()
+                                eval(same)
+                                guard same.item(Bool.self) else { return nil }
+                            }
+                            let logits = (full ? head(x) : prefix(x))[0, -1].asType(.float32)
+                            eval(logits, result.id, result.candidateIds, result.candidateValues)
+                            let values = logits.asArray(Float.self)
+                            let ids = result.candidateIds.asArray(Int32.self)
+                            let kept = result.candidateValues.asArray(Float.self)
+                            let chosen = Int(result.id.item(Int32.self))
+                            var best = 0
+                            for i in ids.indices where kept[i] > kept[best]
+                                || (kept[i] == kept[best] && ids[i] < ids[best]) { best = i }
+                            guard Set(ids).count == ids.count,
+                                  ids.allSatisfy({ (0..<Int32(values.count)).contains($0) }),
+                                  zip(ids, kept).allSatisfy({ values[Int($0)].bitPattern == $1.bitPattern }),
+                                  chosen == Int(ids[best])
+                            else { return nil }
+                          }
+                        }
+                    }
+                    return banks
+                }
+                if let qualified {
+                    plan.banks = qualified
+                    // Bank zero already contains this identical static record
+                    // layout. Drop the redundant standalone copy.
+                    plan.records2 = nil
+                    bankNote = "on (four packed banks, 25% energy gate)"
+                }
+                else {
+                    precondition(!bankRequired, "Required packed screen banks failed shape or exact rescore qualification")
+                    bankNote = "off (unsupported layout or qualification)"
+                }
+            } catch {
+                precondition(!bankRequired, "Required packed screen banks failed load: \(error)")
+                bankNote = "off (\(error))"
+            }
+        }
+        precondition(!bankRequired || plan.banks != nil,
+                     "Required packed screen banks did not engage on the supported pinned layout")
+        report("screen banks \(bankNote)")
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -435,10 +527,19 @@ private final class NemotronMTPDraftHead {
             eval(NemotronHeadScreen.run(
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                upperGroupCount: upperCount,
                 packed: plan.packed, records: plan.records, records2: plan.records2,
-                counter: plan.counter).id)
+                counter: plan.counter, banks: plan.banks).id)
         }
-        report("on, \(plan.records2 == nil ? 4 : 2)-bit, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
+        if let banks = plan.banks {
+            let x = (MLXArray.ones([k]) * g).asType(.bfloat16).reshaped(1, 1, k)
+            eval(NemotronHeadScreen.run(
+                x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                upperGroups: plan.upperGroups, upperGroupCount: upperCount,
+                records2: plan.records2, counter: plan.counter, banks: banks).id)
+        }
+        report("on, \(plan.records2 == nil && plan.banks == nil ? 4 : 2)-bit, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
             + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
             + " qualified (synthetic agreement \(chosen.agree)/4)")

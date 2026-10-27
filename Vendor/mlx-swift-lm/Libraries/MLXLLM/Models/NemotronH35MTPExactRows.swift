@@ -3523,6 +3523,179 @@ enum NemotronHeadScreen {
         let candidateValues: MLXArray
     }
 
+    /// Four fixed draft-screen layouts. Each bank keeps the same K budget,
+    /// chunk selection and original-head exact rescore. Only partial screening
+    /// reads the banked copies; target projections never reference them.
+    struct Banks {
+        let records: MLXArray
+        let groups: MLXArray
+        let upperGroups: MLXArray
+        let importance: MLXArray
+        let masks: MLXArray
+        let upperGroupCount: Int
+        var arrays: [MLXArray] { [records, groups, upperGroups, importance, masks] }
+    }
+
+    /// Input-independent coverage plans built from column norms, not prompts,
+    /// token IDs or output logits. Bank zero is the inherited static layout.
+    /// Profiles span isotropic and concentrated group energy without fitting
+    /// any model examples. The runtime selector uses current hidden energy.
+    static func bankPairPlans(prior: [Double], baseline: [Int], count: Int) -> [[Int]] {
+        precondition(prior.count == 21 && baseline.count == count && count > 0)
+        func top(_ energy: [Double]) -> [Int] {
+            Array((0..<21).sorted {
+                energy[$0] > energy[$1] || (energy[$0] == energy[$1] && $0 < $1)
+            }.prefix(count)).sorted()
+        }
+        var state: UInt64 = 0xD3B5_7129_46A0_C8EF
+        func uniform() -> Double {
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Double(state >> 11) / 9007199254740992.0
+        }
+        func normal() -> Double {
+            var value = -6.0
+            for _ in 0..<12 { value += uniform() }
+            return value
+        }
+        var profiles: [[Double]] = []
+        for family in 0..<4 {
+            for _ in 0..<256 {
+                var amplitude = Array(repeating: 1.0, count: 21)
+                if family == 1 || family == 3 {
+                    for i in 0..<21 { amplitude[i] = exp((family == 1 ? 2.0 : 1.0) * normal()) }
+                } else if family == 2 {
+                    amplitude = Array(repeating: 0.0025, count: 21)
+                    var live: Set<Int> = []
+                    while live.count < 4 { live.insert(min(20, Int(uniform() * 21))) }
+                    for i in live { amplitude[i] = 1 }
+                }
+                var energy = zip(prior, amplitude).map { $0 * $1 }
+                let total = energy.reduce(0, +)
+                guard total.isFinite && total > 0 else { continue }
+                for i in energy.indices { energy[i] /= total }
+                profiles.append(energy)
+            }
+        }
+        var plans = [baseline]
+        func coverage(_ profile: [Double], _ plan: [Int]) -> Double {
+            plan.reduce(0) { $0 + profile[$1] }
+        }
+        while plans.count < 4 {
+            var worst = 0, least = Double.infinity
+            for i in profiles.indices {
+                let covered = plans.map { coverage(profiles[i], $0) }.max() ?? 0
+                if covered < least { least = covered; worst = i }
+            }
+            let next = top(profiles[worst])
+            if plans.contains(next) { break }
+            plans.append(next)
+            for _ in 0..<4 {
+                var sums = Array(repeating: Array(repeating: 0.0, count: 21), count: plans.count)
+                var assigned = Array(repeating: 0, count: plans.count)
+                for profile in profiles {
+                    var winner = 0, score = coverage(profile, plans[0])
+                    for b in 1..<plans.count {
+                        let candidate = coverage(profile, plans[b])
+                        if candidate > score { winner = b; score = candidate }
+                    }
+                    assigned[winner] += 1
+                    for i in 0..<21 { sums[winner][i] += profile[i] }
+                }
+                for b in 1..<plans.count where assigned[b] > 0 { plans[b] = top(sums[b]) }
+            }
+        }
+        while plans.count < 4 { plans.append(baseline) }
+        return plans
+    }
+
+    static func makeBanks(
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        groups: [Int], upperGroups: [Int]?, lowerEnergy: MLXArray,
+        upperEnergy: MLXArray, gamma: MLXArray
+    ) -> Banks? {
+        guard groups.count == 16, upperGroups?.count == 6,
+              lowerEnergy.shape == [width], upperEnergy.shape == [width],
+              gamma.shape == [width]
+        else { return nil }
+        let g = gamma.asType(.float32)
+        func plans(_ energy: MLXArray, _ original: [Int]) -> [[Int]] {
+            let prior = (energy * g * g).reshaped(21, 128).sum(axis: 1).asArray(Float.self)
+                .map { Double($0) }
+            return bankPairPlans(prior: prior, baseline: stride(from: 0, to: original.count, by: 2)
+                .map { original[$0] / 2 }, count: original.count / 2)
+                .map { $0.flatMap { [2 * $0, 2 * $0 + 1] } }
+        }
+        let lower = plans(lowerEnergy, groups), upper = plans(upperEnergy, upperGroups!)
+        var records: [MLXArray] = []
+        for b in 0..<4 {
+            let packed = packRecords2(weight: weight, scales: scales, biases: biases,
+                                      groups: lower[b], upperGroups: upper[b])
+            eval(packed)
+            records.append(packed)
+        }
+        let masks = (lower + upper).map { groupList -> UInt32 in
+            stride(from: 0, to: groupList.count, by: 2).reduce(UInt32(0)) {
+                $0 | (UInt32(1) << UInt32(groupList[$1] / 2))
+            }
+        }
+        let result = Banks(records: concatenated(records, axis: 0),
+                           groups: MLXArray(lower.flatMap { $0.map { UInt32($0) } }),
+                           upperGroups: MLXArray(upper.flatMap { $0.map { UInt32($0) } }),
+                           importance: stacked([lowerEnergy, upperEnergy], axis: 0),
+                           masks: MLXArray(masks), upperGroupCount: upperGroups!.count)
+        eval(result.arrays)
+        return result
+    }
+
+    /// One SIMD group chooses each half's bank without a host readback. A
+    /// different bank must retain at least 25% more current weighted energy;
+    /// otherwise bank zero is kept. Nonfinite input also keeps bank zero.
+    private static let bankSelectKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_bank_select", inputNames: ["x", "energy", "masks"],
+        outputNames: ["selected"], source: """
+          const uint lane = thread_index_in_simdgroup;
+          for (uint h = 0; h < 2; h++) {
+            float value = 0;
+            if (lane < 21) {
+              for (uint j = 0; j < 128; j++) {
+                const uint c = lane * 128 + j;
+                const float a = float(x[c]);
+                value += a * a * energy[h * 2688 + c];
+              }
+            }
+            const bool valid = simd_all(isfinite(value) && value >= 0);
+            float base = 0, best = 0;
+            uint winner = 0;
+            for (uint b = 0; b < 4; b++) {
+              const bool included = lane < 21 && ((masks[h * 4 + b] >> lane) & 1u);
+              const float retained = simd_sum(included ? value : 0.0f);
+              if (b == 0) base = retained;
+              if (retained > best) { best = retained; winner = b; }
+            }
+            if (lane == 0) selected[h] = valid && isfinite(best) && isfinite(base) && best >= base * 1.25f ? winner : 0;
+          }
+        """)
+
+    private static let bankPartialSource: String = {
+        let groupPointer = "const int g = on ? int(upper ? groups2[gi] : groups[gi]) : 0;"
+        let recordPointer = "const device uint32_t* rp = rec + (upper"
+        precondition(record2PartialSource.components(separatedBy: groupPointer).count == 2,
+                     "Bank partial source requires exactly one group pointer seam")
+        precondition(record2PartialSource.components(separatedBy: recordPointer).count == 2,
+                     "Bank partial source requires exactly one record pointer seam")
+        return record2PartialSource
+            .replacingOccurrences(of: groupPointer, with: """
+              const int bank = int(selected[upper ? 1 : 0]);
+              const int g = on ? int(upper ? groups2[bank * S2 + gi] : groups[bank * S + gi]) : 0;
+            """)
+            .replacingOccurrences(of: recordPointer,
+                with: "const device uint32_t* rp = rec + size_t(bank) * LO * 5 * (S + S2) + (upper")
+    }()
+    private static let bankPartialKernel = MLXFast.metalKernel(
+        name: "nemotron_head_screen_partial_banked_record2_affine2",
+        inputNames: ["rec", "x", "groups", "groups2", "selected"],
+        outputNames: ["scores"], source: bankPartialSource)
+
     /// hidden [1, 1, 2688] bf16; the head arrays are the full shared head.
     /// `upperGroups` (count `upperGroupCount`) also screens rows 65536..<131072
     /// with that smaller group set; candidate ids stay global head rows, and
@@ -3535,7 +3708,7 @@ enum NemotronHeadScreen {
         groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
-        counter: MLXArray? = nil,
+        counter: MLXArray? = nil, banks: Banks? = nil, bankOverride: MLXArray? = nil,
         rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
@@ -3545,7 +3718,20 @@ enum NemotronHeadScreen {
             ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
         let partialHalf = partialHalfDecodeForm != 0
         let partialTemplate = template + nemotronHalfTemplate(partialHalf, partialHalfDecodeForm)
-        let scores = (records2.map {
+        let bankScores = banks.map { bank in
+            let selected = bankOverride ?? bankSelectKernel([hidden, bank.importance, bank.masks],
+                template: [("T", hidden.dtype)], grid: (32, 1, 1), threadGroup: (32, 1, 1),
+                outputShapes: [[2]], outputDTypes: [.uint32])[0]
+            // Even a lower-half-only request uses the full two-half record
+            // stride; active vocabulary scope does not change bank offsets.
+            let bankTemplate: [(String, any KernelTemplateArg)] = [
+                ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),
+                ("NSG", simdgroups), ("LO", Self.rows), ("S2", bank.upperGroupCount)]
+            return bankPartialKernel([bank.records, hidden, bank.groups, bank.upperGroups, selected],
+                template: bankTemplate, grid: (32, rows / rowsPerSimdgroup, 1),
+                threadGroup: (32, simdgroups, 1), outputShapes: [[rows]], outputDTypes: [.float32])
+        }
+        let scores = (bankScores ?? records2.map {
             record2PartialKernel(
                 [$0, hidden, groups, upperGroups ?? groups], template: template,
                 grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
