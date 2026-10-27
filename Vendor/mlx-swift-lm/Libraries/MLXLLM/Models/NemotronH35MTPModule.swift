@@ -15,6 +15,7 @@ enum NemotronMTPDraftTail {
     static let fusedQKV = enabled("NEMOTRON_MTP_DRAFT_QKV")
     static let exactTail = enabled("NEMOTRON_MTP_DRAFT_TAIL")
     static let oneLaunchRouter = enabled("NEMOTRON_MTP_DRAFT_ROUTER_FUSED")
+    static let sharedEarly = enabled("NEMOTRON_MTP_DRAFT_SD_EARLY")
 }
 
 enum NemotronMTPFrontNorms {
@@ -65,10 +66,11 @@ enum NemotronMTPFrontNorms {
             }
             """
     private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_bf16",
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_bf16_1b" : "nemotron_mtp_front_norms_concat_bf16",
         inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
         outputNames: ["out"],
-        source: source, ensureRowContiguous: true)
+        source: NemotronHResidualRMSNorm.oneBarrierSource(source), ensureRowContiguous: true)
 
     /// The same launch also emitting eh_proj's prepared K=5376 activation
     /// (the lane-coalesced FP32 buffer `nemotron_head_prepare_activation`
@@ -110,10 +112,11 @@ enum NemotronMTPFrontNorms {
 """)
     }
     private static let preparedKernel = MLXFast.metalKernel(
-        name: "nemotron_mtp_front_norms_concat_prepared_bf16",
+        name: NemotronHResidualRMSNorm.oneBarrier
+            ? "nemotron_mtp_front_norms_concat_prepared_bf16_1b" : "nemotron_mtp_front_norms_concat_prepared_bf16",
         inputNames: ["e", "h", "ew", "hw", "axis_size", "e_eps", "h_eps"],
         outputNames: ["out", "prepared"],
-        source: preparedSource(), ensureRowContiguous: true)
+        source: NemotronHResidualRMSNorm.oneBarrierSource(preparedSource()), ensureRowContiguous: true)
 
     /// Post-verify rows (R = 3): (joined norms, eh_proj's prepared input).
     static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
@@ -524,11 +527,13 @@ final class NemotronH35MTPExpertBlock: Module {
             && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
             ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
         let (indices, scores) = fused ?? gate(h)
+        // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
+        let early = NemotronMTPDraftTail.sharedEarly ? mixer.sharedExperts.map { $0(h) } : nil
         guard let sharedExperts = mixer.sharedExperts,
               let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
-                h, indices, scores, mixer.switchMLP, products: true)
+                h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
-        let shared = sharedExperts(h)
+        let shared = early ?? sharedExperts(h)
         if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
             return joined.1
         }
