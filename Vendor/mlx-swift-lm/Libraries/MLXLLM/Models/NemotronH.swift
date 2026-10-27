@@ -7490,8 +7490,9 @@ func nemotronRunGather(
 enum NemotronPrefillFC2Copy {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY"] != "0"
     nonisolated(unsafe) static var verified = false
-    /// Columns per threadgroup (each of the two SIMD groups across N takes half).
-    static let columns = Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY_BN"] ?? "") ?? 64
+    /// Columns per threadgroup (each of the two SIMD groups across N takes half): 128, i.e. 64 per SIMD group;
+    /// NEMOTRON_PREFILL_FC2_COPY_BN=64 restores the record's 64.
+    static let columns = Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY_BN"] ?? "") ?? 128
 
     private static let header: String = nemotronRunGatherHeader + "\n" + #"""
 // Nemotron: the run gather reading the routed fc2 tile-major decode copy
