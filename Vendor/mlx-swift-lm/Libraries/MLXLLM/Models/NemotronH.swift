@@ -1566,6 +1566,157 @@ enum NemotronHCompactSSMGated {
             ? "on (normalized rows, prepared activation and state bitwise equal, 0 and 2 pending steps)"
             : "off (differs from the record launch)")
     }
+    /// Each lane issues its next state-component B/C reads before updating
+    /// the current state component. The original four-component accumulation
+    /// order and every recurrence/state/output rounding boundary remain.
+    /// No SIMD/TG sharing, new barrier or physical overlap is asserted.
+    static let componentPipelineEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_SSM_COMPONENT_PIPELINE"] != "0"
+    nonisolated(unsafe) private(set) static var componentPipelineQualified = false
+
+    static func componentPipelineSource(_ original: String) -> String? {
+        guard componentPipelineEnabled else { return nil }
+        // Only the window loop has C/output work; the pending prefix remains
+        // byte-for-byte original. These are source literals, matched at load.
+        let old = """
+                float acc = 0.0;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+                    auto state = dA * prior[i] + dB_by_x;
+                    if (t == L - 1) {
+                        state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                    }
+                    prior[i] = static_cast<U>(state);
+                    acc += state * C_[s_idx];
+                }
+            """
+        let pipelined = """
+                float acc = 0.0;
+                // The host selects this twin only for Ds=128 (four words/lane).
+                float ncp_b = static_cast<float>(B_[n_per_t * ds_idx]);
+                T ncp_c = C_[n_per_t * ds_idx];
+                #pragma unroll
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * ds_idx + i;
+                    if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+                    float ncp_next_b = 0.0f;
+                    T ncp_next_c = T(0);
+                    if (i + 1 < n_per_t) {
+                        ncp_next_b = static_cast<float>(B_[s_idx + 1]);
+                        ncp_next_c = C_[s_idx + 1];
+                    }
+                    auto dB_by_x = x_ * dt_ * ncp_b;
+                    auto state = dA * prior[i] + dB_by_x;
+                    if (t == L - 1) {
+                        state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);
+                    }
+                    prior[i] = static_cast<U>(state);
+                    acc += state * ncp_c;
+                    ncp_b = ncp_next_b;
+                    ncp_c = ncp_next_c;
+                }
+            """
+        guard original.components(separatedBy: old).count == 2 else { return nil }
+        return original.replacingOccurrences(of: old, with: pipelined)
+    }
+
+    private static let componentPipelineRowsKernel = componentPipelineSource(source)
+        .flatMap { rowsTail($0) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_mtp_ssm_compact_gated_prepared_sh1b_component_pipeline",
+                inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                             "eps", "counter"],
+                outputNames: ["out", "state_out", "normed", "prepared"],
+                source: $0, mutableInputs: ["counter"])
+        }
+    private static let componentPipelinePendingKernel = componentPipelineSource(pendingSource)
+        .flatMap { rowsTail($0) }.map {
+            MLXFast.metalKernel(
+                name: "nemotron_mtp_ssm_compact_gated_prepared_pending_sh1b_component_pipeline",
+                inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                             "eps", "counter", "pconv", "pdt"],
+                outputNames: ["out", "state_out", "normed", "prepared"],
+                source: $0, mutableInputs: ["counter"])
+        }
+
+    /// Only the existing one-barrier-row tail has a component-pipeline twin.
+    static func componentPipelineKernel(pending: Bool) -> MLXFast.MLXFastKernel? {
+        pending ? componentPipelinePendingKernel : componentPipelineRowsKernel
+    }
+
+    /// Official load-time only: explicit original/twin bindings compare all
+    /// four outputs, including raw SSM rows and every final-state word.
+    /// Every P from zero through the source's maximum is checked, with
+    /// three operand scales; an error/difference keeps the original kernels.
+    static func qualifyComponentPipeline(_ mixer: NemotronHMamba2Mixer) {
+        componentPipelineQualified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron ssm component pipeline: \(message)\n".utf8))
+        }
+        guard componentPipelineEnabled, enabled, rowsTailQualified, let counter,
+              let plain = rowsKernel, let folded = rowsPendingKernel,
+              let twin = componentPipelineRowsKernel, let foldedTwin = componentPipelinePendingKernel,
+              mixer.numHeads == 64, mixer.headDim == 64, mixer.numGroups == 8,
+              mixer.ssmStateSize == 128, mixer.convDim == 6144
+        else { return report("off (setting, source or original admission)") }
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for steps in 0 ... NemotronMTPPendingSSM.maxSteps {
+                    for (index, scale) in [Float(0.03), 1, 4].enumerated() {
+                        let seed = UInt64(0x5dc0_0000 + steps * 16 + index)
+                        let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 6)
+                        let conv = MLXRandom.normal([1, 3, 6144], scale: scale, key: keys[0]).asType(.bfloat16)
+                        let dt = MLXRandom.uniform(Float(0.001) ..< 0.5, [1, 3, 64], key: keys[1])
+                        let state = MLXRandom.normal([1, 64, 64, 128], key: keys[2]) * Float(0.1)
+                        let projected = MLXRandom.normal([1, 3, 10304], scale: scale, key: keys[3])
+                            .asType(.bfloat16)
+                        var inputs: [any ScalarOrArray] = [
+                            conv, mixer.aLog, mixer.D, dt, state, projected, mixer.norm.weight,
+                            NemotronHGatedRMSKernel.identity, mixer.norm.eps, counter]
+                        var template: [(String, any KernelTemplateArg)] = [
+                            ("T", DType.bfloat16), ("U", DType.float32),
+                            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+                            ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
+                        if steps > 0 {
+                            let pconv = MLXRandom.normal([1, steps, 6144], scale: scale, key: keys[4])
+                                .asType(.bfloat16)
+                            let pdt = MLXRandom.uniform(Float(0.001) ..< 0.5, [1, steps, 64], key: keys[5])
+                            inputs += [pconv, pdt]
+                            template.append(("P", steps))
+                        }
+                        func run(_ kernel: MLXFast.MLXFastKernel) -> [MLXArray] {
+                            kernel(inputs, template: template,
+                                grid: (32, 64, 64), threadGroup: (32, 8, 1),
+                                outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128],
+                                               [1, 3, 4096], [3, 8, 17 * 32]],
+                                outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
+                        }
+                        let reference = run(steps == 0 ? plain : folded)
+                        let candidate = run(steps == 0 ? twin : foldedTwin)
+                        eval(reference + candidate)
+                        for (a, b) in zip(reference, candidate) {
+                            let dtype: DType = a.dtype == .bfloat16 ? .uint16 : .uint32
+                            if !(a.view(dtype: dtype) .== b.view(dtype: dtype)).all().item(Bool.self) {
+                                return false
+                            }
+                        }
+                        guard counter.max().item(UInt32.self) == 0 else { return false }
+                        cases += 1
+                    }
+                }
+                return true
+            }
+            componentPipelineQualified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(componentPipelineQualified ? "on (\(cases) cases, all raw/state/norm/prepared words equal)"
+                                   : "off (differs after \(cases) cases)")
+    }
+
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -1589,7 +1740,7 @@ extension NemotronHRMSNormGated {
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil, shuffle: Bool? = nil,
-        rowsTail: Bool? = nil
+        rowsTail: Bool? = nil, componentPipeline: Bool? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
@@ -1630,6 +1781,16 @@ extension NemotronHRMSNormGated {
             kernel = (rows ? NemotronHCompactSSMGated.rowsPendingKernel : nil)
                 ?? (tail ? NemotronHCompactSSMGated.shufflePendingKernel : nil)
                 ?? NemotronHCompactSSMGated.pendingKernel
+        }
+        let wantsComponentPipeline = componentPipeline ?? NemotronHCompactSSMGated.componentPipelineQualified
+        if wantsComponentPipeline && rows {
+            if let twin = NemotronHCompactSSMGated.componentPipelineKernel(pending: pending != nil) {
+                kernel = twin
+            } else if componentPipeline == true {
+                return nil
+            }
+        } else if componentPipeline == true {
+            return nil
         }
         let outputs = kernel(
             inputs, template: template,
