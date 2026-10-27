@@ -5452,7 +5452,8 @@ class NemotronHSwitchMLP: Module {
             // Seed only: fc1 reads the token rows directly; `xs` stays lazy.
             y = activated
         } else if let tiles = runTiles, let q = fc1 as? QuantizedSwitchLinear,
-            let activated = nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
+            let activated = NemotronSeedRetile.fc1Plain(xs, q, tiles: tiles)
+                ?? nemotronRunGather(xs, q, tiles: tiles, relu2: true) {
             y = activated
         } else {
             y = gather(fc1, xs)
@@ -5470,6 +5471,9 @@ class NemotronHSwitchMLP: Module {
         if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
            let fromCopy = NemotronPrefillFC2Copy.apply(y, q, tiles: tiles) {
             y = fromCopy
+        } else if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
+                  let retiled = NemotronSeedRetile.fc2Plain(y, q, tiles: tiles) {
+            y = retiled
         } else {
             y = gather(fc2, y)
         }
@@ -5926,7 +5930,7 @@ private func nemotronCountingSort(_ flat: MLXArray, experts: Int)
 
 /// `nemotronCountingSort` through the chunk-parallel kernel, plus
 /// order / k; nil outside its shapes (n <= 3072, experts a multiple of 32).
-private func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
+func nemotronCountingSortChunked(_ flat: MLXArray, experts: Int, k: Int)
     -> (order: MLXArray, inverse: MLXArray, sorted: MLXArray, tiles: NemotronHRunTiles,
         orderK: MLXArray)?
 {
@@ -6253,7 +6257,7 @@ private func nemotronWarmUpPrefillKernels(
 /// that the stock affine_gather_qmm_rhs_nax uses, followed by its run-aligned
 /// clone. Output stores add a typed ReLU2 specialization; the remaining
 /// declarations retain the stock math. Unused declarations are dropped.
-private let nemotronRunGatherHeader = #"""
+let nemotronRunGatherHeader = #"""
 // Subset of the MLX JIT preamble that stock affine_gather_qmm_rhs_nax is
 // compiled from (mlx-generated gemm_nax.cpp + quantized_nax.cpp). Only the
 // output stores add the typed ReLU2 specialization; unused declarations are dropped.
@@ -7751,10 +7755,10 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, tiles: tiles)
+        return NemotronSeedRetile.fc2Copy(x, lin, tiles: tiles) ?? launch(x, lin, tiles: tiles)
     }
 
-    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
               let copy = NemotronZSkip.copy(for: lin), copy.dict
@@ -7891,10 +7895,10 @@ enum NemotronPrefillDenseDict {
 
     static func apply(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool = false) -> MLXArray? {
         guard NemotronHPrefillX5.active, !kinds.isEmpty, kinds.contains(kind) else { return nil }
-        return launch(x, linear, relu2: relu2)
+        return NemotronSeedRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -8039,10 +8043,10 @@ enum NemotronPrefillSharedDownCopy {
 
     static func apply(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, down)
+        return NemotronSeedRetile.sharedDown(x, down) ?? launch(x, down)
     }
 
-    private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -8422,11 +8426,12 @@ const device T* xn = x;
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
                       tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
+        return NemotronSeedRetile.fc1Routed(x, lin, rows: rows, tiles: tiles, dict: dictVerified)
+            ?? launch(x, lin, rows: rows, tiles: tiles, useDict: dictVerified)
     }
 
-    private static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
-                               tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ lin: QuantizedSwitchLinear, rows: MLXArray,
+                       tiles: NemotronHRunTiles, useDict: Bool = false) -> MLXArray? {
         guard let kernel, NemotronHPrefillX5.runGather,
               lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
               x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
