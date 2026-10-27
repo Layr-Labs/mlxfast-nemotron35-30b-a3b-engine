@@ -2967,6 +2967,10 @@ enum NemotronHeadScreen {
             && recordPartialSource.contains("(rp + (lane >> 1) * 8 + part * 4)")
             && !recordPartialSource.contains("(w + ") && !recordPartialSource.contains("sb[size_t(row)")
     }
+    /// Head rows scored per SIMD group by the partial launch (two SIMD groups per threadgroup);
+    /// NEMOTRON_MTP_HEAD_SCREEN_RPS=8 restores eight.
+    static let screenRowsPerSimdgroup =
+        Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_RPS"] ?? "") ?? 4
     static let width = 2688
     static let wordsPerRow = 336
     static let groupsPerRow = 42
@@ -3536,7 +3540,7 @@ enum NemotronHeadScreen {
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
         counter: MLXArray? = nil,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2
+        rowsPerSimdgroup: Int = screenRowsPerSimdgroup, simdgroups: Int = 2
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
