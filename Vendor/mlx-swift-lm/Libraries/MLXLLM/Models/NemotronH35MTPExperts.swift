@@ -2162,6 +2162,76 @@ private let nemotronZSkipTiledFastSource = """
   }
 """
 
+
+// Exact integer-code conversion only. Each input is the original uint16 word
+// carrying four output nibbles, not a rescaled activation or a new weight form.
+private let nemotronZSkipExactDecodeHeader = """
+inline float4 nmz_output_codes_half(uint w) {
+  const uint a = ((w | (w << 12)) & 0x000f000fu) | 0x64006400u;
+  const uint wh = w >> 8;
+  const uint b = ((wh | (wh << 12)) & 0x000f000fu) | 0x64006400u;
+  const half2 lo = as_type<half2>(a) - half2(1024.0h);
+  const half2 hi = as_type<half2>(b) - half2(1024.0h);
+  return float4(lo.x, lo.y, hi.x, hi.y);
+}
+"""
+
+private func nemotronZSkipExactDecodeSource(_ source: String) -> String {
+    let one = """
+            for (int o = 0; o < 4; o++) {
+              const uint code = ((w >> (4 * o)) & 0xfu);
+              U accum = 0;
+              accum += xtj * U(int(code));
+    """
+    let oneNew = """
+            const float4 dc = nmz_output_codes_half(w);
+            for (int o = 0; o < 4; o++) {
+              U accum = 0;
+              accum += xtj * U(dc[o]);
+    """
+    let two = """
+            for (int o = 0; o < 4; o++) {
+              const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+              const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
+              const U accum = xt1 * c1 + xt2 * c2;
+    """
+    let twoNew = """
+            const float4 dc1 = nmz_output_codes_half(w1);
+            const float4 dc2 = nmz_output_codes_half(w2);
+            for (int o = 0; o < 4; o++) {
+              const U c1 = U(dc1[o]);
+              const U c2 = U(dc2[o]);
+              const U accum = xt1 * c1 + xt2 * c2;
+    """
+    let three = """
+            for (int o = 0; o < 4; o++) {
+              const U c1 = U(int(((w1 >> (4 * o)) & 0xfu)));
+              const U c2 = U(int(((w2 >> (4 * o)) & 0xfu)));
+              const U c3 = U(int(((w3 >> (4 * o)) & 0xfu)));
+              const U t1 = xt1 * c1;
+    """
+    let threeNew = """
+            const float4 dc1 = nmz_output_codes_half(w1);
+            const float4 dc2 = nmz_output_codes_half(w2);
+            const float4 dc3 = nmz_output_codes_half(w3);
+            for (int o = 0; o < 4; o++) {
+              const U c1 = U(dc1[o]);
+              const U c2 = U(dc2[o]);
+              const U c3 = U(dc3[o]);
+              const U t1 = xt1 * c1;
+    """
+    var result = source
+    for (old, new) in [(one, oneNew), (two, twoNew), (three, threeNew)] {
+        precondition(result.components(separatedBy: old).count == 2,
+            "NEMOTRON_ZSKIP_EXACT_DECODE source seam")
+        result = result.replacingOccurrences(of: old, with: new)
+    }
+    return result
+}
+
+private let nemotronZSkipProductionFastSource = NemotronZSkipExactDecode.enabled
+    ? nemotronZSkipExactDecodeSource(nemotronZSkipTiledFastSource) : nemotronZSkipTiledFastSource
+
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
 // tile-major uint16 pair index (one per group and output) and `bk` the bank's
@@ -2356,8 +2426,8 @@ enum NemotronZSkip {
         ensureRowContiguous: true)
     private static let tiledFastSlotKernel = MLXFast.metalKernel(
         name: "nemotron_zskip_fc2_slots_tiled_fast", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
-        outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
-        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        outputNames: ["prod"], source: nemotronZSkipProductionFastSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader + nemotronZSkipExactDecodeHeader,
         ensureRowContiguous: true)
     private static let tiledDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledSeqSource).map {
         MLXFast.metalKernel(
@@ -2366,11 +2436,11 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipProductionFastSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
             outputNames: ["prod"], source: $0,
-            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader + nemotronZSkipExactDecodeHeader,
             ensureRowContiguous: true)
     }
     /// The slot kernel that reads a dictionary copy (the fast or plain tiled form).
@@ -2981,13 +3051,13 @@ enum NemotronFC2SharedColaunch {
         return MLXFast.metalKernel(
             name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "swk", "ssk", "sbk", "sx", "sinds"],
             outputNames: ["prod", "shared_y"], source: source,
-            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader + nemotronZSkipExactDecodeHeader,
             ensureRowContiguous: true)
     }
     private static let plainKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast",
-                                          fc2: nemotronZSkipTiledFastSource)
+                                          fc2: nemotronZSkipProductionFastSource)
     private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd",
-                                         fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+                                         fc2: nemotronZSkipDictSource(nemotronZSkipProductionFastSource))
 
     private static let lock = NSLock()
     /// Routed FC2 owner -> its layer's shared down owner, for layers whose co-launch matched.
@@ -3047,6 +3117,31 @@ enum NemotronFC2SharedColaunch {
     /// True when the co-launch may serve the layer of `fc2` and `down`.
     static func covers(fc2: SwitchLinear, down: Linear) -> Bool {
         enabled && lock.withLock { pairs[ObjectIdentifier(fc2)] == ObjectIdentifier(down) }
+    }
+
+
+    private static let exactReferencePlain = make("nemotron_exact_decode_reference_colaunch",
+        fc2: nemotronZSkipTiledFastSource)
+    private static let exactReferenceDict = make("nemotron_exact_decode_reference_colaunch_sbd",
+        fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+
+    static func checkExactDecode(_ moe: NemotronHMoE, copy: NemotronZSkip.Copy,
+                                x: MLXArray, inds: MLXArray, scores: MLXArray, sx: MLXArray) throws {
+        guard enabled, NemotronZSkip.joinReduce else { return }
+        guard let down = moe.sharedExperts?.downProj, covers(fc2: moe.switchMLP.fc2, down: down) else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE default co-launch preparation unavailable")
+        }
+        guard let actualKernel = kernel(for: copy), let shared = sharedCopy(down),
+              let referenceKernel = copy.dict ? exactReferenceDict : exactReferencePlain else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE co-launch reference unavailable")
+        }
+        let actual = dispatch(actualKernel, x, inds, scores, copy, sx, shared.0, shared.1)
+        let expected = dispatch(referenceKernel, x, inds, scores, copy, sx, shared.0, shared.1)
+        let same = NemotronZSkipExactDecode.sameProducts(actual.0, expected.0)
+            .&& (actual.1.view(dtype: .uint16) .== expected.1.view(dtype: .uint16)).all()
+        guard same.item(Bool.self) else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE co-launch differs")
+        }
     }
 
     /// Load time, after `NemotronZSkip.prepare` and `NemotronSharedDownZSkip.prepare`: every layer's co-launch
@@ -3746,5 +3841,115 @@ enum NemotronSBDict {
         }
         eval(Array(same.values))
         return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
+    }
+}
+
+/// Coefficient decoding only. The original dense qdot and shared-down source
+/// are intentionally independent and unchanged.
+enum NemotronZSkipExactDecode {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_HALF_CODES"] != "0"
+    private static let referencePlain = MLXFast.metalKernel(
+        name: "nemotron_zskip_integer_reference_slots", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+        outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
+        header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+        ensureRowContiguous: true)
+    private static let referenceDict = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+        MLXFast.metalKernel(name: "nemotron_zskip_integer_reference_slots_sbd",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"], outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+
+    static func sameProducts(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        // All finite bits, including signed zero, remain exact. Nonfinite
+        // adversarial cases compare NaN class without assuming a payload.
+        logicalOr(a.view(dtype: .uint32) .== b.view(dtype: .uint32),
+            logicalAnd(isNaN(a), isNaN(b))).all()
+    }
+
+    private static func integerReference(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                                         _ copy: NemotronZSkip.Copy) -> MLXArray? {
+        guard let kernel = copy.dict ? referenceDict : referencePlain else { return nil }
+        let sgs = NemotronZSkip.sgs
+        return kernel([NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+            NemotronBankBinding.bind(copy.biases), x, inds, scores],
+            template: [("T", DType.bfloat16), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+            grid: (32 * sgs * (2688 / 128), 18, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[18 * 2688]], outputDTypes: [.float32])[0]
+    }
+
+    static func qualify(_ model: Module) throws {
+        let env = ProcessInfo.processInfo.environment
+        guard enabled, NemotronZSkip.enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu, env["NEMOTRON_MTP_ZSKIP_FAST"] != "0",
+              env["NEMOTRON_MTP_ZSKIP_TILED"] != "0", NemotronZSkip.layerLimit > 0 else { return }
+        guard NemotronZSkip.fast, NemotronZSkip.tiled else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE default fast/tiled qualification fell back")
+        }
+        let inds = MLXArray([UInt32(3),17,42,77,100,121,17,5,64,90,3,11,3,8,50,66,101,127])
+        let scores = MLXArray((0..<18).map { Float($0 + 1) / 171.0 })
+        let normals: [UInt16] = [0x3e80,0x3f00,0x3f80,0x4000,0x4120,0x3880,0x3c80,0x4200]
+        let unsafe: [UInt16] = [1,0x8001,0x087f,0x0880,0x0881,0x7f7f,0xff7f,0x7f80,0xff80,0x7fc0,0xffff]
+        let masks: [UInt16] = (0..<(18 * 1856)).map { index in
+            let chunk = index / 8, lane = index % 8, mask = chunk % 256
+            return mask & (1 << lane) != 0 ? normals[(chunk + lane) % normals.count]
+                : (chunk % 7 == 0 ? 0x8000 : 0)
+        }
+        let adversarial: [UInt16] = (0..<(18 * 1856)).map { index in
+            let chunk = index / 8, lane = index % 8
+            if lane == chunk % 8 { return unsafe[chunk % unsafe.count] }
+            return lane == (chunk + 3) % 8 ? normals[lane] : 0
+        }
+        let families = [masks, adversarial].map { MLXArray($0).reshaped(18, 1856).view(dtype: .bfloat16) }
+        let sx = (abs(sin(MLXArray(0..<(3 * 3712)).asType(.float32) * 0.021)) * 0.25)
+            .asType(.bfloat16).reshaped(3, 3712)
+        var layers = 0, plainForms = 0, dictionaryForms = 0
+        try withError { () -> Void in
+            for module in model.modules() {
+                guard let moe = module as? NemotronHMoE else { continue }
+                guard let actualCopy = NemotronZSkip.lock.withLock({ NemotronZSkip.copies[ObjectIdentifier(moe.switchMLP.fc2)] }) else {
+                    if NemotronZSkip.layerLimit != Int.max { continue }
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE native FC2 preparation unavailable")
+                }
+                guard env["NEMOTRON_MTP_ZSKIP_SB_DICT"] == "0" || actualCopy.dict else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE default dictionary preparation fell back")
+                }
+                guard let bank = NemotronMoELeader.bank(moe.switchMLP.fc2, k: 1856, dtype: .bfloat16),
+                      bank.k == 1856, bank.n == 2688 else {
+                    throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE native FC2 bank unavailable")
+                }
+                func tiled(_ a: MLXArray) -> MLXArray {
+                    a.reshaped(128, 21, 128, 29).transposed(0, 1, 3, 2).contiguous()
+                }
+                let plain = NemotronZSkip.Copy(codes: actualCopy.codes,
+                    scales: tiled(bank.scales), biases: tiled(bank.biases))
+                var copies = [plain]
+                if actualCopy.dict {
+                    copies.append(actualCopy)
+                } else if let dict = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
+                    copies.append(NemotronZSkip.Copy(codes: actualCopy.codes,
+                        scales: tiled(dict.index), biases: dict.table, dict: true))
+                }
+                for copy in copies {
+                    for x in families {
+                        let actual = NemotronZSkip.products(x, inds, scores, copy: copy, rows: 3)
+                        guard let expected = integerReference(x, inds, scores, copy),
+                              sameProducts(actual, expected).item(Bool.self) else {
+                            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE sparse/dense slot products differ")
+                        }
+                        try NemotronFC2SharedColaunch.checkExactDecode(moe, copy: copy,
+                            x: x, inds: inds, scores: scores, sx: sx)
+                    }
+                    if copy.dict { dictionaryForms += 1 } else { plainForms += 1 }
+                }
+                layers += 1
+            }
+        }
+        let intendedLayers = min(model.modules().filter { $0 is NemotronHMoE }.count, NemotronZSkip.layerLimit)
+        guard layers > 0, layers == intendedLayers, plainForms == layers,
+              env["NEMOTRON_MTP_ZSKIP_SB_DICT"] == "0" || dictionaryForms == layers else {
+            throw NemotronH35MTPError.invalidArtifact("NEMOTRON_ZSKIP_EXACT_DECODE supported plain/dictionary qualification incomplete")
+        }
+        FileHandle.standardError.write(Data("nemotron exact ZSkip coefficients: qualified \(layers) FC2 layers, \(plainForms) plain/\(dictionaryForms) dictionary forms\n".utf8))
     }
 }
