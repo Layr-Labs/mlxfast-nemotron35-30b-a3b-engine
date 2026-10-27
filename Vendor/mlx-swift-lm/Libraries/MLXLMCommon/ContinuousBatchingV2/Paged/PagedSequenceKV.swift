@@ -843,3 +843,89 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         pool.unreserve([groupKey: reservedPages])
     }
 }
+
+// MARK: - Direct reads (the MTP draft attention)
+
+/// The operands of one single-segment read of a row's attendable range: what `snapshot()`'s gather reads,
+/// without launching it (`PagedSequenceKV.directRead`). Key/value `i` of the range (0 ..< `count`, oldest first)
+/// is slot `(firstSlot + i) % pageSize` of local page `pages[(firstSlot + i) / pageSize]` of `storage`: the key
+/// plane element `((page * kvHeads + head) * pageSize + slot) * headDim + d`, the value plane the same plus
+/// `valueOffset` (the segment read's addressing).
+public struct CBv2PagedDirectRead {
+    /// The segment's `[2, pages, kvHeads, pageSize, headDim]` storage holding every page of the range.
+    public let storage: MLXArray
+    public let valueOffset: Int
+    /// `[pageCount]` int32: the segment-local page of each logical page of the range, in order.
+    public let pages: MLXArray
+    public let firstSlot: Int
+    public let count: Int
+    public let kvHeads: Int
+    public let headDim: Int
+    public let pageSize: Int
+    public let dtype: DType
+    /// The row's `absoluteOffset` when the operands were taken.
+    public let offset: Int
+    /// The group's write fence when the operands were taken: bind it to the reading launch so the read orders
+    /// after every prior write of the group (the edge `snapshot()`'s gather takes).
+    public let writeFence: MLXArray
+
+    public init(storage: MLXArray, valueOffset: Int, pages: MLXArray, firstSlot: Int, count: Int, kvHeads: Int,
+                headDim: Int, pageSize: Int, dtype: DType, offset: Int, writeFence: MLXArray) {
+        self.storage = storage
+        self.valueOffset = valueOffset
+        self.pages = pages
+        self.firstSlot = firstSlot
+        self.count = count
+        self.kvHeads = kvHeads
+        self.headDim = headDim
+        self.pageSize = pageSize
+        self.dtype = dtype
+        self.offset = offset
+        self.writeFence = writeFence
+    }
+}
+
+extension PagedSequenceKV {
+    /// The attendable range's direct-read operands, or nil where `snapshot()` would not be one single-segment read
+    /// (no segment layout, a range spanning segments, an empty range). Reads the row's table and the group's
+    /// state; changes nothing.
+    public func directRead() -> CBv2PagedDirectRead? {
+        let count = retainedCount
+        let start = absoluteOffset - count
+        guard count > 0, start >= baseOffset, start >= oldestValidPosition else { return nil }
+        let group = pool.group(groupKey)
+        guard let layout = group.segmentLayout else { return nil }
+        let s = pool.config.pageSize
+        guard s == group.pageSize else { return nil }
+        let lpFirst = start / s
+        let lpLast = (start + count - 1) / s
+        var local: [Int32] = []
+        local.reserveCapacity(lpLast - lpFirst + 1)
+        var segmentIndex: Int? = nil
+        for lp in lpFirst ... lpLast {
+            let idx = ringPages.map { lp % $0 } ?? lp
+            guard idx < table.count else { return nil }
+            let page = table[idx]
+            guard group.isAllocatable(page) else { return nil }
+            let index = layout.segmentIndex(page: page)
+            if let segmentIndex, segmentIndex != index { return nil }
+            segmentIndex = index
+            local.append(Int32(layout.localPage(page)))
+        }
+        guard let segmentIndex, let segment = group.segments[segmentIndex] else { return nil }
+        return CBv2PagedDirectRead(
+            storage: segment.storage, valueOffset: segment.valueOffset, pages: MLXArray(local),
+            firstSlot: start % s, count: count, kvHeads: groupKey.kvHeads, headDim: groupKey.headDim,
+            pageSize: s, dtype: group.dtype, offset: absoluteOffset, writeFence: group.writeFence)
+    }
+
+    /// After a launch that read `directRead()`'s storage, fold one element of its output into the group's write
+    /// fence: the back-edge `snapshot()`'s gather publishes, so every later write of the group orders after that
+    /// read. The fence keeps its value (`* 0` in int32).
+    public func publishDirectRead(_ output: MLXArray) {
+        guard output.size > 0 else { return }
+        let group = pool.group(groupKey)
+        let probe = output.reshaped(-1)[0]
+        group.writeFence = group.writeFence + probe.asType(group.writeFence.dtype) * 0
+    }
+}
