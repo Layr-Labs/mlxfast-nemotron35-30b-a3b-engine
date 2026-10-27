@@ -2669,6 +2669,30 @@ private let nemotronZSkipReduceSource = """
   y[row * N + n] = static_cast<T>(total);
 """
 
+/// The zero-skip slot sources' staging with each SIMD group staging exactly the chunks its own lane partials
+/// read, ordered by a SIMD-group barrier instead of the threadgroup barrier (NEMOTRON_MTP_ZSKIP_SGSTAGE).
+/// SIMD group `sg` reads only chunks c with c % 32 = l for its lane partials l = sg + SGS * ll (each chunk loop
+/// walks l, l + 32, ...), so it stages exactly those: lane i stages chunk (sg + SGS * (i / 16)) + 32 * (i % 16)
+/// with the record's statements (the same mask, sentinel and copied values). The staged values, and every
+/// later read of them, are the record's; only which thread writes a chunk changes. Applied to every staging
+/// loop of `source` (the wide shared down has two bodies); nil when the record text moved.
+func nemotronZSkipSimdStage(_ source: String) -> String? {
+    let header = "for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {"
+    let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+    let parts = source.components(separatedBy: header)
+    guard parts.count >= 2 else { return nil }
+    var out = parts[0]
+    for part in parts.dropFirst() {
+        guard let b = part.range(of: barrier) else { return nil }
+        out += "static_assert(chunks <= 32 * 16, \"a lane stages one chunk per 16 lane partials\");\n"
+            + "    for (int nms = lid; nms < LPS * 16; nms += 32) {\n"
+            + "      const int c = sg + SGS * (nms / 16) + 32 * (nms % 16);\n"
+            + "      if (c >= chunks) { continue; }"
+            + part[..<b.lowerBound] + "simdgroup_barrier(mem_flags::mem_threadgroup);" + part[b.upperBound...]
+    }
+    return out
+}
+
 /// MLX commits a command buffer once the distinct input buffers bound in it
 /// exceed its per-buffer budget (`max_mb_per_buffer`, 40-50 MB). An expert
 /// bank is one buffer of hundreds of MB, so every launch that binds a whole
@@ -2713,6 +2737,17 @@ enum NemotronBankBinding {
         eval(made.values.map { $0.1 })
         lock.withLock { views.merge(made) { _, new in new } }
     }
+}
+
+/// SIMD-group staging for the zero-skip slot and shared-down kernels (`nemotronZSkipSimdStage`), set at load by
+/// `NemotronZSkip.qualifySimdStage`. NEMOTRON_MTP_ZSKIP_SGSTAGE=0 keeps the threadgroup-staged kernels.
+enum NemotronZSkipSimdStage {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGSTAGE"] != "0"
+    /// Off by default (NEMOTRON_MTP_ZSKIP_SGSTAGE_SD=1 turns it on): the shared down keeps its threadgroup staging (the routed FC2 slots still
+    /// take their twin).
+    static let sharedEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGSTAGE_SD"] == "1"
+    nonisolated(unsafe) static var qualified = false
+    static var active: Bool { enabled && qualified }
 }
 
 enum NemotronZSkip {
@@ -2857,6 +2892,31 @@ enum NemotronZSkip {
         guard tiled, fast else { return nil }
         return copy.dict ? tiledFastDictSlotKernelDep : tiledFastSlotKernelDep
     }
+    /// The two fast tiled slot kernels with SIMD-group staging (`nemotronZSkipSimdStage`; the verify's only).
+    private static func sgKernel(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        source.flatMap(nemotronZSkipSimdStage).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+                outputNames: ["prod"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
+    }
+    private static let tiledFastSlotKernelSG = sgKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_sg", nemotronZSkipTiledFastSource)
+    private static let tiledFastDictSlotKernelSG = sgKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_sbd_sg", nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+    /// True when both SIMD-group staging twins built.
+    static var simdStageBuilt: Bool { tiledFastSlotKernelSG != nil && tiledFastDictSlotKernelSG != nil }
+    /// The slot kernel `products` runs for `copy` without `dep`: the record kernel, or with `simdStage` (and the
+    /// fast tiled form) its SIMD-group staging twin.
+    private static func slotKernel(for copy: Copy, simdStage: Bool) -> MLXFast.MLXFastKernel {
+        if simdStage, tiled, fast,
+           let twin = copy.dict ? tiledFastDictSlotKernelSG : tiledFastSlotKernelSG {
+            return twin
+        }
+        return copy.dict ? dictKernel! : kernel
+    }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
     /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
@@ -2929,12 +2989,132 @@ enum NemotronZSkip {
         let slots = rows * 6
         let threads = 32 * sgs
         let twin = dep.flatMap { _ in depKernel(for: copy) }
-        return (twin ?? (copy.dict ? dictKernel! : kernel))(
+        // The SIMD-group staging twin serves the verify's launches (R >= 2) only; the draft keeps the record.
+        return launchSlots(twin ?? slotKernel(for: copy, simdStage: rows > 1 && NemotronZSkipSimdStage.active),
+                           x, inds, scores, copy: copy, slots: slots, dep: twin != nil ? dep : nil)
+    }
+
+    private static func launchSlots(_ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ inds: MLXArray,
+                                    _ scores: MLXArray, copy: Copy, slots: Int, dep: MLXArray?) -> MLXArray {
+        let threads = 32 * sgs
+        return kernel(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
-             NemotronBankBinding.bind(copy.biases), x, inds, scores] + (twin != nil ? [dep!] : []),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores] + (dep.map { [$0] } ?? []),
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
+    }
+
+    /// Load time, after `prepare` and `NemotronSharedDownZSkip.prepare`: the SIMD-group staging twins against the
+    /// record kernels they replace, bit for bit, on every copy they serve in the verify: each target layer's
+    /// routed FC2 slot kernel (18 slots) and each layer's shared down (its decode codes), over seeded ReLU²-like
+    /// rows. Any miss keeps the record kernels. One stderr line.
+    static func qualifySimdStage() {
+        NemotronZSkipSimdStage.qualified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron zskip simdgroup staging: \(message)\n".utf8))
+        }
+        guard NemotronZSkipSimdStage.enabled else { return report("off (setting)") }
+        guard tiled, fast, simdStageBuilt, NemotronSharedDownZSkip.kernelSG != nil,
+              NemotronSharedDownZSkip.wideKernelSG != nil
+        else { return report("off (the staging text moved or not the fast tiled form)") }
+        let target = lock.withLock { Array(copies.values) }
+        let shared = NemotronSharedDownZSkip.lock.withLock { () -> ([NemotronSharedDownZSkip.Copy], MLXArray?) in
+            (Array(NemotronSharedDownZSkip.copies.values), NemotronSharedDownZSkip.inds)
+        }
+        guard !target.isEmpty else { return report("off (no routed FC2 copy)") }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            try withError { () -> Void in
+                for (i, copy) in target.enumerated() {
+                    let c = simdStageCases(slots: 18, seed: i)
+                    for act in c.acts {
+                        let a = launchSlots(slotKernel(for: copy, simdStage: false), act, c.inds, c.scores,
+                                            copy: copy, slots: 18, dep: nil)
+                        let b = launchSlots(slotKernel(for: copy, simdStage: true), act, c.inds, c.scores,
+                                            copy: copy, slots: 18, dep: nil)
+                        same = logicalAnd(same, (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all())
+                        cases += 1
+                    }
+                    eval(same)
+                }
+                if let sinds = shared.1 {
+                    for (i, copy) in shared.0.enumerated() {
+                        guard let record = NemotronSharedDownZSkip.recordKernel(for: copy, simdStage: false),
+                              let twin = NemotronSharedDownZSkip.recordKernel(for: copy, simdStage: true)
+                        else { continue }
+                        for sx in simdStageSharedRows(seed: i) {
+                            let a = NemotronSharedDownZSkip.dispatch(sx, copy, sinds, record)
+                            let b = NemotronSharedDownZSkip.dispatch(sx, copy, sinds, twin)
+                            same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                            cases += 1
+                        }
+                        eval(same)
+                    }
+                }
+            }
+            NemotronZSkipSimdStage.qualified = same.item(Bool.self)
+        } catch {
+            NemotronZSkipSimdStage.qualified = false
+        }
+        report(NemotronZSkipSimdStage.qualified
+            ? "on (\(target.count) routed FC2 copies, \(shared.0.count) shared down; "
+                + "\(cases) launches bitwise equal to the threadgroup-staged kernels)"
+            : "off (differs from the threadgroup-staged kernels)")
+    }
+
+    /// Seeded [slots, 1856] ReLU² rows (sparse with an all-zero and a one-hot slot, tail chunks only, dense, tiny
+    /// values, -0 for some zeros, the measured verify density) with a route that repeats experts across rows.
+    private static func simdStageCases(slots: Int, seed: Int) -> (inds: MLXArray, scores: MLXArray, acts: [MLXArray]) {
+        let base: [UInt32] = [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127]
+        let inds = MLXArray((0 ..< slots).map { (i: Int) -> UInt32 in
+            let picked: UInt32 = base[i % base.count]
+            let shift: UInt32 = UInt32(seed) * 7
+            return (picked + shift) % 128
+        })
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5e57 + seed)), into: 6)
+        let zero = MLXArray(Float(0))
+        let h = abs(MLXRandom.normal([slots, 1856], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [slots, 1856], key: keys[1]) .< MLXArray(Float(0.08))
+        let slot = MLXArray((0 ..< slots).map(Int32.init)).reshaped(slots, 1)
+        let column = MLXArray((0 ..< 1856).map(Int32.init)).reshaped(1, 1856)
+        let oneHot = which(column .== MLXArray(Int32(1800)), MLXArray(Float(1.5)), zero)
+        let sparse = which(slot .== MLXArray(Int32(slots - 2)), zero,
+                           which(slot .== MLXArray(Int32(slots - 1)), oneHot, which(keep, h, zero)))
+        let tail = which(column .>= MLXArray(Int32(1792)), h, zero)
+        let tiny = which(keep, which(MLXRandom.uniform(Float(0) ..< 1, [slots, 1856], key: keys[2]) .< MLXArray(Float(0.5)),
+                                     h * 1e-18, h), zero)
+        let dense = which(MLXRandom.uniform(Float(0) ..< 1, [slots, 1856], key: keys[3]) .< MLXArray(Float(0.075)),
+                          h * 0.5, zero)
+        var acts = [sparse, tail, h, tiny, dense].map { a -> MLXArray in
+            let b = a.asType(.bfloat16)
+            return (b * b).asType(.bfloat16)
+        }
+        let flip = MLXRandom.uniform(Float(0) ..< 1, [slots, 1856], key: keys[4]) .< MLXArray(Float(0.05))
+        acts.append(which(logicalAnd(acts[0] .== MLXArray(Float(0)).asType(.bfloat16), flip),
+                          MLXArray(Float(-0.0)).asType(.bfloat16), acts[0]))
+        return (inds, MLXRandom.uniform(Float(0) ..< 1, [slots], key: keys[5]), acts)
+    }
+
+    /// Seeded [3, 3712] shared ReLU² rows: the shared-down record check's realistic densities plus sparse with an
+    /// all-zero row, tail chunks only, tiny values and dense.
+    private static func simdStageSharedRows(seed: Int) -> [MLXArray] {
+        let k = NemotronSharedDownZSkip.k
+        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5e58 + seed)), into: 3)
+        let zero = MLXArray(Float(0))
+        let h = abs(MLXRandom.normal([3, k], key: keys[0])) + 1e-3
+        let keep = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[1]) .< MLXArray(Float(0.16))
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+        let sparse = which(row .== MLXArray(Int32(1)), zero, which(keep, h, zero))
+        let tail = which(column .>= MLXArray(Int32(k - 128)), h, zero)
+        let tiny = which(keep, which(MLXRandom.uniform(Float(0) ..< 1, [3, k], key: keys[2]) .< MLXArray(Float(0.5)),
+                                     h * 1e-18, h), zero)
+        return [sparse, tail, tiny, h].map { a -> MLXArray in
+            let b = a.asType(.bfloat16)
+            return (b * b).asType(.bfloat16)
+        } + NemotronSharedDownZSkip.realisticRows(seed: seed)
     }
 
     /// The record's top-six reduce of `products` output: [1, rows, 2688] BF16.
@@ -3329,9 +3509,27 @@ enum NemotronSharedDownZSkip {
         return copy
     }
 
-    /// The shared-down kernel that reads `copy`'s decode codes.
+    /// The shared-down kernel that reads `copy`'s decode codes (its SIMD-group staging twin once admitted).
     fileprivate static func kernel(for copy: Copy) -> MLXFast.MLXFastKernel? {
-        copy.wide ? wideKernel : kernel
+        recordKernel(for: copy, simdStage: NemotronZSkipSimdStage.active && NemotronZSkipSimdStage.sharedEnabled)
+    }
+    fileprivate static func recordKernel(for copy: Copy, simdStage: Bool) -> MLXFast.MLXFastKernel? {
+        if simdStage, let twin = copy.wide ? wideKernelSG : kernelSG { return twin }
+        return copy.wide ? wideKernel : kernel
+    }
+    fileprivate static let kernelSG: MLXFast.MLXFastKernel? = source.flatMap(nemotronZSkipSimdStage).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_shared_down_tiled_fast_sg",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    fileprivate static let wideKernelSG: MLXFast.MLXFastKernel? = wideSource.flatMap(nemotronZSkipSimdStage).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_shared_down_wide_sg",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
     }
 
     /// `copy` without its wide codes: the tile-major kernels' copy.
@@ -4510,7 +4708,10 @@ extension NemotronU2 {
                let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16) {
                 let rows = (MLXRandom.normal([22, 2688], key: MLXRandom.key(0x52a7)) * 0.5).asType(.bfloat16)
                 for route in 0 ..< 22 {
-                    let inds = MLXArray((0 ..< 6).map { UInt32((route * 6 + $0) % 128) })
+                    let inds = MLXArray((0 ..< 6).map { (j: Int) -> UInt32 in
+                        let flat: Int = route * 6 + j
+                        return UInt32(flat % 128)
+                    })
                     let x = rows[route ..< route + 1]
                     for relu2 in [false, true] {
                         let a = NemotronMoELeader.apply(x, inds, rows: 1, topK: 6, bank: up, perSlot: false,
@@ -4534,5 +4735,6 @@ extension NemotronU2 {
         inProj = admit(.inProj) { NemotronMambaInProjConvDt.u2Check(target) }
         self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }
         draft = admit(.draft) { draftCheck(head) }
+        sharedUp = admit(.sharedUp) { NemotronHeadPreparedActivation.u2CheckSharedUp(target) }
     }
 }
