@@ -239,11 +239,23 @@ extension NemotronHMoE {
         } else {
             packed = nil
         }
+        var y: MLXArray
+        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
+        let colaunch = products && NemotronFC2SharedColaunch.enabled
+            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         // Router matmul retains M=1. Gathered experts already have M=1 per
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
         let scores: MLXArray
-        if NemotronMTPExecution.batchedRouter {
+        if NemotronMTPExecution.batchedRouter, let colaunch, let packed,
+           NemotronSharedUpPacking.unpackedApplies(colaunch.x, up: colaunch.mlp.upProj, down: colaunch.mlp.downProj),
+           let fused = NemotronRouterSharedUpColaunch.run(x, gate: gate, up: colaunch.mlp.upProj, prepared: packed) {
+            // The router and the shared up in one launch; the shared up rows
+            // feed the shared down launch below.
+            indices = fused.indices
+            scores = fused.weights
+            colaunch.up = fused.up
+        } else if NemotronMTPExecution.batchedRouter {
             let routed = gate.mtpForwardRows(x)
             indices = routed.0
             scores = routed.1
@@ -252,10 +264,6 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
-        var y: MLXArray
-        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
-        let colaunch = products && NemotronFC2SharedColaunch.enabled
-            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
             y = reduced
@@ -1326,6 +1334,8 @@ enum NemotronMoELeader {
 
     /// unroll: the unrolled main loops (nil: `fc1Unroll` once qualified); the
     /// record kernel stands in whenever its unrolled twin is missing.
+    static let fc1Twice = ProcessInfo.processInfo.environment["NEMOTRON_FC1_TWICE"] != "0"
+
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
         prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
@@ -1354,16 +1364,25 @@ enum NemotronMoELeader {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
         let nsg = (bank.n / rps) % fc1SimdGroups == 0 ? fc1SimdGroups : 2
-        let activation = kernel(
-            useDict
-                ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
-                : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
-                   NemotronBankBinding.bind(bank.biases), packed, inds],
-            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
-                       ("K", bank.k), ("N", bank.n), ("XSLOT", false),
-                       ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, bank.n / rps, 18), threadGroup: (32, nsg, 1),
-            outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+        func launch(_ act: MLXArray) -> MLXArray {
+            kernel(
+                useDict
+                    ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, act, inds]
+                    : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+                       NemotronBankBinding.bind(bank.biases), act, inds],
+                template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+                           ("K", bank.k), ("N", bank.n), ("XSLOT", false),
+                           ("RELU2", relu2), ("RPS", rps)],
+                grid: (32, bank.n / rps, 18), threadGroup: (32, nsg, 1),
+                outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+        }
+        var activation = launch(packed)
+        // NEMOTRON_FC1_TWICE (default on): the same launch runs a second time on the same operands, ordered after
+        // the first through a `depends` input; the second launch's output (the same values) is used.
+        if fc1Twice {
+            let ordered = MLX.depends(inputs: [activation, packed], dependencies: [activation])
+            activation = launch(ordered[1])
+        }
         guard selfTest else { return activation }
         let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
             perSlot: false, relu2: relu2, prepared: packed)
@@ -1454,7 +1473,7 @@ enum NemotronMoELeader {
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
         _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, products: Bool = false,
-        colaunch: NemotronFC2SharedColaunch.Shared? = nil
+        colaunch: NemotronFC2SharedColaunch.Shared? = nil, after: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -1511,7 +1530,8 @@ enum NemotronMoELeader {
         }
         if products, let prod = rows == 3
             ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
-            : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
+            : (rows == 1 ? NemotronZSkip.draftProducts(
+                after.map { depends(input: act, dependencies: [$0]) } ?? act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -3493,6 +3513,10 @@ enum NemotronFC2SharedColaunch {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH"] != "0"
         && !NemotronMoELeader.selfTest
     private static let sharedFirst = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH_SD_FIRST"] != "0"
+    /// Unless NEMOTRON_MTP_SD_EARLY=0, a covered layer runs the two separate launches the co-launch was checked
+    /// against, and the routed slot products take the shared rows as a dependency: MLX then encodes the shared
+    /// down beside the routed FC1 and the shared up beside the router.
+    private static let early = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SD_EARLY"] != "0"
     private static let slots = 18
     private static let sharedRows = 3
 
@@ -3503,6 +3527,8 @@ enum NemotronFC2SharedColaunch {
         let x: MLXArray
         let prepared: MLXArray?
         var rows: MLXArray? = nil
+        /// The shared up ReLU² rows when `NemotronRouterSharedUpColaunch` already produced them.
+        var up: MLXArray? = nil
         init(mlp: NemotronHMLP, x: MLXArray, prepared: MLXArray?) {
             self.mlp = mlp
             self.x = x
@@ -3515,9 +3541,15 @@ enum NemotronFC2SharedColaunch {
                     shared: Shared) -> MLXArray? {
         let down = shared.mlp.downProj
         guard covers(fc2: fc2, down: down),
-              let sx = NemotronSharedUpPacking.unpackedActivation(
-                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared),
-              let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
+              let sx = shared.up ?? NemotronSharedUpPacking.unpackedActivation(
+                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared) else { return nil }
+        if early, let rows = NemotronSharedDownZSkip.run(sx, owner: down),
+           let prod = NemotronZSkip.weightedProducts(
+               depends(input: x, dependencies: [rows]), inds, scores, owner: fc2) {
+            shared.rows = rows
+            return prod
+        }
+        guard let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
         shared.rows = pair.1
         return pair.0
     }
