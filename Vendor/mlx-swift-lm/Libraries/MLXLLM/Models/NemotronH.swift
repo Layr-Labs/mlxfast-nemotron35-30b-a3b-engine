@@ -8865,6 +8865,11 @@ private class NemotronHBackbone: Module {
             hidden = result.0
             preparedNorm = result.1
             preparedActivation = result.2
+            if let norm = preparedNorm, let activation = preparedActivation,
+               let copied = NemotronVerifyLayerCopy.apply(norm, activation) {
+                preparedNorm = copied.0
+                preparedActivation = copied.1
+            }
             // Submit after the listed layers (or on the interval) so the GPU
             // runs the verify while the host builds the rest of the chunk
             // (evaluation order only).
@@ -8880,6 +8885,41 @@ private class NemotronHBackbone: Module {
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
         return (preparedNorm!, preparedActivation)
+    }
+}
+
+/// Captured verify only: after every layer, one more launch copies the
+/// layer's normalized rows and prepared activation, and the next layer reads
+/// the copies. Every value is unchanged (element copies).
+/// NEMOTRON_VERIFY_LAYER_COPY=0 skips it.
+enum NemotronVerifyLayerCopy {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_VERIFY_LAYER_COPY"] != "0"
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_verify_layer_copy",
+        inputNames: ["a", "b"],
+        outputNames: ["a_out", "b_out"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i < NA) {
+                a_out[i] = a[i];
+            }
+            if (i < NB) {
+                b_out[i] = b[i];
+            }
+            """,
+        ensureRowContiguous: true)
+
+    static func apply(_ a: MLXArray, _ b: MLXArray) -> (MLXArray, MLXArray)? {
+        guard enabled, a.dtype == .bfloat16, b.dtype == .float32 else { return nil }
+        let na = a.size
+        let nb = b.size
+        let n = max(na, nb)
+        let outputs = kernel([a, b],
+            template: [("NA", na), ("NB", nb)],
+            grid: ((n + 255) / 256 * 256, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [a.shape, b.shape], outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
     }
 }
 
