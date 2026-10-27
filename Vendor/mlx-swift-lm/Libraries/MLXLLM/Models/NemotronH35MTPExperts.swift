@@ -2197,6 +2197,53 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+// The dictionary slot source with the pair index read from its 12-bit form
+// (`nemotronZSkipPackedIndex`): per (tile, group) 128 low bytes, then 64 bytes
+// of high nibbles (output 2j in the low nibble of byte j, 2j + 1 in the high).
+// A lane's four indices load as one 4-byte word of low bytes and one 2-byte
+// word of high nibbles; each rebuilt index is the uint16 index's value, so the
+// table entries, `sv`, `bv` and every product are unchanged.
+// Nil when the dictionary source no longer has the expected statements.
+private func nemotronZSkipDictPackedSource(_ source: String) -> String? {
+    guard var s = nemotronZSkipDictSource(source) else { return nil }
+    let pointer = "  const device uint16_t* sq = (const device uint16_t*)sk + tb * groups * OT + 4 * lid;\n"
+    guard s.components(separatedBy: pointer).count == 2 else { return nil }
+    s = s.replacingOccurrences(of: pointer, with:
+        "  const device uint8_t* sq = (const device uint8_t*)sk + tb * groups * (OT + OT / 2);\n")
+    var replaced = 0
+    for indent in ["      ", "        "] {
+        let from = indent + "const uint2 ir = *((const device uint2*)(sq + gi * OT));\n"
+            + indent + "const float2 e0 = sbt[ir.x & 0xffffu];\n"
+            + indent + "const float2 e1 = sbt[ir.x >> 16];\n"
+            + indent + "const float2 e2 = sbt[ir.y & 0xffffu];\n"
+            + indent + "const float2 e3 = sbt[ir.y >> 16];\n"
+        let to = indent + "const device uint8_t* nmq_ip = sq + gi * (OT + OT / 2);\n"
+            + indent + "const uint nmq_lo = *((const device uint*)(nmq_ip + 4 * lid));\n"
+            + indent + "const uint nmq_hi = uint(*((const device ushort*)(nmq_ip + OT + 2 * lid)));\n"
+            + indent + "const float2 e0 = sbt[(nmq_lo & 0xffu) | ((nmq_hi & 0xfu) << 8)];\n"
+            + indent + "const float2 e1 = sbt[((nmq_lo >> 8) & 0xffu) | ((nmq_hi & 0xf0u) << 4)];\n"
+            + indent + "const float2 e2 = sbt[((nmq_lo >> 16) & 0xffu) | (nmq_hi & 0xf00u)];\n"
+            + indent + "const float2 e3 = sbt[(nmq_lo >> 24) | ((nmq_hi & 0xf000u) >> 4)];\n"
+        replaced += s.components(separatedBy: from).count - 1
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    guard replaced > 0, !s.contains("ir."), !s.contains("sq + gi * OT)") else { return nil }
+    return s
+}
+
+/// A tile-major uint16 pair index [..., 128] (every value below 4096) in the
+/// 12-bit form the packed slot sources read: [..., 192] uint8, the 128 low
+/// bytes then the 64 bytes of high-nibble pairs.
+func nemotronZSkipPackedIndex(_ index: MLXArray) -> MLXArray {
+    let i = index.asType(.uint32)
+    let lo = (i & MLXArray(UInt32(0xff))).asType(.uint8)
+    var shape = index.shape
+    shape[shape.count - 1] = 64
+    let hi = (i >> MLXArray(UInt32(8))).reshaped(shape + [2])
+    let pairs = (hi[.ellipsis, 0] | (hi[.ellipsis, 1] << MLXArray(UInt32(4)))).asType(.uint8)
+    return concatenated([lo, pairs], axis: -1)
+}
+
 // The record's top-six reduce: products of one row in slot order.
 private let nemotronZSkipReduceSource = """
   const uint n = thread_position_in_grid.x;
@@ -2269,6 +2316,8 @@ enum NemotronZSkip {
         /// The tile-major biases, or with `dict` the bank's FP32 pair table.
         let biases: MLXArray
         var dict = false
+        /// With `dict`: `scales` holds the pair index in 12 bits (`nemotronZSkipPackedIndex`).
+        var packed = false
     }
 
     fileprivate static let lock = NSLock()
@@ -2377,6 +2426,26 @@ enum NemotronZSkip {
     private static var dictKernel: MLXFast.MLXFastKernel? {
         fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
     }
+    private static let tiledDictPackedSlotKernel = nemotronZSkipDictPackedSource(nemotronZSkipTiledSeqSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_sbd12", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static let tiledFastDictPackedSlotKernel = nemotronZSkipDictPackedSource(nemotronZSkipTiledFastSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd12", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            outputNames: ["prod"], source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    /// The slot kernel that reads a dictionary copy with a 12-bit pair index.
+    private static var dictPackedKernel: MLXFast.MLXFastKernel? {
+        fast ? tiledFastDictPackedSlotKernel : tiledDictPackedSlotKernel
+    }
+    /// NEMOTRON_MTP_ZSKIP_PACKED=0 keeps the uint16 pair index in the copies.
+    static let packedIndex = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_PACKED"] != "0"
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
     /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
     /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
@@ -2423,6 +2492,11 @@ enum NemotronZSkip {
             }
             if sbDict, dictKernel != nil,
                let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
+                // Fewer than 4097 pairs: the index in 12 bits (`nemotronZSkipPackedIndex`).
+                if packedIndex, dictPackedKernel != nil, d.table.dim(0) <= 4096 {
+                    return Copy(codes: codes, scales: nemotronZSkipPackedIndex(tileMajor(d.index)), biases: d.table,
+                                dict: true, packed: true)
+                }
                 return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
             }
             return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
@@ -2448,7 +2522,7 @@ enum NemotronZSkip {
                                  copy: Copy, rows: Int) -> MLXArray {
         let slots = rows * 6
         let threads = 32 * sgs
-        return (copy.dict ? dictKernel! : kernel)(
+        return (copy.packed ? dictPackedKernel! : copy.dict ? dictKernel! : kernel)(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores],
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
@@ -2577,7 +2651,7 @@ enum NemotronZSkip {
         lock.withLock { draftCopies = built }
         let dicts = built.values.filter(\.dict).count
         FileHandle.standardError.write(
-            Data("nemotron draft zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+            Data("nemotron draft zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, \(built.values.filter(\.packed).count) with 12-bit indices\n".utf8))
     }
 
     /// Seeded one-row cases against the production R = 1 kernel: sparse rows
@@ -2660,7 +2734,7 @@ enum NemotronZSkip {
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
             FileHandle.standardError.write(
-                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
+                Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries, \(built.values.filter(\.packed).count) with 12-bit indices\n".utf8))
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
@@ -2778,6 +2852,10 @@ enum NemotronSharedDownZSkip {
     nonisolated(unsafe) fileprivate static var inds: MLXArray? = nil
     static var copyArrays: [MLXArray] {
         lock.withLock { copies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
+    }
+    /// The verified copy of `down` (a target layer's shared down projection), if any.
+    static func copyArrays(for down: Linear) -> (codes: MLXArray, scales: MLXArray, biases: MLXArray)? {
+        lock.withLock { copies[ObjectIdentifier(down)].map { ($0.codes, $0.scales, $0.biases) } }
     }
 
     private static func admissible(_ q: QuantizedLinear) -> Bool {
@@ -2988,6 +3066,8 @@ enum NemotronFC2SharedColaunch {
                                           fc2: nemotronZSkipTiledFastSource)
     private static let dictKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd",
                                          fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+    private static let dictPackedKernel = make("nemotron_zskip_fc2_shared_down_tiled_fast_sbd12",
+                                               fc2: nemotronZSkipDictPackedSource(nemotronZSkipTiledFastSource))
 
     private static let lock = NSLock()
     /// Routed FC2 owner -> its layer's shared down owner, for layers whose co-launch matched.
@@ -2996,7 +3076,7 @@ enum NemotronFC2SharedColaunch {
     /// The kernel that runs `copy`'s slot body today, or nil when the routed side is not the fast tiled kernel.
     private static func kernel(for copy: NemotronZSkip.Copy) -> MLXFast.MLXFastKernel? {
         guard NemotronZSkip.tiled, NemotronZSkip.fast else { return nil }
-        return copy.dict ? dictKernel : plainKernel
+        return copy.packed ? dictPackedKernel : copy.dict ? dictKernel : plainKernel
     }
 
     private static func dispatch(
@@ -3633,6 +3713,25 @@ enum NemotronSBDict {
     /// Every admitted draft-head index and table (decode-only backing for the head's residency set).
     static var draftArrays: [MLXArray] {
         lock.withLock { draftDicts.values.flatMap { [$0.index, $0.table] } }
+    }
+
+    /// `arrays` without the scales and biases of the head's routed banks that have an admitted dictionary: the
+    /// head's routed experts run only one-row draft steps, whose dictionary twin binds the bank's codes, index
+    /// and table, so those scales and biases are not decode backing. NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY=1
+    /// keeps them.
+    static func withoutDictBankMetadata(_ arrays: [MLXArray], module: Module) -> [MLXArray] {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY"] != "1" else { return arrays }
+        var skip = Set<ObjectIdentifier>()
+        for (_, m) in module.namedModules() {
+            guard let linear = m as? SwitchLinear, draftDict(linear) != nil else { continue }
+            for (key, a) in linear.parameters().flattened() where key == "scales" || key == "biases" {
+                skip.insert(ObjectIdentifier(a))
+            }
+        }
+        let kept = arrays.filter { !skip.contains(ObjectIdentifier($0)) }
+        FileHandle.standardError.write(Data(
+            "nemotron head residency: \(arrays.count - kept.count) dictionary bank scale/bias arrays left out\n".utf8))
+        return kept
     }
 
     /// The admitted routed-bank indices (for `NemotronBankBinding.warm`: addressed from their base).
