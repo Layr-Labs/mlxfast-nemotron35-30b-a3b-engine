@@ -794,6 +794,62 @@ enum CBv2AttentionV1 {
             spanContext: nil, keepMask: nil)
     }
 
+
+    /// Typed-payload counterpart of updateAndAttendSerialQueryRows. Only
+    /// the pure attention result changes representation; row.update and
+    /// all eligibility/sink/window/fallback rules are the same statements.
+    static func updateAndTransformSerialQueryRows<Output>(
+        row: CBv2SequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        attendTransform: ((MLXArray, MLXArray, MLXArray, Float) -> Output?)? = nil,
+        transformRows: ([MLXArray]) -> Output
+    ) -> Output {
+        precondition(
+            queries.dim(0) == 1 && queries.dim(2) > 1,
+            "CBv2AttentionV1: serial query rows serve one row with L > 1")
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if let attendTransform, window(of: kind) == nil, effectiveSinks == nil, softcap == nil,
+           let output = attendTransform(queries, cachedKeys, cachedValues, scale) {
+            return output
+        }
+        return transformRows(queryBlockOutputs(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: 1,
+            spanContext: nil, keepMask: nil))
+    }
+
+    /// Typed-payload counterpart of attendSerialQueryRowsWritten. The same
+    /// commitInPlaceAppend retains the dependency on the Q/K/V producer.
+    static func transformSerialQueryRowsWritten<Output>(
+        row: CBv2FullSequenceKV, kind: CBv2LayerKind,
+        queries: MLXArray, written: MLXArray,
+        scale: Float, sinks: MLXArray?, softcap: Float?,
+        attendTransform: ((MLXArray, MLXArray, MLXArray, Float) -> Output?)? = nil,
+        transformRows: ([MLXArray]) -> Output
+    ) -> Output {
+        precondition(
+            queries.dim(0) == 1 && queries.dim(2) > 1,
+            "CBv2AttentionV1: serial query rows serve one row with L > 1")
+        let effectiveSinks = dispatchSinks(
+            sinks, kind: kind, queries: queries, softcap: softcap)
+        let L = queries.dim(2)
+        let (cachedKeys, cachedValues) = row.commitInPlaceAppend(count: L, written: written)
+        if let attendTransform, window(of: kind) == nil, effectiveSinks == nil, softcap == nil,
+           let output = attendTransform(queries, cachedKeys, cachedValues, scale) {
+            return output
+        }
+        return transformRows(queryBlockOutputs(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            newTokenCount: L, window: window(of: kind), scale: scale,
+            sinks: effectiveSinks, softcap: softcap, blockSize: 1,
+            spanContext: nil, keepMask: nil))
+    }
+
     /// One query at a time — the pinned MTP serial-verification path.
     private static func attendSerialQueries(
         queries: MLXArray, keys: MLXArray, values: MLXArray,

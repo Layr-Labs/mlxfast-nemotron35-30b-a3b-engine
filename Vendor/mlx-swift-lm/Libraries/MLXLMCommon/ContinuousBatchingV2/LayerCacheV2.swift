@@ -239,6 +239,49 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         return outputs
     }
 
+
+    /// The serial-query state transition above, with a typed attention
+    /// payload. A producer may pass consumer-ready data without exporting
+    /// raw attention rows; the model performs its projection after return.
+    /// Offset advancement still follows attention and precedes projection.
+    public func updateAndTransformSerialQueryRows<Output>(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?,
+        attendTransform: ((MLXArray, MLXArray, MLXArray, Float) -> Output?)? = nil,
+        transformRows: ([MLXArray]) -> Output
+    ) -> Output? {
+        guard kind.sharesKVWithLayer == nil, mtpSerializesRectangularAttention,
+              rows.count == 1, queries.ndim == 4, queries.dim(0) == 1, queries.dim(2) > 1,
+              attentionSoftcap == nil, attentionMetadata == nil, attentionPacket == nil,
+              boundSpanContexts?.contains(where: { $0 != nil }) != true
+        else { return nil }
+        let output = CBv2AttentionV1.updateAndTransformSerialQueryRows(
+            row: rows[0], kind: kind,
+            queries: queries, keys: keys, values: values,
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            attendTransform: attendTransform, transformRows: transformRows)
+        advancePositionOffsets(by: queries.dim(2))
+        return output
+    }
+
+    /// The corresponding in-place append transition: commit behind the
+    /// original written dependency, advance once, and return the payload.
+    public func transformSerialQueryRowsWritten<Output>(
+        queries: MLXArray, written: MLXArray, scale: Float, sinks: MLXArray?,
+        attendTransform: ((MLXArray, MLXArray, MLXArray, Float) -> Output?)? = nil,
+        transformRows: ([MLXArray]) -> Output
+    ) -> Output {
+        guard let row = rows[0] as? CBv2FullSequenceKV else {
+            preconditionFailure("CBv2LayerCache: in-place KV append on a non-contiguous row")
+        }
+        let output = CBv2AttentionV1.transformSerialQueryRowsWritten(
+            row: row, kind: kind, queries: queries, written: written,
+            scale: scale, sinks: sinks, softcap: attentionSoftcap,
+            attendTransform: attendTransform, transformRows: transformRows)
+        advancePositionOffsets(by: queries.dim(2))
+        return output
+    }
+
     /// Final-layer prompt specialization (see LastQueryPrefillV2.swift):
     /// commit the whole chunk's K/V, attend only its newest query row.
     /// Offsets advance by the K/V length, NOT the query length — the chunk
