@@ -14,6 +14,102 @@ extension NemotronHMLP {
     }
 }
 
+/// MLX keeps each thread's compiled-graph cache apart (thread-local), and a request's engine queue may run on a pool
+/// thread that has never called the verify's or the draft head's compiled graphs: its first decode round then traces
+/// and compiles every one of them on the host. The compiled-graph caches note each call that traced, with the graph's
+/// entry (`Token`), its compiled function and the argument shapes and dtypes. Before the engine's step thread waits on
+/// a readback (the request prefill's, while the GPU runs it), `run` calls every noted graph that this thread has not
+/// traced, on lazy zero inputs of the noted signature, and drops the outputs unevaluated: graph construction and
+/// compilation only, no value is computed. NEMOTRON_ENGINE_PRETRACE=0 disables it.
+enum NemotronPretrace {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_ENGINE_PRETRACE"] != "0"
+
+    /// One compiled function: one cache entry.
+    final class Token: @unchecked Sendable {}
+
+    private struct Argument: Hashable {
+        let shape: [Int]
+        let dtype: DType
+    }
+    private struct Key: Hashable {
+        let token: ObjectIdentifier
+        let arguments: [Argument]
+    }
+    private struct Record {
+        let token: Token
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+        let arguments: [Argument]
+        /// The verify MoE graph's `NemotronZSkip.needsOriginal` state, which its trace reads (nil: none).
+        let needsOriginal: Bool?
+    }
+    private final class ThreadState {
+        var traces = 0
+        var version = -1
+        var done = Set<Key>()
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var records: [Key: Record] = [:]
+    nonisolated(unsafe) private static var version = 0
+    private static let threadKey = "nemotron.pretrace"
+
+    private static var thread: ThreadState {
+        let dictionary = Thread.current.threadDictionary
+        if let state = dictionary[threadKey] as? ThreadState { return state }
+        let state = ThreadState()
+        dictionary[threadKey] = state
+        return state
+    }
+
+    /// Inside a compile closure: MLX traces the graph on this thread.
+    static func traced() {
+        if enabled { thread.traces += 1 }
+    }
+
+    /// `function(arguments)`; a call that traced on this thread notes its signature. `needsOriginal`: the
+    /// `NemotronZSkip.needsOriginal` state the graph is traced under (the verify MoE graphs), replayed by `run`.
+    static func call(_ function: @escaping @Sendable ([MLXArray]) -> [MLXArray], token: Token,
+                     _ arguments: [MLXArray], needsOriginal: Bool? = nil) -> [MLXArray] {
+        guard enabled else { return function(arguments) }
+        let state = thread
+        let before = state.traces
+        let result = function(arguments)
+        if state.traces != before {
+            let signature = arguments.map { Argument(shape: $0.shape, dtype: $0.dtype) }
+            let key = Key(token: ObjectIdentifier(token), arguments: signature)
+            state.done.insert(key)
+            lock.withLock {
+                if records[key] == nil {
+                    records[key] = Record(token: token, function: function, arguments: signature,
+                                          needsOriginal: needsOriginal)
+                    version += 1
+                }
+            }
+        }
+        return result
+    }
+
+    /// Trace every noted graph that this thread has not traced; see `NemotronPretrace`.
+    static func run() {
+        guard enabled else { return }
+        let state = thread
+        guard let (seen, all) = lock.withLock({ () -> (Int, [(Key, Record)])? in
+            state.version == version ? nil : (version, records.map { ($0.key, $0.value) })
+        }) else { return }
+        for (key, record) in all where !state.done.contains(key) {
+            let inputs = record.arguments.map { MLXArray.zeros($0.shape, dtype: $0.dtype) }
+            if let needsOriginal = record.needsOriginal {
+                NemotronZSkip.tracing(needsOriginal: needsOriginal) {
+                    _ = call(record.function, token: record.token, inputs, needsOriginal: needsOriginal)
+                }
+            } else {
+                _ = call(record.function, token: record.token, inputs)
+            }
+            state.done.insert(key)
+        }
+        state.version = seen
+    }
+}
+
 /// Stateless graph cache only. Request KV, recurrent state, offsets and
 /// transactions must never be captured by this helper.
 final class NemotronH35MTPGraphCache {
@@ -21,6 +117,7 @@ final class NemotronH35MTPGraphCache {
         let identity: [ObjectIdentifier]
         let usesPrepared: Bool
         let function: @Sendable ([MLXArray]) -> [MLXArray]
+        let token = NemotronPretrace.Token()
     }
     private let lock = NSLock()
     private var entries: [Entry?] = Array(repeating: nil, count: 16)
@@ -60,6 +157,7 @@ final class NemotronH35MTPGraphCache {
             if let entry = entries[slot], entry.identity == identity { return entry }
             let state = (parameters ?? owner.innerState()) + (joins ? [nextNorm!.weight] : [])
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
+                NemotronPretrace.traced()
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 let outputs = owner.mtpForwardRowsUncompiledOutputs(arrays[0],
                     prepared: usesPrepared ? arrays[1] : nil, parts: parts)
@@ -81,7 +179,9 @@ final class NemotronH35MTPGraphCache {
         // evaluation owns a separate global/per-function lock ordering.
         var arguments = prepared.map { [x, $0] } ?? [x]
         if let residual, joins { arguments.append(residual) }
-        return withExtendedLifetime(retired) { current.function(arguments) }
+        return withExtendedLifetime(retired) {
+            NemotronPretrace.call(current.function, token: current.token, arguments, needsOriginal: slot & 4 != 0)
+        }
     }
 
     func recordJoinCheck() {
@@ -2300,7 +2400,18 @@ enum NemotronZSkip {
         lock.withLock { copyReady = [:]; roundOriginal = [] }
     }
     static func needsOriginal(_ owner: SwitchLinear) -> Bool {
-        lock.withLock { roundOriginal.contains(ObjectIdentifier(owner)) }
+        lock.withLock {
+            if let trace = traceOverride, pthread_equal(trace.thread, pthread_self()) != 0 { return trace.value }
+            return roundOriginal.contains(ObjectIdentifier(owner))
+        }
+    }
+    nonisolated(unsafe) private static var traceOverride: (thread: pthread_t, value: Bool)?
+    /// `NemotronPretrace` replays a verify MoE graph traced under `needsOriginal`: meanwhile `needsOriginal` returns
+    /// that value on this thread, so the replayed trace takes the same route as the call it replays.
+    static func tracing(needsOriginal value: Bool, _ body: () -> Void) {
+        lock.withLock { traceOverride = (pthread_self(), value) }
+        defer { lock.withLock { traceOverride = nil } }
+        body()
     }
     static func decodeCopyOwners(_ model: Module) -> [ObjectIdentifier] {
         let supported = lock.withLock { Set(copies.keys) }

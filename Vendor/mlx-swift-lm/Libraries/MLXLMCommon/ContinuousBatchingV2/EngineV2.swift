@@ -115,6 +115,9 @@ final class CBv2EngineGauges: @unchecked Sendable {
 /// Request-independent work a model library starts when an engine is built (installed once at load).
 public enum CBv2EngineInitHooks {
     nonisolated(unsafe) public static var onInit: (() -> Void)?
+    /// Called on the engine's step thread right before it waits on the readback of an in-flight step that is not
+    /// an MTP verify round (a request prefill or seed step).
+    nonisolated(unsafe) public static var beforeReadback: (() -> Void)?
 }
 
 public final class EngineV2: CBv2Engine, @unchecked Sendable {

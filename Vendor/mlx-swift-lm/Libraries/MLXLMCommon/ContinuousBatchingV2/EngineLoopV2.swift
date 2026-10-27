@@ -2247,6 +2247,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // the plan sees confirmed tokens and post-stop membership.
         if let previous = inFlight {
             inFlight = nil
+            // Host work while the GPU still runs `previous` (see `CBv2EngineInitHooks`): a request prefill or
+            // seed step, never a verify round.
+            if previous.mtpRound?.verify == nil { CBv2EngineInitHooks.beforeReadback?() }
             finalize(previous, now: stepNow)
         }
         // Apply the rollback path's deferred lease rewinds now that the

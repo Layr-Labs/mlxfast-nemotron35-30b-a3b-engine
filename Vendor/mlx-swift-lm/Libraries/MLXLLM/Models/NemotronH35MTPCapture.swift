@@ -120,6 +120,7 @@ final class NemotronH35MTPCompactGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
+        let token = NemotronPretrace.Token()
     }
     private static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
@@ -180,6 +181,7 @@ final class NemotronH35MTPCompactGraphCache {
             let state = owner.innerState() + (joins ? [nextNorm!.weight] : [])
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
+                NemotronPretrace.traced()
                 guard let owner else { preconditionFailure("Released Nemotron MTP Mamba-window owner") }
                 let base = pendingSteps > 0 ? 5 : 3
                 let values = owner.mtpCompactArrays(
@@ -199,7 +201,7 @@ final class NemotronH35MTPCompactGraphCache {
             return replacement
         }
         let result = withExtendedLifetime(retired) {
-            current.function([hidden, convState, initialSSM]
+            NemotronPretrace.call(current.function, token: current.token, [hidden, convState, initialSSM]
                 + (pending.map { [$0.conv, $0.dt] } ?? []) + (prepared.map { [$0] } ?? [])
                 + (joins ? [residual!] : []))
         }

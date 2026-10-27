@@ -400,6 +400,7 @@ private final class NemotronH35MTPDraftFrontCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
+        let token = NemotronPretrace.Token()
     }
     private static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_DRAFT_FRONT"] != "0"
@@ -428,6 +429,7 @@ private final class NemotronH35MTPDraftFrontCache {
             let state = modules.dropFirst().flatMap { $0.innerState() }
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
+                NemotronPretrace.traced()
                 guard let owner else { preconditionFailure("Released Nemotron MTP draft-front owner") }
                 return owner.uncompiledDraftFront(hidden: arrays[0], embedding: arrays[1])
             }
@@ -436,7 +438,9 @@ private final class NemotronH35MTPDraftFrontCache {
             entry = replacement
             return replacement
         }
-        let result = withExtendedLifetime(retired) { current.function([hidden, embedding]) }
+        let result = withExtendedLifetime(retired) {
+            NemotronPretrace.call(current.function, token: current.token, [hidden, embedding])
+        }
         return result.count == 2 ? result
             : owner.uncompiledDraftFront(hidden: hidden, embedding: embedding)
     }
@@ -517,6 +521,7 @@ private final class NemotronH35MTPOneTokenTailCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
         let function: @Sendable ([MLXArray]) -> [MLXArray]
+        let token = NemotronPretrace.Token()
     }
     private let lock = NSLock()
     private var entries: [Entry?] = [nil, nil, nil]
@@ -538,6 +543,7 @@ private final class NemotronH35MTPOneTokenTailCache {
             let state = parameters ?? owner.innerState()
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
+                NemotronPretrace.traced()
                 guard let owner else { preconditionFailure("Released Nemotron MTP expert-tail owner") }
                 switch mode {
                 case 0: return [owner.uncompiledOneTokenTail(arrays[0])]
@@ -552,7 +558,9 @@ private final class NemotronH35MTPOneTokenTailCache {
         }
         // The compiler has its own locks; retire old entries after releasing
         // this cache lock, including when a module tree has been replaced.
-        let result = withExtendedLifetime(retired) { current.function(inputs) }
+        let result = withExtendedLifetime(retired) {
+            NemotronPretrace.call(current.function, token: current.token, inputs)
+        }
         guard result.count == 1 else {
             switch mode {
             case 0: return owner.uncompiledOneTokenTail(inputs[0])
