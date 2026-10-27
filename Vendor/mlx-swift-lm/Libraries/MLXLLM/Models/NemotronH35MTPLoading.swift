@@ -109,6 +109,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillDirectFC1.qualifyDict(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
+        NemotronPrefillSharedDownCopy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
         NemotronPrefillDtxDecay4.qualify()
         NemotronPrefillScanExp.qualify()
@@ -401,9 +402,6 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// With `NemotronPrefillFC2Copy` verified, a MoE layer's routed fc2 bank is replaced in its group by
     /// that layer's decode copy (codes, pair index, pair table): the request prefill reads the copy, the
     /// decode reads the copy, and nothing in the request reads the bank.
-    /// NEMOTRON_RESIDENCY_SPLIT_EXPERTS=0 keeps one set per backbone layer.
-    static let splitExpertGroups = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_SPLIT_EXPERTS"] != "0"
-
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
         var copies: [Int: [MLXArray]] = [:]
         if NemotronPrefillFC2Copy.verified {
@@ -427,34 +425,41 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 fc1Dicts[n] = [d.index, d.table]
             }
         }
-        // With `splitExpertGroups` a MoE layer's group is three consecutive sets in the order the request
-        // prefill reads them: the layer's own small arrays (router, shared expert, norms), its routed fc1
-        // (bank words and their scale/bias form), then its routed fc2 (the decode copy when verified).
-        let split = Self.splitExpertGroups
-        func key(_ layer: Int, _ part: Int) -> Int { split ? 3 * layer + part : layer }
-        var groups: [Int: [MLXArray]] = [:]
-        for (path, a) in model.parameters().flattened() {
-            let parts = path.split(separator: ".")
-            var g = Int.max
-            var layer: Int? = nil
-            if parts.contains("embeddings") { g = split ? -3 : -1 }
-            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) {
-                layer = n
-                g = key(n, 0)
+        // With `NemotronPrefillSharedDownCopy.verified`, the request prefill's shared down reads the layer's
+        // shared-down decode copy (as the verify does) instead of the dense weights.
+        var sharedCopies: [Int: [MLXArray]] = [:]
+        if NemotronPrefillSharedDownCopy.verified {
+            for (name, module) in model.namedModules() {
+                let parts = name.split(separator: ".")
+                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
+                      let moe = module as? NemotronHMoE, let down = moe.sharedExperts?.downProj,
+                      let c = NemotronSharedDownZSkip.copyArrays(for: down) else { continue }
+                sharedCopies[n] = [c.codes, c.scales, c.biases]
             }
-            if let n = layer, let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
-                if parts[s + 1] == "fc2" {
-                    if copies[n] != nil { continue }
-                    g = key(n, 2)
-                } else if parts[s + 1] == "fc1" {
-                    if fc1Dicts[n] != nil, parts[s + 2] == "scales" || parts[s + 2] == "biases" { continue }
-                    g = key(n, 1)
+        }
+        var groups: [Int: [MLXArray]] = [:]
+        for (key, a) in model.parameters().flattened() {
+            let parts = key.split(separator: ".")
+            var g = Int.max
+            if parts.contains("embeddings") { g = -1 }
+            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
+            if sharedCopies[g] != nil, let s = parts.firstIndex(of: "shared_experts"), s + 1 < parts.count,
+               parts[s + 1] == "down_proj" {
+                continue
+            }
+            if let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
+                if copies[g] != nil, parts[s + 1] == "fc2" { continue }
+                if fc1Dicts[g] != nil, parts[s + 1] == "fc1", parts[s + 2] == "scales" || parts[s + 2] == "biases" {
+                    continue
                 }
             }
             groups[g, default: []].append(a)
         }
-        for (n, arrays) in copies { groups[key(n, 2), default: []].append(contentsOf: arrays) }
-        for (n, arrays) in fc1Dicts { groups[key(n, 1), default: []].append(contentsOf: arrays) }
+        for (g, arrays) in copies { groups[g, default: []].append(contentsOf: arrays) }
+        for (g, arrays) in fc1Dicts { groups[g, default: []].append(contentsOf: arrays) }
+        for (g, arrays) in sharedCopies { groups[g, default: []].append(contentsOf: arrays) }
+        FileHandle.standardError.write(Data(
+            "nemotron target residency: \(sharedCopies.count) MoE shared down projections replaced by their decode copies\n".utf8))
         FileHandle.standardError.write(Data(
             "nemotron target residency: \(fc1Dicts.count) MoE fc1 scales/biases replaced by their pair dictionaries\n".utf8))
         FileHandle.standardError.write(Data(
@@ -634,7 +639,5 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 
 // Second measurement of 208838c4.
 // e-man07: third measurement of c28 (b550b079, 2dbff4f2).
-
-// Measurement entry 2 of this tree.
 
 // Measurement entry 2 of this tree.

@@ -5123,13 +5123,14 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
             return nemotronR1Linear(activated.reshaped(1, 1, 3712), downProj)
         }
         // Request prefill: up projection and relu2 in one launch (`NemotronPrefillSharedUpGather`).
+        // Request prefill: the down projection reads the decode copy (`NemotronPrefillSharedDownCopy`).
         if let activated = NemotronPrefillSharedUpGather.apply(x, upProj) {
-            return downProj(activated)
+            return NemotronPrefillSharedDownCopy.apply(activated, downProj) ?? downProj(activated)
         }
         let up = upProj(x)
         // Request prefill: the stock relu2 in one launch (`NemotronPrefillSharedRelu2`).
         if let activated = NemotronPrefillSharedRelu2.apply(up) {
-            return downProj(activated)
+            return NemotronPrefillSharedDownCopy.apply(activated, downProj) ?? downProj(activated)
         }
         return downProj(relu2(up))
     }
@@ -7493,7 +7494,7 @@ enum NemotronPrefillFC2Copy {
     /// Columns per threadgroup (each of the two SIMD groups across N takes half).
     static let columns = Int(ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY_BN"] ?? "") ?? 64
 
-    private static let header: String = nemotronRunGatherHeader + "\n" + #"""
+    static let header: String = nemotronRunGatherHeader + "\n" + #"""
 // Nemotron: the run gather reading the routed fc2 tile-major decode copy
 // (codes, pair index and pair table) instead of the bank. tiles[t] = (first sorted row, rows <= BM, expert). Every
 // tile holds exactly one expert segment, so the stock segment loop collapses
@@ -7825,6 +7826,141 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
         }
         report(verified ? "on (\(checked) cases bitwise equal, every MoE layer in the first)"
                         : "off (outputs differ from the bank run gather after \(checked) cases)")
+    }
+}
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`) shared-expert down
+/// projection: the run gather of `NemotronPrefillFC2Copy` over a single
+/// "expert" (as `NemotronPrefillSharedUpGather` runs the shared up), reading the
+/// layer's shared-down zero-skip decode copy (`NemotronSharedDownZSkip`:
+/// tile-major codes with tile-major BF16 scales and biases) instead of the
+/// dense weights. Its loader widens each group's BF16 scale and bias to FP32
+/// (the values the fc2 copy's pair table holds) and otherwise runs the fc2 copy
+/// loader's statements, so the threadgroup weight block, A loads, K loop and
+/// NAX MMA sequence are the run gather's. The verify already reads the copy
+/// (co-launched with the routed fc2), so with this on nothing in the request
+/// reads the dense shared down, and the decode residency maps the copy in its
+/// place (`NemotronDecodeResidency.targetGroups`). `qualify` compares it with
+/// `downProj(x)` bit for bit on every MoE layer's shared down with seeded
+/// relu2-like rows. NEMOTRON_PREFILL_SHARED_DOWN_COPY=0 keeps the dense weights.
+enum NemotronPrefillSharedDownCopy {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_DOWN_COPY"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// The fc2 copy loader with the pair lookup replaced by the copy's BF16 scale and bias.
+    private static let header: String? = {
+        let swaps: [(String, String)] = [
+            ("METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(",
+             "METAL_FUNC void nemotron_gather_qmm_runs_copy_sb_impl("),
+            ("    const device uint16_t* sidx,\n    const device float* table,\n",
+             "    const device T* sk,\n    const device T* bk,\n"),
+            ("  const device uint16_t* cl_idx = sidx\n      + (size_t(index)",
+             "  const size_t cl_sb = (size_t(index)"),
+            ("      const uint pair = uint(cl_idx[o]);\n      const float s = table[2 * pair];\n      const float b = table[2 * pair + 1];\n",
+             "      const float s = float(cl_s[o]);\n      const float b = float(cl_b[o]);\n"),
+            ("        cl_idx += 128;\n",
+             "        cl_s += 128;\n        cl_b += 128;\n"),
+        ]
+        var source = NemotronPrefillFC2Copy.header
+        for (old, new) in swaps {
+            guard source.components(separatedBy: old).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: old, with: new)
+        }
+        let pointers = "* size_t(K / group_size) * 128 + (cl_n % 128);\n"
+        guard source.components(separatedBy: pointers).count == 2 else { return nil }
+        return source.replacingOccurrences(of: pointers, with: pointers
+            + "  const device T* cl_s = sk + cl_sb;\n  const device T* cl_b = bk + cl_sb;\n")
+    }()
+
+    private static let kernel = header.map { header in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_shared_down_copy",
+            inputNames: ["x", "wk", "sk", "bk", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                nemotron_gather_qmm_runs_copy_sb_impl<T, GS, BITS, BM, BN, BK, 2, 2, true, true, false>(
+                    x, wk, sk, bk, tiles, y, N, K, Ws,
+                    threadgroup_position_in_grid,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            """,
+            header: header)
+    }
+
+    static func apply(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active else { return nil }
+        return launch(x, down)
+    }
+
+    private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
+              type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              let copy = NemotronSharedDownZSkip.copyArrays(for: down)
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
+              copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+              copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
+              copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
+        else { return nil }
+        // Row tiles of 64 over the request's tokens, at least three descriptors
+        // (as `NemotronPrefillSharedUpGather`); a zero-row descriptor is skipped.
+        let used = (rows + 63) / 64
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
+        }
+        let tiles = MLXArray(desc).reshaped(count, 3)
+        let y = kernel(
+            [x.reshaped(rows, 1, k), copy.codes, copy.scales, copy.biases, tiles, nOut, k],
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", 64), ("BN", 64), ("BK", 64)],
+            grid: ((nOut / 64) * 128, count, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(1, rows, nOut)
+    }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill shared down copy: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather else { return report("off (setting)") }
+        guard kernel != nil else { return report("off (kernel source)") }
+        let downs = target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }
+        guard let first = downs.first, downs.allSatisfy({ NemotronSharedDownZSkip.copyArrays(for: $0) != nil })
+        else { return report("off (not every shared down has a decode copy)") }
+        var checked = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, rows) in [488, 488, 300, 97, 17].enumerated() {
+                    let k = first.weight.dim(1) * 8
+                    var a = MLXRandom.normal([1, rows, k], scale: 2, key: MLXRandom.key(UInt64(0x5d0c_0000 + index)))
+                    if index != 1 {
+                        // ReLU2-like rows: mostly exact zeros.
+                        a = MLX.maximum(a - 1.5, MLXArray(Float(0)))
+                        a = a * a
+                    }
+                    let x = a.asType(.bfloat16)
+                    for down in (index == 0 ? downs : [first]) {
+                        guard let fused = launch(x, down) else { return false }
+                        let stock = down(x)
+                        let same = (fused.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all()
+                        if !same.item(Bool.self) { return false }
+                    }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            return report("off (\(error))")
+        }
+        report(verified ? "on (\(checked) cases bitwise equal, every MoE layer in the first)"
+                        : "off (outputs differ from the quantized matmul after \(checked) cases)")
     }
 }
 

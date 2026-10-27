@@ -484,7 +484,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     func prepareDecodeResidency() {
         if #available(macOS 15.0, *) {
             decodeResidency = NemotronDecodeResidency(
-                head: NemotronZSkip.withoutCopiedDraftBanks(module)
+                head: NemotronSBDict.withoutDictBankMetadata(NemotronZSkip.withoutCopiedDraftBanks(module), module: module)
                     + draftHead.decodeResidencyArrays + NemotronSBDict.draftArrays,
                 layers: NemotronZSkip.decodeCopyLayers(target), owners: NemotronZSkip.decodeCopyOwners(target),
                 target: NemotronDecodeResidency.targetGroups(target),
