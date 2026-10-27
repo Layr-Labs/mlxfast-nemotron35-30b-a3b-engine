@@ -359,3 +359,129 @@ final class NemotronMTPReplayGroup {
             steps: keep, writeOutput: false).finalState)
     }
 }
+
+
+// Four SIMD groups share the CB producer work as 16x32 rows each, before
+// the original scan consumer phase. The record uses two 32x32 producers.
+// TN stays 2, so tile_matmad_nax still calls the same 16x32x16 MMA in the
+// same K order for each output. All barriers and As[64*33] ownership stay.
+enum NemotronPrefillCBBalanced {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_CB_SIMD4"] != "0"
+    nonisolated(unsafe) private static var ready = false
+    static var active: Bool { enabled && ready }
+
+    private static func source(_ record: String) -> String {
+        nemotronSwapped(record, [
+            ("if (k0 <= m0 + 63 && sg < 2) {", "if (k0 <= m0 + 63) {", 1),
+            ("const int rowBase = m0 + 32 * int(sg);", "const int rowBase = m0 + 16 * int(sg);", 1),
+            ("NAXTile<float, 2, 2> Ct;", "NAXTile<float, 1, 2> Ct;", 1),
+            ("NAXTile<CBT, 2, 2> At;", "NAXTile<CBT, 1, 2> At;", 1),
+            ("At.load_safe(cw + rowBase * cs1 + kk, cs1, short2(32, short(max(0, min(32, L - rowBase)))));",
+             "At.load_safe(cw + rowBase * cs1 + kk, cs1, short2(32, short(max(0, min(16, L - rowBase)))));", 1),
+            ("for (short fm = 0; fm < 2; ++fm) {", "for (short fm = 0; fm < 1; ++fm) {", 1),
+            ("const thread typename NAXTile<float, 2, 2>::frag_type& cf = Ct.frag_at(fm, fn);",
+             "const thread typename NAXTile<float, 1, 2>::frag_type& cf = Ct.frag_at(fm, fn);", 1),
+            ("CBs[(32 * int(sg) + fm * 16 + int(csc.y) + ii * 8) * 33 + fn * 16 + int(csc.x) + u]",
+             "CBs[(16 * int(sg) + fm * 16 + int(csc.y) + ii * 8) * 33 + fn * 16 + int(csc.x) + u]", 1),
+        ])
+    }
+
+    static let kernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_scan_decay_gemm_dt_cb_simd4",
+        inputNames: ["dtA", "Cw", "Bw", "dtv", "XW", "L"], outputNames: ["y", "last"],
+        source: source(NemotronPrefillScanDecayGemm.source(mode: 0, dtFromX: true, cbFused: true)),
+        header: nemotronRunGatherHeader, ensureRowContiguous: false)
+    static let freshKernel = MLXFast.metalKernel(
+        name: "nemotron_ssm_scan_decay_gemm_fresh_out_dt_cb_simd4",
+        inputNames: ["dtA", "Cw", "Bw", "dtv", "XW", "L", "ec", "X", "Dw"], outputNames: ["o", "last"],
+        source: source(NemotronPrefillScanDecayGemm.source(mode: 1, dtFromX: true, cbFused: true)),
+        header: nemotronRunGatherHeader, ensureRowContiguous: false)
+
+    private enum Refusal: Error { case failed(String) }
+
+    /// Explicit record CB producers vs balanced producers in both modes,
+    /// including short tails and the wide-row/second-window views used by
+    /// the actual convolution front. Only the official remote worker runs it.
+    static func qualify() throws {
+        ready = false
+        guard enabled else { return }
+        guard NemotronPrefillScanDecayGemm.cbVerified,
+              NemotronPrefillScanDecayGemm.dtVerified, NemotronPrefillDtFromX.verified,
+              Device.defaultDevice().deviceType == .gpu else {
+            throw Refusal.failed("CB reference family unavailable")
+        }
+        let (h, g, dh, ds) = (64, 8, 64, 128)
+        var cases = 0
+        try withError { () -> Void in
+            for (seed, shape) in [(256, 232, 488), (256, 17, 273), (64, 17, 81)].enumerated() {
+                let (n1, n, length) = shape
+                for pattern in 0..<4 {
+                    let key = MLXRandom.split(
+                        key: MLXRandom.key(UInt64(0xcb54_0000 + seed * 32 + pattern)), into: 6)
+                    let dtA = -MLX.abs(MLXRandom.normal([1, length, h], key: key[0])) * Float(0.05)
+                    let dt = MLX.abs(MLXRandom.normal([1, length, h], key: key[1])) * Float(0.1)
+                    var wide = MLXRandom.normal([1, length, h * dh + 2 * g * ds + 5], key: key[2])
+                        .asType(.bfloat16)
+                    if pattern == 1 {
+                        wide = which(abs(wide) .< 0.4, MLXArray(Float(0)).asType(.bfloat16), wide)
+                    }
+                    if pattern == 2 { wide = MLXArray.zeros(wide.shape, dtype: .bfloat16) }
+                    if pattern == 3 { wide = -abs(wide) }
+                    let x = wide[0..., 0..., 0..<(h * dh)].reshaped(1, length, h, dh)
+                    let b = wide[0..., 0..., (h * dh)..<(h * dh + g * ds)].reshaped(1, length, g, ds)
+                    let c = wide[0..., 0..., (h * dh + g * ds)..<(h * dh + 2 * g * ds)]
+                        .reshaped(1, length, g, ds)
+                    let dtx = dt.reshaped(1, length, h, 1) * x
+                    let ec = MLX.exp(-MLX.abs(MLXRandom.normal([1, length, h], key: key[3])))
+                    let d = MLXRandom.normal([h], key: key[4]).asType(.bfloat16)
+                    func s3(_ a: MLXArray, _ start: Int, _ count: Int) -> MLXArray {
+                        a[0..., start..<(start + count), 0...]
+                    }
+                    func s4(_ a: MLXArray, _ start: Int, _ count: Int) -> MLXArray {
+                        a[0..., start..<(start + count), 0..., 0...]
+                    }
+                    func run(_ balanced: Bool, _ fresh: Bool) throws -> [MLXArray] {
+                        let start = fresh ? 0 : n1
+                        let count = fresh ? n1 : n
+                        // Both explicit CB paths consume C/B, not this shape-only
+                        // original-CB placeholder; no stock CB matmul is evaluated.
+                        let cbShape = MLXArray.zeros([1, g, count, count], dtype: .bfloat16)
+                        let dtX = (dt: s3(dt, start, count), x: s4(x, start, count))
+                        let cb = (C: s4(c, start, count), B: s4(b, start, count))
+                        if fresh {
+                            guard let v = NemotronPrefillScanDecayGemm.launchFresh(
+                                dtA: s3(dtA, start, count), CB: cbShape, dtx: s4(dtx, start, count),
+                                n: count, h: h, g: g, dh: dh, ec: s3(ec, start, count), x: x, D: d,
+                                lt: count, dtX: dtX, cb: cb, balanced: balanced) else {
+                                throw Refusal.failed("fresh shape")
+                            }
+                            return [v.o, v.last]
+                        }
+                        guard let v = NemotronPrefillScanDecayGemm.launch(
+                            dtA: s3(dtA, start, count), CB: cbShape, dtx: s4(dtx, start, count),
+                            n: count, b: 1, h: h, g: g, dh: dh, dtX: dtX, cb: cb,
+                            balanced: balanced) else { throw Refusal.failed("plain shape") }
+                        return [v.y, v.last]
+                    }
+                    for fresh in [true, false] {
+                        let a = try run(false, fresh)
+                        eval(a)
+                        let b = try run(true, fresh)
+                        eval(b)
+                        for (u, v) in zip(a, b) {
+                            let word: DType = u.dtype == .float32 ? .uint32 : .uint16
+                            guard (u.view(dtype: word) .== v.view(dtype: word)).all().item(Bool.self) else {
+                                throw Refusal.failed("CB words seed\(seed) pattern\(pattern) fresh\(fresh)")
+                            }
+                        }
+                        cases += 1
+                    }
+                }
+            }
+            guard cases == 24 else { throw Refusal.failed("CB case coverage") }
+        }
+        ready = true
+        FileHandle.standardError.write(
+            Data("nemotron CB SIMD4: \(cases) explicit record/balanced cases exact\n".utf8))
+    }
+}
