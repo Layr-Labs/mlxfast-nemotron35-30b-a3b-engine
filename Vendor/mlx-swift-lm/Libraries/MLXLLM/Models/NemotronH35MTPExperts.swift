@@ -2333,6 +2333,70 @@ private let nemotronZSkipTiledFastSource = """
   }
 """
 
+// NEMOTRON_MTP_ZSKIP_TWO_PHASE: the fast tiled slot kernel's closing reduction in two phases of 64
+// outputs through a half-size partial array (32 x 65 floats instead of 32 x 129), so the threadgroup holds
+// about 12 KB of threadgroup memory instead of 20 KB. Each lane keeps its LPS x 4 partials in registers;
+// lanes 0-15 (outputs 0-63) store theirs first, every SIMD group sums its four outputs of that half with
+// the same `simd_sum` over the 32 lane-partials l = 0 ... 31 (lane l reads partial l of the output), then
+// lanes 16-31 do the same for outputs 64-127. Every partial, its value and the order of each closing
+// reduction are the one-phase kernel's; only which SIMD group stores which output and the two added
+// threadgroup barriers change. Nil when the source no longer has the expected statements.
+private func nemotronZSkipTwoPhaseSource(_ source: String) -> String? {
+    let swaps: [(String, String)] = [
+        ("  threadgroup float part[32 * PS];\n",
+         "  constexpr int PH = OT / 2 + 1;\n  threadgroup float part[32 * PH];\n  thread U pk[LPS][4];\n"),
+        ("      part[l * PS + 4 * lid + o] = p[o];\n", "      pk[ll][o] = p[o];\n"),
+        ("""
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int q = 0; q < OT / SGS; q++) {
+            const int n = sg * (OT / SGS) + q;
+            const U r = simd_sum(part[lid * PS + n]);
+            if (lid == 0) {
+              const T h = nml_store<T, false>(r);
+              prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;
+            }
+          }
+
+        """, """
+          for (int hp = 0; hp < 2; hp++) {
+            if (hp == 1) {
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if ((lid >> 4) == hp) {
+              for (int ll = 0; ll < LPS; ll++) {
+                const int l = sg + SGS * ll;
+                for (int o = 0; o < 4; o++) {
+                  part[l * PH + 4 * (lid & 15) + o] = pk[ll][o];
+                }
+              }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int q = 0; q < OT / 2 / SGS; q++) {
+              const int nh = sg * (OT / 2 / SGS) + q;
+              const U r = simd_sum(part[lid * PH + nh]);
+              if (lid == 0) {
+                const int n = hp * (OT / 2) + nh;
+                const T h = nml_store<T, false>(r);
+                prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;
+              }
+            }
+          }
+
+        """),
+    ]
+    var s = source
+    for (old, new) in swaps {
+        guard s.components(separatedBy: old).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    return s
+}
+private let nemotronZSkipTwoPhase = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TWO_PHASE"] != "0"
+/// The fast tiled slot kernels' source: the two-phase closing reduction when enabled and it applies.
+private let nemotronZSkipTiledFastSlotSource = nemotronZSkipTwoPhase
+    ? (nemotronZSkipTwoPhaseSource(nemotronZSkipTiledFastSource) ?? nemotronZSkipTiledFastSource)
+    : nemotronZSkipTiledFastSource
+
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
 // tile-major uint16 pair index (one per group and output) and `bk` the bank's
@@ -2814,7 +2878,7 @@ enum NemotronZSkip {
         ensureRowContiguous: true)
     private static let tiledFastSlotKernel = MLXFast.metalKernel(
         name: "nemotron_zskip_fc2_slots_tiled_fast", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
-        outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
+        outputNames: ["prod"], source: nemotronZSkipTiledFastSlotSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
     private static let tiledDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledSeqSource).map {
@@ -2824,7 +2888,7 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSlotSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
             outputNames: ["prod"], source: $0,
@@ -2841,10 +2905,10 @@ enum NemotronZSkip {
     private static let tiledFastSlotKernelDep = MLXFast.metalKernel(
         name: "nemotron_zskip_fc2_slots_tiled_fast_dep",
         inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
-        outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
+        outputNames: ["prod"], source: nemotronZSkipTiledFastSlotSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
-    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSlotSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
             inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
