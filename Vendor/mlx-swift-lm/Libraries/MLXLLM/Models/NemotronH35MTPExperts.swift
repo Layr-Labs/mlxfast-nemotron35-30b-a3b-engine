@@ -1141,8 +1141,19 @@ enum NemotronMoELeader {
     static let narrowLeader =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW"] != "0"
     static func leaderResultsPerSimdgroup(rows: Int) -> Int {
-        narrowLeader && rows == 3 ? 2 : 4
+        if narrowLeader && rows == 3 { return 2 }
+        return rows == 1 && narrowDraftQualified ? 2 : 4
     }
+    /// The R = 1 leader QMV (the draft tail's routed FC1, every MTP round) at
+    /// two outputs per SIMD group instead of four, the narrow geometry the
+    /// R = 3 leader already uses: twice the SIMD groups over the same outputs.
+    /// Only the output-to-SIMD-group map moves; each output keeps its lane
+    /// split, K order, products, closing simd_sum and store.
+    /// NEMOTRON_MTP_MOE_NARROW_R1=0 keeps four. Selected only after
+    /// `qualifyNarrowDraft` found it bit for bit equal to the four-output kernel.
+    static let narrowDraft =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_NARROW_R1"] != "0"
+    nonisolated(unsafe) private(set) static var narrowDraftQualified = false
     static let selfTest = nemotronKernelSelfTestBuild
         || ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 
@@ -1182,8 +1193,8 @@ enum NemotronMoELeader {
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
                       prepared: MLXArray? = nil, tail8: Bool = false,
-                      dict: NemotronSBDict.Dict? = nil) -> MLXArray {
-        let rps = leaderResultsPerSimdgroup(rows: rows)
+                      dict: NemotronSBDict.Dict? = nil, rpsOverride: Int? = nil) -> MLXArray {
+        let rps = rpsOverride ?? leaderResultsPerSimdgroup(rows: rows)
         if preparedGateUp, rows == 3, !perSlot, bank.k % 64 == 0, bank.k % 512 != 0,
            let kernel = NemotronMoELeaderPreparedKernels.shared.gateUp {
             let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
@@ -1427,6 +1438,53 @@ enum NemotronMoELeader {
         fc1UnrollQualified = true
         FileHandle.standardError.write(Data(
             "nemotron fc1 unroll on: \(layers) routed FC1 banks, plan-free triple FC1 bitwise equal to the record kernel\n".utf8))
+    }
+
+    /// Load time, after the draft head's pair dictionaries: the R = 1 leader
+    /// QMV at two outputs per SIMD group against four, bit for bit, on every
+    /// routed FC1 bank of the draft head (without and with its pair
+    /// dictionary) and of the target's first two MoE layers, both tail forms
+    /// and both ReLU2 forms. Any difference keeps four outputs.
+    static func qualifyNarrowDraft(_ target: Module, draft: Module) {
+        guard enabled else { return }
+        guard narrowDraft else {
+            FileHandle.standardError.write(Data("nemotron narrow draft leader: off (setting)\n".utf8))
+            return
+        }
+        let route = MLXArray([UInt32](arrayLiteral: 3, 17, 42, 77, 100, 121))
+        var same = MLXArray(true)
+        var checks = 0
+        func compare(_ mlp: NemotronHSwitchMLP, dict: NemotronSBDict.Dict?, seed: UInt64) {
+            guard type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+                  let up = bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+                  up.weight.shape == [128, 1856, 336], up.n % 4 == 0 else { return }
+            let x = (MLXRandom.normal([1, 2688], key: MLXRandom.key(seed)) * 0.5).asType(.bfloat16)
+            for tail8 in [false, true] {
+                for relu2 in [false, true] {
+                    let a = apply(x, route, rows: 1, topK: 6, bank: up, perSlot: false,
+                                  relu2: relu2, tail8: tail8, dict: dict, rpsOverride: 4)
+                    let b = apply(x, route, rows: 1, topK: 6, bank: up, perSlot: false,
+                                  relu2: relu2, tail8: tail8, dict: dict, rpsOverride: 2)
+                    same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                    checks += 1
+                }
+            }
+        }
+        for mlp in draft.modules().compactMap({ $0 as? NemotronHSwitchMLP }) {
+            compare(mlp, dict: nil, seed: 0x7a11_0001)
+            if let d = NemotronSBDict.draftDict(mlp.fc1) { compare(mlp, dict: d, seed: 0x7a11_0002) }
+        }
+        for (i, mlp) in target.modules().compactMap({ $0 as? NemotronHSwitchMLP }).prefix(2).enumerated() {
+            compare(mlp, dict: nil, seed: 0x7a11_0100 + UInt64(i))
+        }
+        guard checks > 0, same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "nemotron narrow draft leader off: \(checks > 0 ? "differs from four outputs" : "no routed FC1 bank ran")\n".utf8))
+            return
+        }
+        narrowDraftQualified = true
+        FileHandle.standardError.write(Data(
+            "nemotron narrow draft leader on: \(checks) R = 1 leader checks bitwise equal at two outputs per SIMD group\n".utf8))
     }
 
     /// Same leader pairs as apply(), with separate FP32 products and the
