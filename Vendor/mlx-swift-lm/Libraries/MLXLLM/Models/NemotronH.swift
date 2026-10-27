@@ -1566,6 +1566,62 @@ enum NemotronHCompactSSMGated {
             ? "on (normalized rows, prepared activation and state bitwise equal, 0 and 2 pending steps)"
             : "off (differs from the record launch)")
     }
+    /// Official-load proof for the private gate-only projection ABI. The
+    /// original shader and all four result buffers are compared at both PS.
+    static func qualifyGateProjection(_ mixer: NemotronHMamba2Mixer) -> Bool {
+        guard enabled, rowsTailQualified, let counter, let plain = rowsKernel,
+              let folded = rowsPendingKernel, mixer.numHeads == 64,
+              mixer.headDim == 64, mixer.numGroups == 8, mixer.ssmStateSize == 128,
+              mixer.convDim == 6144 else { return false }
+        do {
+            return try withError { () -> Bool in
+                for steps in 0 ... NemotronMTPPendingSSM.maxSteps {
+                    for (index, scale) in [Float(0.03), 1, 4].enumerated() {
+                        let keys = MLXRandom.split(
+                            key: MLXRandom.key(UInt64(0x6700 + steps * 16 + index)), into: 6)
+                        let conv = MLXRandom.normal([1, 3, 6144], scale: scale, key: keys[0]).asType(.bfloat16)
+                        let dt = MLXRandom.uniform(Float(0.001) ..< 0.5, [1, 3, 64], key: keys[1])
+                        let state = MLXRandom.normal([1, 64, 64, 128], key: keys[2]) * Float(0.1)
+                        let full = MLXRandom.normal([1, 3, 10304], scale: scale, key: keys[3]).asType(.bfloat16)
+                        let gate = MLX.contiguous(full[0..., 0..., 0 ..< 4096])
+                        let pconv = steps > 0
+                            ? MLXRandom.normal([1, steps, 6144], scale: scale, key: keys[4]).asType(.bfloat16) : nil
+                        let pdt = steps > 0
+                            ? MLXRandom.uniform(Float(0.001) ..< 0.5, [1, steps, 64], key: keys[5]) : nil
+                        func run(_ projection: MLXArray, stride: Int) -> [MLXArray] {
+                            var inputs: [any ScalarOrArray] = [conv, mixer.aLog, mixer.D, dt, state,
+                                projection, mixer.norm.weight, NemotronHGatedRMSKernel.identity,
+                                mixer.norm.eps, counter]
+                            var template: [(String, any KernelTemplateArg)] = [
+                                ("T", DType.bfloat16), ("U", DType.float32), ("Dh", 64), ("Ds", 128),
+                                ("H", 64), ("G", 8), ("L", 3), ("CD", 6144), ("BO", 4096),
+                                ("CO", 5120), ("PS", stride)]
+                            if steps > 0 {
+                                inputs += [pconv!, pdt!]
+                                template.append(("P", steps))
+                            }
+                            return (steps == 0 ? plain : folded)(inputs, template: template,
+                                grid: (32, 64, 64), threadGroup: (32, 8, 1),
+                                outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128],
+                                               [1, 3, 4096], [3, 8, 17 * 32]],
+                                outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
+                        }
+                        let a = run(full, stride: 10304), b = run(gate, stride: 4096)
+                        eval(a + b)
+                        for (u, v) in zip(a, b) {
+                            let type: DType = u.dtype == .float32 ? .uint32 : .uint16
+                            if !(u.view(dtype: type) .== v.view(dtype: type)).all().item(Bool.self) {
+                                return false
+                            }
+                        }
+                        guard counter.max().item(UInt32.self) == 0 else { return false }
+                    }
+                }
+                return true
+            }
+        } catch { return false }
+    }
+
     /// Per-norm-group arrival counters; every launch leaves them at zero.
     /// `counter` is a mutable input, so MLX's encoder orders any two launches
     /// that share it (a barrier), even without a data edge between them.
@@ -1589,7 +1645,7 @@ extension NemotronHRMSNormGated {
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil, shuffle: Bool? = nil,
-        rowsTail: Bool? = nil
+        rowsTail: Bool? = nil, gateOnlyProjection: Bool = false
     ) -> (MLXArray, MLXArray, MLXArray)? {
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
@@ -1605,7 +1661,7 @@ extension NemotronHRMSNormGated {
               convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
               dt.dtype == .float32, dt.shape == [1, 3, 64],
               state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              projected.shape == [1, 3, gateOnlyProjection ? 4096 : 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16
         else { return nil }
         // Created and evaluated at load (`prepareCounter`), never inside a
@@ -1617,7 +1673,7 @@ extension NemotronHRMSNormGated {
         var template: [(String, any KernelTemplateArg)] = [
             ("T", DType.bfloat16), ("U", DType.float32),
             ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
-            ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
+            ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", gateOnlyProjection ? 4096 : 10304)]
         let tail = shuffle ?? NemotronHCompactSSMGated.shuffleQualified
         // The one-barrier tail (NEMOTRON_SSM_TAIL_ONE_BARRIER) once qualified; `shuffle` set by a load-time
         // check keeps the kernel it names unless `rowsTail` asks for the one-barrier one.

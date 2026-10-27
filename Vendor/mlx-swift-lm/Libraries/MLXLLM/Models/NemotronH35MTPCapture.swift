@@ -437,11 +437,52 @@ extension NemotronHMamba2Mixer {
     /// Return its replay tape explicitly; staging/commit stay outside compile.
     /// `inputPrepared`: in_proj's K=2688 activation, prepared by the preceding
     /// join from these exact BF16 rows (otherwise prepared here).
+    /// Private early path with no unused xBC/dt projection materialization.
+    /// All old full-projection APIs/checks and fallback remain below.
+    func mtpCompactGateOnlyArrays(
+        _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
+        prepared inputPrepared: MLXArray? = nil,
+        pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil,
+        qualifying: Bool = false
+    ) -> [MLXArray]? {
+        guard NemotronMambaInProjGateOnly.enabled,
+              qualifying || NemotronMambaInProjGateOnly.verified,
+              !NemotronMambaInProjConvDt.check, !NemotronMoELeader.selfTest,
+              NemotronMTPExecution.batchedNorm, NemotronHCompactSSMGated.rowsTailQualified,
+              hiddenStates.shape == [1, 3, 2688], hiddenStates.dtype == .bfloat16,
+              intermediateSize == 4096, convDim == 6144,
+              numHeads == 64, headDim == 64, numGroups == 8, ssmStateSize == 128,
+              convKernelSize == 4, conv1d.groups == convDim,
+              conv1d.stride == 1, conv1d.dilation == 1, conv1d.padding == 0,
+              let cb = conv1d.bias, let qi = inProj as? QuantizedLinear,
+              let qo = outProj as? QuantizedLinear, qo.mode == .affine,
+              qo.bits == 4, qo.groupSize == 64, qo.bias == nil,
+              qo.weight.shape == [2688, 512], qo.weight.dtype == .uint32,
+              qo.scales.shape == [2688, 64], qo.scales.dtype == .bfloat16,
+              qo.biases?.shape == [2688, 64], qo.biases?.dtype == .bfloat16,
+              let thin = NemotronMambaInProjGateOnly.apply(
+                  hiddenStates.reshaped(3, 2688), qi, prepared: inputPrepared,
+                  oldState: convState, convWeight: conv1d.weight, convBias: cb,
+                  dtBias: dtBias, timeStepLimit: timeStepLimit, qualifying: qualifying),
+              let fused = norm.compactSSMPreparedRows(
+                  convolution: thin.convolution, ALog: aLog, D: D, dt: thin.dt,
+                  state: initialSSM, projected: thin.gate.reshaped(1, 3, 4096),
+                  heads: numHeads, headDim: headDim, groups: numGroups,
+                  stateDim: ssmStateSize, pending: pending, gateOnlyProjection: true)
+        else { return nil }
+        return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
+                thin.padded, thin.convolution, thin.dt, fused.2]
+    }
+
     func mtpCompactArrays(
         _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
         prepared inputPrepared: MLXArray? = nil,
         pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
     ) -> [MLXArray] {
+        if let thin = mtpCompactGateOnlyArrays(hiddenStates, convState: convState,
+            initialSSM: initialSSM, prepared: inputPrepared, pending: pending) {
+            return thin
+        }
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         // The window's conv, padded history and timestep come from in_proj's
         // own epilogue when the shapes allow it (same values, one launch fewer).

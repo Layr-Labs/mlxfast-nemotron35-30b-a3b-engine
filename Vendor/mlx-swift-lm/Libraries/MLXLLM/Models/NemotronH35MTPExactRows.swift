@@ -903,6 +903,269 @@ enum NemotronMambaInProjConvDt {
     }
 }
 
+
+/// Private native verify ABI: materialize only the gate prefix of in_proj.
+/// Conv/history/dt consume the same register words; the public full-projection
+/// producer and all old admissions remain unchanged.
+private let nemotronGateOnlyOriginalStoreLoop = """
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
+      }
+    }
+  }
+"""
+private let nemotronGateOnlyStoreLoop = """
+  const int nmc_row = int(simd_lid) / R;
+  T nmc_y[R];
+  #pragma clang loop unroll(full)
+  for (int r = 0; r < R; r++) {
+    nmc_y[r] = static_cast<T>(0);
+  }
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        if (out_row + row < CS) y[r * CS + out_row + row] = h;
+      }
+      if (nmc_row == row) {
+        T hc = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(hc) ? hc : (hc > zero ? hc : zero);
+          hc = m * m;
+        }
+        nmc_y[r] = hc;
+      }
+    }
+  }
+"""
+private let nemotronGateOnlyEpilogue = """
+
+  // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). Its
+  // row's BF16 outputs are in nmc_y, kept by the store loop above.
+  {
+    const int l = int(simd_lid);
+    if (l < results_per_simdgroup * R) {
+      const int row = l / R;
+      const int t = l % R;
+      const int o = out_row + row;
+      T yt = nmc_y[0];
+      #pragma clang loop unroll(full)
+      for (int s = 1; s < R; ++s) {
+        yt = t == s ? nmc_y[s] : yt;
+      }
+      if (o >= CS && o < CS + CC) {
+        const int64_t channel = int64_t(o - CS);
+        if (t < 3) {
+          padded[int64_t(t) * CC + channel] =
+              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        }
+        padded[(int64_t(t) + 3) * CC + channel] = yt;
+        float acc = 0;
+        for (int i = 0; i < 4; ++i) {
+          int64_t crow = int64_t(t) + int64_t(i);
+          T value = nmc_y[0];
+          if (crow < 3) {
+            value = oldState[crow * oldState_strides[1] + channel * oldState_strides[2]];
+          } else {
+            #pragma clang loop unroll(full)
+            for (int s = 1; s < R; ++s) {
+              value = crow - 3 == int64_t(s) ? nmc_y[s] : value;
+            }
+          }
+          acc += static_cast<float>(value)
+              * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+        }
+        T convolved = static_cast<T>(acc);
+        T xc = convolved + cb[channel * cb_strides[0]];
+        auto yc = 1 / (1 + metal::exp(metal::abs(xc)));
+        T sigmoid = xc < 0 ? yc : 1 - yc;
+        conv[int64_t(t) * CC + channel] = xc * sigmoid;
+      } else if (o >= DS && o < DS + NH) {
+        const int head = o - DS;
+        float v = static_cast<float>(yt)
+            + static_cast<float>(dtBias[int64_t(head) * dtBias_strides[0]]);
+        float sp;
+        if (metal::isnan(v)) {
+          sp = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(v, 0.0f);
+          float minval = metal::min(v, 0.0f);
+          sp = (minval == -inf || maxval == inf)
+              ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        float lo = dtLo;
+        float hi = dtHi;
+        float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+        dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+      }
+    }
+  }
+"""
+
+private func nemotronGateOnlySource() -> String? {
+    let pointer = "device T* yp = y + out_row;"
+    guard nemotronHeadPreparedQMVSource.components(separatedBy: nemotronGateOnlyOriginalStoreLoop).count == 2,
+          nemotronHeadPreparedQMVSource.components(separatedBy: pointer).count == 2 else { return nil }
+    return nemotronHeadPreparedQMVSource
+        .replacingOccurrences(of: nemotronGateOnlyOriginalStoreLoop, with: nemotronGateOnlyStoreLoop)
+        .replacingOccurrences(of: pointer, with: "// Gate output uses a guarded CS stride and direct y address.")
+        + nemotronGateOnlyEpilogue
+}
+
+enum NemotronMambaInProjGateOnly {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_GATE_ONLY"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+    private static func make(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        guard enabled, let source else { return nil }
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"], source: source,
+            header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    private static let source = nemotronGateOnlySource()
+    private static let dictionary = source.flatMap { nemotronSBDictSource($0) }
+    private static let plain = make("nemotron_mamba_gate_only", source)
+    private static let dict = make("nemotron_mamba_gate_only_sbd", dictionary)
+    private static let unrolled = make("nemotron_mamba_gate_only_u2",
+        nemotronU2Source(source, loop: NemotronU2.qmvLoop, count: 1))
+    private static let dictUnrolled = make("nemotron_mamba_gate_only_sbd_u2",
+        nemotronU2Source(dictionary, loop: NemotronU2.qmvLoop, count: 1))
+
+    static func apply(
+        _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
+        oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
+        dtBias: MLXArray, timeStepLimit: (Float, Float), qualifying: Bool = false
+    ) -> (gate: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
+        guard enabled, qualifying || verified, NemotronMambaInProjConvDt.enabled,
+              let plain, let dict, let unrolled, let dictUnrolled,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              x.ndim == 2, x.shape == [3, 2688], x.dtype == .bfloat16,
+              type(of: q) == QuantizedLinear.self, q.mode == .affine,
+              q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [10304, 336],
+              q.scales.dtype == .bfloat16, let biases = q.biases, biases.dtype == .bfloat16,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              oldState.shape == [1, 3, 6144], oldState.dtype == .bfloat16,
+              convWeight.shape == [6144, 4, 1], convWeight.dtype == .bfloat16,
+              convBias.shape == [6144], convBias.dtype == .bfloat16,
+              dtBias.shape == [64], [DType.bfloat16, .float32].contains(dtBias.dtype)
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
+            ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
+        let args = NemotronMultiRowQMV.scalarPair(2688, 10304)
+        let bank = NemotronSBDict.enabled ? NemotronSBDict.dict(q) : nil
+        let kernel = NemotronU2.inProj ? (bank != nil ? dictUnrolled : unrolled)
+            : (bank != nil ? dict : plain)
+        let o = kernel(
+            [q.weight, bank?.index ?? q.scales, bank?.table ?? biases, packed, args.0, args.1,
+             oldState, convWeight, convBias, dtBias,
+             MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", false),
+                       ("RPS", 2), ("CS", 4096), ("CC", 6144), ("DS", 10240), ("NH", 64)],
+            grid: (32, 10304 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[3, 4096], [1, 3, 6144], [1, 6, 6144], [1, 3, 64]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
+        return (o[0], o[1], o[2], o[3])
+    }
+
+    /// Official load only: real-layer producer buffers, direct SSM PS twins,
+    /// and full native Mamba output/state arrays before publishing admission.
+    static func qualify(_ model: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron in_proj gate only: \(message)\n".utf8))
+        }
+        guard enabled, !NemotronMambaInProjConvDt.check, !NemotronMoELeader.selfTest,
+              NemotronHCompactSSMGated.rowsTailQualified,
+              plain != nil, dict != nil, unrolled != nil, dictUnrolled != nil
+        else { return report("off (setting, original admission or source)") }
+        var layers = 0, producerCases = 0, nativeCases = 0
+        var same = MLXArray(true)
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let m = module as? NemotronHMamba2Mixer,
+                          m.intermediateSize == 4096, m.convDim == 6144,
+                          m.numHeads == 64, m.headDim == 64, m.numGroups == 8, m.ssmStateSize == 128,
+                          let q = m.inProj as? QuantizedLinear, let cb = m.conv1d.bias else { continue }
+                    if layers == 0 && !NemotronHCompactSSMGated.qualifyGateProjection(m) {
+                        same = MLXArray(false); return
+                    }
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x67a1 + layers * 16 + seed)), into: 5)
+                        let x = (MLXRandom.normal([3, 2688], key: keys[0]) * Float(seed == 0 ? 0.5 : 4))
+                            .asType(.bfloat16)
+                        let state = (MLXRandom.normal([1, 3, 6144], key: keys[1]) * 0.5).asType(.bfloat16)
+                        let prepared = seed == 1 ? NemotronHeadPreparedActivation.pack(x) : nil
+                        guard let full = NemotronMambaInProjConvDt.apply(
+                            x, q, prepared: prepared, oldState: state, convWeight: m.conv1d.weight,
+                            convBias: cb, dtBias: m.dtBias, timeStepLimit: m.timeStepLimit,
+                            convStart: 4096, convDim: 6144, heads: 64),
+                              let thin = apply(x, q, prepared: prepared, oldState: state,
+                            convWeight: m.conv1d.weight, convBias: cb, dtBias: m.dtBias,
+                            timeStepLimit: m.timeStepLimit, qualifying: true)
+                        else { same = MLXArray(false); return }
+                        let a = [full.projected[0..., 0 ..< 4096], full.convolution, full.padded, full.dt]
+                        let b = [thin.gate, thin.convolution, thin.padded, thin.dt]
+                        for (u, v) in zip(a, b) {
+                            same = logicalAnd(same, u.dtype == .float32
+                                ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                        }
+                        producerCases += 1
+                        let ssm = MLXRandom.normal([1, 64, 64, 128], key: keys[2]) * Float(0.1)
+                        let steps = seed == 0 ? [0, NemotronMTPPendingSSM.maxSteps] : [1]
+                        for pendingSteps in steps {
+                            let pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = pendingSteps == 0 ? nil : (
+                                MLXRandom.normal([1, pendingSteps, 6144], key: keys[3]).asType(.bfloat16),
+                                MLXRandom.uniform(Float(0.001) ..< 0.5, [1, pendingSteps, 64], key: keys[4]),
+                                pendingSteps)
+                            let expected = m.mtpCompactArrays(x.reshaped(1, 3, 2688), convState: state,
+                                initialSSM: ssm, prepared: prepared, pending: pending)
+                            guard let actual = m.mtpCompactGateOnlyArrays(
+                                x.reshaped(1, 3, 2688), convState: state, initialSSM: ssm,
+                                prepared: prepared, pending: pending, qualifying: true)
+                            else { same = MLXArray(false); return }
+                            for (u, v) in zip(expected, actual) {
+                                same = logicalAnd(same, u.dtype == .float32
+                                    ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                    : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                            }
+                            nativeCases += 1
+                        }
+                        eval(same)
+                    }
+                    layers += 1
+                }
+            }
+        } catch { return report("off (\(error))") }
+        verified = layers > 0 && same.item(Bool.self)
+        report(verified ? "on (\(layers) layers, \(producerCases) producer and \(nativeCases) full native cases)"
+                        : "off (differs or unavailable)")
+    }
+}
+
 enum NemotronHeadPreparedActivation {
     static let prepare = MLXFast.metalKernel(
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
