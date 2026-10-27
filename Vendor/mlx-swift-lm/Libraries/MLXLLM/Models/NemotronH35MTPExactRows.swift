@@ -1219,6 +1219,141 @@ enum NemotronHeadPreparedActivation {
         return prepared
     }
 
+
+    static let outResidualEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_OUTPROJ_RESIDUAL"] != "0"
+    nonisolated(unsafe) private static var outResidualOwners = Set<ObjectIdentifier>()
+    nonisolated(unsafe) private static var outResidualKernels: [String: MLXFast.MLXFastKernel?] = [:]
+    private static let outResidualLock = NSLock()
+
+    private static func outResidualKernel(dict: Bool) -> MLXFast.MLXFastKernel? {
+        let (_, hf) = projectKernel(rows: 3, fast: true)
+        let name = "nemotron_mamba_outproj_residual" + (dict ? "_sbd" : "")
+        outResidualLock.lock(); defer { outResidualLock.unlock() }
+        if let cached = outResidualKernels[name] { return cached }
+        var body: String? = nemotronPreparedVariantSource(
+            hf.isEmpty ? nemotronHeadPreparedQMVSource : preparedHalfSource, load: 2, nsg: false)
+        if dict { body = body.flatMap { nemotronSBDictSource($0) } }
+        let store = "yp[r * out_vec_size + row] = h;"
+        guard let body, body.components(separatedBy: store).count == 2 else { return nil }
+        // Keep the original BF16 projection rounding BEFORE the BF16 Add.
+        // Only the output slot changes: residual sum instead of raw projection.
+        let source = body.replacingOccurrences(of: store, with:
+            "T joined = residual[r * out_vec_size + out_row + row] + h;\n"
+            + "        yp[r * out_vec_size + row] = joined;")
+        let kernel = MLXFast.metalKernel(name: name,
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N", "residual"],
+            outputNames: ["y"], source: source, header: variantHeader(half: !hf.isEmpty, load: 2))
+        outResidualKernels[name] = kernel
+        return kernel
+    }
+
+    private static func outResidualShape(_ q: QuantizedLinear) -> Bool {
+        outResidualEnabled && NemotronMTPExecution.batchedM1 && NemotronMTPExecution.batchedNorm
+            && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && type(of: q) == QuantizedLinear.self
+            && NemotronMultiRowQMV.enabled && NemotronMultiRowQMV.narrowEnabled
+            && NemotronHResidualRMSNorm.plumbingAvailable && !NemotronMoELeader.selfTest
+            && q.weight.shape == [2688, 512] && q.weight.dtype == .uint32
+            && q.mode == .affine && q.bits == 4 && q.groupSize == 64 && q.bias == nil
+            && q.scales.shape == [2688, 64] && q.scales.dtype == .bfloat16
+            && q.biases?.shape == [2688, 64] && q.biases?.dtype == .bfloat16
+            && loadForm(k: 4096, n: 2688) == 2
+            && preparedGeometry[[4096, 2688]] == nil
+    }
+
+    static func canOutResidual(_ linear: Linear, _ residual: MLXArray) -> Bool {
+        guard let q = linear as? QuantizedLinear else { return false }
+        return outResidualOwners.contains(ObjectIdentifier(q)) && outResidualShape(q)
+            && residual.shape == [1, 3, 2688] && residual.dtype == .bfloat16
+    }
+
+    private static func launchOutResidual(_ x: MLXArray, _ q: QuantizedLinear,
+        residual: MLXArray, prepared: MLXArray?, dict: Bool) -> MLXArray? {
+        guard x.shape == [1, 3, 4096], x.dtype == .bfloat16,
+              residual.shape == [1, 3, 2688], residual.dtype == .bfloat16,
+              let kernel = outResidualKernel(dict: dict) else { return nil }
+        let scales: MLXArray, biases: MLXArray
+        if dict {
+            guard let d = NemotronSBDict.dict(q) else { return nil }
+            scales = d.index; biases = d.table
+        } else {
+            guard let b = q.biases else { return nil }
+            scales = q.scales; biases = b
+        }
+        let packed = compatible(prepared, rows: 3, k: 4096) ?? pack(x.reshaped([3, 4096]))
+        let args = NemotronMultiRowQMV.scalarPair(4096, 2688)
+        let (_, hf) = projectKernel(rows: 3, fast: true)
+        // Exactly the original out_proj's HF/load2, RPS2/NSG2 and no U2.
+        return kernel([q.weight, scales, biases, packed, args.0, args.1, residual.reshaped([3, 2688])],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", true), ("RELU2", false), ("RPS", 2)] + hf,
+            grid: (32, 2688 / 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[3, 2688]], outputDTypes: [.bfloat16])[0].reshaped([1, 3, 2688])
+    }
+
+    static func outResidual(_ x: MLXArray, _ linear: Linear,
+        residual: MLXArray, prepared: MLXArray?) -> MLXArray? {
+        guard canOutResidual(linear, residual), let q = linear as? QuantizedLinear else { return nil }
+        let dict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil
+            && dictLaunchAvailable(k: 4096, n: 2688)
+        return launchOutResidual(x, q, residual: residual, prepared: prepared, dict: dict)
+    }
+
+    static func validPrepared2688(_ x: MLXArray) -> MLXArray {
+        // 336 valid chunks in 11x32 allocation. The last16 padding chunks
+        // were never written/read by the original prepared consumer.
+        x.reshaped([3, 11, 9, 32]).transposed(0, 1, 3, 2).reshaped([3, 352, 9])[0..., 0..<336, 0...]
+    }
+
+    static func disableOutResidual() { outResidualOwners.removeAll() }
+
+    /// Official-only load-time tests of real projection banks and the exact
+    /// old Add+RMS+prepared outputs. No request or capture state is touched.
+    static func qualifyOutResidual(_ model: Module) {
+        outResidualOwners.removeAll()
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron outproj residual: \(text)\n".utf8))
+        }
+        guard outResidualEnabled,
+              let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+                  type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+              }) else { return report("off (setting/norm)") }
+        let owners = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+            .compactMap { $0.outProj as? QuantizedLinear }
+        guard !owners.isEmpty, owners.allSatisfy(outResidualShape) else { return report("off (unsupported head)") }
+        var cases = 0
+        do {
+            let matches = try withError { () -> Bool in
+                for (index, q) in owners.enumerated() {
+                    let dict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil
+                        && dictLaunchAvailable(k: 4096, n: 2688)
+                    for mode in (dict ? [false, true] : [false]) {
+                        for kind in 0..<3 {
+                            let x = (MLXRandom.normal([1, 3, 4096], key: MLXRandom.key(UInt64(0x92a0 + index * 8 + kind)))
+                                * Float(kind == 0 ? 0 : (kind == 1 ? 1 : 8))).asType(.bfloat16)
+                            let residual = MLXRandom.normal([1, 3, 2688],
+                                key: MLXRandom.key(UInt64(0x92b0 + index * 8 + kind))).asType(.bfloat16)
+                            let prepared = kind == 2 ? pack(x.reshaped([3, 4096])) : nil
+                            let original = apply(x.reshaped([3, 4096]), q, relu2: false, rps: 2,
+                                prepared: prepared, sbDict: mode, u2: false).reshaped([1, 3, 2688])
+                            guard let expected = NemotronHResidualRMSNorm.applyPreparedRows(residual, original, norm: norm),
+                                  let sum = launchOutResidual(x, q, residual: residual, prepared: prepared, dict: mode),
+                                  let result = NemotronHResidualRMSNorm.normPreparedRows(sum, norm: norm) else { return false }
+                            let same = NemotronU2.equal(sum, expected.0)
+                                .&& NemotronU2.equal(result.0, expected.1)
+                                .&& NemotronU2.equal(validPrepared2688(result.1), validPrepared2688(expected.2))
+                            if !same.item(Bool.self) { return false }
+                            cases += 1
+                        }
+                    }
+                }
+                return cases > 0
+            }
+            if matches { outResidualOwners = Set(owners.map { ObjectIdentifier($0) }) }
+        } catch { return report("off (\(error))") }
+        report(outResidualOwners.isEmpty ? "off (difference after \(cases) cases)"
+            : "on (\(cases) real-bank joined/normalized/valid-prepared word cases equal)")
+    }
+
     /// `u2`: the R = 3 launch's unroll-by-two twin (nil: the admitted family, `NemotronU2.prepared`).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
                       prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil) -> MLXArray {
