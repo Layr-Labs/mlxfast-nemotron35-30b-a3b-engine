@@ -106,6 +106,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillCombineAdd.qualify()
         NemotronPrefillSharedRelu2.qualify(target)
         NemotronPrefillDirectFC1.qualify(target)
+        NemotronPrefillDirectFC1.qualifyDict(target)
         NemotronPrefillSharedUpGather.qualify(target)
         NemotronPrefillFC2Copy.qualify(target)
         NemotronPrefillMoEJoin.qualify(target)
@@ -399,6 +400,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// With `NemotronPrefillFC2Copy` verified, a MoE layer's routed fc2 bank is replaced in its group by
     /// that layer's decode copy (codes, pair index, pair table): the request prefill reads the copy, the
     /// decode reads the copy, and nothing in the request reads the bank.
+    /// NEMOTRON_RESIDENCY_SPLIT_EXPERTS=0 keeps one set per backbone layer.
+    static let splitExpertGroups = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_SPLIT_EXPERTS"] != "0"
+
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
         var copies: [Int: [MLXArray]] = [:]
         if NemotronPrefillFC2Copy.verified {
@@ -410,19 +414,48 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 copies[n] = [copy.codes, copy.scales, copy.biases]
             }
         }
+        // With `NemotronPrefillDirectFC1.dictVerified`, the request prefill's fc1 reads the bank's pair
+        // dictionary (as the decode does) instead of its BF16 scales and biases.
+        var fc1Dicts: [Int: [MLXArray]] = [:]
+        if NemotronPrefillDirectFC1.dictVerified {
+            for (name, module) in model.namedModules() {
+                let parts = name.split(separator: ".")
+                guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
+                      let moe = module as? NemotronHMoE,
+                      let d = NemotronSBDict.dict(moe.switchMLP.fc1) else { continue }
+                fc1Dicts[n] = [d.index, d.table]
+            }
+        }
+        // With `splitExpertGroups` a MoE layer's group is three consecutive sets in the order the request
+        // prefill reads them: the layer's own small arrays (router, shared expert, norms), its routed fc1
+        // (bank words and their scale/bias form), then its routed fc2 (the decode copy when verified).
+        let split = Self.splitExpertGroups
+        func key(_ layer: Int, _ part: Int) -> Int { split ? 3 * layer + part : layer }
         var groups: [Int: [MLXArray]] = [:]
-        for (key, a) in model.parameters().flattened() {
-            let parts = key.split(separator: ".")
+        for (path, a) in model.parameters().flattened() {
+            let parts = path.split(separator: ".")
             var g = Int.max
-            if parts.contains("embeddings") { g = -1 }
-            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) { g = n }
-            if copies[g] != nil, let s = parts.firstIndex(of: "switch_mlp"), s + 1 < parts.count,
-               parts[s + 1] == "fc2" {
-                continue
+            var layer: Int? = nil
+            if parts.contains("embeddings") { g = split ? -3 : -1 }
+            if let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]) {
+                layer = n
+                g = key(n, 0)
+            }
+            if let n = layer, let s = parts.firstIndex(of: "switch_mlp"), s + 2 < parts.count {
+                if parts[s + 1] == "fc2" {
+                    if copies[n] != nil { continue }
+                    g = key(n, 2)
+                } else if parts[s + 1] == "fc1" {
+                    if fc1Dicts[n] != nil, parts[s + 2] == "scales" || parts[s + 2] == "biases" { continue }
+                    g = key(n, 1)
+                }
             }
             groups[g, default: []].append(a)
         }
-        for (g, arrays) in copies { groups[g, default: []].append(contentsOf: arrays) }
+        for (n, arrays) in copies { groups[key(n, 2), default: []].append(contentsOf: arrays) }
+        for (n, arrays) in fc1Dicts { groups[key(n, 1), default: []].append(contentsOf: arrays) }
+        FileHandle.standardError.write(Data(
+            "nemotron target residency: \(fc1Dicts.count) MoE fc1 scales/biases replaced by their pair dictionaries\n".utf8))
         FileHandle.standardError.write(Data(
             "nemotron target residency: \(copies.count) MoE fc2 banks replaced by their decode copies\n".utf8))
         return groups.keys.sorted().map { groups[$0]! }
