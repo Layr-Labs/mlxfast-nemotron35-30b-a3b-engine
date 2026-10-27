@@ -1139,6 +1139,14 @@ enum NemotronSharedUpPacking {
         return (outputs[0], outputs[1])
     }
 
+    /// True when `unpackedActivation` would return the prepared QMV's rows for these operands.
+    static func unpackedApplies(_ x: MLXArray, up: Linear, down: Linear) -> Bool {
+        guard verified, !NemotronMoELeader.selfTest, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 3,
+              let q = up as? QuantizedLinear, unpackedEnabled, NemotronSharedDownZSkip.covers(down)
+        else { return false }
+        return unpackedLock.withLock { unpackedOwners.contains(ObjectIdentifier(q)) }
+    }
+
     /// The shared relu2 rows [3, N] that `apply` hands the zero-skip shared down on its unpacked route, or nil
     /// when `apply` would take another route (`NemotronFC2SharedColaunch` then keeps the separate launches).
     static func unpackedActivation(_ x: MLXArray, up: Linear, down: Linear,
@@ -1533,6 +1541,156 @@ func nemotronR1Linear(_ x: MLXArray, _ linear: Linear) -> MLXArray {
     let out = y.reshaped(shape)
     guard NemotronMoELeader.selfTest else { return out }
     return nemotronBitwiseOrNaN(out, linear(x))
+}
+
+extension NemotronMultiRowQMV {
+    /// One row of `q` through the R = 1 twin `dispatch` selects, reading
+    /// (scale, bias) through `dict` (the tensor's `NemotronSBDict`), at the
+    /// stock four outputs per SIMD group. nil when the shape is not the stock
+    /// qmv / qmv_fast one.
+    static func dictRow(_ x: MLXArray, _ q: QuantizedLinear, dict: NemotronSBDict.Dict) -> MLXArray? {
+        guard enabled, draftDictAvailable, x.ndim == 2, x.dim(0) == 1, x.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, q.scales.dtype == x.dtype, biases.dtype == x.dtype,
+              q.weight.ndim == 2, q.weight.dtype == .uint32,
+              dict.index.shape == q.scales.shape, dict.index.dtype == .uint16,
+              dict.table.dtype == .float32
+        else { return nil }
+        let k = x.dim(1), n = q.weight.dim(0)
+        guard k % 64 == 0, k > 128, n % 8 == 0, q.weight.dim(1) * 8 == k else { return nil }
+        return dispatch(q.weight, q.scales, biases, x, relu2: false, rps: 4, dict: dict)
+    }
+}
+
+/// Seed target head only: move each lane's input widening, three nibble
+/// rescalings per four values and ordered partial sum out of the 16,384
+/// output threadgroups. One 336-thread preparation produces the same lane
+/// operands once; the R = 1 HF2 dictionary QMV consumes them in the original
+/// K order at the original four outputs / SIMD group and two SIMD groups / TG.
+/// No activation cache: the packed array is a local lazy graph dependency.
+enum NemotronSeedHeadPrepared {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_HEAD_PREPARED"] != "0"
+    private static let kernel = nemotronSBDictSource(
+        NemotronHeadPreparedActivation.preparedHalfSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_seed_head_prepared_r1_hf2_sbd",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y"], source: $0,
+            header: NemotronHeadPreparedActivation.preparedHalfHeader)
+    }
+
+    static func launch(_ x: MLXArray, _ q: QuantizedLinear,
+                       dict: NemotronSBDict.Dict) -> MLXArray? {
+        guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16,
+              type(of: q) == QuantizedLinear.self, q.bias == nil,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.weight.dtype == .uint32, q.weight.shape == [131072, 336],
+              q.scales.dtype == .bfloat16, q.scales.shape == [131072, 42],
+              let biases = q.biases, biases.dtype == .bfloat16, biases.shape == q.scales.shape,
+              dict.index.dtype == .uint16, dict.index.shape == q.scales.shape,
+              dict.table.dtype == .float32, let kernel
+        else { return nil }
+        let packed = NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(1, 2688), pv: 8)
+        let args = NemotronMultiRowQMV.scalarPair(2688, 131072)
+        return kernel([q.weight, dict.index, dict.table, packed, args.0, args.1],
+            template: [("T", DType.bfloat16), ("R", 1), ("FAST", false),
+                       ("RELU2", false), ("RPS", 4), ("HF", 2)],
+            grid: (32, 131072 / 4, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[1, 1, 131072]], outputDTypes: [.bfloat16])[0]
+    }
+}
+
+/// Seed only (request prefill, `NemotronHPrefillX5.active`): the target head's
+/// one-row logits (`logits(last)` of the sampling prefill chunk) through the
+/// R = 1 multi-row qmv twin reading the head's `NemotronSBDict` pair
+/// dictionary (uint16 index + FP32 pair table, 11 MB) instead of the stock qmv
+/// reading its BF16 scales and biases (22 MB). With prepared reuse enabled,
+/// one small prepare precedes the projection and amortizes input arithmetic;
+/// without it the imported route remains one projection. Both twins keep the
+/// stock per-row body, lane split, block order and simd_sum, and the
+/// table holds the exact FP32 widenings of the BF16 pairs. `qualify` compares
+/// it with `head(x)` bit for bit on the loaded head; only then does the seed
+/// use it. NEMOTRON_SEED_HEAD_DICT=0 keeps the stock call.
+enum NemotronSeedHeadDict {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_HEAD_DICT"] != "0"
+    nonisolated(unsafe) static var verified = false
+
+    /// `head(x)` for x: [1, 1, K] inside the request prefill; nil otherwise.
+    static func apply(_ x: MLXArray, _ head: Linear?) -> MLXArray? {
+        guard verified, NemotronHPrefillX5.active, let head, x.ndim == 3, x.dim(0) == 1, x.dim(1) == 1
+        else { return nil }
+        guard let y = launch(x, head) else { return nil }
+        guard NemotronMoELeader.selfTest else { return y }
+        return nemotronBitwiseOrNaN(y, head(x))
+    }
+
+    private static func launch(_ x: MLXArray, _ head: Linear,
+                               reusePrepared: Bool = true) -> MLXArray? {
+        guard type(of: head) == QuantizedLinear.self, let q = head as? QuantizedLinear,
+              let d = NemotronSBDict.dict(q) else { return nil }
+        if reusePrepared && NemotronSeedHeadPrepared.enabled {
+            return NemotronSeedHeadPrepared.launch(x, q, dict: d)
+        }
+        guard let y = NemotronMultiRowQMV.dictRow(x.reshaped(1, x.dim(-1)), q, dict: d)
+        else { return nil }
+        return y.reshaped(1, 1, q.weight.dim(0))
+    }
+
+    /// Load time, after `NemotronSBDict.prepare`: the head must have a pair
+    /// dictionary in its scales' shape whose table decodes to the scales' and
+    /// biases' raw BF16 words, and the twin must equal `head(x)` bit for bit
+    /// on seeded rows of several scales.
+    static func qualify(_ target: NemotronHModel) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron seed head dict: \(message)\n".utf8))
+        }
+        guard enabled, NemotronSBDict.enabled else { return report("off (setting)") }
+        var checked = 0
+        defer {
+            if NemotronSeedHeadPrepared.enabled {
+                precondition(verified && checked == 6,
+                    "seed prepared R1 head qualification refused; no unchanged-fallback score")
+            }
+        }
+        guard let head = target.lmHead, type(of: head) == QuantizedLinear.self,
+              let q = head as? QuantizedLinear, let biases = q.biases
+        else { return report("off (no quantized head)") }
+        guard let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape,
+              d.index.dtype == .uint16, d.table.dtype == .float32
+        else { return report("off (no pair dictionary for the head)") }
+        do {
+            let matches = try withError { () -> Bool in
+                // Raw words: every group's table entry is the head's (scale, bias) BF16 pair.
+                let pairs = take(d.table, d.index.reshaped(-1).asType(.int32), axis: 0)
+                let words = stacked([q.scales.reshaped(-1).asType(.float32),
+                                     biases.reshaped(-1).asType(.float32)], axis: 1)
+                guard (pairs.view(dtype: .uint32) .== words.view(dtype: .uint32)).all().item(Bool.self)
+                else { return false }
+                let width = q.weight.dim(1) * 8
+                for (index, scale) in [Float(1), 0.25, 4, 16, 1, 0.05].enumerated() {
+                    let x = MLXRandom.normal([1, 1, width], scale: scale,
+                                             key: MLXRandom.key(UInt64(0x5eed_d1c7 + index)))
+                        .asType(.bfloat16)
+                    guard let twin = launch(x, head) else { return false }
+                    let stock = head(x)
+                    guard let raw = launch(x, head, reusePrepared: false),
+                          twin.shape == stock.shape, raw.shape == stock.shape,
+                          (raw.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all().item(Bool.self),
+                          (twin.view(dtype: .uint16) .== stock.view(dtype: .uint16)).all().item(Bool.self)
+                    else { return false }
+                    checked += 1
+                }
+                return true
+            }
+            verified = matches
+        } catch {
+            report("off (\(error))")
+        }
+        report(verified ? "on (dictionary raw words, raw R1 and prepared R1 equal to stock, \(checked) cases)"
+                        : "off (differs from the stock head after \(checked) cases)")
+    }
 }
 
 /// Self-test select: `y` where it is bitwise equal to `expected`, else NaN
@@ -2458,7 +2616,7 @@ enum NemotronMTPRouterRowsSelect {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_SELECT_FUSED"] != "0"
     nonisolated(unsafe) static var verified = false
     nonisolated(unsafe) static var draftVerified = false
-    nonisolated(unsafe) private static var counter: MLXArray? = nil
+    nonisolated(unsafe) fileprivate static var counter: MLXArray? = nil
     nonisolated(unsafe) private static var draftCounter: MLXArray? = nil
     /// Router rows per threadgroup: one (128 threadgroups) instead of the
     /// gemv's four (32). A row's per-thread terms, shuffle tree and simdgroup
@@ -2612,6 +2770,171 @@ enum NemotronMTPRouterRowsSelect {
         }
         report(draftVerified ? "on (bitwise equal to the head's gemv + selection at R = 1)"
             : "off (differs or failed)")
+    }
+}
+
+// MARK: - Router and shared up in one launch
+//
+// In the captured verify, a MoE layer's router (`NemotronMTPRouterRowsSelect`: 128 gemv threadgroups, the last
+// ticket runs the top-six selection) and its shared-expert up projection with ReLU² (the prepared QMV the
+// zero-skip shared down reads) both read only the layer's input, and only later launches read their results.
+// One launch runs both: threadgroups y < 128 run the router body, the rest the shared up body at eight SIMD
+// groups per threadgroup instead of two (each SIMD group keeps its own rows, loads, order, simd_sum and store).
+// Each body is its kernel's source text with its threadgroup position (and the router's grid size) shadowed and
+// the router's threadgroup arrays declared once at kernel scope. `qualify` compares every layer with the two
+// separate launches bit for bit at load. NEMOTRON_MTP_ROUTER_UP_COLAUNCH=0 keeps the separate launches.
+enum NemotronRouterSharedUpColaunch {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROUTER_UP_COLAUNCH"] != "0"
+        && !NemotronMoELeader.selfTest
+    private static let routerThreadgroups = 128
+    private static let upSimdgroups = 8
+    private static let lock = NSLock()
+    /// Shared up projections whose layer matched the separate launches at load.
+    nonisolated(unsafe) private static var owners: Set<ObjectIdentifier> = []
+
+    private static func source(up: String) -> String {
+        let router = nemotronSwapped(
+            nemotronSwapped(nemotronMTPRouterRowsSource, [
+                ("  constexpr int TM = 4;\n", "  constexpr int TM = 1;\n", 1),
+                ("  threadgroup AccT tgp_memory[R * BN * (blockM + TM)];\n",
+                 "  threadgroup AccT* tgp_memory = nrc_tgp;\n", 1),
+            ]) + nemotronMTPRouterRowsSelectEpilogue, [
+                ("  threadgroup uint nmr_ticket[1];\n", "  threadgroup uint* nmr_ticket = nrc_ticket;\n", 1),
+                ("  threadgroup float nmr_original[R * 128];\n",
+                 "  threadgroup float* nmr_original = nrc_original;\n", 1),
+                ("  threadgroup float nmr_normalized[R * 6];\n",
+                 "  threadgroup float* nmr_normalized = nrc_normalized;\n", 1),
+            ])
+        return """
+          threadgroup float nrc_tgp[R * 8 * 2];
+          threadgroup uint nrc_ticket[1];
+          threadgroup float nrc_original[R * 128];
+          threadgroup float nrc_normalized[R * 6];
+          const uint nrc_tg = threadgroup_position_in_grid.y;
+          if (nrc_tg >= uint(RT)) {
+            const auto w = uw;
+            const auto scales = uscales;
+            const auto biases = ubiases;
+            const int K = UK;
+            const int N = UN;
+            device T* y = uy;
+            const uint3 threadgroup_position_in_grid = uint3(0, nrc_tg - uint(RT), 0);
+          \(up)
+            return;
+          }
+          {
+            const uint3 threadgroup_position_in_grid = uint3(nrc_tg, 0, 0);
+            const uint3 threadgroups_per_grid = uint3(RT, 1, 1);
+          \(router)
+          }
+          """
+    }
+
+    private static func make(_ name: String, up: String?) -> MLXFast.MLXFastKernel? {
+        guard let up else { return nil }
+        return MLXFast.metalKernel(
+            name: name,
+            inputNames: ["w", "x", "K", "N", "bias", "counter", "uw", "uscales", "ubiases", "prepared", "UK", "UN"],
+            outputNames: ["y", "indices", "weights", "uy"],
+            source: source(up: up),
+            header: NemotronHRouterSelection.sigmoidHeader + nemotronMultiRowQMVHeader,
+            ensureRowContiguous: true, mutableInputs: ["counter"])
+    }
+    private static let upBody = nemotronPreparedVariantSource(nemotronHeadPreparedQMVSource, load: 0, nsg: true)
+    private static let plainKernel = make("nemotron_router_select_shared_up_r3", up: upBody)
+    private static let dictKernel = make("nemotron_router_select_shared_up_r3_sbd", up: nemotronSBDictSource(upBody))
+
+    /// The router's (indices, weights) and the shared up's ReLU² rows [3, N] of one captured-verify MoE layer,
+    /// or nil when the layer did not qualify (the caller keeps the separate launches).
+    static func run(_ x: MLXArray, gate: NemotronHMoEGate, up: Linear, prepared: MLXArray)
+        -> (indices: MLXArray, weights: MLXArray, up: MLXArray)?
+    {
+        guard enabled, let q = up as? QuantizedLinear,
+              lock.withLock({ owners.contains(ObjectIdentifier(q)) }) else { return nil }
+        return dispatch(x, gate: gate, q: q, prepared: prepared)
+    }
+
+    private static func dispatch(_ x: MLXArray, gate: NemotronHMoEGate, q: QuantizedLinear, prepared: MLXArray)
+        -> (indices: MLXArray, weights: MLXArray, up: MLXArray)?
+    {
+        let k = 2688, n = q.weight.dim(0)
+        guard NemotronMTPRouterRowsSelect.enabled, NemotronMTPRouterRowsSelect.verified,
+              NemotronMTPRouterRowsSelect.rowsPerThreadgroup == 1,
+              let counter = NemotronMTPRouterRowsSelect.counter,
+              gate.topK == 6, gate.nGroup == 1, gate.topkGroup == 1, gate.normTopkProb,
+              gate.routedScalingFactor == 2.5,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 3, k], x.dtype == .bfloat16,
+              gate.weight.dtype == .bfloat16, gate.weight.shape == [128, k],
+              NemotronMTPRouterRows.isRowMajor(gate.weight),
+              gate.eSCB.shape == [128], gate.eSCB.dtype == .float32,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              let biases = q.biases, biases.dtype == .bfloat16, q.scales.dtype == .bfloat16,
+              q.weight.dtype == .uint32, q.weight.shape == [n, k / 8],
+              n % (2 * upSimdgroups) == 0,
+              let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: k)
+        else { return nil }
+        // The separate shared up takes the dictionary twin exactly when this holds.
+        let dict = NemotronSBDict.enabled && NemotronHeadPreparedActivation.dictLaunchAvailable(k: k, n: n)
+            ? NemotronSBDict.dict(q) : nil
+        guard let kernel = dict != nil ? dictKernel : plainKernel else { return nil }
+        let (kArray, nArray) = NemotronMultiRowQMV.scalarPair(k, 128)
+        let (ukArray, unArray) = NemotronMultiRowQMV.scalarPair(k, n)
+        let upGroups = n / (2 * upSimdgroups)
+        let out = kernel(
+            [gate.weight, x, kArray, nArray, gate.eSCB, counter,
+             q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, ukArray, unArray],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", true), ("RPS", 2),
+                       ("NSG", upSimdgroups), ("RT", routerThreadgroups)],
+            grid: (32, 8 * (routerThreadgroups + upGroups), 1), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 128], [1, 3, 6], [1, 3, 6], [3, n]],
+            outputDTypes: [.bfloat16, .uint32, .float32, .bfloat16])
+        return (out[1], out[2], out[3])
+    }
+
+    /// Load time, after `NemotronMTPRouterRowsSelect.qualify` and `NemotronSBDict.prepare`: every MoE layer's
+    /// launch against the router launch and the shared up launch it replaces, bit for bit on the indices, the
+    /// weights and the ReLU² rows, over seeded rows (twice each, so the ticket reset is exercised). Any miss keeps
+    /// every layer on the separate launches.
+    static func qualify(_ model: Module) {
+        lock.withLock { owners = [] }
+        guard enabled, NemotronMTPRouterRowsSelect.verified else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron router+shared up colaunch: \(message)\n".utf8))
+        }
+        var built: Set<ObjectIdentifier> = []
+        var accepted = false
+        do {
+            accepted = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let moe = module as? NemotronHMoE, let shared = moe.sharedExperts,
+                          let q = shared.upProj as? QuantizedLinear else { continue }
+                    for seed in 0 ..< 2 {
+                        let key = MLXRandom.key(UInt64(0x7a0c + built.count * 4 + seed))
+                        let x = MLXRandom.normal([1, 3, 2688], key: key).asType(.bfloat16)
+                        let packed = NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+                        guard let fused = dispatch(x, gate: moe.gate, q: q, prepared: packed),
+                              let router = NemotronMTPRouterRowsSelect.run(x, moe.gate.weight, bias: moe.gate.eSCB)
+                        else { return false }
+                        let up = NemotronHeadPreparedActivation.apply(
+                            x.reshaped(3, 2688), q, relu2: true, rps: 2, prepared: packed)
+                        let ok = MLX.logicalAnd(MLX.logicalAnd(
+                            (fused.indices .== router.0).all(),
+                            (fused.weights.view(dtype: .uint32) .== router.1.view(dtype: .uint32)).all()),
+                            (fused.up.view(dtype: .uint16) .== up.view(dtype: .uint16)).all())
+                        eval(ok)
+                        guard ok.item(Bool.self),
+                              NemotronMTPRouterRowsSelect.counter?.item(UInt32.self) == 0 else { return false }
+                    }
+                    built.insert(ObjectIdentifier(q))
+                }
+                return !built.isEmpty
+            }
+        } catch {
+            accepted = false
+        }
+        lock.withLock { owners = accepted ? built : [] }
+        report(accepted ? "on (\(built.count) MoE layers bitwise equal)" : "off (differs or failed)")
     }
 }
 
