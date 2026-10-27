@@ -82,6 +82,8 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronMambaInProjConvDt.qualifyUnroll(target)
+        NemotronHeadPreparedActivation.qualifyUnroll([target, assistant.module])
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)

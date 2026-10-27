@@ -611,6 +611,22 @@ private let nemotronHeadPreparedQMVSource = nemotronHeadPreparedQMVTail8
     ? nemotronSwapped(nemotronHeadPreparedQMVCrownSource, nemotronHeadPreparedQMVTail8Swaps)
     : nemotronHeadPreparedQMVCrownSource
 
+/// A prepared-QMV body with its main K loop unrolled by two: `#pragma clang
+/// loop unroll_count(2)` ahead of its one `for (; k < k_end; k += block_size)`.
+/// The unrolled loop runs the same block bodies in the same order (block k,
+/// then block k + block_size, the tail block after the loop as before), so
+/// every load, decode, product, term order, accumulation, affine close,
+/// closing simd_sum and store is the record's; only the instruction stream of
+/// two consecutive blocks is laid out together. K is a run-time scalar here,
+/// so the compiler also emits a remainder pass; every caller's main trip count
+/// is even (K 2688: 10, 4096 FAST: 8, 5376: 20), so it never runs. Nil when
+/// the record text has moved (the record kernels stay).
+func nemotronPreparedUnrollSource(_ source: String) -> String? {
+    let loop = "\n  for (; k < k_end; k += block_size) {\n"
+    guard source.components(separatedBy: loop).count == 2 else { return nil }
+    return source.replacingOccurrences(of: loop, with: "\n  #pragma clang loop unroll_count(2)" + loop)
+}
+
 /// Mamba verify in_proj (R = 3 prepared QMV) whose epilogue also produces the
 /// window's conv + SiLU, padded history and timestep transform. After the
 /// stock store, lane 0 of each simdgroup reads back its own just-stored BF16
@@ -701,6 +717,33 @@ enum NemotronMambaInProjConvDt {
             source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
     }
     static var dictAvailable: Bool { dictKernel != nil }
+    /// The same two launches with the projection's main K loop unrolled by
+    /// two (nemotronPreparedUnrollSource); the epilogue is unchanged.
+    private static let unrolledKernel = nemotronPreparedUnrollSource(
+        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_u2",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    private static let unrolledDictKernel = nemotronPreparedUnrollSource(
+        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue)
+        .flatMap(nemotronSBDictSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_sbd_u2",
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"],
+            source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    /// NEMOTRON_MTP_INPROJ_UNROLL=0 keeps the record main loop. Selected only
+    /// after `qualifyUnroll` found the unrolled launch bit for bit equal to
+    /// the record launch on the real in_proj weights of every Mamba layer.
+    static let unrollEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_UNROLL"] != "0"
+    nonisolated(unsafe) private(set) static var unrollQualified = false
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
@@ -710,7 +753,7 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, unroll: Bool? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -730,7 +773,13 @@ enum NemotronMambaInProjConvDt {
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: pv)
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
-        let outputs = (dict != nil ? dictKernel! : kernel)(
+        // unroll: the unrolled main loop (nil: `unrollEnabled` once qualified),
+        // in the same (scale, bias) form; the record launch stands in whenever
+        // that twin is missing.
+        let record = dict != nil ? dictKernel! : kernel
+        let launch = (unroll ?? (unrollEnabled && unrollQualified)
+            ? (dict != nil ? unrolledDictKernel : unrolledKernel) : nil) ?? record
+        let outputs = launch(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
@@ -747,6 +796,59 @@ enum NemotronMambaInProjConvDt {
             return (nemotronBitwiseOrNaN(outputs[0], reference), outputs[1], outputs[2], outputs[3])
         }
         return (outputs[0], outputs[1], outputs[2], outputs[3])
+    }
+
+    /// Load time, after the pair dictionaries: the unrolled launch against the
+    /// record launch, bit for bit on all four outputs, on the real in_proj
+    /// weights, conv weights and timestep bias of every Mamba layer, in both
+    /// (scale, bias) forms, with seeded rows and conv history. Any difference,
+    /// or a missing twin, keeps the record launch.
+    static func qualifyUnroll(_ model: Module) {
+        guard enabled else { return }
+        guard unrollEnabled else {
+            FileHandle.standardError.write(Data("nemotron inproj unroll: off (setting)\n".utf8))
+            return
+        }
+        guard unrolledKernel != nil, unrolledDictKernel != nil || dictKernel == nil else {
+            FileHandle.standardError.write(
+                Data("nemotron inproj unroll off: the record main loop moved, no unrolled kernel\n".utf8))
+            return
+        }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5bd6), into: 2)
+        var same = MLXArray(true)
+        var layers = 0
+        for module in model.modules() {
+            guard let mixer = module as? NemotronHMamba2Mixer,
+                  let q = mixer.inProj as? QuantizedLinear, let convBias = mixer.conv1d.bias
+            else { continue }
+            let x = (MLXRandom.normal([3, 2688], key: keys[0]) * 0.5).asType(.bfloat16)
+            let state = (MLXRandom.normal([1, 3, mixer.convDim], key: keys[1]) * 0.5).asType(.bfloat16)
+            var ran = false
+            for sbDict in [false, true] {
+                func run(_ on: Bool) -> [MLXArray]? {
+                    apply(x, q, prepared: nil, oldState: state, convWeight: mixer.conv1d.weight,
+                        convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                        convStart: mixer.intermediateSize, convDim: mixer.convDim, heads: mixer.numHeads,
+                        sbDict: sbDict, unroll: on).map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                }
+                guard let a = run(false), let b = run(true) else { continue }
+                for (u, v) in zip(a, b) {
+                    same = logicalAnd(same, u.dtype == .float32
+                        ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                        : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                }
+                ran = true
+            }
+            if ran { layers += 1 }
+        }
+        guard layers > 0, same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "nemotron inproj unroll off: \(layers > 0 ? "differs from the record kernel" : "no Mamba in_proj ran")\n".utf8))
+            return
+        }
+        unrollQualified = true
+        FileHandle.standardError.write(Data(
+            "nemotron inproj unroll on: \(layers) Mamba in_proj layers, unrolled R = 3 launch bitwise equal to the record kernel\n".utf8))
     }
 }
 
@@ -809,6 +911,16 @@ enum NemotronHeadPreparedActivation {
         loadFormOverrides[[k, n]] ?? (k % 512 == 0 ? fastLoadForm : loadForm)
     }
 
+    /// NEMOTRON_MTP_QMV_UNROLL=0 keeps the record main loops. On, every R = 3
+    /// prepared launch (target head, out_proj / o_proj, Q, the MTP head's
+    /// projections) runs its kernel's twin with the main K loop unrolled by
+    /// two (nemotronPreparedUnrollSource), same load form, decode form,
+    /// geometry and (scale, bias) form, once `qualifyUnroll` found it bit for
+    /// bit equal to the record kernel on the real weights of every shape.
+    static let unrollEnabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_QMV_UNROLL"] != "0"
+    nonisolated(unsafe) private(set) static var unrollQualified = false
+
     nonisolated(unsafe) private static var variants: [String: MLXFast.MLXFastKernel] = [:]
     private static let variantsLock = NSLock()
     /// Prepared QMV twin for (decode form twin, load form, NSG template).
@@ -826,16 +938,34 @@ enum NemotronHeadPreparedActivation {
         variants[name] = kernel
         return kernel
     }
+    nonisolated(unsafe) private static var unrolledVariants: [String: MLXFast.MLXFastKernel?] = [:]
+    /// variantKernel's body with its main K loop unrolled by two, or nil.
+    static func unrolledVariantKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel? {
+        let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
+            + (nsg ? "_nsg" : "") + "_u2"
+        variantsLock.lock(); defer { variantsLock.unlock() }
+        if let kernel = unrolledVariants[name] { return kernel }
+        let kernel = nemotronPreparedUnrollSource(nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+                outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
+        }
+        unrolledVariants[name] = kernel
+        return kernel
+    }
     nonisolated(unsafe) private static var dictVariants: [String: MLXFast.MLXFastKernel?] = [:]
     /// The prepared QMV twin reading (scale, bias) through `NemotronSBDict`
     /// (`nemotronSBDictSource` of the same body), or nil.
-    static func dictKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel? {
+    /// unroll: the same twin with its main K loop unrolled by two.
+    static func dictKernel(half: Bool, load: Int, nsg: Bool, unroll: Bool = false) -> MLXFast.MLXFastKernel? {
         let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
-            + (nsg ? "_nsg" : "") + "_sbd"
+            + (nsg ? "_nsg" : "") + "_sbd" + (unroll ? "_u2" : "")
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = dictVariants[name] { return kernel }
-        let kernel = nemotronSBDictSource(nemotronPreparedVariantSource(
-            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)).map {
+        let body = nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)
+        let kernel = (unroll ? nemotronPreparedUnrollSource(body) : body).flatMap(nemotronSBDictSource).map {
             MLXFast.metalKernel(
                 name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
                 outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
@@ -849,13 +979,20 @@ enum NemotronHeadPreparedActivation {
     }
 
     /// Kernel, extra template arguments, RPS and SIMD groups for one prepared
-    /// launch of `rows` x [K, N] at the caller's RPS.
-    private static func projectLaunch(rows: Int, k: Int, n: Int, rps: Int)
+    /// launch of `rows` x [K, N] at the caller's RPS. unroll (R = 3): the
+    /// kernel's unrolled twin (nil: `unrollEnabled` once qualified); the
+    /// record kernel stands in whenever that twin is missing.
+    private static func projectLaunch(rows: Int, k: Int, n: Int, rps: Int, unroll: Bool? = nil)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int) {
         let (kernel, hf) = projectKernel(rows: rows, fast: k % 512 == 0)
         guard rows == 3 else { return (kernel, hf, rps, 2) }
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
+        if unroll ?? (unrollEnabled && unrollQualified),
+           let twin = unrolledVariantKernel(half: !hf.isEmpty, load: load, nsg: geometry.nsg != 2) {
+            let extra: [(String, any KernelTemplateArg)] = geometry.nsg != 2 ? [("NSG", geometry.nsg)] : []
+            return (twin, hf + extra, geometry.rps, geometry.nsg)
+        }
         guard load != 0 || geometry.nsg != 2 else { return (kernel, hf, geometry.rps, 2) }
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
@@ -863,14 +1000,16 @@ enum NemotronHeadPreparedActivation {
     }
 
     /// projectLaunch's R = 3 launch with its kernel's dictionary twin, or nil.
-    private static func dictLaunch(k: Int, n: Int, rps: Int)
+    private static func dictLaunch(k: Int, n: Int, rps: Int, unroll: Bool? = nil)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
-        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
+        guard let record = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
+        let kernel = (unroll ?? (unrollEnabled && unrollQualified)
+            ? dictKernel(half: !hf.isEmpty, load: load, nsg: nsg, unroll: true) : nil) ?? record
         return (kernel, hf + extra, geometry.rps, geometry.nsg)
     }
     static func dictLaunchAvailable(k: Int, n: Int) -> Bool {
@@ -1005,7 +1144,7 @@ enum NemotronHeadPreparedActivation {
     }
 
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
-                      prepared: MLXArray? = nil, sbDict: Bool = true) -> MLXArray {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, unroll: Bool? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
@@ -1014,17 +1153,71 @@ enum NemotronHeadPreparedActivation {
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps) {
+           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps, unroll: unroll) {
             return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
                 outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
         }
-        let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps)
+        let (kernel, hf, launchRPS, nsg) = projectLaunch(rows: rows, k: k, n: n, rps: rps, unroll: unroll)
         return kernel([q.weight, q.scales, q.biases!, packed, args.0, args.1],
             template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
             grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
             outputShapes: [[rows, n]], outputDTypes: [x.dtype])[0]
+    }
+
+    /// Load time, after the pair dictionaries: every unrolled R = 3 prepared
+    /// launch against its record kernel, bit for bit, on the real weights of
+    /// every 4-bit projection of a verify shape in each model (the target and
+    /// the MTP head), in both (scale, bias) forms and both ReLU2 forms, at
+    /// the RPS each caller uses. Any difference, or a missing twin, keeps the
+    /// record kernels. Also compiles every unrolled pipeline before timing.
+    static func qualifyUnroll(_ models: [Module]) {
+        guard NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled else { return }
+        guard unrollEnabled else {
+            FileHandle.standardError.write(Data("nemotron qmv unroll: off (setting)\n".utf8))
+            return
+        }
+        let key = MLXRandom.key(0x5bd7)
+        var same = MLXArray(true)
+        var shapes: [[Int]] = []
+        var tensors = 0
+        for model in models {
+            for module in model.modules() {
+                guard let q = module as? QuantizedLinear, q.mode == .affine, q.bits == 4,
+                      q.groupSize == 64, q.bias == nil, q.weight.dtype == .uint32,
+                      let biases = q.biases, q.scales.dtype == .bfloat16, biases.dtype == .bfloat16
+                else { continue }
+                let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+                guard verifyShapes.contains([k, n]) else { continue }
+                let (record, _, _, _) = projectLaunch(rows: 3, k: k, n: n, rps: 2, unroll: false)
+                let (twin, _, _, _) = projectLaunch(rows: 3, k: k, n: n, rps: 2, unroll: true)
+                guard twin !== record else {
+                    FileHandle.standardError.write(Data(
+                        "nemotron qmv unroll off: the record main loop moved, no unrolled kernel for [\(k), \(n)]\n".utf8))
+                    return
+                }
+                let x = (MLXRandom.normal([3, k], key: key) * 0.5).asType(.bfloat16)
+                let rps = n == 131072 ? NemotronMultiRowQMV.headRPS(n: n) : 2
+                for sbDict in [false, true] {
+                    for relu2 in [false, true] {
+                        let a = apply(x, q, relu2: relu2, rps: rps, sbDict: sbDict, unroll: false)
+                        let b = apply(x, q, relu2: relu2, rps: rps, sbDict: sbDict, unroll: true)
+                        same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                    }
+                }
+                tensors += 1
+                if !shapes.contains([k, n]) { shapes.append([k, n]) }
+            }
+        }
+        guard tensors > 0, same.item(Bool.self) else {
+            FileHandle.standardError.write(Data(
+                "nemotron qmv unroll off: \(tensors > 0 ? "differs from the record kernel" : "no R = 3 prepared projection ran")\n".utf8))
+            return
+        }
+        unrollQualified = true
+        FileHandle.standardError.write(Data(
+            "nemotron qmv unroll on: \(tensors) tensors, shapes \(shapes), unrolled R = 3 prepared QMV bitwise equal to the record kernels\n".utf8))
     }
 }
 
