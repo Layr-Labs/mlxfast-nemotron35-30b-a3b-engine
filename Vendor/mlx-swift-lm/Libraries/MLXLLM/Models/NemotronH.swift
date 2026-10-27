@@ -144,16 +144,35 @@ enum NemotronHResidualRMSNorm {
     static let preparedMoEEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_RMS_PREPARED_MOE"] != "0"
 
+    /// NEMOTRON_JOIN_WEIGHT_HOIST=0 keeps the record text. On, the verify's prepared joins (every kernel
+    /// built by `preparedSource`: the MoE products join, the Mamba/attention joins, the sum and norm-only
+    /// twins and the verify entry) read the row's norm weights into registers with their other inputs,
+    /// before the reduction barriers, instead of after the last one (a dependent device read on the
+    /// join's serial path). The plain and prefill joins keep the record text. Same values and expressions.
+    static let weightHoist =
+        ProcessInfo.processInfo.environment["NEMOTRON_JOIN_WEIGHT_HOIST"] != "0"
+    private static func preparedBase() -> String {
+        guard weightHoist else { return source }
+        return nemotronSwapped(source, [
+            ("float thread_x[n_reads];\n",
+             "float thread_x[n_reads];\nT wv[n_reads];\nfor (uint i = 0; i < n_reads; i++) {\n"
+                + "    wv[i] = weight[lid * n_reads + i];\n}\n", 1),
+            ("normalized[offset + i] = weight[lid * n_reads + i]", "normalized[offset + i] = wv[i]", 1),
+        ])
+    }
+
     private static func preparedSource() -> String {
+        let source = preparedBase()
+        let weightRead = weightHoist ? "wv[i]" : "weight[lid * n_reads + i]"
         let scratch = "threadgroup float local_inv_mean[1];"
-        let store = "normalized[offset + i] = weight[lid * n_reads + i]"
+        let store = "normalized[offset + i] = " + weightRead
         let product = "* static_cast<T>(thread_x[i] * local_inv_mean[0]);"
         precondition(source.components(separatedBy: scratch).count == 2)
         precondition(source.components(separatedBy: store).count == 2)
         precondition(source.components(separatedBy: product).count == 2)
         let s = source.replacingOccurrences(of: scratch,
             with: scratch + "\nthreadgroup T rounded[2688];")
-            .replacingOccurrences(of: store, with: "T value = weight[lid * n_reads + i]")
+            .replacingOccurrences(of: store, with: "T value = " + weightRead)
             .replacingOccurrences(of: product, with: product
                 + "\nnormalized[offset + i] = value;\nrounded[lid * n_reads + i] = value;")
         return s + """
@@ -1154,12 +1173,57 @@ enum NemotronHCompactSSMGated {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             """
+    /// NEMOTRON_SSM_TAIL_HOIST=0 keeps the tail above as is. On, the gated-norm tail reads all three
+    /// rows' gate and y and the group's norm weights once, right after the arrival fence, instead of
+    /// each row's device reads waiting behind the previous row's barriers; the rows then take their
+    /// values from registers (a fixed current/next/last set shifted after each row, no dynamic
+    /// indexing). Same values, and every per-row expression, its order and both reductions are unchanged.
+    static let tailHoist = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_HOIST"] != "0"
+    static let tailSource: String = {
+        guard tailHoist else { return source }
+        let hoist = """
+            static_assert(L == 3, "three hoisted rows");
+            T gc[4], yc[4], gn[4], yn[4], gl[4], yl[4], wv[4];
+            if (on) {
+                const int64_t f0 = int64_t(grp) * 512 + int64_t(lid) * 4;
+                for (int i = 0; i < 4; i++) {
+                    wv[i] = weight[f0 + i];
+                    gc[i] = proj[f0 + i];
+                    gn[i] = proj[int64_t(PS) + f0 + i];
+                    gl[i] = proj[int64_t(2 * PS) + f0 + i];
+                    yc[i] = out[f0 + i];
+                    yn[i] = out[int64_t(H * Dh) + f0 + i];
+                    yl[i] = out[int64_t(2 * H * Dh) + f0 + i];
+                }
+            }
+
+            """
+        let shift = """
+                if (on) {
+                    for (int i = 0; i < 4; i++) {
+                        gc[i] = gn[i];
+                        yc[i] = yn[i];
+                        gn[i] = gl[i];
+                        yn[i] = yl[i];
+                    }
+                }
+
+            """
+        let end = "prepared[base + 16 * 32] = total;\n    }\n    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        return nemotronSwapped(source, [
+            ("const bool on = lid < 128;\n", "const bool on = lid < 128;\n" + hoist, 1),
+            ("T g = proj[int64_t(row) * PS + f];", "T g = gc[i];", 1),
+            ("T gated = out[int64_t(row) * (H * Dh) + f] * activated;", "T gated = yc[i] * activated;", 1),
+            ("T weighted = weight[f] * unweighted;", "T weighted = wv[i] * unweighted;", 1),
+            (end, end + shift, 1),
+        ])
+    }()
     static let kernel = MLXFast.metalKernel(
         name: "nemotron_mtp_ssm_compact_gated_prepared",
         inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                      "eps", "counter"],
         outputNames: ["out", "state_out", "normed", "prepared"],
-        source: source, mutableInputs: ["counter"])
+        source: tailSource, mutableInputs: ["counter"])
     /// NEMOTRON_MTP_SSM_PENDING_FOLD (see NemotronMTPPendingSSM): the same
     /// launch with `P` pending strict-prefix steps of earlier windows (`pconv`
     /// [1, P, CD], `pdt` [1, P, H]) run first from `state_in`, with the
@@ -1167,7 +1231,7 @@ enum NemotronHCompactSSMGated {
     /// from the resulting state exactly as above.
     static let pendingSource: String = {
         let loop = "\nfor (int t = 0; t < L; ++t) {\n"
-        precondition(source.components(separatedBy: loop).count == 2, "pending ssm source")
+        precondition(tailSource.components(separatedBy: loop).count == 2, "pending ssm source")
         let prelude = """
                     for (int t = 0; t < P; ++t) {
                         auto x_ = static_cast<float>(pconv[t * CD + n * Dh + d_idx]);
@@ -1185,7 +1249,7 @@ enum NemotronHCompactSSMGated {
                     }
 
         """
-        return source.replacingOccurrences(of: loop, with: "\n" + prelude + loop)
+        return tailSource.replacingOccurrences(of: loop, with: "\n" + prelude + loop)
     }()
     static let pendingKernel = MLXFast.metalKernel(
         name: "nemotron_mtp_ssm_compact_gated_prepared_pending",

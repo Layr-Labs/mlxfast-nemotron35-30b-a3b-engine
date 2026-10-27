@@ -507,14 +507,14 @@ extension CBv2MTPDeviceAcceptedPrestaging {
     }
 }
 
-/// The acceptance readback polls the packet's completion event instead of
+/// The acceptance readback can poll the packet's completion event instead of
 /// sleeping in the event wait, so the engine thread resumes as soon as the
 /// verify signals rather than after a thread wake-up. Bounded: after the cap it
 /// falls back to the blocking read. Only when the waiting changes, never what
-/// is read. CBV2_MTP_SPIN_READBACK=0 keeps the blocking wait.
+/// is read. Off by default (the blocking wait); CBV2_MTP_SPIN_READBACK=1 polls.
 enum CBv2MTPReadbackSpin {
     static let enabled =
-        ProcessInfo.processInfo.environment["CBV2_MTP_SPIN_READBACK"] != "0"
+        ProcessInfo.processInfo.environment["CBV2_MTP_SPIN_READBACK"] == "1"
     static let capSeconds = 0.05
 
     static func awaitAvailable(_ packet: MLXArray) {
