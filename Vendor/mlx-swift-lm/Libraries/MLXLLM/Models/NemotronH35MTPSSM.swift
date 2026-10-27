@@ -90,6 +90,16 @@ private enum NemotronMTPCompactSSMKernel {
         inputNames: ["conv", "A_log", "D", "dt", "state_in"],
         outputNames: ["out", "state_out"],
         source: source)
+    /// NEMOTRON_MAMBA_Z_OVERLAP with a folded strict prefix: this source with
+    /// the pending prelude inserted by `NemotronHCompactSSMGated
+    /// .withPendingPrelude` (the function that builds the fused pending
+    /// launch), so `P` pending steps run from `state_in` first and the window
+    /// follows from the resulting state.
+    static let pendingKernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_ssm_compact_pending",
+        inputNames: ["conv", "A_log", "D", "dt", "state_in", "pconv", "pdt"],
+        outputNames: ["out", "state_out"],
+        source: NemotronHCompactSSMGated.withPendingPrelude(source))
 
     static let source = """
             auto n = thread_position_in_grid.z;
@@ -157,6 +167,37 @@ func nemotronMTPSSMCompact(
                    ("WO", writeOutput)],
         grid: (32, headDim, heads), threadGroup: (32, 8, 1),
         outputShapes: [writeOutput ? [1, steps, heads, headDim] : [1], [1, heads, headDim, stateDim]],
+        outputDTypes: [convolution.dtype, .float32])
+    return (outputs[0], outputs[1])
+}
+
+/// NEMOTRON_MAMBA_Z_OVERLAP: `nemotronMTPSSMCompact(steps: W, writeOutput:
+/// true)` from `anchor` advanced by `pending.steps` folded strict-prefix steps
+/// (`pending.conv` [1, P, convDim], `pending.dt` [1, P, heads] FP32) inside
+/// the same launch, as the fused pending launch runs them. Returns y for the
+/// window's W positions and the final state.
+func nemotronMTPSSMCompactPending(
+    convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+    anchor: MLXArray, pending: (conv: MLXArray, dt: MLXArray, steps: Int),
+    heads: Int, headDim: Int, groups: Int, stateDim: Int
+) -> (output: MLXArray, finalState: MLXArray) {
+    let width = convolution.dim(1), convDim = convolution.dim(2)
+    precondition(convolution.ndim == 3 && convolution.dim(0) == 1 && width >= 1)
+    precondition(groups > 0 && heads % groups == 0 && convDim == heads * headDim + 2 * groups * stateDim)
+    precondition(dt.dtype == .float32 && dt.shape == [1, width, heads])
+    precondition(anchor.dtype == .float32 && anchor.shape == [1, heads, headDim, stateDim])
+    precondition(pending.steps >= 1 && pending.conv.shape == [1, pending.steps, convDim]
+        && pending.conv.dtype == convolution.dtype
+        && pending.dt.dtype == .float32 && pending.dt.shape == [1, pending.steps, heads])
+    let outputs = NemotronMTPCompactSSMKernel.pendingKernel(
+        [convolution, ALog, D, dt, anchor, pending.conv, pending.dt],
+        template: [("T", convolution.dtype), ("U", DType.float32),
+                   ("Dh", headDim), ("Ds", stateDim), ("H", heads),
+                   ("G", heads / groups), ("L", width), ("CD", convDim),
+                   ("BO", heads * headDim), ("CO", heads * headDim + groups * stateDim),
+                   ("WO", true), ("P", pending.steps)],
+        grid: (32, headDim, heads), threadGroup: (32, 8, 1),
+        outputShapes: [[1, width, heads, headDim], [1, heads, headDim, stateDim]],
         outputDTypes: [convolution.dtype, .float32])
     return (outputs[0], outputs[1])
 }

@@ -1165,9 +1165,13 @@ enum NemotronHCompactSSMGated {
     /// [1, P, CD], `pdt` [1, P, H]) run first from `state_in`, with the
     /// replay kernel's per-step statements (no y, no store), then the window
     /// from the resulting state exactly as above.
-    static let pendingSource: String = {
+    static let pendingSource = withPendingPrelude(source)
+    /// `body` with the pending steps' prelude ahead of its window loop. Also
+    /// builds the un-fused window kernel's pending twin
+    /// (NEMOTRON_MAMBA_Z_OVERLAP): same prelude text at the same point.
+    static func withPendingPrelude(_ body: String) -> String {
         let loop = "\nfor (int t = 0; t < L; ++t) {\n"
-        precondition(source.components(separatedBy: loop).count == 2, "pending ssm source")
+        precondition(body.components(separatedBy: loop).count == 2, "pending ssm source")
         let prelude = """
                     for (int t = 0; t < P; ++t) {
                         auto x_ = static_cast<float>(pconv[t * CD + n * Dh + d_idx]);
@@ -1185,8 +1189,8 @@ enum NemotronHCompactSSMGated {
                     }
 
         """
-        return source.replacingOccurrences(of: loop, with: "\n" + prelude + loop)
-    }()
+        return body.replacingOccurrences(of: loop, with: "\n" + prelude + loop)
+    }
     static let pendingKernel = MLXFast.metalKernel(
         name: "nemotron_mtp_ssm_compact_gated_prepared_pending",
         inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
@@ -1217,6 +1221,19 @@ extension NemotronHRMSNormGated {
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
     ) -> (MLXArray, MLXArray, MLXArray)? {
+        compactSSMPreparedOutputs(
+            convolution: convolution, ALog: ALog, D: D, dt: dt, state: state,
+            projected: projected, heads: heads, headDim: headDim, groups: groups,
+            stateDim: stateDim, pending: pending).map { ($0[2], $0[3], $0[1]) }
+    }
+
+    /// The fused launch's four outputs: y [1, 3, 64, 64], final state, normed
+    /// rows and prepared activation (`compactSSMPreparedRows` keeps the last three).
+    func compactSSMPreparedOutputs(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
+        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
+    ) -> [MLXArray]? {
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
                   pending.conv.shape == [1, pending.steps, 6144], pending.conv.dtype == .bfloat16,
@@ -1255,7 +1272,7 @@ extension NemotronHRMSNormGated {
             grid: (32, 64, 64), threadGroup: (32, 8, 1),
             outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
-        return (outputs[2], outputs[3], outputs[1])
+        return outputs
     }
 }
 

@@ -113,6 +113,100 @@ final class NemotronMTPPendingSSM {
     }
 }
 
+/// One compact verify window's rows: in_proj's z rows (`gate` [3, 4096]) and
+/// xBC | dt rows (`window` [3, 6208]), the conv/timestep outputs, the SSM's y
+/// [1, 3, 64, 64] and final state, and the gated norm's rows and out_proj's
+/// prepared activation.
+struct NemotronMambaZOverlapRows {
+    let gate: MLXArray, window: MLXArray
+    let convolution: MLXArray, padded: MLXArray, dt: MLXArray
+    let y: MLXArray, state: MLXArray
+    let normed: MLXArray, prepared: MLXArray
+}
+
+/// NEMOTRON_MAMBA_Z_OVERLAP: in the captured verify, each Mamba layer's
+/// in_proj z rows (read only by the gated norm) leave the launch the SSM
+/// waits on. The window runs as in_proj launch A (xBC and dt rows with the
+/// conv/timestep epilogue), the compact SSM window, in_proj launch B (z rows)
+/// and the gated RMS norm with out_proj's prepared activation
+/// (`mtpZOverlapRows`); B takes the SSM's y as a dependency, so MLX encodes it
+/// after the SSM's barrier and the two have no edge between them. Admitted at
+/// load only if, on the first Mamba layer's weights with seeded rows, every
+/// output (projection, conv, padded, dt, y, state, normed, prepared) equals
+/// the record route's (in_proj + epilogue in one launch, then the fused SSM +
+/// gated norm launch), bitwise, with no pending steps and with each folded
+/// step count, each with the prepared activation given and prepared in place.
+/// NEMOTRON_MAMBA_Z_OVERLAP=0 keeps the record route.
+enum NemotronMambaZOverlap {
+    static let requested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MAMBA_Z_OVERLAP"] != "0"
+    nonisolated(unsafe) static var qualified = false
+    static var enabled: Bool { requested && qualified }
+
+    /// Load time, after `NemotronSBDict.prepare` (the dictionary twins the
+    /// runtime launches read) and before any verify graph is traced.
+    static func qualify(_ model: Module) {
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mamba z overlap: \(message)\n".utf8))
+        }
+        qualified = false
+        guard requested else { return report("off (setting)") }
+        guard !NemotronMoELeader.selfTest else { return report("off (self-test)") }
+        guard let mixer = model.modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first
+        else { return report("off (no Mamba layer)") }
+        let (heads, dim, stateDim, convDim) =
+            (mixer.numHeads, mixer.headDim, mixer.ssmStateSize, mixer.convDim)
+        let keys = MLXRandom.split(key: MLXRandom.key(0x2b0f), into: 3 + 2 * NemotronMTPPendingSSM.maxSteps)
+        let hidden = (MLXRandom.normal([1, 3, 2688], key: keys[0]) * 0.5).asType(.bfloat16)
+        let convState = (MLXRandom.normal([1, 3, convDim], key: keys[1]) * 0.5).asType(.bfloat16)
+        let initial = MLXRandom.normal([1, heads, dim, stateDim], key: keys[2]) * 0.5
+        let prepared = NemotronHeadPreparedActivation.prepareContiguousRows(
+            hidden.reshaped(3, 2688), pv: 8)
+        eval(hidden, convState, initial, prepared)
+        func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            guard a.shape == b.shape, a.dtype == b.dtype else { return MLXArray(false) }
+            let bits: DType = a.dtype == .float32 ? .uint32 : .uint16
+            return (a.view(dtype: bits) .== b.view(dtype: bits)).all()
+        }
+        let names = ["projection", "conv", "padded", "dt", "y", "state", "normed", "prepared"]
+        let counts = [0] + (NemotronMTPPendingSSM.enabled ? Array(1 ... NemotronMTPPendingSSM.maxSteps) : [])
+        var cases = 0
+        for steps in counts {
+            let pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = steps == 0 ? nil : (
+                conv: (MLXRandom.normal([1, steps, convDim], key: keys[1 + 2 * steps]) * 1.5)
+                    .asType(.bfloat16),
+                dt: MLXRandom.uniform(
+                    low: Float(0.01), high: Float(0.5), [1, steps, heads], key: keys[2 + 2 * steps]),
+                steps: steps)
+            // The joined verify passes the preceding join's prepared activation;
+            // without one, both routes prepare it from the rows themselves.
+            for operand in [prepared, nil] as [MLXArray?] {
+                let at = "\(steps) pending steps" + (operand == nil ? ", rows prepared in place" : "")
+                guard let r = mixer.mtpFusedRecordRows(
+                        hidden, convState: convState, initialSSM: initial, prepared: operand,
+                        pending: pending),
+                      let split = mixer.mtpZOverlapRows(
+                        hidden, convState: convState, initialSSM: initial, prepared: operand,
+                        pending: pending)
+                else { return report("off (route unavailable at \(at))") }
+                let checks = [
+                    logicalAnd(same(split.gate, r.gate), same(split.window, r.window)),
+                    same(split.convolution, r.convolution), same(split.padded, r.padded),
+                    same(split.dt, r.dt), same(split.y, r.y), same(split.state, r.state),
+                    same(split.normed, r.normed), same(split.prepared, r.prepared)]
+                eval(checks)
+                if let miss = checks.firstIndex(where: { !$0.item(Bool.self) }) {
+                    return report("off (\(names[miss]) differs at \(at))")
+                }
+                cases += 1
+            }
+        }
+        qualified = true
+        report("on (\(cases) cases bitwise equal to in_proj + fused SSM/norm: "
+            + names.joined(separator: ", ") + ")")
+    }
+}
+
 /// Cache the complete numerical Mamba verify window, with explicit current
 /// conv/SSM inputs and explicit replay-tape outputs. No evaluation object,
 /// transaction, prefix-replay closure or request identity enters this graph.
@@ -443,6 +537,14 @@ extension NemotronHMamba2Mixer {
         pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
+        // NEMOTRON_MAMBA_Z_OVERLAP (see NemotronMambaZOverlap): in_proj's z
+        // rows run beside the SSM window; same tape outputs and out_proj input.
+        if NemotronMambaZOverlap.enabled,
+           let rows = mtpZOverlapRows(hiddenStates, convState: convState, initialSSM: initialSSM,
+                                      prepared: inputPrepared, pending: pending) {
+            return [nemotronMTPLinearRows(rows.normed, outProj, prepared: rows.prepared),
+                    rows.padded, rows.convolution, rows.dt, rows.state]
+        }
         // The window's conv, padded history and timestep come from in_proj's
         // own epilogue when the shapes allow it (same values, one launch fewer).
         var fusedWindow: (MLXArray, MLXArray, MLXArray)? = nil
@@ -551,6 +653,102 @@ extension NemotronHMamba2Mixer {
             convolution: pending.conv, ALog: aLog, D: D, dt: pending.dt, state: anchor,
             heads: numHeads, headDim: headDim, groups: numGroups, stateDim: ssmStateSize,
             steps: pending.steps, writeOutput: false).finalState
+    }
+
+    /// NEMOTRON_MAMBA_Z_OVERLAP: the compact verify window of three rows as
+    /// in_proj launch A (xBC and dt rows, conv/timestep epilogue), the compact
+    /// SSM window (its pending twin when strict-prefix steps are folded) that
+    /// reads only A's outputs, in_proj launch B (z rows) whose activation input
+    /// carries the SSM's y as a dependency so MLX encodes it after the SSM
+    /// (beside it, not before the SSM's barrier), and the gated RMS norm with
+    /// out_proj's prepared activation reading y and z. These are the
+    /// NEMOTRON_SSM_GATED_FUSED=0 window and norm launches. Nil (record route)
+    /// for any other shape.
+    func mtpZOverlapRows(
+        _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
+        prepared: MLXArray?, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?
+    ) -> NemotronMambaZOverlapRows? {
+        let length = hiddenStates.dim(1)
+        guard hiddenStates.ndim == 3, hiddenStates.dim(0) == 1, length == 3,
+              NemotronMTPExecution.batchedNorm,
+              numHeads == 64, headDim == 64, numGroups == 8, ssmStateSize == 128,
+              convDim == 6144, intermediateSize == numHeads * headDim,
+              convKernelSize == 4, conv1d.groups == convDim, conv1d.stride == 1,
+              conv1d.dilation == 1, conv1d.padding == 0, let convBias = conv1d.bias,
+              let q = inProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+              let o = outProj as? QuantizedLinear, o.mode == .affine,
+              o.bits == 4, o.groupSize == 64, o.bias == nil,
+              o.weight.shape == [2688, 512], o.weight.dtype == .uint32,
+              o.scales.shape == [2688, 64], o.scales.dtype == .bfloat16,
+              o.biases?.shape == [2688, 64], o.biases?.dtype == .bfloat16,
+              initialSSM.shape == [1, 64, 64, 128], initialSSM.dtype == .float32
+        else { return nil }
+        if let pending {
+            guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
+                  pending.conv.shape == [1, pending.steps, 6144], pending.conv.dtype == .bfloat16,
+                  pending.dt.shape == [1, pending.steps, 64], pending.dt.dtype == .float32
+            else { return nil }
+        }
+        guard let window = NemotronMambaInProjConvDt.applyWindowRows(
+            hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: prepared,
+            oldState: convState, convWeight: conv1d.weight, convBias: convBias,
+            dtBias: dtBias, timeStepLimit: timeStepLimit,
+            convStart: intermediateSize, convDim: convDim, heads: numHeads)
+        else { return nil }
+        let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
+        let ssm = pending.map {
+            nemotronMTPSSMCompactPending(
+                convolution: window.convolution, ALog: aLog, D: D, dt: window.dt,
+                anchor: initialSSM, pending: $0,
+                heads: heads, headDim: dim, groups: groups, stateDim: state)
+        } ?? nemotronMTPSSMCompact(
+            convolution: window.convolution, ALog: aLog, D: D, dt: window.dt,
+            state: initialSSM, heads: heads, headDim: dim, groups: groups, stateDim: state,
+            steps: length, writeOutput: true)
+        // The SSM's y leads the inputs so the dependency node takes the
+        // engine's stream from it (MLX picks the first input's stream; a
+        // primitive-less first input would select MLX's own default stream
+        // and fence every layer across streams).
+        guard let gate = NemotronMambaInProjConvDt.applyGateRows(
+                depends(inputs: [ssm.output, window.packed], dependencies: [ssm.output])[1], q,
+                convStart: intermediateSize, dict: window.dict),
+              let pair = norm.preparedRows(
+                ssm.output.reshaped(1, length, heads * dim),
+                gate: gate.reshaped(1, length, intermediateSize))
+        else { return nil }
+        return NemotronMambaZOverlapRows(
+            gate: gate, window: window.projected, convolution: window.convolution,
+            padded: window.padded, dt: window.dt, y: ssm.output, state: ssm.finalState,
+            normed: pair.0, prepared: pair.1)
+    }
+
+    /// The record route's rows for the same operands (load check only):
+    /// in_proj with its conv/timestep epilogue in one launch, then the fused
+    /// SSM + gated norm launch, as `mtpCompactArrays` calls them.
+    func mtpFusedRecordRows(
+        _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
+        prepared: MLXArray?, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?
+    ) -> NemotronMambaZOverlapRows? {
+        let length = hiddenStates.dim(1)
+        guard hiddenStates.ndim == 3, hiddenStates.dim(0) == 1, length == 3,
+              let convBias = conv1d.bias,
+              let q = inProj as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+              let fused = NemotronMambaInProjConvDt.apply(
+                hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: prepared,
+                oldState: convState, convWeight: conv1d.weight, convBias: convBias,
+                dtBias: dtBias, timeStepLimit: timeStepLimit,
+                convStart: intermediateSize, convDim: convDim, heads: numHeads),
+              let outputs = norm.compactSSMPreparedOutputs(
+                convolution: fused.convolution, ALog: aLog, D: D, dt: fused.dt,
+                state: initialSSM, projected: fused.projected.reshaped(1, length, -1),
+                heads: numHeads, headDim: headDim, groups: numGroups, stateDim: ssmStateSize,
+                pending: pending)
+        else { return nil }
+        let columns = MLX.split(fused.projected, indices: [intermediateSize], axis: 1)
+        return NemotronMambaZOverlapRows(
+            gate: columns[0], window: columns[1], convolution: fused.convolution,
+            padded: fused.padded, dt: fused.dt, y: outputs[0], state: outputs[1],
+            normed: outputs[2], prepared: outputs[3])
     }
 
     func mtpCapturedArrays(_ hiddenStates: MLXArray, convState: MLXArray,
