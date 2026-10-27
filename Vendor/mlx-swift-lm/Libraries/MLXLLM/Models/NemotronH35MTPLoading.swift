@@ -84,6 +84,8 @@ extension NemotronH35MTPAssistant {
         NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
+        try NemotronSIMDChunkStage.qualify(target)
+        try NemotronFC2PacketPipeline.qualify(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
@@ -94,6 +96,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
+        NemotronRouterSharedUpColaunch.qualify(target)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(

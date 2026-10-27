@@ -239,11 +239,23 @@ extension NemotronHMoE {
         } else {
             packed = nil
         }
+        var y: MLXArray
+        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
+        let colaunch = products && NemotronFC2SharedColaunch.enabled
+            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         // Router matmul retains M=1. Gathered experts already have M=1 per
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
         let scores: MLXArray
-        if NemotronMTPExecution.batchedRouter {
+        if NemotronMTPExecution.batchedRouter, let colaunch, let packed,
+           NemotronSharedUpPacking.unpackedApplies(colaunch.x, up: colaunch.mlp.upProj, down: colaunch.mlp.downProj),
+           let fused = NemotronRouterSharedUpColaunch.run(x, gate: gate, up: colaunch.mlp.upProj, prepared: packed) {
+            // The router and the shared up in one launch; the shared up rows
+            // feed the shared down launch below.
+            indices = fused.indices
+            scores = fused.weights
+            colaunch.up = fused.up
+        } else if NemotronMTPExecution.batchedRouter {
             let routed = gate.mtpForwardRows(x)
             indices = routed.0
             scores = routed.1
@@ -252,10 +264,6 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
-        var y: MLXArray
-        let products = parts && NemotronHResidualRMSNorm.plumbingAvailable
-        let colaunch = products && NemotronFC2SharedColaunch.enabled
-            ? sharedExperts.map { NemotronFC2SharedColaunch.Shared(mlp: $0, x: x, prepared: packed) } : nil
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
             x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
             y = reduced
@@ -1454,7 +1462,7 @@ enum NemotronMoELeader {
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
         _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, products: Bool = false,
-        colaunch: NemotronFC2SharedColaunch.Shared? = nil
+        colaunch: NemotronFC2SharedColaunch.Shared? = nil, after: MLXArray? = nil
     ) -> MLXArray? {
         guard enabled, type(of: mlp) == NemotronHSwitchMLP.self,
               type(of: mlp.fc1) == QuantizedSwitchLinear.self,
@@ -1511,7 +1519,8 @@ enum NemotronMoELeader {
         }
         if products, let prod = rows == 3
             ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
-            : (rows == 1 ? NemotronZSkip.draftProducts(act, flat, weights, owner: mlp.fc2) : nil) {
+            : (rows == 1 ? NemotronZSkip.draftProducts(
+                after.map { depends(input: act, dependencies: [$0]) } ?? act, flat, weights, owner: mlp.fc2) : nil) {
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -2123,7 +2132,7 @@ private let nemotronZSkipTiledSeqSource = """
 // scale exactly when the BF16 magnitude is at least 2^-110 and finite. Smaller
 // or non-finite values retain the complete tiled arithmetic below, avoiding
 // flush-to-zero differences from cancelling a subnormal intermediate.
-private let nemotronZSkipTiledFastSource = """
+private let nemotronZSkipTiledFastRecordSource = """
   constexpr int OT = 128;
   constexpr int LPS = 32 / SGS;
   constexpr int chunks = K / 8;
@@ -2295,6 +2304,13 @@ private let nemotronZSkipTiledFastSource = """
   }
 """
 
+private let nemotronZSkipTiledFastStagedSource = NemotronSIMDChunkStage.enabled
+    ? NemotronSIMDChunkStage.replacingStage(nemotronZSkipTiledFastRecordSource)
+    : nemotronZSkipTiledFastRecordSource
+private let nemotronZSkipTiledFastSource = NemotronFC2PacketPipeline.enabled
+    ? NemotronFC2PacketPipeline.replacingReads(nemotronZSkipTiledFastStagedSource)
+    : nemotronZSkipTiledFastStagedSource
+
 // A tiled slot kernel's source reading each group's (scale, bias) through the
 // routed FC2 bank's `NemotronSBDict` pair dictionary: `sk` holds the
 // tile-major uint16 pair index (one per group and output) and `bk` the bank's
@@ -2347,7 +2363,7 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
 // through the same `part` array twice (low tile, then high tile), so each output's closing simd_sum sees the
 // same 32 lane partials in the same lanes, and the store is unchanged. Every output therefore carries the bits
 // of the tile-major kernel.
-private let nemotronZSkipWideBodySource = """
+private let nemotronZSkipWideBodyRecordSource = """
     constexpr int OT = 128;
     constexpr int LPS = 32 / SGS;
     constexpr int chunks = K / 8;
@@ -2553,6 +2569,13 @@ private let nemotronZSkipWideBodySource = """
     }
 """
 
+private let nemotronZSkipWideBodyStagedSource = NemotronSIMDChunkStage.enabled
+    ? NemotronSIMDChunkStage.replacingStage(nemotronZSkipWideBodyRecordSource)
+    : nemotronZSkipWideBodyRecordSource
+private let nemotronZSkipWideBodySource = NemotronFC2PacketPipeline.enabled
+    ? NemotronFC2PacketPipeline.replacingReads(nemotronZSkipWideBodyStagedSource)
+    : nemotronZSkipWideBodyStagedSource
+
 /// The (scale, bias) bits of a lane's four outputs of group `gi` in tile 2W + h from the tile-major BF16 arrays
 /// (the tiled kernel's loads and shifts). Bit moves only.
 private let nemotronZSkipWidePlainSetup = """
@@ -2579,7 +2602,8 @@ private let nemotronZSkipWidePlainSetup = """
 /// ones. Grid x: N / 256 + 1 threadgroups (N % 256 == 128); threadgroups past the tail tile return at once (a
 /// co-launch's grid is the tile-major body's N / 128). Nil when the narrow source no longer has the expected
 /// statements.
-private func nemotronZSkipWideSource(narrow: String, store: String) -> String? {
+private func nemotronZSkipWideSource(narrow: String, store: String,
+                                    body: String = nemotronZSkipWideBodySource) -> String? {
     let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
     let slot = "  const int slot = int(threadgroup_position_in_grid.y);\n"
     let grid = "int(threadgroup_position_in_grid.x)"
@@ -2589,7 +2613,7 @@ private func nemotronZSkipWideSource(narrow: String, store: String) -> String? {
     let tailBody = narrow.replacingOccurrences(of: arrays, with: "")
         .replacingOccurrences(of: slot, with: "")
         .replacingOccurrences(of: grid, with: "(N / 128 - 1)")
-    let wideBody = nemotronZSkipWideBodySource
+    let wideBody = body
         .replacingOccurrences(of: "  NMW_SB_SETUP\n", with: nemotronZSkipWidePlainSetup)
         .replacingOccurrences(of: "  NMW_STORE\n", with: "          " + store + "\n")
     guard !wideBody.contains("NMW_") else { return nil }
@@ -3161,7 +3185,7 @@ enum NemotronSharedDownZSkip {
         source: nemotronZSkipTiledLayoutSource)
     /// The shared-down body: the routed slot kernel's fast tiled source with K-generic chunk bounds and a BF16
     /// row store (also the shared half of `NemotronFC2SharedColaunch`). Nil when a swap no longer applies.
-    fileprivate static let source: String? = {
+    fileprivate static func makeSource(_ routed: String) -> String? {
         let swaps: [(String, String)] = [
             ("  constexpr int tail = chunks - 224;\n",
              "  constexpr int full = chunks / 32;\n  constexpr int tail = chunks - 32 * full;\n"),
@@ -3172,13 +3196,14 @@ enum NemotronSharedDownZSkip {
             ("      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;\n",
              "      shared_y[slot * N + n0 + n] = h;\n"),
         ]
-        var source = nemotronZSkipTiledFastSource
+        var source = routed
         for (old, new) in swaps {
             guard source.components(separatedBy: old).count == 2 else { return nil }
             source = source.replacingOccurrences(of: old, with: new)
         }
         return source
-    }()
+    }
+    fileprivate static let source = makeSource(nemotronZSkipTiledFastSource)
     fileprivate static let kernel: MLXFast.MLXFastKernel? = source.map { source in
         MLXFast.metalKernel(
             name: "nemotron_zskip_shared_down_tiled_fast",
@@ -3493,6 +3518,10 @@ enum NemotronFC2SharedColaunch {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH"] != "0"
         && !NemotronMoELeader.selfTest
     private static let sharedFirst = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH_SD_FIRST"] != "0"
+    /// Unless NEMOTRON_MTP_SD_EARLY=0, a covered layer runs the two separate launches the co-launch was checked
+    /// against, and the routed slot products take the shared rows as a dependency: MLX then encodes the shared
+    /// down beside the routed FC1 and the shared up beside the router.
+    private static let early = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SD_EARLY"] != "0"
     private static let slots = 18
     private static let sharedRows = 3
 
@@ -3503,6 +3532,8 @@ enum NemotronFC2SharedColaunch {
         let x: MLXArray
         let prepared: MLXArray?
         var rows: MLXArray? = nil
+        /// The shared up ReLU² rows when `NemotronRouterSharedUpColaunch` already produced them.
+        var up: MLXArray? = nil
         init(mlp: NemotronHMLP, x: MLXArray, prepared: MLXArray?) {
             self.mlp = mlp
             self.x = x
@@ -3515,9 +3546,15 @@ enum NemotronFC2SharedColaunch {
                     shared: Shared) -> MLXArray? {
         let down = shared.mlp.downProj
         guard covers(fc2: fc2, down: down),
-              let sx = NemotronSharedUpPacking.unpackedActivation(
-                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared),
-              let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
+              let sx = shared.up ?? NemotronSharedUpPacking.unpackedActivation(
+                  shared.x, up: shared.mlp.upProj, down: down, prepared: shared.prepared) else { return nil }
+        if early, let rows = NemotronSharedDownZSkip.run(sx, owner: down),
+           let prod = NemotronZSkip.weightedProducts(
+               depends(input: x, dependencies: [rows]), inds, scores, owner: fc2) {
+            shared.rows = rows
+            return prod
+        }
+        guard let pair = run(x, inds, scores, fc2: fc2, sx: sx, down: down) else { return nil }
         shared.rows = pair.1
         return pair.0
     }
@@ -4411,5 +4448,282 @@ enum NemotronSBDict {
         }
         eval(Array(same.values))
         return Set(same.compactMap { $0.value.item(Bool.self) && !failed.contains($0.key) ? $0.key : nil })
+    }
+}
+
+/// Decode-only software pipeline for the native sparse FC2 code words.
+/// The next chunk's masked device reads precede this chunk's unchanged
+/// activation arithmetic, metadata lookup and accumulation. Two private
+/// eight-word packets cost registers; no shared storage or barrier is added.
+enum NemotronFC2PacketPipeline {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC2_PACKET_PIPELINE"] != "0"
+
+    static func replacingReads(_ source: String) -> String {
+        let loop = "for (int j = 0; j < count; j++) {"
+        let mask = "const uint m = cmask[c];"
+        precondition(source.components(separatedBy: loop).count == 2
+            && source.components(separatedBy: mask).count == 2, "FC2 packet pipeline unique chunk loop")
+        var result = source
+        // Every device code read in the one-, two-, three-value and dense
+        // paths. The source's arithmetic and the dictionary transforms stay.
+        let reads: [(String, String, Int)] = [
+            ("wq[(8 * c + j1) * 32]", "nmp_word(j1)", 3),
+            ("wq[(8 * c + j2) * 32]", "nmp_word(j2)", 2),
+            ("wq[(8 * c + j3) * 32]", "nmp_word(j3)", 1),
+            ("wq[(8 * c + i) * 32]", "nmp_word(i)", 1),
+            ("wq[(8 * c + i + 4) * 32]", "nmp_word(i + 4)", 1),
+        ]
+        for (old, new, count) in reads {
+            precondition(result.components(separatedBy: old).count == count + 1,
+                         "FC2 packet pipeline exact device read sites")
+            result = result.replacingOccurrences(of: old, with: new)
+        }
+        precondition(!result.contains("wq["), "FC2 packet pipeline accounts for all code reads")
+        let packet = """
+uint4 nmp_next_lo, nmp_next_hi;
+    uint4 nmp_current_lo, nmp_current_hi;
+    auto nmp_read = [&](const int pc) {
+      const uint pm = cmask[pc];
+      nmp_next_lo = uint4(
+          (pm &   1u) != 0 ? uint(wq[(8 * pc    ) * 32]) : 0u,
+          (pm &   2u) != 0 ? uint(wq[(8 * pc + 1) * 32]) : 0u,
+          (pm &   4u) != 0 ? uint(wq[(8 * pc + 2) * 32]) : 0u,
+          (pm &   8u) != 0 ? uint(wq[(8 * pc + 3) * 32]) : 0u);
+      nmp_next_hi = uint4(
+          (pm &  16u) != 0 ? uint(wq[(8 * pc + 4) * 32]) : 0u,
+          (pm &  32u) != 0 ? uint(wq[(8 * pc + 5) * 32]) : 0u,
+          (pm &  64u) != 0 ? uint(wq[(8 * pc + 6) * 32]) : 0u,
+          (pm & 128u) != 0 ? uint(wq[(8 * pc + 7) * 32]) : 0u);
+    };
+    // Vector packets avoid a runtime-indexed addressable thread array.
+    // Both vector subscripts are always in [0, 3].
+    auto nmp_word = [&](const int pi) {
+      return pi < 4 ? nmp_current_lo[pi & 3] : nmp_current_hi[pi & 3];
+    };
+    if (count > 0) {
+      nmp_read(l);
+    }
+
+"""
+        result = result.replacingOccurrences(of: loop, with: packet + loop)
+        let advance = """
+const uint m = cmask[c];
+      nmp_current_lo = nmp_next_lo;
+      nmp_current_hi = nmp_next_hi;
+      // Native chunk order is l, l+32, ... including its partial final round.
+      // Complete this transition before any zero/sparse-path continue.
+      if (j + 1 < count) {
+        nmp_read(l + 32 * (j + 1));
+      }
+"""
+        return result.replacingOccurrences(of: mask, with: advance)
+    }
+
+    static func qualify(_ model: Module) throws {
+        guard enabled else { return }
+        try NemotronFC2SharedColaunch.qualifyPacketPipeline(model)
+    }
+}
+
+extension NemotronFC2SharedColaunch {
+    // Explicit unmodified whole-43 chunk loops. The co-launch wrapper, code
+    // copies, scale dictionaries, wide layout and output stores are the same.
+    private static let packetRecordShared: String? = NemotronSharedDownZSkip
+        .makeSource(nemotronZSkipTiledFastRecordSource).flatMap {
+            nemotronZSkipWideSource(narrow: $0, store: "shared_y[slot * N + n0 + n] = h;",
+                                   body: nemotronZSkipWideBodyRecordSource)
+        }
+    private static let packetRecordPlain = make("nemotron_fc2_packet_record_plain",
+        fc2: nemotronZSkipTiledFastRecordSource, shared: packetRecordShared)
+    private static let packetRecordDict = make("nemotron_fc2_packet_record_dict",
+        fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastRecordSource), shared: packetRecordShared)
+
+    /// Official load-time qualification: compare both full co-launch outputs
+    /// with the original chunk loops on every actual target bank. Byte masks,
+    /// signed zeros, tiny finite values and the final partial round are covered
+    /// by the constructed rows; original seeded/realistic cases cover the ends.
+    fileprivate static func qualifyPacketPipeline(_ model: Module) throws {
+        guard enabled, NemotronZSkip.fast, NemotronZSkip.tiled,
+              NemotronSharedDownZSkip.wideEnabled,
+              let plain = packetRecordPlain, let dict = packetRecordDict
+        else { throw NemotronH35MTPError.invalidArtifact("FC2 packet pipeline native reference unavailable") }
+        let owners = model.modules().compactMap { $0 as? NemotronHMoE }
+        guard !owners.isEmpty else {
+            throw NemotronH35MTPError.invalidArtifact("FC2 packet pipeline no native owners")
+        }
+        func maskRows(_ rows: Int, _ k: Int, _ seed: Int) -> MLXArray {
+            let values: [UInt16] = [0x3f80, 0xbf00, 0x0880, 0x087f]
+            let chunks = rows * k / 8
+            var bits = [UInt16](repeating: 0, count: rows * k)
+            for c in 0..<chunks {
+                let mask = (c + seed * 19) & 255
+                for i in 0..<8 {
+                    bits[8 * c + i] = (mask & (1 << i)) == 0
+                        ? (((c + i) & 1) == 0 ? 0 : 0x8000)
+                        : values[((c >> 8) + i + seed) & 3]
+                }
+            }
+            return MLXArray(bits).reshaped(rows, k).view(dtype: .bfloat16)
+        }
+        var checked = 0
+        try withError { () -> Void in
+            for (i, owner) in owners.enumerated() {
+                guard let down = owner.sharedExperts?.downProj,
+                      let copy = NemotronZSkip.copy(for: owner.switchMLP.fc2),
+                      let shared = sharedCopy(down), shared.0.wide,
+                      simdStagePair(owner.switchMLP.fc2, down),
+                      let candidate = kernel(for: copy, shared: shared.0)
+                else { throw NemotronH35MTPError.invalidArtifact("FC2 packet pipeline all-bank native admission refused") }
+                let record = copy.dict ? dict : plain
+                let cases = seededCases(seed: i, realistic: true)
+                var rows = [(maskRows(18, 1856, i), maskRows(3, 3712, i))]
+                if i == 0 || i == owners.count - 1 { rows += cases.rows }
+                for (x, sx) in rows {
+                    let a = dispatch(record, x, cases.inds, cases.scores, copy, sx, shared.0, shared.1)
+                    let b = dispatch(candidate, x, cases.inds, cases.scores, copy, sx, shared.0, shared.1)
+                    let same = (a.0.view(dtype: .uint32) .== b.0.view(dtype: .uint32)).all()
+                        .&& (a.1.view(dtype: .uint16) .== b.1.view(dtype: .uint16)).all()
+                    guard same.item(Bool.self) else {
+                        throw NemotronH35MTPError.invalidArtifact("FC2 packet pipeline differs from original chunk loop")
+                    }
+                    checked += 1
+                }
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "nemotron FC2 packet pipeline: \(owners.count) native owners, \(checked) full-output cases bitwise equal\n".utf8))
+    }
+}
+
+// Same xsh/cmask contents, with eight neighbouring lanes cooperatively
+// classifying a chunk. No floating-point arithmetic or barriers move.
+enum NemotronSIMDChunkStage {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_SIMD_STAGE"] != "0"
+    private static let loop = "for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {"
+    private static let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+
+    private static func stageRange(_ source: String) -> Range<String.Index> {
+        precondition(source.components(separatedBy: loop).count == 2, "SIMD stage unique loop")
+        let first = source.range(of: loop)!
+        guard let last = source.range(of: barrier, range: first.upperBound..<source.endIndex) else {
+            preconditionFailure("SIMD stage publication seam")
+        }
+        let span = first.lowerBound..<last.lowerBound
+        let old = source[span]
+        precondition(old.contains("for (int i = 0; i < 8; i++)")
+            && old.contains("xsh[8 * c + i] = xs[8 * c + i];")
+            && old.contains("cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);"), "SIMD stage exact ownership")
+        return span
+    }
+    private static let cooperative = """
+static_assert(K % 32 == 0, "SIMD mask staging requires complete SIMD rounds");
+  for (int b = sg * 32; b < K; b += SGS * 32) {
+    const int j = b + lid;
+    const uint ab = uint(((const device uint16_t*)xs)[j]) & 0x7fffu;
+    xsh[j] = xs[j];
+    const uint64_t live = static_cast<uint64_t>(simd_ballot(ab != 0));
+    const uint64_t unsafe = static_cast<uint64_t>(simd_ballot(
+        ab != 0 && (ab < 0x0880u || ab >= 0x7f80u)));
+    if ((lid & 7) == 0) {
+      const uint m = uint((live >> lid) & 255ul);
+      const bool bad = ((unsafe >> lid) & 255ul) != 0;
+      cmask[j / 8] = bad ? uchar(255) : uchar(m);
+    }
+  }
+"""
+    static func replacingStage(_ source: String) -> String {
+        var result = source
+        result.replaceSubrange(stageRange(source), with: cooperative + "\n  ")
+        return result
+    }
+    private static func stageSource(cooperative useCooperative: Bool) -> String {
+        let original = String(nemotronZSkipTiledFastRecordSource[stageRange(nemotronZSkipTiledFastRecordSource)])
+        let prefix = """
+  constexpr int chunks = K / 8;
+  const int row = int(threadgroup_position_in_grid.y);
+  const int lid = int(thread_index_in_simdgroup);
+  const int sg = int(simdgroup_index_in_threadgroup);
+  const device T* xs = x + row * K;
+  threadgroup T xsh[K];
+  threadgroup uchar cmask[chunks];
+  """
+        let suffix = """
+threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int j = sg * 32 + lid; j < K; j += SGS * 32) {
+    copied[row * K + j] = xsh[j];
+  }
+  for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+    masks[row * chunks + c] = cmask[c];
+  }
+"""
+        return prefix + "\n" + (useCooperative ? cooperative : original) + "\n" + suffix
+    }
+    private static let reference = MLXFast.metalKernel(
+        name: "nemotron_chunk_stage_reference", inputNames: ["x"], outputNames: ["copied", "masks"],
+        source: stageSource(cooperative: false))
+    private static let candidate = MLXFast.metalKernel(
+        name: "nemotron_chunk_stage_simd_vote", inputNames: ["x"], outputNames: ["copied", "masks"],
+        source: stageSource(cooperative: true))
+
+    /// Official-only: all byte masks and special BF16 classes, directly
+    /// comparing every staged bit and metadata byte. Existing all-bank
+    /// product/shared/co-launch checks run first on the production sources.
+    static func qualify(_ model: Module) throws {
+        guard enabled else { return }
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              NemotronZSkip.tiled, NemotronZSkip.fast,
+              NemotronSharedDownZSkip.enabled, NemotronFC2SharedColaunch.enabled
+        else { throw NemotronH35MTPError.invalidArtifact("SIMD stage native production prerequisites unavailable") }
+        let owners = model.modules().compactMap { $0 as? NemotronHMoE }
+        var native: Set<ObjectIdentifier> = []
+        for owner in owners {
+            let id = ObjectIdentifier(owner.switchMLP.fc2)
+            guard let down = owner.sharedExperts?.downProj,
+                  NemotronZSkip.lock.withLock({ NemotronZSkip.copies[id] != nil }),
+                  NemotronSharedDownZSkip.copyArrays(for: down) != nil,
+                  NemotronFC2SharedColaunch.simdStagePair(owner.switchMLP.fc2, down)
+            else { throw NemotronH35MTPError.invalidArtifact("SIMD stage all-bank product/co-launch admission refused") }
+            native.insert(id)
+        }
+        guard !native.isEmpty else { throw NemotronH35MTPError.invalidArtifact("SIMD stage no native FC2 owners") }
+        let sgs = NemotronZSkip.sgs
+        let values: [UInt16] = [0x3f80, 0xbf80, 0x0880, 0x8880, 0x087f, 0x0001, 0x007f, 0x7f7f, 0x7f80, 0xff80, 0x7fc1, 0xff81]
+        var checked = 0
+        try withError { () -> Void in
+            for k in [1856, 3712] {
+                let chunks = k / 8
+                for (variant, value) in values.enumerated() {
+                    var bits = [UInt16](repeating: 0, count: 3 * k)
+                    for c in 0..<(3 * chunks) {
+                        let mask = c & 255
+                        for i in 0..<8 {
+                            let zero: UInt16 = ((c + i + variant) & 1) == 0 ? 0 : 0x8000
+                            bits[c * 8 + i] = (mask & (1 << i)) != 0 ? value : zero
+                        }
+                    }
+                    let x = MLXArray(bits).reshaped(3, k).view(dtype: .bfloat16)
+                    func run(_ kernel: MLXFast.MLXFastKernel) -> [MLXArray] {
+                        kernel([x], template: [("T", DType.bfloat16), ("K", k), ("SGS", sgs)],
+                            grid: (32 * sgs, 3, 1), threadGroup: (32 * sgs, 1, 1),
+                            outputShapes: [[3, k], [3, chunks]], outputDTypes: [.bfloat16, .uint8])
+                    }
+                    let a = run(reference), b = run(candidate)
+                    let same = (a[0].view(dtype: .uint16) .== b[0].view(dtype: .uint16)).all()
+                        .&& (a[1] .== b[1]).all()
+                    guard same.item(Bool.self) else {
+                        throw NemotronH35MTPError.invalidArtifact("SIMD stage activation bits or chunk mask differs")
+                    }
+                    checked += 1
+                }
+            }
+        }
+        FileHandle.standardError.write(Data(
+            "nemotron SIMD chunk stage: \(native.count) native FC2/co-launch owners, \(checked) mask/activation cases\n".utf8))
+    }
+}
+
+extension NemotronFC2SharedColaunch {
+    fileprivate static func simdStagePair(_ fc2: SwitchLinear, _ down: Linear) -> Bool {
+        lock.withLock { pairs[ObjectIdentifier(fc2)] == ObjectIdentifier(down) }
     }
 }
