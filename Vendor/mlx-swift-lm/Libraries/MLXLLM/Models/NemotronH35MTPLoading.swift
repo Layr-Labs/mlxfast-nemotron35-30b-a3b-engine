@@ -82,6 +82,7 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -406,7 +407,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let decodeSets: [any MTLResidencySet]
     let owners: [ObjectIdentifier]
     let cut: Int
-    let queue = DispatchQueue(label: "nemotron.decode.memory")
+    /// The residency queues run at user-interactive QoS whichever thread enqueues their requests.
+    let queue = DispatchQueue(label: "nemotron.decode.memory", qos: .userInteractive)
     /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
     /// requests are left standing between requests.
     static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
@@ -415,7 +417,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// rest), requested on their own serial queue when a request's lease begins and ended with the lease.
     static let targetEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_TARGET_RESIDENCY"] != "0"
     let targetSets: [any MTLResidencySet]
-    let targetQueue = DispatchQueue(label: "nemotron.target.memory")
+    let targetQueue = DispatchQueue(label: "nemotron.target.memory", qos: .userInteractive)
     /// Load-time decode-only backing outside the head and copy sets (the draft head's routed-FC2 copy and the
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
