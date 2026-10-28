@@ -484,6 +484,22 @@ enum NemotronHResidualRMSNorm {
                 which(ok, outputs[2], MLXArray(Float.nan)))
     }
 
+    /// `normPreparedRows`' launch on one row ([1, 1, 2688]): the normalized row (the prepared activation the
+    /// launch also writes is not read). The MTP draft front's norm (`NemotronMTPDraftFrontNorm`).
+    static func normPreparedRow(_ x: MLXArray, norm: RMSNorm) -> MLXArray? {
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              x.shape == [1, 1, 2688], x.dtype == .bfloat16, type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let outputs = normPreparedKernel([x, norm.weight, axis, eps],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [x.shape, [1, 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+        guard NemotronMoELeader.selfTest else { return outputs[0] }
+        return nemotronBitwiseOrNaN(outputs[0], norm(x))
+    }
+
     /// Captured verify entry norm: (normalized, prepared K=2688 rows).
     static func normPreparedRows(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray)? {
         guard plumbingRows(x, norm: norm) else { return nil }
@@ -496,6 +512,63 @@ enum NemotronHResidualRMSNorm {
         let ok = (outputs[0].view(dtype: .uint16) .== norm(x).view(dtype: .uint16)).all()
         return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
                 which(ok, outputs[1], MLXArray(Float.nan)))
+    }
+
+    /// `kernel`'s text with the residual read moved to row a of `lhs` [1, W, 2688], where a is the device
+    /// accept walk's count over the acceptance packet (the count of leading packet[targets + i] ==
+    /// packet[drafts + i], i < count; the row pick's loop) formed in the launch. Nil if the read moved.
+    private static let walkSource: String? = {
+        let base = oneBarrierSource(source)
+        let read = "T sum = lhs[offset + i] + rhs[offset + i];"
+        guard base.components(separatedBy: read).count == 2 else { return nil }
+        return """
+            size_t nmw_row = 0;
+            {
+                int nmw_a = 0;
+                const int64_t nmw_step = packet_strides[0];
+                while (nmw_a < walk[0] && packet[(walk[2] + nmw_a) * nmw_step] == packet[(walk[1] + nmw_a) * nmw_step]) {
+                    ++nmw_a;
+                }
+                nmw_row = size_t(nmw_a) * axis_size;
+            }
+
+            """ + base.replacingOccurrences(of: read, with: "T sum = lhs[nmw_row + offset + i] + rhs[offset + i];")
+    }()
+    private static let walkKernel = walkSource.map {
+        MLXFast.metalKernel(
+            name: name("nemotron_h_residual_rms_walk_bf16"),
+            inputNames: ["lhs", "rhs", "weight", "axis_size", "eps", "packet", "walk"],
+            outputNames: ["residual", "normalized"], source: $0, ensureRowContiguous: true)
+    }
+    static var walkKernelAvailable: Bool { walkKernel != nil }
+
+    /// Whether `applyWalk` serves these operands (checked before the caller builds anything).
+    static func walkServes(_ rows: MLXArray, packet: MLXArray, count: Int, drafts: Int, targets: Int,
+                           norm: RMSNorm) -> Bool {
+        walkKernel != nil && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && rows.ndim == 3 && rows.dim(0) == 1 && rows.dim(2) == 2688 && rows.dtype == .bfloat16
+            && rows.strides == [rows.dim(1) * 2688, 2688, 1]
+            && count >= 0 && count < rows.dim(1)
+            && packet.ndim == 1 && packet.dtype == .int32 && drafts >= 0 && targets >= 0
+            && drafts + count <= packet.dim(0) && targets + count <= packet.dim(0)
+            && type(of: norm) == RMSNorm.self && norm.weight.shape == [2688] && norm.weight.dtype == .bfloat16
+    }
+
+    /// `apply(rows[a], rhs, norm)` for the row a the device accept walk selects (see `walkSource`), without the
+    /// row being gathered first: rows [1, W, 2688] row-contiguous, rhs [1, 1, 2688], both BF16. Nil outside these
+    /// shapes.
+    static func applyWalk(_ rows: MLXArray, _ rhs: MLXArray, packet: MLXArray, count: Int, drafts: Int,
+                          targets: Int, norm: RMSNorm) -> (MLXArray, MLXArray)? {
+        guard walkServes(rows, packet: packet, count: count, drafts: drafts, targets: targets, norm: norm),
+              rhs.shape == [1, 1, 2688], rhs.dtype == .bfloat16, let walkKernel
+        else { return nil }
+        let result = walkKernel(
+            [rows, rhs, norm.weight, UInt32(2688), norm.eps, packet,
+             MLXArray([Int32(count), Int32(drafts), Int32(targets)])],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [rhs.shape, rhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
     }
 
     static func apply(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
@@ -661,6 +734,35 @@ enum NemotronHEmbeddingRows {
             """, ensureRowContiguous: true)
 
     static func apply(_ tokens: MLXArray, _ embedding: Embedding) -> MLXArray? {
+        operands(tokens, embedding).map(rows)
+    }
+
+    /// What `apply` reads for `tokens`: the flat ids, the packed rows with their scales and biases, and the
+    /// kernel's V, BYTES and G. nil exactly where `apply` launches nothing.
+    struct Operands {
+        let ids: MLXArray
+        let weight: MLXArray
+        let scales: MLXArray
+        let biases: MLXArray
+        let vocabulary: Int
+        let bytes: Int
+        let groups: Int
+        var count: Int { ids.dim(0) }
+        var dims: Int { 2 * bytes }
+        var arrays: [MLXArray] { [ids, weight, scales, biases] }
+        var template: [(String, any KernelTemplateArg)] {
+            [("V", vocabulary), ("BYTES", bytes), ("G", groups)]
+        }
+
+        /// Operands over `arrays` (`[ids, weight, scales, biases]`, e.g. a compiled trace's inputs); V, BYTES
+        /// and G from their shapes, as `operands` derives them.
+        static func with(_ arrays: [MLXArray]) -> Operands {
+            Operands(ids: arrays[0], weight: arrays[1], scales: arrays[2], biases: arrays[3],
+                     vocabulary: arrays[1].dim(0), bytes: arrays[1].dim(1) * 4, groups: arrays[2].dim(1))
+        }
+    }
+
+    static func operands(_ tokens: MLXArray, _ embedding: Embedding) -> Operands? {
         guard enabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               tokens.ndim == 2, tokens.dim(0) == 1, (1...512).contains(tokens.dim(1)),
               tokens.dtype == .int32 || tokens.dtype == .uint32,
@@ -675,12 +777,16 @@ enum NemotronHEmbeddingRows {
         guard dims % 64 == 0, q.scales.shape == [vocabulary, dims / 64],
               biases.shape == q.scales.shape, (dims / 2) % 64 == 0
         else { return nil }
-        let count = tokens.dim(1)
-        return kernel([tokens.reshaped(count), q.weight, q.scales, biases],
-            template: [("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2),
-                       ("G", dims / 64)],
-            grid: (dims / 2, count, 1), threadGroup: (64, 1, 1),
-            outputShapes: [[1, count, dims]], outputDTypes: [.bfloat16])[0]
+        return Operands(ids: tokens.reshaped(tokens.dim(1)), weight: q.weight, scales: q.scales,
+                        biases: biases, vocabulary: vocabulary, bytes: dims / 2, groups: dims / 64)
+    }
+
+    /// `apply`'s launch on its operands: [1, count, dims] BF16 rows.
+    static func rows(_ o: Operands) -> MLXArray {
+        kernel(o.arrays,
+            template: [("T", DType.bfloat16), ("V", o.vocabulary), ("BYTES", o.bytes), ("G", o.groups)],
+            grid: (o.bytes, o.count, 1), threadGroup: (64, 1, 1),
+            outputShapes: [[1, o.count, o.dims]], outputDTypes: [.bfloat16])[0]
     }
 }
 
@@ -701,6 +807,18 @@ enum NemotronHVerifyEntry {
         admittedEmbedding = accepted ? embedding : nil
         admittedNorm = accepted ? norm : nil
     }
+
+    /// NEMOTRON_MTP_ENTRY_IDS3=0 keeps the entry reading the concatenated window. Otherwise, when the engine
+    /// publishes the window's three columns (`CBv2MTPVerifyWindowColumns`), the entry reads row r's id from
+    /// column r (`ids0[0]`, `ids1[0]`, `ids2[0]`) instead of from the window's copy of it; set by
+    /// `qualifyVerifyEntryIds3`.
+    nonisolated(unsafe) static var ids3Verified = false
+    /// NEMOTRON_MTP_SCREEN_NO_TICKET=0 keeps the column entry. Otherwise, when both drafts' token arrays are
+    /// ticket-free screen picks, rows 1 and 2 form their ids from the screens' chunk bests in the launch; set by
+    /// `qualifyVerifyEntryPicks`.
+    nonisolated(unsafe) static var picksVerified = false
+    /// NEMOTRON_MTP_SCREEN_PICK_HOIST=0 keeps the picks entry's loop form; set by `qualifyVerifyEntryPicksHoist`.
+    nonisolated(unsafe) static var picksHoistVerified = false
 }
 
 extension NemotronHResidualRMSNorm {
@@ -748,6 +866,289 @@ extension NemotronHResidualRMSNorm {
             grid: (672 * count, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [residualShape, residualShape, preparedShape],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
+    }
+
+    /// The entry reading row r's id from its own window column (`gid` is the row): the record entry's text with
+    /// only the id load replaced.
+    private static func verifyEntryIds3Source() -> String {
+        let read = "int64_t id = int64_t(ids[gid]);"
+        let s = verifyEntrySource()
+        precondition(s.components(separatedBy: read).count == 2, "verify entry id load")
+        return s.replacingOccurrences(
+            of: read, with: "int64_t id = int64_t(gid == 0 ? ids0[0] : gid == 1 ? ids1[0] : ids2[0]);")
+    }
+    private static let verifyEntryIds3Kernel = MLXFast.metalKernel(
+        name: oneBarrier ? "nemotron_h_verify_entry_ids3_rms_prepared_1b" : "nemotron_h_verify_entry_ids3_rms_prepared",
+        inputNames: ["ids0", "ids1", "ids2", "w", "scales", "biases", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: oneBarrierSource(verifyEntryIds3Source()), ensureRowContiguous: true)
+
+    /// `verifyEntryRows` of the window `concatenated(columns, axis: 1)`, reading the three [1, 1] columns.
+    private static func verifyEntryRows3(_ columns: [MLXArray], _ q: QuantizedEmbedding, norm: RMSNorm)
+        -> [MLXArray]
+    {
+        let dims: Int = 2688
+        let vocabulary: Int = q.weight.dim(0)
+        let biases: MLXArray = q.biases!
+        let (axis, eps) = scalars(norm.eps)
+        let inputs: [MLXArray] = columns.map { $0.reshaped(1) }
+            + [q.weight, q.scales, biases, norm.weight, axis, eps]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2), ("G", dims / 64),
+        ]
+        let residualShape: [Int] = [1, 3, dims]
+        let preparedShape: [Int] = [3, 11, 288]
+        return verifyEntryIds3Kernel(
+            inputs, template: template,
+            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [residualShape, residualShape, preparedShape],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+    }
+
+    /// The three-column entry whose draft rows (1 and 2) form their ids from the drafts' ticket-free screen
+    /// bests (`NemotronScreenPicks`): every SIMD group of those rows runs the final kernel's statements on its
+    /// draft's bests (`NemotronHeadScreen.pickStatements`, lane 0's id) before the reads; row 0 reads the seed
+    /// column. The id load itself becomes that pick.
+    private static func verifyEntryPicksSource(hoisted: Bool = false) -> String {
+        let read = "int64_t id = int64_t(ids[gid]);"
+        let anchor = "const size_t offset = size_t(gid) * axis_size + lid * n_reads;"
+        let s = verifyEntrySource()
+        precondition(s.components(separatedBy: read).count == 2, "verify entry id load")
+        precondition(s.components(separatedBy: anchor).count == 2, "verify entry offset")
+        return s.replacingOccurrences(of: read, with: "int64_t id = int64_t(nvp_id);")
+            .replacingOccurrences(of: anchor, with: """
+                int nvp_id;
+                if (gid == 0) {
+                    nvp_id = ids0[0];
+                } else {
+                    const device float* nvp_values = gid == 1 ? pv1 : pv2;
+                    const device int* nvp_ids = gid == 1 ? pi1 : pi2;
+                    const int nvp_count = gid == 1 ? NCH1 : NCH2;
+                \(hoisted
+                    ? NemotronHeadScreen.pickStatementsHoisted(
+                        values: "nvp_values", ids: "nvp_ids", count: "nvp_count",
+                        maxCount: "NCH1 > NCH2 ? NCH1 : NCH2", result: "nvp_pick")
+                    : NemotronHeadScreen.pickStatements(
+                        values: "nvp_values", ids: "nvp_ids", count: "nvp_count", result: "nvp_pick"))
+                    nvp_id = nvp_pick;
+                }
+                \(anchor)
+                """)
+    }
+    private static let verifyEntryPicksKernel = MLXFast.metalKernel(
+        name: oneBarrier ? "nemotron_h_verify_entry_picks_rms_prepared_1b" : "nemotron_h_verify_entry_picks_rms_prepared",
+        inputNames: ["ids0", "pv1", "pi1", "pv2", "pi2", "w", "scales", "biases", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: oneBarrierSource(verifyEntryPicksSource()), ensureRowContiguous: true)
+    /// The picks entry with the picks' loads hoisted (`NemotronHeadScreen.pickStatementsHoisted`); used once
+    /// `qualifyVerifyEntryPicksHoist` found it bitwise equal to the loop form.
+    private static let verifyEntryPicksHoistKernel = MLXFast.metalKernel(
+        name: oneBarrier ? "nemotron_h_verify_entry_picks_hoist_rms_prepared_1b"
+            : "nemotron_h_verify_entry_picks_hoist_rms_prepared",
+        inputNames: ["ids0", "pv1", "pi1", "pv2", "pi2", "w", "scales", "biases", "weight", "axis_size", "eps"],
+        outputNames: ["residual", "normalized", "prepared"],
+        source: oneBarrierSource(verifyEntryPicksSource(hoisted: true)), ensureRowContiguous: true)
+
+    /// `verifyEntryRows3` with draft rows 1 and 2 picked from `bests1` / `bests2` in the launch.
+    private static func verifyEntryRowsPicks(
+        _ seed: MLXArray, _ bests1: NemotronScreenPicks.Bests, _ bests2: NemotronScreenPicks.Bests,
+        _ q: QuantizedEmbedding, norm: RMSNorm, hoisted: Bool? = nil
+    ) -> [MLXArray] {
+        let dims: Int = 2688
+        let vocabulary: Int = q.weight.dim(0)
+        let biases: MLXArray = q.biases!
+        let (axis, eps) = scalars(norm.eps)
+        let inputs: [MLXArray] = [seed.reshaped(1), bests1.values, bests1.ids, bests2.values, bests2.ids,
+                                  q.weight, q.scales, biases, norm.weight, axis, eps]
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("V", vocabulary), ("BYTES", dims / 2), ("G", dims / 64),
+            ("NCH1", bests1.count), ("NCH2", bests2.count),
+        ]
+        let residualShape: [Int] = [1, 3, dims]
+        let preparedShape: [Int] = [3, 11, 288]
+        return ((hoisted ?? NemotronHVerifyEntry.picksHoistVerified) ? verifyEntryPicksHoistKernel : verifyEntryPicksKernel)(
+            inputs, template: template,
+            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [residualShape, residualShape, preparedShape],
+            outputDTypes: [.bfloat16, .bfloat16, .float32])
+    }
+
+    private static func picksServe(_ b: NemotronScreenPicks.Bests) -> Bool {
+        b.values.ndim == 1 && b.values.dtype == .float32 && (1...4096).contains(b.count)
+            && b.ids.shape == b.values.shape && b.ids.dtype == .int32
+    }
+
+    /// The seed column and the two drafts' screen bests, when the picks entry qualified, the window's columns
+    /// are published (int32) and both drafts' token arrays (`CBv2MTPVerifyWindowColumns.sources`) are
+    /// ticket-free screen picks.
+    private static func verifyEntryPicks(_ tokens: MLXArray)
+        -> (MLXArray, NemotronScreenPicks.Bests, NemotronScreenPicks.Bests)?
+    {
+        guard NemotronHVerifyEntry.picksVerified, tokens.dtype == .int32,
+              let columns = verifyEntryColumns(tokens),
+              let sources = CBv2MTPVerifyWindowColumns.sources(of: tokens), sources.count == 2,
+              let b1 = NemotronScreenPicks.bests(of: sources[0]), picksServe(b1),
+              let b2 = NemotronScreenPicks.bests(of: sources[1]), picksServe(b2)
+        else { return nil }
+        return (columns[0], b1, b2)
+    }
+
+    /// Load time, after `qualifyVerifyEntryIds3` admitted the column entry: the picks entry against the record
+    /// entry on the window `[seed, pick(bests1), pick(bests2)]` (picks by the final kernel), bit for bit in the
+    /// residual rows, the normalized rows and every written prepared word, for every pair of the ticket-free
+    /// screen's chunk counts. Bests: Gaussian, exact ties, all-equal, NaNs (one in slot 0), infinities and ties at
+    /// the maximum; seeds at the first and last rows and seeded. Any miss or MLX error keeps the column entry.
+    static func qualifyVerifyEntryPicks(_ embedding: Embedding, norm: RMSNorm) {
+        NemotronHVerifyEntry.picksVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron verify entry picks: \(message)\n".utf8))
+        }
+        guard NemotronHeadScreen.noTicketEnabled else { return report("off (setting)") }
+        let counts = NemotronScreenPicks.chunkCounts
+        guard !counts.isEmpty else { return report("off (no ticket-free draft screen)") }
+        guard NemotronHVerifyEntry.ids3Verified, plumbingAvailable,
+              let q = verifyEntryShape(embedding, norm: norm), NemotronHVerifyEntry.matches(q, norm)
+        else { return report("off (the column entry is off)") }
+        let vocabulary: Int = q.weight.dim(0)
+        var cases = 0
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                for n1 in counts {
+                    for n2 in counts {
+                        for kind in 0 ..< 6 {
+                            let b1 = NemotronScreenPicks.seededBests(
+                                count: n1, vocabulary: vocabulary, kind: kind, seed: UInt64(0x5f00 + 16 * n1 + kind))
+                            let b2 = NemotronScreenPicks.seededBests(
+                                count: n2, vocabulary: vocabulary, kind: (kind + 3) % 6,
+                                seed: UInt64(0x5f80 + 16 * n2 + kind))
+                            let seedId: Int32 = kind == 0 ? 0 : kind == 1 ? Int32(vocabulary - 1) : Int32(977 * kind)
+                            let seed = MLXArray([seedId]).reshaped(1, 1)
+                            let got = verifyEntryRowsPicks(seed, b1, b2, q, norm: norm)
+                            let window = concatenated(
+                                [seed, NemotronHeadScreen.pick(values: b1.values, ids: b1.ids).reshaped(1, 1),
+                                 NemotronHeadScreen.pick(values: b2.values, ids: b2.ids).reshaped(1, 1)], axis: 1)
+                            let expected = verifyEntryRows(window, q, norm: norm)
+                            ok = ok .&& halfEqual(got[0], expected[0]) .&& halfEqual(got[1], expected[1])
+                                .&& preparedEqual(got[2], expected[2])
+                            cases += 1
+                        }
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        NemotronHVerifyEntry.picksVerified = admitted
+        report(admitted
+            ? "on (\(cases) windows bitwise equal to the entry on the final kernel's picks, chunk counts \(counts))"
+            : "off (differs from the entry on the final kernel's picks)")
+    }
+
+    /// Load time, after `qualifyVerifyEntryPicks` admitted the picks entry: the hoisted-load form against the loop
+    /// form, bit for bit in the residual rows, the normalized rows and every written prepared word, over every pair
+    /// of the ticket-free screen's chunk counts plus counts that leave the last slot of some lanes empty (113, 200),
+    /// with the same six kinds of bests. Any miss or MLX error keeps the loop form.
+    static func qualifyVerifyEntryPicksHoist(_ embedding: Embedding, norm: RMSNorm) {
+        NemotronHVerifyEntry.picksHoistVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron verify entry picks hoist: \(message)\n".utf8))
+        }
+        guard NemotronHeadScreen.pickHoistEnabled else { return report("off (setting)") }
+        guard NemotronHVerifyEntry.picksVerified, let q = verifyEntryShape(embedding, norm: norm)
+        else { return report("off (the picks entry is off)") }
+        let vocabulary: Int = q.weight.dim(0)
+        let counts = NemotronScreenPicks.chunkCounts + [113, 200]
+        var cases = 0
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                for n1 in counts {
+                    for n2 in counts {
+                        for kind in 0 ..< 6 {
+                            let b1 = NemotronScreenPicks.seededBests(
+                                count: n1, vocabulary: vocabulary, kind: kind, seed: UInt64(0x6f00 + 16 * n1 + kind))
+                            let b2 = NemotronScreenPicks.seededBests(
+                                count: n2, vocabulary: vocabulary, kind: (kind + 3) % 6,
+                                seed: UInt64(0x6f80 + 16 * n2 + kind))
+                            let seed = MLXArray([Int32(331 * (kind + 1))]).reshaped(1, 1)
+                            let a = verifyEntryRowsPicks(seed, b1, b2, q, norm: norm, hoisted: true)
+                            let b = verifyEntryRowsPicks(seed, b1, b2, q, norm: norm, hoisted: false)
+                            ok = ok .&& halfEqual(a[0], b[0]) .&& halfEqual(a[1], b[1]) .&& preparedEqual(a[2], b[2])
+                            cases += 1
+                        }
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        NemotronHVerifyEntry.picksHoistVerified = admitted
+        report(admitted
+            ? "on (\(cases) windows bitwise equal to the loop form, counts \(counts))"
+            : "off (differs from the loop form)")
+    }
+
+    /// The published columns of `tokens` (the verify window) when the three-column entry qualified and they
+    /// are what `concatenated(columns, axis: 1)` reads: three [1, 1] columns of the window's dtype.
+    private static func verifyEntryColumns(_ tokens: MLXArray) -> [MLXArray]? {
+        guard NemotronHVerifyEntry.ids3Verified, let columns = CBv2MTPVerifyWindowColumns.columns(of: tokens),
+              columns.count == 3, columns.allSatisfy({ $0.shape == [1, 1] && $0.dtype == tokens.dtype })
+        else { return nil }
+        return columns
+    }
+
+    /// Load time, after `qualifyVerifyEntry` admitted the entry: the three-column entry against the record entry
+    /// on the concatenated window, bit for bit in the residual rows, the normalized rows and every written
+    /// prepared word. Seeded int32 and uint32 triples, wrapped negative ids, the first and last rows and a
+    /// repeated id; any miss or MLX error keeps the window read.
+    static func qualifyVerifyEntryIds3(_ embedding: Embedding, norm: RMSNorm) {
+        NemotronHVerifyEntry.ids3Verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron verify entry ids3: \(message)\n".utf8))
+        }
+        guard CBv2MTPVerifyWindowColumns.entryEnabled else { return report("off (setting)") }
+        guard plumbingAvailable, let q = verifyEntryShape(embedding, norm: norm),
+              NemotronHVerifyEntry.matches(q, norm)
+        else { return report("off (the record entry is off)") }
+        let vocabulary: Int = q.weight.dim(0)
+        var cases = 0
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                func check(_ columns: [MLXArray]) {
+                    let got = verifyEntryRows3(columns, q, norm: norm)
+                    let expected = verifyEntryRows(concatenated(columns, axis: 1), q, norm: norm)
+                    ok = ok .&& halfEqual(got[0], expected[0]) .&& halfEqual(got[1], expected[1])
+                        .&& preparedEqual(got[2], expected[2])
+                    cases += 1
+                }
+                var state: UInt64 = 0xA076_1D64_78BD_642F
+                func draw() -> Int {
+                    state = state &* 6364136223846793005 &+ 1442695040888963407
+                    return Int(state >> 33) % vocabulary
+                }
+                for _ in 0 ..< 24 {
+                    check((0 ..< 3).map { _ in MLXArray([Int32(draw())]).reshaped(1, 1) })
+                    check((0 ..< 3).map { _ in MLXArray([UInt32(draw())]).reshaped(1, 1) })
+                }
+                let v = Int32(vocabulary)
+                for triple in [[-v, -1, 0], [v - 1, -(v / 2), 1], [0, v - 1, -v], [7, 7, 7]] {
+                    check(triple.map { MLXArray([$0]).reshaped(1, 1) })
+                }
+                return ok.item(Bool.self)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        NemotronHVerifyEntry.ids3Verified = admitted
+        report(admitted ? "on (\(cases) windows bitwise equal to the entry on the concatenated window)"
+               : "off (differs from the entry on the concatenated window)")
     }
 
     private static func verifyEntryShape(_ embedding: Embedding, norm: RMSNorm) -> QuantizedEmbedding? {
@@ -799,7 +1200,9 @@ extension NemotronHResidualRMSNorm {
         guard tokens.dtype == .int32 || tokens.dtype == .uint32 else { return nil }
         guard let q = verifyEntryShape(embedding, norm: norm) else { return nil }
         guard NemotronHVerifyEntry.matches(q, norm) else { return nil }
-        let outputs = verifyEntryRows(tokens, q, norm: norm)
+        let outputs = verifyEntryPicks(tokens).map { verifyEntryRowsPicks($0.0, $0.1, $0.2, q, norm: norm) }
+            ?? verifyEntryColumns(tokens).map { verifyEntryRows3($0, q, norm: norm) }
+            ?? verifyEntryRows(tokens, q, norm: norm)
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
         let hidden = embedding(tokens)
         guard let expected = normPreparedRows(hidden, norm: norm) else { return nil }
@@ -1246,11 +1649,6 @@ enum NemotronHCompactSSMGated {
             }
             """
     /// NEMOTRON_SSM_TAIL_SHUFFLE=0 keeps the threadgroup copy of the rounded rows. Otherwise the group's last
-    /// threadgroup runs each row with one barrier: simdgroups 0-3 store their sums in that row's slots, every
-    /// one of them then forms the record's 32-lane sum (the four sums, zeros elsewhere) and inverse mean itself,
-    /// and each lane writes its own four prepared words; the chunk's total adds the four lanes' partial sums
-    /// (each the record's four-value expression) in lane order through simd_shuffle_down.
-    /// The launch uses it only after `qualifyShuffle` found its outputs bitwise equal to the record kernel's.
     static let tailShuffle = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_SHUFFLE"] != "0"
     static func shuffledTail(_ source: String) -> String? {
         let head = "threadgroup T rounded[512];\n"
@@ -1317,11 +1715,6 @@ enum NemotronHCompactSSMGated {
             """
     }
     /// NEMOTRON_SSM_TAIL_ONE_BARRIER=0 keeps one barrier per row in the shuffle tail. Otherwise the group's
-    /// last threadgroup first forms every row's gated values and SIMD-group sums of squares (the shuffle tail's
-    /// statements, row by row), stores the sums of all rows, passes one barrier, and then finishes the rows in
-    /// order with the shuffle tail's statements: the same values, sums, inverse means and prepared words, with
-    /// one barrier instead of L. The launch uses it only after `qualifyRowsTail` found it bitwise equal to the
-    /// shuffle-tail launch.
     static let tailOneBarrier = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_ONE_BARRIER"] != "0"
     static func rowsTail(_ source: String) -> String? {
         let head = "threadgroup T rounded[512];\n"
@@ -2525,17 +2918,6 @@ func nemotronPrefillComputeDt(
 }
 
 /// Bitwise copy of `ssmAttn` (SSM.swift, not editable) for L > 1 with a
-/// prior state. Only materialized copies feeding element-wise ops change:
-/// the segsum input is a broadcast view instead of `repeated` (the tril
-/// `where` writes the same contiguous array either way, so the cumsum sees
-/// identical input), and the CB repeat/promotion/exp/product/tril chain is
-/// one kernel with the same per-element arithmetic. Every matmul, cumsum
-/// and the state/output algebra is unchanged.
-/// `state == nil` is a fresh request's FP32 zero state (see
-/// `NemotronMambaZeroState`): the first window adds `decay * 0` per head
-/// instead of `decay * zeros` per element, and the window output reads a
-/// zero-stride +0.0 view, so every element sees the same IEEE operations
-/// on the same operands without a [b, h, dh, d] zero buffer.
 func nemotronSSMAttn(
     x: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
     dt: MLXArray, dtBias: MLXArray, state: MLXArray?,
@@ -2814,15 +3196,6 @@ func nemotronSSMAttn(
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`): a fresh
-/// request's first scan window state, `prod1 + e1 * (+0.0)` (the
-/// `NemotronFreshStateUpdate` launch), is not written; the second window's
-/// two readers evaluate it per element with the same statements instead.
-/// `stateUpdate` computes `prod + e * (prod1 + e1 * zero)` and `windowOut`
-/// is `windowOutFinalSG` whose state rows are loaded as `prod1 + e1 * zero`.
-/// `qualify` checks both bit for bit against the fresh state update followed
-/// by the stock second-window launches, with signed zeros, infinities and NaN
-/// in the products and decays. NEMOTRON_PREFILL_FRESH_STATE_FOLD=0 keeps the
-/// first window's launch.
 enum NemotronPrefillFreshStateFold {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FRESH_STATE_FOLD"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -2977,21 +3350,6 @@ enum NemotronPrefillFreshStateFold {
 }
 
 /// Seed request prefill only (`NemotronHPrefillX5.active`): the second scan
-/// window's two launches of a fresh request (`NemotronPrefillFreshStateFold`'s
-/// state update and folded window output) with 32-bit index arithmetic.
-/// Every statement that produces a value and its order per element is the
-/// existing kernels' (the folded state load `sp + e1 * zero`, the `acc += s *
-/// c` partials, the butterfly tree, the epilogue casts; the state update's
-/// `e1 * zero`, `+`, `e *`, `+`). What changes: strides are read once as
-/// `int` (MLX passes them as int64 and the stock kernels multiply them per
-/// access), the state update moves its four floats as one vector when the
-/// rows are contiguous, and the window output copies the first window's rows
-/// 16 bytes at a time when they are the contiguous [b, s0, h, dh] output.
-/// The thread grid and each output's thread are the stock kernels'.
-/// `qualify` runs the whole scan (`nemotronSSMAttn`) with and without them on
-/// the real first and last Mamba layers and compares output and state bit
-/// for bit, then the two kernels directly on special values.
-/// NEMOTRON_PREFILL_SEED_I32=0 keeps the existing kernels.
 enum NemotronPrefillSeedI32 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SEED_I32"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -3350,16 +3708,6 @@ enum NemotronPrefillSeedI32 {
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`): a scan window's
-/// `scanDecay(Skip)` launch and the FP32 matmul of its [b, h, n, n] masked
-/// decay matrix with `dtx` in one launch that never writes the matrix. Each
-/// threadgroup rebuilds its 64-row strip of the matrix, 32 columns at a time,
-/// with `scanDecaySkip`'s statements (the column's 32-row
-/// `simd_prefix_inclusive_sum` blocks from the block holding the column, the
-/// carried prefix, `precise::exp`, the CB product and the `last` row), and
-/// multiplies it with the MLX NAX GEMM loop's fragments: 32 x 32 simdgroup
-/// tiles, K in 32-column steps from 0 with the last step zero-padded, and
-/// `tile_matmad_nax` per step. `qualify` compares `y` and `last` with the two
-/// launches bit for bit. NEMOTRON_PREFILL_SCAN_GEMM=0 keeps them.
 enum NemotronPrefillScanDecayGemm {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SCAN_GEMM"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -3683,14 +4031,6 @@ enum NemotronPrefillScanDecayGemm {
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`): a scan window's
-/// state product, `dtxDecayT` (`dtx[t, h, i] * last[h, t]` written as the
-/// [b, g, R, dh, n] left operand) and its FP32 matmul with the window's FP32 B
-/// block, in one launch that never writes the left operand. Each threadgroup
-/// (one head) forms the operand 32 tokens at a time with `dtxDecayT`'s
-/// product and multiplies it with the MLX NAX GEMM loop's fragments (32 x 32
-/// simdgroup tiles, K in 32-token steps from 0 with the last step
-/// zero-padded, `tile_matmad_nax` per step). `qualify` compares the product
-/// with the two launches bit for bit. NEMOTRON_PREFILL_STATE_GEMM=0 keeps them.
 enum NemotronPrefillStateGemm {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_STATE_GEMM"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -4043,17 +4383,6 @@ extension NemotronHResidualRMSNorm {
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`): each MoE
-/// block's join with the next block's norm (norm_f after the last block)
-/// rides the combine-add launch (`NemotronHResidualRMSNorm.applyMoEJoin`), one
-/// launch per row instead of the combine add and the residual + norm launch,
-/// and the MoE output is no longer stored and reloaded (23 launches per seed;
-/// only where the combine add runs, L > 10 rows). `qualify` checks the
-/// (residual, normalized) pair bitwise against the stock graph (unsort
-/// gather, score multiply, K-way sum, astype, shared add, residual add,
-/// rms_norm) and against the two launches it replaces, for every norm these
-/// joins use, on seeded rows at L = 488, 300 and 9 with special values in the
-/// expert rows, the shared output and the residual, and zero and unit scores.
-/// NEMOTRON_PREFILL_MOE_JOIN=0 keeps the two launches.
 enum NemotronPrefillMoEJoin {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_MOE_JOIN"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -4260,14 +4589,6 @@ enum NemotronPrefillFreshWindowOut {
 }
 
 /// Fresh-request Mamba prefill: a request with no recurrent input state
-/// starts from zero conv and SSM state. Instead of materialising
-/// [1, 3, convDim] BF16 and [1, H, Dh, Ds] FP32 zeros per layer (about 49 MB
-/// per request on the 23 Mamba layers), the conv history and the window
-/// output read a zero-stride view of one +0.0 scalar and the first scan
-/// window adds `decay * 0` per head. The values every kernel reads are the
-/// same +0.0, so outputs are bitwise identical, signed zeros and NaN
-/// propagation included. Restored, carried or partial state keeps the
-/// existing path. NEMOTRON_MAMBA_ZERO_STATE_SKIP=0 restores the zero buffers.
 enum NemotronMambaZeroState {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MAMBA_ZERO_STATE_SKIP"] != "0"
@@ -4424,17 +4745,6 @@ private enum NemotronRequestConvHistory {
 }
 
 /// Seed-only request-prefill front of a Mamba layer in one launch: the
-/// stock `silu(conv1d(concatenated([oldState, input])))` (the statements of
-/// `nemotron_packed_conv_silu`), the conv history rows, and the scan inputs
-/// `dtA = dt * A` and `dtx = dt * float(x)` with dt the statements of
-/// `nemotron_packed_conv_silu_dt` (= `nemotronCompiledPrefillDt`). Each x
-/// thread recomputes its head's dt with those statements; every output
-/// element is one product of the same operands as the stock op. Replaces
-/// the concatenate, depthwise conv, bias add, SiLU, dt transform, dtA and
-/// dtx multiplies, the x promotion and the history copy.
-/// Used only inside the request prefill (`NemotronHPrefillX5.active`) after
-/// `qualify` found all four outputs bitwise equal to the stock graph.
-/// NEMOTRON_PREFILL_CONV_DT=0 keeps the stock graph.
 enum NemotronPrefillConvDt {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_CONV_DT"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -5794,18 +6104,6 @@ class NemotronHSwitchMLP: Module {
     }
 
     /// Multi-token MoE (sorted gather route) fused with the caller's
-    /// weighted reduction. Same graph as `callAsFunction` followed by
-    /// `(y * scores[..., None]).sum(-2).asType(y.dtype)`, except that
-    /// (1) the inverse permutation is a scatter instead of a second argsort
-    /// (a permutation has exactly one inverse), (2) relu2 keeps the stock typed
-    /// Maximum/Multiply at the fc1 store or in one separate pass, and
-    /// (3) the unsort gather, fp32 promotion, score multiply, K-way sum and
-    /// narrowing are one kernel that reproduces col_reduce_small's order
-    /// (lsize.y == K <= 8: row j is op(v_j, 0), then total = op(row_j, total)
-    /// for j = 1..K-1). With x5 enabled, (4) argsort + inverse + sorted ids
-    /// come from one stable counting sort and (5) where stock takes the
-    /// sorted-rhs NAX gather, fc1/fc2 run its expert-run-aligned clone.
-    /// Every value is bitwise identical to the unfused graph.
     func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray) -> MLXArray? {
         fusedSortedCombine(x, indices, scores, addend: nil)?.out
     }
@@ -6448,13 +6746,6 @@ enum NemotronPrefillCombineAdd {
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) shared-expert
-/// relu2: the stock `maximum(up, 0)` (the int scalar cast to T, then the
-/// NaN-propagating Maximum) and `m * m` as one `relu2` launch, the kernel the
-/// routed experts use. Replaces three launches per MoE layer and two passes
-/// over the [L, 3712] activation. `qualify` checks it bitwise against the
-/// stock chain on the target's shared up-projection of seeded rows, with
-/// signed zeros, infinities, NaN and subnormals injected.
-/// NEMOTRON_PREFILL_SHARED_RELU2=0 keeps the stock chain.
 enum NemotronPrefillSharedRelu2 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_RELU2"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -7893,18 +8184,6 @@ func nemotronRunGather(
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) routed fc2: the
-/// run gather reads the layer's zero-skip decode copy (`NemotronZSkip.Copy`,
-/// tile-major codes with the pair index and FP32 pair table) instead of the
-/// original bank. Each loader thread takes one code word lane (four outputs)
-/// and eight k, rebuilds each k pair's bank byte from the two nibbles and
-/// applies the stock `dequantize` statements to the pair's scale and bias (the
-/// table holds their exact FP32 widenings), so the threadgroup weight block,
-/// A loads, K loop and NAX MMA sequence are the run gather's. The seed then
-/// needs the copies, not the original fc2 banks, which the decode residency
-/// therefore requests in their place (`NemotronDecodeResidency.targetGroups`).
-/// `qualify` compares it with `nemotronRunGather` on the bank bit for bit on
-/// the target's MoE fc2 with seeded inputs and routes.
-/// NEMOTRON_PREFILL_FC2_COPY=0 keeps the bank.
 enum NemotronPrefillFC2Copy {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_FC2_COPY"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -8247,20 +8526,6 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) dense projections
-/// through their pair dictionaries: each Mamba layer's input and output
-/// projections and each MoE layer's shared-expert up projection (with its
-/// typed ReLU2 store) run as a one-"expert" NAX run gather whose weight loader
-/// reads each group's (scale, bias) through the tensor's `NemotronSBDict`
-/// pair dictionary (uint16 index in the scales' layout, FP32 pair table of
-/// exact BF16 widenings), the loader the fc1 dictionary gather uses
-/// (`QuantizedBlockLoaderDict`). The run gather's tiles, K loop and NAX MMA
-/// sequence are unchanged, so each output is the run gather's. The verify
-/// already reads these dictionaries, so with a kind admitted nothing in the
-/// request reads that kind's BF16 scales and biases, and the decode residency
-/// maps the dictionaries in their place (`NemotronDecodeResidency.targetGroups`).
-/// `qualify` compares each kind with the stock projection (`relu2(up(x))` for
-/// the shared up) bit for bit on every layer's tensor with seeded rows; each
-/// kind is admitted on its own. NEMOTRON_PREFILL_DENSE_DICT=0 keeps the stock launches.
 enum NemotronPrefillDenseDict {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_DENSE_DICT"] != "0"
     /// The admitted kinds: "in_proj", "out_proj" (Mamba mixers), "up_proj" (shared experts, with ReLU2).
@@ -8392,19 +8657,6 @@ enum NemotronPrefillDenseDict {
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) shared-expert down
-/// projection: the run gather of `NemotronPrefillFC2Copy` over a single
-/// "expert" (as `NemotronPrefillSharedUpGather` runs the shared up), reading the
-/// layer's shared-down zero-skip decode copy (`NemotronSharedDownZSkip`:
-/// tile-major codes with tile-major BF16 scales and biases) instead of the
-/// dense weights. Its loader widens each group's BF16 scale and bias to FP32
-/// (the values the fc2 copy's pair table holds) and otherwise runs the fc2 copy
-/// loader's statements, so the threadgroup weight block, A loads, K loop and
-/// NAX MMA sequence are the run gather's. The verify already reads the copy
-/// (co-launched with the routed fc2), so with this on nothing in the request
-/// reads the dense shared down, and the decode residency maps the copy in its
-/// place (`NemotronDecodeResidency.targetGroups`). `qualify` compares it with
-/// `downProj(x)` bit for bit on every MoE layer's shared down with seeded
-/// relu2-like rows. NEMOTRON_PREFILL_SHARED_DOWN_COPY=0 keeps the dense weights.
 enum NemotronPrefillSharedDownCopy {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_SHARED_DOWN_COPY"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -8527,16 +8779,6 @@ enum NemotronPrefillSharedDownCopy {
 }
 
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) routed fc1: the
-/// run gather reads each sorted row's token row of the MoE input through the
-/// counting sort's `orderK` instead of the expanded `xs` copy, so the `xs`
-/// gather stays lazy and is never launched. Every A-fragment element is the
-/// same BF16 value at the same fragment position (rows past the tile are
-/// zero, as `load_safe` writes them); the loader, K loop, NAX MMA sequence and
-/// typed ReLU2 store are the run gather's. Carried from newjordan's
-/// `8007c64b` (`nemotron_load_routed`), with the adaptive 32/64-row tile
-/// dispatch of the current run gather. `qualify` compares it with
-/// `nemotronRunGather` on `xs` bit for bit on the target's first MoE fc1
-/// with seeded inputs and routes. NEMOTRON_PREFILL_DIRECT_FC1=0 keeps `xs`.
 private let nemotronQuantizedBlockLoaderDictSource = #"""
 // The bank loader reading each group's (scale, bias) through the pair
 // dictionary: `scales` is the uint16 pair index (the scales' layout) and
@@ -9818,6 +10060,15 @@ public class NemotronHModel:
     func prepareVerifyEntry() {
         guard let first = backbone.layers.first else { return }
         NemotronHResidualRMSNorm.qualifyVerifyEntry(backbone.embeddings, norm: first.norm)
+        NemotronHResidualRMSNorm.qualifyVerifyEntryIds3(backbone.embeddings, norm: first.norm)
+        NemotronHResidualRMSNorm.qualifyVerifyEntryPicks(backbone.embeddings, norm: first.norm)
+        NemotronHResidualRMSNorm.qualifyVerifyEntryPicksHoist(backbone.embeddings, norm: first.norm)
+    }
+
+    /// The operands `mtpEmbedding`'s launch reads for `tokens` (nil where it would not launch), for draft-head
+    /// kernels that dequantize the token rows themselves.
+    func mtpEmbeddingOperands(_ tokens: MLXArray) -> NemotronHEmbeddingRows.Operands? {
+        NemotronHEmbeddingRows.operands(tokens, backbone.embeddings)
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray {

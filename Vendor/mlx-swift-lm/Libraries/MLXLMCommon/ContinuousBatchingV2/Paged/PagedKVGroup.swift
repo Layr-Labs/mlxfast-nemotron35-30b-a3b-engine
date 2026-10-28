@@ -26,6 +26,19 @@ final class PagedKVGroup {
     /// Latest fence of the group's bulk-write chain (`[1]` int32). Gathers
     /// consume it so page reads order after every prior bulk write.
     var writeFence: MLXArray
+
+    /// The fence's initial 0 is made from host data, so the group's first write
+    /// reads it without a launch. `MLXArray.zeros` is a lazy fill that is
+    /// evaluated with that first write (for a request-owned pool, inside the
+    /// request's first round). Same value, shape and dtype.
+    /// NEMOTRON_PAGED_HOST_FENCE=0 keeps the zeros fill; so does a failed
+    /// load-time check (`cbv2PagedHostWriteFenceReport`).
+    nonisolated(unsafe) static var hostWriteFence =
+        ProcessInfo.processInfo.environment["NEMOTRON_PAGED_HOST_FENCE"] != "0"
+
+    static func initialWriteFence() -> MLXArray {
+        hostWriteFence ? MLXArray([Int32(0)]) : MLXArray.zeros([1], dtype: .int32)
+    }
     /// Intrusive free queue. The computed array preserves the historical
     /// test/diagnostic surface without making arbitrary removal O(n).
     private var freeQueue: PagedBlockFreeQueue
@@ -90,7 +103,7 @@ final class PagedKVGroup {
         self.segmentLayout = segmentLayout
         self.fixedK = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
         self.fixedV = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
-        self.writeFence = MLXArray.zeros([1], dtype: .int32)
+        self.writeFence = Self.initialWriteFence()
         // Initial FIFO order is ascending ids, so fresh allocations remain
         // physically consecutive (enables run-coalesced writes). The poison
         // page is excluded permanently.
@@ -438,4 +451,22 @@ final class PagedKVGroup {
         }
     }
 
+}
+
+/// Load time: how new paged groups make their write fence's initial value
+/// (`PagedKVGroup.initialWriteFence`), checked against the zeros fill.
+package func cbv2PagedHostWriteFenceReport() {
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 paged host write fence: \(message)\n".utf8))
+    }
+    guard PagedKVGroup.hostWriteFence else { return report("off (setting)") }
+    let made = PagedKVGroup.initialWriteFence()
+    let zeros = MLXArray.zeros([1], dtype: .int32)
+    guard made.shape == zeros.shape, made.dtype == zeros.dtype,
+        arrayEqual(made, zeros).item(Bool.self)
+    else {
+        PagedKVGroup.hostWriteFence = false
+        return report("off (differs from the zeros fill)")
+    }
+    report("on (initial fence made from host data: value 0, shape [1], int32, equal to the zeros fill)")
 }
