@@ -220,8 +220,23 @@ enum NemotronMTPSSMAnchor {
         return s.replacingOccurrences(of: tailStart, with: "\n" + after + tailStart)
     }
 
+    /// Load-time geometry tune of these launches (NEMOTRON_SSM_TUNE): 8 d's (8 SIMD groups) per thread group, the
+    /// incumbent, or 4 d's (`threadGroup` (32, 4, 1), 1024 thread groups, same grid): every SIMD group runs the same
+    /// per-(h, d) text, and a norm group's last thread group is its 128th arrival instead of its 64th (the one count
+    /// in the text, `arrival8` -> `arrival4`); its threads 0 ... 127 run the same tail text on the same stored
+    /// outputs. `tune` checks the 4-d launches against the 8-d launches and adopts them only when
+    /// `NemotronTuneAdoption.decide` admits them (at least 3% faster by median and faster in at least 75% of the
+    /// cycles). NEMOTRON_SSM_TUNE=0 keeps 8 d's; NEMOTRON_SSM_FORCE=1 adopts 4 d's when they qualified, 0 keeps 8.
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] != "0"
+    static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "")
+    /// Soft cap on the tune's load time: the timing does not start past it.
+    static let tuneBudgetSeconds = 1.2
+    nonisolated(unsafe) static var tg4Adopted = false
+    static let arrival8 = "gr_last = prev == uint((512 / Dh) * (Dh / 8)) - 1u ? 1u : 0u;"
+    static let arrival4 = "gr_last = prev == uint((512 / Dh) * (Dh / 4)) - 1u ? 1u : 0u;"
+
     /// Tail form 0 record, 1 shuffle, 2 one barrier (as NemotronHCompactSSMGated's kernels).
-    private static func make(form: Int, pending: Bool, store: Store) -> MLXFast.MLXFastKernel? {
+    private static func make(form: Int, pending: Bool, store: Store, tg4: Bool) -> MLXFast.MLXFastKernel? {
         let base = pending ? NemotronHCompactSSMGated.pendingSource : NemotronHCompactSSMGated.source
         guard base.components(separatedBy: windowStore).count == 2,
               base.components(separatedBy: windowLoop).count == 2,
@@ -233,30 +248,35 @@ enum NemotronMTPSSMAnchor {
         if loadsFirst, let s = loadsFirstSource(source, anchor: store == .anchor) {
             source = s
         }
-        let tailed = form == 2 ? NemotronHCompactSSMGated.rowsTail(source)
-            : form == 1 ? NemotronHCompactSSMGated.shuffledTail(source) : source
-        guard let tailed else { return nil }
+        guard var tailed = form == 2 ? NemotronHCompactSSMGated.rowsTail(source)
+            : form == 1 ? NemotronHCompactSSMGated.shuffledTail(source) : source else { return nil }
+        if tg4 {
+            guard tailed.components(separatedBy: arrival8).count == 2 else { return nil }
+            tailed = tailed.replacingOccurrences(of: arrival8, with: arrival4)
+        }
         return MLXFast.metalKernel(
             name: "nemotron_mtp_ssm_compact_gated_prepared" + (pending ? "_pending" : "")
-                + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form],
+                + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form] + (tg4 ? "_tg4" : ""),
             inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                          "eps", "counter"] + (pending ? ["pconv", "pdt"] : []),
             outputNames: store == .anchor ? ["out", "state_out", "normed", "prepared"] : ["out", "normed", "prepared"],
             source: tailed, mutableInputs: ["counter"])
     }
 
-    /// [form][pending][anchor]
-    private static let kernels: [[[MLXFast.MLXFastKernel?]]] = (0 ..< 3).map { form in
-        [false, true].map { pending in
-            [Store.none, .anchor].map { make(form: form, pending: pending, store: $0) }
+    /// [tg4][form][pending][anchor]
+    private static let kernels: [[[[MLXFast.MLXFastKernel?]]]] = [false, true].map { tg4 in
+        (0 ..< 3).map { form in
+            [false, true].map { pending in
+                [Store.none, .anchor].map { make(form: form, pending: pending, store: $0, tg4: tg4) }
+            }
         }
     }
 
     /// The form `compactSSMPreparedRows` launches by default after the load-time checks.
-    static func kernel(pending: Bool, store: Store) -> MLXFast.MLXFastKernel? {
+    static func kernel(pending: Bool, store: Store, tg4: Bool = false) -> MLXFast.MLXFastKernel? {
         let form = NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? 2
             : NemotronHCompactSSMGated.shuffleQualified && NemotronHCompactSSMGated.shuffleKernel != nil ? 1 : 0
-        return kernels[form][pending ? 1 : 0][store == .anchor ? 1 : 0]
+        return kernels[tg4 ? 1 : 0][form][pending ? 1 : 0][store == .anchor ? 1 : 0]
     }
 
     /// The pending count of the latest anchor-skip window (warm-up bookkeeping).
@@ -361,7 +381,7 @@ enum NemotronMTPSSMAnchor {
             guard let r = mixer.norm.compactSSMAnchorRows(
                 convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
                 projected: w.projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
-                pending: tape, store: store) else { return nil }
+                pending: tape, store: store, tg4: false) else { return nil }
             eval([r.0, r.1] + (r.2.map { [$0] } ?? []))
             return r
         }
@@ -448,17 +468,283 @@ enum NemotronMTPSSMAnchor {
         report("on (state stored only by windows with >= \(at) pending steps, up to \(top) pending; \(cases) cases: "
             + "normed rows, prepared activation and committed states bitwise equal to the window-store launches)")
     }
+
+    /// Load time, after `qualify` (the 4-d launches only replace anchor-skip launches): with operands seeded as
+    /// in `qualify` and `mixer`'s parameters, the 4-d launches against the 8-d launches. For every pending count
+    /// 0 ... anchorAt + 2, at two scales: the `none` launch, and with pending steps the `anchor` launch
+    /// (normalized rows, prepared activation, stored state). Then two whole acceptance sequences (one steered
+    /// through every pending count, one random) run the anchor-skip policy once per geometry, each run from its
+    /// own outputs: every window's normalized rows and prepared activation, every stored anchor and the committed
+    /// state replayed from either run. Returns the cases run and the first miss (nil: every case bitwise equal).
+    static func checkTG4(_ mixer: NemotronHMamba2Mixer) -> (cases: Int, failure: String?) {
+        let at = NemotronMTPPendingSSM.anchorAt
+        let top = at + 2
+        let (heads, dim, groups, stateDim) =
+            (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        let convDim = mixer.convDim
+        let projectedWidth = mixer.intermediateSize + convDim + heads
+        var seed: UInt64 = 0x3C6E_F372_FE94_F82B
+        func values(_ count: Int, _ low: Float, _ high: Float) -> [Float] {
+            (0 ..< count).map { _ -> Float in
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                return low + (high - low) * Float(seed >> 40) / Float(1 << 24)
+            }
+        }
+        func bits(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            guard a.shape == b.shape, a.dtype == b.dtype else { return false }
+            let dtype: DType = a.dtype == .float32 ? .uint32 : .uint16
+            return (a.view(dtype: dtype) .== b.view(dtype: dtype)).all().item(Bool.self)
+        }
+        typealias Tape = (conv: MLXArray, dt: MLXArray, steps: Int)
+        typealias Window = (conv: MLXArray, dt: MLXArray, projected: MLXArray)
+        func window(_ scale: Float) -> Window {
+            (MLXArray(values(3 * convDim, -2 * scale, 2 * scale), [1, 3, convDim]).asType(.bfloat16),
+             MLXArray(values(3 * heads, 0.01, 0.5), [1, 3, heads]),
+             MLXArray(values(3 * projectedWidth, -3 * scale, 3 * scale), [1, 3, projectedWidth]).asType(.bfloat16))
+        }
+        func replay(_ tape: Tape?, _ state: MLXArray) -> MLXArray {
+            guard let tape else { return state }
+            return nemotronMTPSSMCompact(
+                convolution: tape.conv, ALog: mixer.aLog, D: mixer.D, dt: tape.dt, state: state,
+                heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                steps: tape.steps, writeOutput: false).finalState
+        }
+        func extend(_ tape: Tape?, _ w: Window, _ keep: Int) -> Tape {
+            let accepted = (w.conv[0..., ..<keep, 0...], w.dt[0..., ..<keep, 0...])
+            guard let tape else { return (accepted.0, accepted.1, keep) }
+            return (concatenated([tape.conv, accepted.0], axis: 1), concatenated([tape.dt, accepted.1], axis: 1),
+                    tape.steps + keep)
+        }
+        // One fused launch per evaluation: the launches share the arrival counters.
+        func launch(_ w: Window, _ state: MLXArray, _ tape: Tape?, _ store: Store, _ quad: Bool)
+            -> (MLXArray, MLXArray, MLXArray?)? {
+            guard let r = mixer.norm.compactSSMAnchorRows(
+                convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
+                projected: w.projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                pending: tape, store: store, tg4: quad) else { return nil }
+            eval([r.0, r.1] + (r.2.map { [$0] } ?? []))
+            return r
+        }
+        func same(_ a: (MLXArray, MLXArray, MLXArray?), _ b: (MLXArray, MLXArray, MLXArray?)) -> Bool {
+            guard bits(a.0, b.0), bits(a.1, b.1) else { return false }
+            if let x = a.2, let y = b.2 { return bits(x, y) }
+            return a.2 == nil && b.2 == nil
+        }
+        var cases = 0
+        var failure: String?
+        perCount: for steps in 0 ... top {
+            for scale: Float in [1, 4] {
+                let anchor = MLXArray(values(heads * dim * stateDim, -0.5, 0.5), [1, heads, dim, stateDim])
+                let tape: Tape? = steps == 0 ? nil : (
+                    MLXArray(values(steps * convDim, -2 * scale, 2 * scale), [1, steps, convDim]).asType(.bfloat16),
+                    MLXArray(values(steps * heads, 0.01, 0.5), [1, steps, heads]), steps)
+                let w = window(scale)
+                for store in steps == 0 ? [Store.none] : [.none, .anchor] {
+                    guard let a = launch(w, anchor, tape, store, false), let b = launch(w, anchor, tape, store, true)
+                    else { failure = "launch unavailable at \(steps) pending steps"; break perCount }
+                    cases += 1
+                    if !same(a, b) { failure = "differs at \(steps) pending steps"; break perCount }
+                }
+            }
+        }
+        if failure == nil {
+            var sequences: [[Int]] = []
+            var steer: [Int] = [2]
+            var seen = Set<Int>()
+            var pendingCount = 0
+            while steer.count < 6 * (top + 1), let keep = warmKeep(pending: pendingCount, keep: steer.last!, seen: &seen) {
+                pendingCount = (pendingCount >= at ? 0 : pendingCount) + steer.last!
+                steer.append(keep)
+            }
+            sequences.append(steer + [3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2])
+            sequences.append((0 ..< 24).map { _ in values(1, 0, 1)[0] < 0.6 ? 3 : (values(1, 0, 1)[0] < 0.5 ? 1 : 2) })
+            sequence: for (index, keeps) in sequences.enumerated() {
+                let scale: Float = index == 0 ? 1 : 3
+                let start = MLXArray(values(heads * dim * stateDim, -0.5, 0.5), [1, heads, dim, stateDim])
+                var runs: [(anchor: MLXArray, tape: Tape?)] = [(start, nil), (start, nil)]
+                for keep in keeps {
+                    let w = window(scale)
+                    var outputs: [(MLXArray, MLXArray, MLXArray?)] = []
+                    for g in 0 ..< 2 {
+                        let writes = (runs[g].tape?.steps ?? 0) >= at
+                        guard let r = launch(w, runs[g].anchor, runs[g].tape, writes ? .anchor : .none, g == 1),
+                              !writes || r.2 != nil else { failure = "sequence launch unavailable"; break sequence }
+                        outputs.append(r)
+                        runs[g] = writes ? (r.2!, extend(nil, w, keep)) : (runs[g].anchor, extend(runs[g].tape, w, keep))
+                    }
+                    cases += 1
+                    guard same(outputs[0], outputs[1]), (runs[1].tape?.steps ?? 0) <= top,
+                          bits(replay(runs[0].tape, runs[0].anchor), replay(runs[1].tape, runs[1].anchor))
+                    else { failure = "acceptance sequence \(index) differs"; break sequence }
+                }
+            }
+        }
+        return (cases, failure)
+    }
+
+    /// Load time, after the anchor-skip check and with the GPU warm, before any verify graph is traced: the 8-d and
+    /// 4-d launches over every Mamba layer's parameters with seeded operands (per layer a `none` launch after 2
+    /// pending steps and an `anchor` launch after `anchorAt`), first compared bit for bit (normed rows, prepared
+    /// activation, stored state of every launch), then timed round robin (`NemotronTuneAdoption.order`, median) as
+    /// one chain per sample (the launches share the arrival counters, so they run one after another). When
+    /// `NemotronTuneAdoption.decide` admits the 4-d launches (or they are forced), `checkTG4` runs on the first Mamba
+    /// layer (every pending count, both forms, two
+    /// acceptance sequences) and the 4-d launches are adopted only if it passes.
+    static func tune(_ model: Module) {
+        tg4Adopted = false
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data(
+                "nemotron ssm tune: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
+        }
+        guard tuneEnabled else { return report("off (setting)") }
+        guard NemotronMTPPendingSSM.anchorSkip else { return report("off (anchor skip off)") }
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard let first = mixers.first else { return report("off (no Mamba layer)") }
+        guard kernel(pending: false, store: .none, tg4: true) != nil, kernel(pending: true, store: .none, tg4: true) != nil,
+              kernel(pending: true, store: .anchor, tg4: true) != nil else { return report("off (kernel source)") }
+        var cases = 0
+        var failure: String?
+        let at = NemotronMTPPendingSSM.anchorAt
+        let (heads, dim, groups, stateDim) = (first.numHeads, first.headDim, first.numGroups, first.ssmStateSize)
+        let convDim = first.convDim
+        let projectedWidth = first.intermediateSize + convDim + heads
+        let chain = 2 * mixers.count
+        var medians: [Double] = []
+        var verdict: NemotronTuneAdoption.Verdict? = nil
+        var reps = 0
+        var compared = 0
+        if failure == nil, elapsed() >= tuneBudgetSeconds { failure = "timing skipped (load budget)" }
+        if failure == nil {
+            do {
+                try withError {
+                    let keys = MLXRandom.split(key: MLXRandom.key(0x55A7), into: 8)
+                    let conv = MLXRandom.uniform(Float(-2) ..< 2, [1, 3, convDim], key: keys[0]).asType(.bfloat16)
+                    let dt = MLXRandom.uniform(Float(0.01) ..< 0.5, [1, 3, heads], key: keys[1])
+                    let projected = MLXRandom.uniform(Float(-3) ..< 3, [1, 3, projectedWidth], key: keys[2])
+                        .asType(.bfloat16)
+                    let tapes: [(conv: MLXArray, dt: MLXArray, steps: Int)] = [2, at].enumerated().map { i, steps in
+                        (MLXRandom.uniform(Float(-2) ..< 2, [1, steps, convDim], key: keys[3 + 2 * i]).asType(.bfloat16),
+                         MLXRandom.uniform(Float(0.01) ..< 0.5, [1, steps, heads], key: keys[4 + 2 * i]), steps)
+                    }
+                    let states = mixers.indices.map {
+                        MLXRandom.uniform(Float(-0.5) ..< 0.5, [1, heads, dim, stateDim],
+                                          key: MLXRandom.key(UInt64(0x55B0 + $0)))
+                    }
+                    eval([conv, dt, projected] + tapes.flatMap { [$0.conv, $0.dt] } + states)
+                    func run(_ quad: Bool) -> [MLXArray]? {
+                        var outs: [MLXArray] = []
+                        for (l, mixer) in mixers.enumerated() {
+                            for (t, store) in [Store.none, .anchor].enumerated() {
+                                guard let r = mixer.norm.compactSSMAnchorRows(
+                                    convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: states[l],
+                                    projected: projected, heads: heads, headDim: dim, groups: groups,
+                                    stateDim: stateDim, pending: tapes[t], store: store, tg4: quad) else { return nil }
+                                outs += [r.0, r.1] + (r.2.map { [$0] } ?? [])
+                            }
+                        }
+                        return outs
+                    }
+                    guard let a = run(false), let b = run(true), a.count == b.count else {
+                        failure = "timed launch unavailable"
+                        return
+                    }
+                    eval(a)
+                    eval(b)
+                    var ok = MLXArray(true)
+                    for (x, y) in zip(a, b) {
+                        let dtype: DType = x.dtype == .float32 ? .uint32 : .uint16
+                        ok = ok .&& (x.view(dtype: dtype) .== y.view(dtype: dtype)).all()
+                    }
+                    guard ok.item(Bool.self) else {
+                        failure = "differs on the timed launches"
+                        return
+                    }
+                    compared = chain
+                    // A round: both geometries' chains built first, then evaluated back to back in `order`.
+                    func round(_ order: [Int]) -> [Double?] {
+                        let chains = order.map { run($0 == 1) }
+                        return chains.map { outs -> Double? in
+                            guard let outs else { return nil }
+                            let begin = DispatchTime.now().uptimeNanoseconds
+                            eval(outs)
+                            Stream.gpu.synchronize()
+                            return Double(DispatchTime.now().uptimeNanoseconds - begin) / 1e6 / Double(chain)
+                        }
+                    }
+                    var wall = 0.0
+                    for _ in 0 ..< 2 {
+                        let begin = DispatchTime.now().uptimeNanoseconds
+                        _ = round([0, 1])
+                        wall = Double(DispatchTime.now().uptimeNanoseconds - begin) / 1e6
+                    }
+                    reps = NemotronTuneAdoption.cycles(target: 120, wall: wall, cap: 61)
+                    var samples: [[Double]] = [[], []]
+                    for rep in 0 ..< reps {
+                        let order = NemotronTuneAdoption.order(2, cycle: rep)
+                        for (i, ms) in zip(order, round(order)) {
+                            if let ms { samples[i].append(ms) }
+                        }
+                    }
+                    guard samples.allSatisfy({ $0.count == reps }) else {
+                        failure = "timing incomplete"
+                        return
+                    }
+                    verdict = NemotronTuneAdoption.decide(samples)
+                    medians = verdict?.medians ?? []
+                }
+            } catch {
+                failure = "error: \(error)"
+            }
+        }
+        var why = "kept"
+        if failure == nil, medians.count == 2 {
+            let wanted: Bool
+            if let f = tuneForced {
+                wanted = f == 1
+                why = f == 1 ? "forced" : f == 0 ? "forced V0" : "forced \(f) not qualified, kept"
+            } else {
+                wanted = verdict?.adopted == 1
+                if wanted { why = "adopted" }
+            }
+            // The whole check before an adoption.
+            if wanted {
+                do {
+                    (cases, failure) = try withError { checkTG4(first) }
+                } catch {
+                    failure = "error: \(error)"
+                }
+                if failure == nil {
+                    tg4Adopted = true
+                } else {
+                    why = "kept"
+                }
+            }
+        }
+        func ms(_ i: Int) -> String { i < medians.count ? String(format: "%.4f", medians[i]) : "n/a" }
+        let rule = verdict?.rule({ _ in "tg4" }) ?? "no candidate timed"
+        report("\(why) \(tg4Adopted ? "tg4" : "V0") \(ms(tg4Adopted ? 1 : 0)) ms vs V0 (tg8) \(ms(0)) ms per launch"
+            + " (\(rule); median of \(reps), \(chain) chained launches/sample on \(mixers.count) layers;"
+            + " \(failure == nil ? 1 : 0)/1 bitwise over \(compared) timed launches"
+            + (cases > 0 ? " and \(cases) cases on layer 0" : "")
+            + (medians.count == 2 ? "; [tg4 \(ms(1)) \(verdict?.won(1) ?? "n/a")]" : "")
+            + (failure.map { "; dropped: tg4 \($0)" } ?? "") + ")")
+    }
 }
 
 extension NemotronHRMSNormGated {
     /// NEMOTRON_MTP_SSM_ANCHOR_SKIP: `compactSSMPreparedRows` (same guards, operands, tail form and
     /// pending fold) without the store of the state after the window; `.anchor` stores the state after
     /// the pending steps instead. Returns (normalized, prepared, that state for `.anchor`) or nil.
+    /// `tg4` (default: the geometry `NemotronMTPSSMAnchor.tune` adopted) runs 4 d's per thread group.
     func compactSSMAnchorRows(
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
-        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?, store: NemotronMTPSSMAnchor.Store
+        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?, store: NemotronMTPSSMAnchor.Store,
+        tg4: Bool? = nil
     ) -> (MLXArray, MLXArray, MLXArray?)? {
+        let quad = tg4 ?? NemotronMTPSSMAnchor.tg4Adopted
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
                   pending.conv.shape == [1, pending.steps, 6144], pending.conv.dtype == .bfloat16,
@@ -477,7 +763,7 @@ extension NemotronHRMSNormGated {
               projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16,
               let counter = NemotronHCompactSSMGated.counter,
-              let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store)
+              let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store, tg4: quad)
         else { return nil }
         var inputs: [any ScalarOrArray] = [
             convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity, eps, counter]
@@ -492,7 +778,7 @@ extension NemotronHRMSNormGated {
         let stores = store == .anchor
         let outputs = kernel(
             inputs, template: template,
-            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            grid: (32, 64, 64), threadGroup: (32, quad ? 4 : 8, 1),
             outputShapes: [[1, 3, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16] + (stores ? [.float32] : []) + [.bfloat16, .float32])
         return stores ? (outputs[2], outputs[3], outputs[1]) : (outputs[1], outputs[2], nil)
