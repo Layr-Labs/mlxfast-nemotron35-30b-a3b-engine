@@ -243,6 +243,28 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         return roots
     }
 
+    /// `appendTrusted` of `n` trusted rows whose K/V `launch` stores straight into the single row's pages
+    /// (`PagedSequenceKV.directWrite`): the same frontier, offsets and fence roots, with the caller's launch in
+    /// place of the segment write dispatch. `launch` receives the reserved destination and returns its keys and
+    /// values outputs with the successor of the bound write fence, or nil when it launches nothing. Nil (and
+    /// nothing moved) when the destination cannot be written directly or `launch` declines; append instead.
+    public func appendTrustedDirect(
+        _ n: Int,
+        launch: (CBv2PagedDirectWrite) -> (keys: MLXArray, values: MLXArray, fence: MLXArray)?
+    ) -> [MLXArray]? {
+        let expected = pool.layerDTypes[layerIndex]
+        guard !pool.writeValidation.isFaulted, kind.sharesKVWithLayer == nil, pagedRows.count == 1,
+              let target = pagedRows[0].directWrite(n), target.dtype == expected,
+              let out = launch(target),
+              pool.writeValidation.validate(
+                  keys: out.keys, values: out.values, expected: expected, layerIndex: layerIndex)
+        else { return nil }
+        pagedRows[0].commitDirectWrite(target, fence: out.fence)
+        rebuildPositionOffsets()
+        retainedPrefillKV = []
+        return [out.keys, out.values] + innerState()
+    }
+
     /// `appendTrusted` of `n` rows the single row's storage already holds
     /// just past its frontier (`PagedSequenceKV.readvanceRetained`): the same
     /// frontier, offsets and fence roots, without the write dispatch. nil,
