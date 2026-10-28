@@ -409,6 +409,16 @@ enum NemotronHResidualRMSNorm {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
+    /// The products join's kernel body and operands, for a launch that runs it as its own tail
+    /// (`NemotronZSkip.fusedJoin`).
+    static var productsJoinSource: String { oneBarrierSource(sumProductsPreparedSource()) }
+    static func joinScalars(_ eps: Float) -> (MLXArray, MLXArray) { scalars(eps) }
+    static func joinRows(_ x: MLXArray, norm: RMSNorm) -> Bool { plumbingRows(x, norm: norm) }
+    static func productsJoinReference(_ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray, MLXArray) {
+        applyProductsRows(lhs, products, shared: shared, norm: norm)
+    }
+
     private static func plumbingRows(_ x: MLXArray, norm: RMSNorm) -> Bool {
         plumbingAvailable
             && x.shape == [1, 3, 2688] && x.dtype == .bfloat16
