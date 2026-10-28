@@ -546,6 +546,9 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "ws64x64w42", bn: 64, bk: 64, wm: 4, wn: 2, direct: false),
+        Variant(name: "d64w42", bn: 64, bk: 64, wm: 4, wn: 2, direct: true),
+        Variant(name: "ws128x64w42", bn: 128, bk: 64, wm: 4, wn: 2, direct: false),
     ]
 
     enum Source: String, Sendable { case bank, dict, copy }
@@ -581,8 +584,12 @@ enum NemotronSeedRetile {
         return """
                 threadgroup T Ws[DIRECT_B ? 1 : BN * (BK + 16 / sizeof(T))];
                 \(make)
+                if constexpr (32 / WM >= 16) {
                 if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
             \(call("32"))
+                } else {
+            \(call("BM"))
+                }
                 } else {
             \(call("BM"))
                 }
