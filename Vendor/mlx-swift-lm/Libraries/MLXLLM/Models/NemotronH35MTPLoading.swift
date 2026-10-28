@@ -131,6 +131,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
         NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        cbv2PagedHostWriteFenceReport()
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
@@ -211,7 +212,9 @@ extension NemotronH35MTPAssistant {
         depth: Int, promptLength: Int, postVerifyWarmupWidth: inout Int?
     ) throws {
         let kinds = target.cbv2LayerKinds
+        // Anchor-skip warm-up uses request-independent acceptance paths only.
         let maxLength = promptLength + 4 * (depth + 2) + 16
+            + (depth == 2 && NemotronMTPPendingSSM.warmsSteps && NemotronMTPPendingSSM.anchorSkip ? 3 * 64 : 0)
         let backend = CBv2ContiguousKVBackend(
             config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
         let rows = try backend.makeSequenceState(
@@ -271,7 +274,19 @@ extension NemotronH35MTPAssistant {
         // branch), then every shallower width.
         var rounds = [(depth, min(2, depth + 1)), (depth, depth + 1), (depth, 1)]
         for k in (1..<depth).reversed() { rounds += [(k, k + 1), (k, 1)] }
-        for (k, confirmed) in rounds {
+        if depth == 2, NemotronMTPPendingSSM.warmsSteps, NemotronMTPPendingSSM.enabled {
+            rounds += [(depth, depth + 1)]
+                + Array(repeating: (depth, 1), count: NemotronMTPPendingSSM.limit + 1)
+                + [(depth, depth + 1)]
+        }
+        // NEMOTRON_MTP_SSM_ANCHOR_SKIP: further rounds until the anchor-skip
+        // windows have folded every pending count 0 ... anchorAt + 2.
+        let anchorWarm = depth == 2 && NemotronMTPPendingSSM.warmsSteps && NemotronMTPPendingSSM.anchorSkip
+        var anchorSeen = Set<Int>()
+        var roundIndex = 0
+        while roundIndex < rounds.count {
+            let (k, confirmed) = rounds[roundIndex]
+            roundIndex += 1
             var tokens = seed, hidden = carry
             var drafts: [MLXArray] = []
             var draftRows: [MLXArray] = []
@@ -346,6 +361,13 @@ extension NemotronH35MTPAssistant {
                     requestState: draftState)
             }
             eval([seed, carry] + evaluationTargets(for: draftState))
+            if anchorWarm, k == depth {
+                anchorSeen.insert(NemotronMTPSSMAnchor.lastPending)
+                if roundIndex == rounds.count, rounds.count < 64, let next = NemotronMTPSSMAnchor.warmKeep(
+                    pending: NemotronMTPSSMAnchor.lastPending, keep: confirmed, seen: &anchorSeen) {
+                    rounds.append((depth, next))
+                }
+            }
         }
         // Depth one has no shallower round to consume the prestaged row.
         // Release that private transaction through the ordinary discard path.

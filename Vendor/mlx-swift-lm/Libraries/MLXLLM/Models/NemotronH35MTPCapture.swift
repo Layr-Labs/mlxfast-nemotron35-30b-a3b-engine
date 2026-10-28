@@ -16,18 +16,36 @@ import MLXNN
 /// .pendingKernel`, the replay kernel's per-step statements) and the replay
 /// array is never evaluated. Every other reader of the committed state still
 /// evaluates the replay. Strict prefixes in a row extend the pending steps up
-/// to `maxSteps`. Admitted at load only after the folded launch matched replay
+/// to `strictSteps`. Admitted at load only after the folded launch matched replay
 /// + launch bitwise for every step count (`qualify`).
 final class NemotronMTPPendingSSM {
     struct Pending {
         let anchor: MLXArray, conv: MLXArray, dt: MLXArray
         let steps: Int
     }
-    static let maxSteps = 4
+    /// The largest folded step count compiled and checked at load (the anchor skip folds up to `anchorAt + 2`).
+    static let maxSteps = 11
+    /// Preserve the record's four-step ordinary strict-prefix bound when the
+    /// new anchor-skip mechanism is off or does not qualify. Larger capacity
+    /// below is used only after the anchor policy's separate bitwise gate.
+    static let strictSteps = 4
+    static let baseSteps = min(4, strictSteps)
     static let requested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_PENDING_FOLD"] != "0"
+    static let warmsSteps =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_WARMUP_PENDING"] != "0"
+    /// NEMOTRON_MTP_SSM_ANCHOR_SKIP (see NemotronMTPSSMAnchor); =0 keeps the window's state store.
+    static let anchorRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_SKIP"] != "0"
+    /// A window launch with at least this many pending steps stores the state after them
+    /// (NEMOTRON_MTP_SSM_ANCHOR_AT, 1 ... maxSteps - 2).
+    static let anchorAt = min(max(Int(
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_AT"] ?? "") ?? 6, 1), maxSteps - 2)
     nonisolated(unsafe) static var qualified = false
+    nonisolated(unsafe) static var anchorQualified = false
+    nonisolated(unsafe) static var limit = 0
     static var enabled: Bool { requested && qualified }
+    static var anchorSkip: Bool { enabled && anchorRequested && anchorQualified }
 
     private final class Entry {
         weak var state: MLXArray?
@@ -42,7 +60,7 @@ final class NemotronMTPPendingSSM {
 
     /// `state` is the replay of `pending.steps` steps of `pending` from its anchor.
     static func register(_ state: MLXArray, _ pending: Pending) {
-        guard enabled, (1 ... maxSteps).contains(pending.steps) else { return }
+        guard enabled, (1 ... limit).contains(pending.steps) else { return }
         lock.withLock {
             entries = entries.filter { $0.value.state != nil }
             entries[ObjectIdentifier(state)] = Entry(state, pending)
@@ -83,6 +101,7 @@ final class NemotronMTPPendingSSM {
         }
         let convDim = mixer.convDim
         let projectedWidth = mixer.intermediateSize + convDim + heads
+        var passed = 0
         for steps in 1 ... maxSteps {
             let pconv = MLXArray(values(steps * convDim, -2, 2), [1, steps, convDim]).asType(.bfloat16)
             let pdt = MLXArray(values(steps * heads, 0.01, 0.5), [1, steps, heads])
@@ -103,13 +122,327 @@ final class NemotronMTPPendingSSM {
                     convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: anchor,
                     projected: projected, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, pending: (pconv, pdt, steps))
-            else { return report("off (fused launch unavailable)") }
+            else {
+                if steps <= baseSteps { return report("off (fused launch unavailable)") }
+                break
+            }
             eval(reference.0, reference.1, reference.2, folded.0, folded.1, folded.2)
             guard bits(reference.0, folded.0), bits(reference.1, folded.1), bits(reference.2, folded.2)
-            else { return report("off (folded launch differs at \(steps) pending steps)") }
+            else {
+                if steps <= baseSteps { return report("off (folded launch differs at \(steps) pending steps)") }
+                break
+            }
+            passed = steps
         }
+        limit = min(passed, strictSteps)
         qualified = true
-        report("on (1...\(maxSteps) pending steps bitwise equal to replay + launch)")
+        report("on (1...\(passed) pending steps bitwise equal to replay + launch)")
+        NemotronMTPSSMAnchor.qualify(mixer, passed: passed)
+    }
+}
+
+/// NEMOTRON_MTP_SSM_ANCHOR_SKIP: the compact verify window's fused launch
+/// (NemotronHCompactSSMGated) without its store of the state after the
+/// window, which a strict prefix never reads. Every acceptance, full or
+/// strict, commits the replay of its accepted steps from an anchor state
+/// and registers it with NemotronMTPPendingSSM, so the next window's launch
+/// folds those steps (compile-time `P`, the pending prelude). A launch whose
+/// pending count is at least `NemotronMTPPendingSSM.anchorAt` stores the
+/// state after its pending steps (`anchor` form; always a committed state),
+/// which anchors the next tape; below that it stores no state (`none` form)
+/// and the tape grows by the accepted steps (at most `anchorAt + 2`). The
+/// state stays FP32 in registers through the fold, so a stored-then-reloaded
+/// state and a folded one are the same bits; `qualify` checks every form and
+/// whole acceptance sequences against the window-store launches before admitting it.
+enum NemotronMTPSSMAnchor {
+    enum Store { case none, anchor }
+
+    static let windowStore = "        if (t == L - 1) {\n"
+        + "            state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(state);\n"
+        + "        }\n"
+    static let windowLoop = "\nfor (int t = 0; t < L; ++t) {\n"
+    static let anchorStore = """
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * ds_idx + i;
+            if constexpr (Ds % 32 != 0) { if (s_idx >= Ds) continue; }
+            state_out[(n * Dh + d_idx) * Ds + s_idx] = static_cast<U>(prior[i]);
+        }
+
+        """
+
+    /// Tail form 0 record, 1 shuffle, 2 one barrier (as NemotronHCompactSSMGated's kernels).
+    private static func make(form: Int, pending: Bool, store: Store) -> MLXFast.MLXFastKernel? {
+        let base = pending ? NemotronHCompactSSMGated.pendingSource : NemotronHCompactSSMGated.source
+        guard base.components(separatedBy: windowStore).count == 2,
+              base.components(separatedBy: windowLoop).count == 2,
+              store == .none || pending else { return nil }
+        var source = base.replacingOccurrences(of: windowStore, with: "")
+        if store == .anchor {
+            source = source.replacingOccurrences(of: windowLoop, with: "\n" + anchorStore + windowLoop)
+        }
+        let tailed = form == 2 ? NemotronHCompactSSMGated.rowsTail(source)
+            : form == 1 ? NemotronHCompactSSMGated.shuffledTail(source) : source
+        guard let tailed else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_mtp_ssm_compact_gated_prepared" + (pending ? "_pending" : "")
+                + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form],
+            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                         "eps", "counter"] + (pending ? ["pconv", "pdt"] : []),
+            outputNames: store == .anchor ? ["out", "state_out", "normed", "prepared"] : ["out", "normed", "prepared"],
+            source: tailed, mutableInputs: ["counter"])
+    }
+
+    /// [form][pending][anchor]
+    private static let kernels: [[[MLXFast.MLXFastKernel?]]] = (0 ..< 3).map { form in
+        [false, true].map { pending in
+            [Store.none, .anchor].map { make(form: form, pending: pending, store: $0) }
+        }
+    }
+
+    /// The form `compactSSMPreparedRows` launches by default after the load-time checks.
+    static func kernel(pending: Bool, store: Store) -> MLXFast.MLXFastKernel? {
+        let form = NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? 2
+            : NemotronHCompactSSMGated.shuffleQualified && NemotronHCompactSSMGated.shuffleKernel != nil ? 1 : 0
+        return kernels[form][pending ? 1 : 0][store == .anchor ? 1 : 0]
+    }
+
+    /// The pending count of the latest anchor-skip window (warm-up bookkeeping).
+    nonisolated(unsafe) static var lastPending = 0
+
+    /// Warm-up: the acceptance length for the round after one whose windows folded `pending` steps and
+    /// committed `keep`, so that the anchor-skip windows reach every pending count 0 ... anchorAt + 2
+    /// (the first step of a shortest path to a count not yet in `seen`); nil once every count was reached.
+    static func warmKeep(pending: Int, keep: Int, seen: inout Set<Int>) -> Int? {
+        let at = NemotronMTPPendingSSM.anchorAt
+        func after(_ count: Int, _ keep: Int) -> Int { (count >= at ? 0 : count) + keep }
+        seen.insert(pending)
+        let next = after(pending, keep)
+        let missing = !seen.contains(next)
+        seen.insert(next)
+        guard missing || seen.count < at + 3 else { return nil }
+        var first: [Int: Int] = [:]
+        var queue: [Int] = []
+        for keep in 1 ... 3 where first[after(next, keep)] == nil {
+            first[after(next, keep)] = keep
+            queue.append(after(next, keep))
+        }
+        var index = 0
+        while index < queue.count {
+            let count = queue[index]
+            index += 1
+            if !seen.contains(count) { return first[count] }
+            for keep in 1 ... 3 where first[after(count, keep)] == nil {
+                first[after(count, keep)] = first[count]
+                queue.append(after(count, keep))
+            }
+        }
+        return 1
+    }
+
+    /// Load time, after the pending fold qualified 1 ... `passed` steps. With operands seeded as in
+    /// NemotronMTPPendingSSM.qualify and `mixer`'s parameters, for every pending count 0 ... anchorAt + 2:
+    /// the `none` and `anchor` launches against the record launch (normed rows, prepared activation),
+    /// the anchor store against the replay of the pending steps, and the record launch's window state
+    /// against the replays the anchor skip commits instead; then whole acceptance sequences (full and
+    /// strict, every pending count) run under both policies: every window's normed rows and prepared
+    /// activation, and the committed state replayed from either representation, bitwise equal.
+    /// Admitted only if every case matches; otherwise the window keeps its store.
+    static func qualify(_ mixer: NemotronHMamba2Mixer, passed: Int) {
+        NemotronMTPPendingSSM.anchorQualified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp ssm anchor skip: \(message)\n".utf8))
+        }
+        let at = NemotronMTPPendingSSM.anchorAt
+        let top = at + 2
+        guard NemotronMTPPendingSSM.anchorRequested else { return report("off (setting)") }
+        guard passed >= top else { return report("off (pending fold qualified to \(passed) steps, needs \(top))") }
+        guard kernel(pending: false, store: .none) != nil, kernel(pending: true, store: .none) != nil,
+              kernel(pending: true, store: .anchor) != nil else { return report("off (kernel source)") }
+        let (heads, dim, groups, stateDim) =
+            (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        let convDim = mixer.convDim
+        let projectedWidth = mixer.intermediateSize + convDim + heads
+        var seed: UInt64 = 0xA5C3_7E21_9B4D_0F17
+        func values(_ count: Int, _ low: Float, _ high: Float) -> [Float] {
+            (0 ..< count).map { _ -> Float in
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                return low + (high - low) * Float(seed >> 40) / Float(1 << 24)
+            }
+        }
+        func bits(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            guard a.shape == b.shape, a.dtype == b.dtype else { return false }
+            let dtype: DType = a.dtype == .float32 ? .uint32 : .uint16
+            return (a.view(dtype: dtype) .== b.view(dtype: dtype)).all().item(Bool.self)
+        }
+        typealias Tape = (conv: MLXArray, dt: MLXArray, steps: Int)
+        func window(_ scale: Float) -> (conv: MLXArray, dt: MLXArray, projected: MLXArray) {
+            (MLXArray(values(3 * convDim, -2 * scale, 2 * scale), [1, 3, convDim]).asType(.bfloat16),
+             MLXArray(values(3 * heads, 0.01, 0.5), [1, 3, heads]),
+             MLXArray(values(3 * projectedWidth, -3 * scale, 3 * scale), [1, 3, projectedWidth]).asType(.bfloat16))
+        }
+        func replay(_ tape: Tape?, _ state: MLXArray) -> MLXArray {
+            guard let tape else { return state }
+            return nemotronMTPSSMCompact(
+                convolution: tape.conv, ALog: mixer.aLog, D: mixer.D, dt: tape.dt, state: state,
+                heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                steps: tape.steps, writeOutput: false).finalState
+        }
+        func extend(_ tape: Tape?, _ w: (conv: MLXArray, dt: MLXArray, projected: MLXArray), _ keep: Int) -> Tape {
+            let accepted = (w.conv[0..., ..<keep, 0...], w.dt[0..., ..<keep, 0...])
+            guard let tape else { return (accepted.0, accepted.1, keep) }
+            return (concatenated([tape.conv, accepted.0], axis: 1), concatenated([tape.dt, accepted.1], axis: 1),
+                    tape.steps + keep)
+        }
+        // One fused launch per evaluation: the launches share the arrival counters.
+        func record(_ w: (conv: MLXArray, dt: MLXArray, projected: MLXArray), _ state: MLXArray, _ tape: Tape?)
+            -> (MLXArray, MLXArray, MLXArray)? {
+            guard let r = mixer.norm.compactSSMPreparedRows(
+                convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
+                projected: w.projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                pending: tape) else { return nil }
+            eval(r.0, r.1, r.2)
+            return r
+        }
+        func skipping(_ w: (conv: MLXArray, dt: MLXArray, projected: MLXArray), _ state: MLXArray, _ tape: Tape?,
+                      _ store: Store) -> (MLXArray, MLXArray, MLXArray?)? {
+            guard let r = mixer.norm.compactSSMAnchorRows(
+                convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
+                projected: w.projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                pending: tape, store: store) else { return nil }
+            eval([r.0, r.1] + (r.2.map { [$0] } ?? []))
+            return r
+        }
+        var cases = 0
+        var failure: String?
+        // Per pending count.
+        perCount: for steps in 0 ... top {
+            for scale: Float in [1, 4] {
+                let anchor = MLXArray(values(heads * dim * stateDim, -0.5, 0.5), [1, heads, dim, stateDim])
+                let tape: Tape? = steps == 0 ? nil : (
+                    MLXArray(values(steps * convDim, -2 * scale, 2 * scale), [1, steps, convDim]).asType(.bfloat16),
+                    MLXArray(values(steps * heads, 0.01, 0.5), [1, steps, heads]), steps)
+                let w = window(scale)
+                guard let reference = record(w, anchor, tape), let none = skipping(w, anchor, tape, .none) else {
+                    failure = "launch unavailable at \(steps) pending steps"; break perCount
+                }
+                var same = bits(reference.0, none.0) && bits(reference.1, none.1)
+                let after = replay(tape, anchor)
+                if steps > 0 {
+                    guard let stored = skipping(w, anchor, tape, .anchor), let state = stored.2 else {
+                        failure = "anchor launch unavailable at \(steps) pending steps"; break perCount
+                    }
+                    same = same && bits(reference.0, stored.0) && bits(reference.1, stored.1) && bits(state, after)
+                    // A full acceptance after an anchor store: three steps from the stored state.
+                    same = same && bits(reference.2, replay(extend(nil, w, 3), state))
+                }
+                // A full acceptance below the threshold: the tape grows by the window.
+                if steps + 3 <= NemotronMTPPendingSSM.maxSteps {
+                    same = same && bits(reference.2, replay(extend(tape, w, 3), anchor))
+                }
+                // Strict prefixes: the longer tape from the old anchor and the short one from the state after it.
+                for keep in 1 ... 2 where steps > 0 && steps + keep <= NemotronMTPPendingSSM.maxSteps {
+                    same = same && bits(replay(extend(tape, w, keep), anchor), replay(extend(nil, w, keep), after))
+                }
+                cases += 1
+                if !same { failure = "differs at \(steps) pending steps"; break perCount }
+            }
+        }
+        // Whole acceptance sequences under both policies (window store: the window's state on full acceptance,
+        // strict chains up to strictSteps; anchor skip: every acceptance pending, the store at `at`).
+        if failure == nil {
+            var sequences: [[Int]] = []
+            var steer: [Int] = [2]
+            var seen = Set<Int>()
+            var pendingCount = 0
+            while steer.count < 6 * (top + 1), let keep = warmKeep(pending: pendingCount, keep: steer.last!, seen: &seen) {
+                pendingCount = (pendingCount >= at ? 0 : pendingCount) + steer.last!
+                steer.append(keep)
+            }
+            sequences.append(steer + [3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2])
+            sequences.append((0 ..< 24).map { _ in values(1, 0, 1)[0] < 0.6 ? 3 : (values(1, 0, 1)[0] < 0.5 ? 1 : 2) })
+            sequence: for (index, keeps) in sequences.enumerated() {
+                let scale: Float = index == 0 ? 1 : 3
+                var record11: (anchor: MLXArray, tape: Tape?) =
+                    (MLXArray(values(heads * dim * stateDim, -0.5, 0.5), [1, heads, dim, stateDim]), nil)
+                var skip: (anchor: MLXArray, tape: Tape?) = (record11.anchor, nil)
+                for keep in keeps {
+                    let w = window(scale)
+                    let writes = (skip.tape?.steps ?? 0) >= at
+                    guard let a = record(w, record11.anchor, record11.tape),
+                          let b = skipping(w, skip.anchor, skip.tape, writes ? .anchor : .none),
+                          !writes || b.2 != nil else {
+                        failure = "sequence launch unavailable"; break sequence
+                    }
+                    var same = bits(a.0, b.0) && bits(a.1, b.1)
+                    if keep == 3 {
+                        record11 = (a.2, nil)
+                    } else {
+                        let grown = extend(record11.tape, w, keep)
+                        record11 = grown.steps <= NemotronMTPPendingSSM.strictSteps
+                            ? (record11.anchor, grown) : (replay(grown, record11.anchor), nil)
+                    }
+                    skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, extend(skip.tape, w, keep))
+                    same = same && (skip.tape?.steps ?? 0) <= top
+                        && bits(replay(record11.tape, record11.anchor), replay(skip.tape, skip.anchor))
+                    cases += 1
+                    if !same { failure = "acceptance sequence \(index) differs"; break sequence }
+                }
+            }
+        }
+        if let failure { return report("off (\(failure))") }
+        NemotronMTPPendingSSM.limit = top
+        NemotronMTPPendingSSM.anchorQualified = true
+        report("on (state stored only by windows with >= \(at) pending steps, up to \(top) pending; \(cases) cases: "
+            + "normed rows, prepared activation and committed states bitwise equal to the window-store launches)")
+    }
+}
+
+extension NemotronHRMSNormGated {
+    /// NEMOTRON_MTP_SSM_ANCHOR_SKIP: `compactSSMPreparedRows` (same guards, operands, tail form and
+    /// pending fold) without the store of the state after the window; `.anchor` stores the state after
+    /// the pending steps instead. Returns (normalized, prepared, that state for `.anchor`) or nil.
+    func compactSSMAnchorRows(
+        convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
+        state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
+        stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?, store: NemotronMTPSSMAnchor.Store
+    ) -> (MLXArray, MLXArray, MLXArray?)? {
+        if let pending {
+            guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
+                  pending.conv.shape == [1, pending.steps, 6144], pending.conv.dtype == .bfloat16,
+                  pending.dt.shape == [1, pending.steps, 64], pending.dt.dtype == .float32
+            else { return nil }
+        }
+        guard store == .none || pending != nil,
+              NemotronHCompactSSMGated.enabled, NemotronMTPExecution.batchedNorm,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              type(of: self) == NemotronHRMSNormGated.self,
+              groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
+              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
+              dt.dtype == .float32, dt.shape == [1, 3, 64],
+              state.dtype == .float32, state.shape == [1, 64, 64, 128],
+              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              weight.shape == [4096], weight.dtype == .bfloat16,
+              let counter = NemotronHCompactSSMGated.counter,
+              let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store)
+        else { return nil }
+        var inputs: [any ScalarOrArray] = [
+            convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity, eps, counter]
+        var template: [(String, any KernelTemplateArg)] = [
+            ("T", DType.bfloat16), ("U", DType.float32),
+            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+            ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
+        if let pending {
+            inputs += [pending.conv, pending.dt]
+            template.append(("P", pending.steps))
+        }
+        let stores = store == .anchor
+        let outputs = kernel(
+            inputs, template: template,
+            grid: (32, 64, 64), threadGroup: (32, 8, 1),
+            outputShapes: [[1, 3, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, 3, 4096], [3, 8, 17 * 32]],
+            outputDTypes: [.bfloat16] + (stores ? [.float32] : []) + [.bfloat16, .float32])
+        return stores ? (outputs[2], outputs[3], outputs[1]) : (outputs[1], outputs[2], nil)
     }
 }
 
@@ -125,7 +458,8 @@ final class NemotronH35MTPCompactGraphCache {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
     private let lock = NSLock()
     /// [plain, consuming a prepared in_proj activation] x [unjoined, joined]
-    /// x pending steps (0 ... NemotronMTPPendingSSM.maxSteps): separate graphs.
+    /// x pending steps (0 ... NemotronMTPPendingSSM.maxSteps) x [window store,
+    /// no store, anchor store] (NemotronMTPSSMAnchor): separate graphs.
     private var entries: [Int: Entry] = [:]
     private var joinTimed = false
     private var joinChecked = false
@@ -143,7 +477,7 @@ final class NemotronH35MTPCompactGraphCache {
     func callAsFunction(
         _ hidden: MLXArray, convState: MLXArray, initialSSM: MLXArray,
         prepared: MLXArray? = nil, pending: NemotronMTPPendingSSM.Pending? = nil,
-        owner: NemotronHMamba2Mixer,
+        store: NemotronMTPSSMAnchor.Store? = nil, owner: NemotronHMamba2Mixer,
         residual: MLXArray? = nil, nextNorm: RMSNorm? = nil
     ) -> [MLXArray] {
         let fold = pending.map { (conv: $0.conv, dt: $0.dt, steps: $0.steps) }
@@ -166,7 +500,7 @@ final class NemotronH35MTPCompactGraphCache {
         else {
             return finish(owner.mtpCompactArrays(
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
-                pending: fold), residual)
+                pending: fold, store: store), residual)
         }
         if joins, let nextNorm {
             identity += [ObjectIdentifier(nextNorm), ObjectIdentifier(nextNorm.weight)]
@@ -174,6 +508,7 @@ final class NemotronH35MTPCompactGraphCache {
         let usesPrepared = prepared != nil
         let pendingSteps = pending?.steps ?? 0
         let slot = (usesPrepared ? 1 : 0) + (joins ? 2 : 0) + 4 * pendingSteps
+            + 4 * (NemotronMTPPendingSSM.maxSteps + 1) * (store.map { $0 == .anchor ? 2 : 1 } ?? 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             if let entry = entries[slot], entry.identity == identity { return entry }
@@ -185,7 +520,7 @@ final class NemotronH35MTPCompactGraphCache {
                 let values = owner.mtpCompactArrays(
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[base] : nil,
-                    pending: pendingSteps > 0 ? (arrays[3], arrays[4], pendingSteps) : nil)
+                    pending: pendingSteps > 0 ? (arrays[3], arrays[4], pendingSteps) : nil, store: store)
                 guard joins, let nextNorm else { return values }
                 guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
                     arrays[base + (usesPrepared ? 1 : 0)], values[0], norm: nextNorm) else {
@@ -207,12 +542,12 @@ final class NemotronH35MTPCompactGraphCache {
             // Retain any enclosing MLX error while avoiding empty indexing.
             return finish(owner.mtpCompactArrays(
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
-                pending: fold), residual)
+                pending: fold, store: store), residual)
         }
         guard NemotronMoELeader.selfTest else { return result }
         // Reference: in_proj prepares its activation from `hidden` itself.
         let expected = finish(owner.mtpCompactArrays(
-            hidden, convState: convState, initialSSM: initialSSM, pending: fold), residual)
+            hidden, convState: convState, initialSSM: initialSSM, pending: fold, store: store), residual)
         return zip(result, expected).enumerated().map {
             joins && $0.offset == 6 ? $0.element.0
                 : nemotronBitwiseOrNaN($0.element.0, $0.element.1)
@@ -370,9 +705,21 @@ extension NemotronHMamba2Mixer {
         // arrives as its anchor and tape; the window's fused launch runs it.
         let pending = length == 3 ? NemotronMTPPendingSSM.take(initialSSM) : nil
         let start = pending?.anchor ?? initialSSM
+        // NEMOTRON_MTP_SSM_ANCHOR_SKIP: no state store after the window; the state after the pending
+        // steps is stored once they reach anchorAt (see NemotronMTPSSMAnchor).
+        let anchorSkip = length == 3 && NemotronMTPPendingSSM.anchorSkip
+        let writes = anchorSkip && (pending?.steps ?? 0) >= NemotronMTPPendingSSM.anchorAt
         let arrays = mtpCompactGraphCache(
             hiddenStates, convState: convState, initialSSM: start, prepared: prepared,
-            pending: pending, owner: self, residual: residual, nextNorm: nextNorm)
+            pending: pending, store: anchorSkip ? (writes ? .anchor : NemotronMTPSSMAnchor.Store.none) : nil,
+            owner: self, residual: residual, nextNorm: nextNorm)
+        if anchorSkip {
+            NemotronMTPSSMAnchor.lastPending = pending?.steps ?? 0
+            stageAnchorReplay(evaluation, modelLayerIndex: modelLayerIndex, length: length,
+                window: (arrays[1], arrays[2], arrays[3]), anchor: writes ? arrays[4] : start,
+                carried: writes ? nil : pending)
+            return arrays
+        }
         if let residual, let nextNorm, pending == nil {
             mtpCompactGraphCache.checkAndBenchmarkJoin(hiddenStates, convState: convState,
                 initialSSM: initialSSM, prepared: prepared, residual: residual, nextNorm: nextNorm,
@@ -433,6 +780,55 @@ extension NemotronHMamba2Mixer {
         return arrays
     }
 
+    /// NEMOTRON_MTP_SSM_ANCHOR_SKIP commit: an accepted prefix of `keep` window steps (full or strict) is
+    /// the compact replay, from `anchor`, of the `carried` pending steps the window's launch did not store
+    /// followed by the accepted ones, registered so the next window's launch folds it. A full acceptance
+    /// is built on first read like a strict prefix (`defersFullAcceptance`).
+    private func stageAnchorReplay(
+        _ evaluation: CBv2RecurrentStateEvaluation, modelLayerIndex: Int, length: Int,
+        window: (padded: MLXArray, convolution: MLXArray, dt: MLXArray), anchor: MLXArray,
+        carried: NemotronMTPPendingSSM.Pending?
+    ) {
+        let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
+        let (logA, skip) = (self.aLog, self.D)
+        let history = convKernelSize - 1
+        let tape = [window.padded, window.convolution, window.dt]
+        let retained = tape + [anchor] + (carried.map { [$0.conv, $0.dt] } ?? [])
+        let retainedBytes = retained.reduce(0) { $0 + $1.nbytes }
+        func committed(_ keep: Int) -> CBv2RecurrentLayerState {
+            var conv = window.convolution[0..., ..<keep, 0...]
+            var dt = window.dt[0..., ..<keep, 0...]
+            if let carried {
+                conv = concatenated([carried.conv, conv], axis: 1)
+                dt = concatenated([carried.dt, dt], axis: 1)
+            }
+            let steps = (carried?.steps ?? 0) + keep
+            let ssm = nemotronMTPSSMCompact(
+                convolution: conv, ALog: logA, D: skip, dt: dt, state: anchor,
+                heads: heads, headDim: dim, groups: groups, stateDim: state,
+                steps: steps, writeOutput: false).finalState
+            NemotronMTPPendingSSM.register(ssm, .init(anchor: anchor, conv: conv, dt: dt, steps: steps))
+            return CBv2RecurrentLayerState(conv: window.padded[0..., keep ..< (keep + history), 0...], ssm: ssm)
+        }
+        do {
+            try evaluation.stagePrefixReplay(
+                modelLayerIndex: modelLayerIndex, positions: length,
+                finalConv: window.padded[0..., length ..< (length + history), 0...],
+                finalSSM: anchor,
+                materializedByteCount: tape.reduce(0) { $0 + $1.nbytes } + anchor.nbytes,
+                evaluationRoots: tape,
+                strictReplayRetainedByteCount: retainedBytes,
+                strictReplayRetainedRoots: retained,
+                fullAcceptanceRetainedByteCount: retainedBytes,
+                fullAcceptanceRetainedRoots: retained,
+                fullAcceptance: { committed(length) },
+                defersFullAcceptance: true,
+                replay: committed)
+        } catch {
+            preconditionFailure("Nemotron MTP anchor-skip recurrent stage failed: \(error)")
+        }
+    }
+
     /// Original numerical graph, with request state supplied as dynamic arrays.
     /// Return its replay tape explicitly; staging/commit stay outside compile.
     /// `inputPrepared`: in_proj's K=2688 activation, prepared by the preceding
@@ -440,7 +836,8 @@ extension NemotronHMamba2Mixer {
     func mtpCompactArrays(
         _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
         prepared inputPrepared: MLXArray? = nil,
-        pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil
+        pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil,
+        store: NemotronMTPSSMAnchor.Store? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         // The window's conv, padded history and timestep come from in_proj's
@@ -479,6 +876,24 @@ extension NemotronHMamba2Mixer {
         }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
+        // NEMOTRON_MTP_SSM_ANCHOR_SKIP (`store`): the last output is the next
+        // tape's anchor instead of the window's final state: the state after
+        // the pending steps (`.anchor`) or `initialSSM` itself (`.none`).
+        func anchorOutput(_ begin: MLXArray, _ final: MLXArray) -> MLXArray {
+            store.map { $0 == .anchor ? begin : initialSSM } ?? final
+        }
+        func fusedRows() -> (MLXArray, MLXArray, MLXArray)? {
+            guard let store else {
+                return norm.compactSSMPreparedRows(
+                    convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                    projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
+                    pending: pending)
+            }
+            return norm.compactSSMAnchorRows(
+                convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+                projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
+                pending: pending, store: store).map { ($0.0, $0.1, $0.2 ?? initialSSM) }
+        }
         // NEMOTRON_SSM_GATED_FUSED: the compact SSM window, the gated RMS norm
         // and out_proj's prepared activation in one launch (see
         // NemotronHCompactSSMGated); the same normed rows, prepared activation
@@ -489,31 +904,30 @@ extension NemotronHMamba2Mixer {
            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
            q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
            q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
-           var fused = norm.compactSSMPreparedRows(
-               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
-               projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
-               pending: pending) {
+           var fused = fusedRows() {
             if NemotronMoELeader.selfTest {
                 // Reference: the two launches (compact SSM, then the gated
                 // norm with the prepared output) on the same operands.
+                let begin = replayedPending(pending, initialSSM)
                 let reference = nemotronMTPSSMCompact(
                     convolution: convolution, ALog: logA, D: skip, dt: dt,
-                    state: replayedPending(pending, initialSSM),
+                    state: begin,
                     heads: heads, headDim: dim, groups: groups, stateDim: state,
                     steps: length, writeOutput: true)
                 if let pair = norm.preparedRows(
                     reference.output.reshaped(batch, length, heads * dim), gate: gate) {
                     fused = (nemotronBitwiseOrNaN(fused.0, pair.0),
                              nemotronBitwiseOrNaN(fused.1, pair.1),
-                             nemotronBitwiseOrNaN(fused.2, reference.finalState))
+                             nemotronBitwiseOrNaN(fused.2, anchorOutput(begin, reference.finalState)))
                 }
             }
             return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
                     padded, convolution, dt, fused.2]
         }
+        let begin = replayedPending(pending, initialSSM)
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt,
-            state: replayedPending(pending, initialSSM),
+            state: begin,
             heads: heads, headDim: dim, groups: groups, stateDim: state,
             steps: length, writeOutput: true)
         let y = result.output.reshaped(batch, length, heads * dim)
@@ -538,7 +952,7 @@ extension NemotronHMamba2Mixer {
             prepared = nil
         }
         return [nemotronMTPLinearRows(normalized, outProj, prepared: prepared),
-                padded, convolution, dt, result.finalState]
+                padded, convolution, dt, anchorOutput(begin, result.finalState)]
     }
 
     /// The window's start state: `anchor` itself, or `anchor` advanced over
