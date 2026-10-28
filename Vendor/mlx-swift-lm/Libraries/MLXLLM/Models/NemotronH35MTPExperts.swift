@@ -264,15 +264,22 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
+        // NemotronSharedUpLate: the shared expert's operand takes the routing indices as a dependency, so MLX
+        // encodes the shared up beside the routed FC1 (not beside the router) and the shared down beside the FC2.
+        var colaunchUsed = colaunch
+        if NemotronSharedUpLate.enabled, let c = colaunch, c.up == nil, let p = c.prepared {
+            colaunchUsed = NemotronFC2SharedColaunch.Shared(
+                mlp: c.mlp, x: c.x, prepared: depends(input: p.reshaped(-1).reshaped(p.shape), dependencies: [indices]))
+        }
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
+            x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunchUsed) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
         guard let sharedExperts else { return [y] }
-        let shared = colaunch?.rows ?? sharedExperts.mtpForwardRows(x, prepared: packed)
+        let shared = colaunchUsed?.rows ?? sharedExperts.mtpForwardRows(x, prepared: packed)
         return parts ? [y, shared] : [y + shared]
     }
 }
@@ -3542,6 +3549,11 @@ enum NemotronSharedDownZSkip {
         }
         return same.item(Bool.self)
     }
+}
+
+/// NEMOTRON_MTP_SU_LATE=0 keeps the shared expert's up projection beside the router.
+enum NemotronSharedUpLate {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SU_LATE"] != "0"
 }
 
 // MARK: - Routed FC2 + shared down in one launch

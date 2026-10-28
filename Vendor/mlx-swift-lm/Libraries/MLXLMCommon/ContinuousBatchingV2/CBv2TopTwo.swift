@@ -231,11 +231,7 @@ public enum CBv2MTPTopTwoPacket {
 /// top-2 values as their int32 bit patterns. `window` is the `[B, 1 + k]`
 /// int32 verify input; logits row r is its position r. Integer stores only:
 /// each element is window[r], or a value this launch already writes.
-private let cbv2TopTwoFinalizePacketKernel = MLXFast.metalKernel(
-    name: "darkbloom_qwen35_mtp_top2_finalize_packet",
-    inputNames: ["partial_ids", "partial_values", "window"],
-    outputNames: ["top_ids", "top_values", "packet"],
-    source: """
+private let cbv2TopTwoFinalizePacketSource = """
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
         uint base = (row * 32 + lane) * 2;
@@ -281,7 +277,12 @@ private let cbv2TopTwoFinalizePacketKernel = MLXFast.metalKernel(
                 packet[(row / width) * (width - 1) + (column - 1)] = window[row];
             }
         }
-    """,
+    """
+private let cbv2TopTwoFinalizePacketKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_finalize_packet",
+    inputNames: ["partial_ids", "partial_values", "window"],
+    outputNames: ["top_ids", "top_values", "packet"],
+    source: cbv2TopTwoFinalizePacketSource,
     header: cbv2TopTwoHeader,
     ensureRowContiguous: true
 )
@@ -402,11 +403,7 @@ private let cbv2TopTwoPartialShuffleKernel = MLXFast.metalKernel(
 )
 
 /// The packet finalize with the shuffle-form reduction: one SIMD group per row.
-private let cbv2TopTwoFinalizePacketShuffleKernel = MLXFast.metalKernel(
-    name: "darkbloom_qwen35_mtp_top2_finalize_packet_sh",
-    inputNames: ["partial_ids", "partial_values", "window"],
-    outputNames: ["top_ids", "top_values", "packet"],
-    source: """
+private let cbv2TopTwoFinalizePacketShuffleSource = """
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
         uint base = (row * 32 + lane) * 2;
@@ -446,10 +443,93 @@ private let cbv2TopTwoFinalizePacketShuffleKernel = MLXFast.metalKernel(
                 packet[(row / width) * (width - 1) + (column - 1)] = window[row];
             }
         }
-    """,
+    """
+private let cbv2TopTwoFinalizePacketShuffleKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_finalize_packet_sh",
+    inputNames: ["partial_ids", "partial_values", "window"],
+    outputNames: ["top_ids", "top_values", "packet"],
+    source: cbv2TopTwoFinalizePacketShuffleSource,
     header: cbv2TopTwoShuffleHeader,
     ensureRowContiguous: true
 )
+
+// MARK: - Packet finalize reading the verify columns
+
+/// CBV2_MTP_PACKET_COLUMNS=0 keeps the packet finalize reading the draft ids from the verify window. Otherwise,
+/// while the engine publishes the window's columns (`CBv2MTPVerifyWindowColumns`, batch 1, width 3), a twin of
+/// each finalize form (tree, shuffle) takes the two draft columns ([1, 1] int32 each) and stores row r's draft
+/// id from column r (`row == 1 ? w1[0] : w2[0]`, the rows `column > 0` admits) where the record stores
+/// `window[row]`, with the window's batch 1 and width 3 as constants. Every other statement is the record's.
+/// With the verify entry reading the columns too, nothing reads the window and its concatenation is never
+/// launched. Used only after `cbv2TopTwoPacketColumnsQualify` found the twins bitwise equal to the window reads.
+public enum CBv2MTPTopTwoPacketColumns {
+    public static let enabled = ProcessInfo.processInfo.environment["CBV2_MTP_PACKET_COLUMNS"] != "0"
+    nonisolated(unsafe) static var verified = false
+}
+
+private func cbv2PacketColumnsSource(_ s: String) -> String {
+    let batch = "uint batch = uint(window_shape[0]);"
+    let width = "uint width = uint(window_shape[1]);"
+    let store = "packet[(row / width) * (width - 1) + (column - 1)] = window[row];"
+    for needle in [batch, width, store] {
+        precondition(s.components(separatedBy: needle).count == 2, "packet columns: \(needle)")
+    }
+    return s.replacingOccurrences(of: batch, with: "uint batch = 1;")
+        .replacingOccurrences(of: width, with: "uint width = 3;")
+        .replacingOccurrences(
+            of: store, with: "packet[(row / width) * (width - 1) + (column - 1)] = row == 1 ? w1[0] : w2[0];")
+}
+
+private let cbv2TopTwoFinalizePacketColumnsKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_finalize_packet_cols",
+    inputNames: ["partial_ids", "partial_values", "w1", "w2"],
+    outputNames: ["top_ids", "top_values", "packet"],
+    source: cbv2PacketColumnsSource(cbv2TopTwoFinalizePacketSource),
+    header: cbv2TopTwoHeader,
+    ensureRowContiguous: true
+)
+
+private let cbv2TopTwoFinalizePacketColumnsShuffleKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_finalize_packet_sh_cols",
+    inputNames: ["partial_ids", "partial_values", "w1", "w2"],
+    outputNames: ["top_ids", "top_values", "packet"],
+    source: cbv2PacketColumnsSource(cbv2TopTwoFinalizePacketShuffleSource),
+    header: cbv2TopTwoShuffleHeader,
+    ensureRowContiguous: true
+)
+
+/// The draft columns (window columns 1 and 2) the packet finalize reads in place of `window`, while `window` is
+/// the published verify window: batch 1, width 3, three [1, 1] int32 columns.
+private func cbv2PacketDraftColumns(_ window: MLXArray) -> [MLXArray]? {
+    guard CBv2MTPTopTwoPacketColumns.verified, window.shape == [1, 3], window.dtype == .int32,
+          let columns = CBv2MTPVerifyWindowColumns.columns(of: window), columns.count == 3,
+          columns.allSatisfy({ $0.shape == [1, 1] && $0.dtype == .int32 })
+    else { return nil }
+    return [columns[1].reshaped(1), columns[2].reshaped(1)]
+}
+
+/// The packet finalize of either form on the partials, reading the draft ids from `draftColumns` ([1] int32
+/// each, window columns 1 and 2) or from `window`.
+private func cbv2TopTwoPacketFinalize(
+    _ partials: [MLXArray], window: MLXArray?, draftColumns: [MLXArray]?, rows: Int, drafts: Int, shuffled: Bool
+) -> [MLXArray] {
+    let inputs: [MLXArray]
+    let kernel: MLXFast.MLXFastKernel
+    if let draftColumns {
+        inputs = [partials[0], partials[1], draftColumns[0], draftColumns[1]]
+        kernel = shuffled ? cbv2TopTwoFinalizePacketColumnsShuffleKernel : cbv2TopTwoFinalizePacketColumnsKernel
+    } else {
+        inputs = [partials[0], partials[1], window!]
+        kernel = shuffled ? cbv2TopTwoFinalizePacketShuffleKernel : cbv2TopTwoFinalizePacketKernel
+    }
+    return kernel(
+        inputs,
+        grid: (rows * 32, 1, 1),
+        threadGroup: (32, 1, 1),
+        outputShapes: [[rows, 2], [rows, 2], [drafts + rows * 3]],
+        outputDTypes: [.int32, .float32, .int32]
+    )
+}
 
 /// `cbv2TopTwoRows` plus the MTP acceptance packet from the same finalize
 /// launch, for logits `[1, B * (1 + k), vocab]` whose rows are the positions
@@ -458,6 +538,14 @@ private let cbv2TopTwoFinalizePacketShuffleKernel = MLXFast.metalKernel(
 /// shapes do not qualify or `CBV2_MTP_TOP2_PACKET=0`.
 package func cbv2TopTwoRowsPacket(
     _ logits: MLXArray, window: MLXArray, shuffle: Bool? = nil
+) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+    cbv2TopTwoRowsPacket(logits, window: window, draftColumns: cbv2PacketDraftColumns(window), shuffle: shuffle)
+}
+
+/// `cbv2TopTwoRowsPacket` with the packet's draft ids read from `draftColumns` (window columns 1 and 2, [1]
+/// int32 each; batch 1, width 3) when given, else from `window`.
+private func cbv2TopTwoRowsPacket(
+    _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, shuffle: Bool?
 ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
     guard CBv2MTPTopTwoPacket.enabled,
         logits.ndim == 3, logits.dim(0) == 1, logits.dim(2) >= 2,
@@ -474,14 +562,77 @@ package func cbv2TopTwoRowsPacket(
         outputShapes: [[rows, 32, 2], [rows, 32, 2]],
         outputDTypes: [.int32, .float32]
     )
-    let outputs = (shuffled ? cbv2TopTwoFinalizePacketShuffleKernel : cbv2TopTwoFinalizePacketKernel)(
-        [partials[0], partials[1], window],
-        grid: (rows * 32, 1, 1),
-        threadGroup: (32, 1, 1),
-        outputShapes: [[rows, 2], [rows, 2], [drafts + rows * 3]],
-        outputDTypes: [.int32, .float32, .int32]
-    )
+    let outputs = cbv2TopTwoPacketFinalize(
+        partials, window: window, draftColumns: window.shape == [1, 3] ? draftColumns : nil,
+        rows: rows, drafts: drafts, shuffled: shuffled)
     return (outputs[0], outputs[1], outputs[2])
+}
+
+/// Load time, after `cbv2TopTwoShuffleQualify`: the column-reading finalize of each form that can run (tree;
+/// shuffle when it qualified) against the same form reading the concatenated window, bit for bit in the ids, the
+/// values (as bits) and the packet. Seeded logits at width 3 over the full vocabulary and a short one: Gaussian,
+/// exact ties, NaNs, infinities, signed zeros and constant rows; draft columns of seeded ids, the int32 extremes
+/// and negative values. Engages only if every case matches (`CBv2MTPTopTwoPacketColumns`).
+package func cbv2TopTwoPacketColumnsQualify(logitsDType: DType, vocabulary: Int) {
+    CBv2MTPTopTwoPacketColumns.verified = false
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 mtp top2 packet columns: \(message)\n".utf8))
+    }
+    guard CBv2MTPTopTwoPacket.enabled else { return report("off (packet finalize off)") }
+    guard CBv2MTPTopTwoPacketColumns.enabled else { return report("off (setting)") }
+    let forms = CBv2MTPTopTwoShuffle.verified ? [false, true] : [false]
+    var cases = 0
+    do {
+        let matches = try withError { () -> Bool in
+            var ok = MLXArray(true)
+            for vocab in [vocabulary, 5003] {
+                for kind in 0 ..< 6 {
+                    let key = MLXRandom.key(UInt64(0x7c00_0000 + vocab * 8 + kind))
+                    var logits = MLXRandom.normal([1, 3, vocab], key: key) * 3
+                    switch kind {
+                    case 1: logits = round(logits)
+                    case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)), MLXArray(Float.nan), logits)
+                    case 3:
+                        logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                            which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                    case 4: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(Float(-0.0)), round(logits))
+                    case 5: logits = MLXArray.zeros([1, 3, vocab]) + MLXArray(Float(0.5))
+                    default: break
+                    }
+                    let typed = logits.asType(logitsDType)
+                    let ids: [[Int32]] = [
+                        MLXRandom.randInt(0 ..< Int32(vocab), [3], key: MLXRandom.key(UInt64(0x7c01_0000 + cases)))
+                            .asType(.int32).asArray(Int32.self),
+                        [Int32(kind), Int32.max, Int32.min], [-1, 0, Int32(vocab - 1)],
+                    ]
+                    for column in ids {
+                        let parts = column.map { MLXArray([$0]).reshaped(1, 1) }
+                        let window = concatenated(parts, axis: 1)
+                        for shuffled in forms {
+                            guard let a = cbv2TopTwoRowsPacket(
+                                    typed, window: window, draftColumns: nil, shuffle: shuffled),
+                                  let b = cbv2TopTwoRowsPacket(
+                                    typed, window: window,
+                                    draftColumns: [parts[1].reshaped(1), parts[2].reshaped(1)], shuffle: shuffled)
+                            else { return false }
+                            ok = ok .&& (a.ids .== b.ids).all()
+                                .&& (a.values.view(dtype: .uint32) .== b.values.view(dtype: .uint32)).all()
+                                .&& (a.packet .== b.packet).all()
+                            cases += 1
+                        }
+                    }
+                }
+                if !ok.item(Bool.self) { return false }
+            }
+            return true
+        }
+        CBv2MTPTopTwoPacketColumns.verified = matches
+    } catch {
+        return report("off (\(error))")
+    }
+    report(CBv2MTPTopTwoPacketColumns.verified
+        ? "on (\(cases) cases bitwise equal to the window reads, forms \(forms.count))"
+        : "off (differs from the window reads)")
 }
 
 /// Load time: the shuffle-form partial + packet finalize against the tree
