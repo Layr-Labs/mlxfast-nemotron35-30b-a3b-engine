@@ -8304,10 +8304,10 @@ enum NemotronPrefillDenseDict {
 
     static func apply(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool = false) -> MLXArray? {
         guard NemotronHPrefillX5.active, !kinds.isEmpty, kinds.contains(kind) else { return nil }
-        return launch(x, linear, relu2: relu2)
+        return NemotronSeedRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -8452,10 +8452,10 @@ enum NemotronPrefillSharedDownCopy {
 
     static func apply(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, down)
+        return NemotronSeedRetile.dense(x, down, kind: "down_proj", relu2: false) ?? launch(x, down)
     }
 
-    private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -10284,3 +10284,4 @@ public struct NemotronHConfiguration: Codable, Sendable {
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
 private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
+// revision 7
