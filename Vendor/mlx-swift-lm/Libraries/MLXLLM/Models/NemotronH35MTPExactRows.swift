@@ -824,6 +824,97 @@ enum NemotronMambaInProjConvDt {
     }
     static var u2Available: Bool { kernelU2 != nil && (dictKernel == nil || dictKernelU2 != nil) }
 
+
+    /// Compact accepted-conv tape: the epilogue already computes every new
+    /// xBC row. Keep just those three rows instead of copying the previous
+    /// three into a six-row output that a full acceptance immediately drops.
+    /// The next request state is selected after acceptance, outside verify.
+    static let compactTapeRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPACT_CONV_TAPE"] != "0"
+    nonisolated(unsafe) static var compactTapeQualified = false
+    static var compactTapeEnabled: Bool { compactTapeRequested && compactTapeQualified }
+
+    private static func makeCompactTapeKernel(dict: Bool, unrolled: Bool) -> MLXFast.MLXFastKernel? {
+        let old = "        if (t < 3) {\n"
+            + "          padded[int64_t(t) * CC + channel] =\n"
+            + "              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];\n"
+            + "        }\n"
+            + "        padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];\n"
+        let new = "        padded[int64_t(t) * CC + channel] = yp[t * out_vec_size + row];\n"
+        let base = nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue
+        guard base.components(separatedBy: old).count == 2 else { return nil }
+        let compact = base.replacingOccurrences(of: old, with: new)
+        guard let decoded = dict ? nemotronSBDictSource(compact) : compact else { return nil }
+        guard let source = unrolled ? nemotronU2Source(decoded, loop: NemotronU2.qmvLoop, count: 1) : decoded
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_mamba_in_proj_conv_dt_ct" + (dict ? "_sbd" : "") + (unrolled ? "_u2" : ""),
+            inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                         "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+            outputNames: ["y", "conv", "padded", "dt"], source: source,
+            header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+    }
+    private static let compactTapeKernel = makeCompactTapeKernel(dict: false, unrolled: false)
+    private static let compactTapeDictKernel = makeCompactTapeKernel(dict: true, unrolled: false)
+    private static let compactTapeKernelU2 = makeCompactTapeKernel(dict: false, unrolled: true)
+    private static let compactTapeDictKernelU2 = makeCompactTapeKernel(dict: true, unrolled: true)
+
+    /// Official load-time only. Test actual per-layer parameters and every
+    /// accepted prefix, with ordinary and strided old-state inputs. Runtime
+    /// may use the compact representation only after all cases pass.
+    static func qualifyCompactTape(_ model: Module) {
+        compactTapeQualified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron compact conv tape: \(message)\n".utf8))
+        }
+        guard compactTapeRequested else { return report("off (setting)") }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let mixer = module as? NemotronHMamba2Mixer,
+                          let q = mixer.inProj as? QuantizedLinear, let bias = mixer.conv1d.bias,
+                          mixer.convDim == 6144, mixer.intermediateSize == 4096, mixer.numHeads == 64
+                    else { continue }
+                    for (index, key) in MLXRandom.split(key: MLXRandom.key(0x6c71), into: 2).enumerated() {
+                        let scale: Float = index == 0 ? 0.5 : 8
+                        let x = (MLXRandom.normal([3, 2688], key: key) * scale).asType(.bfloat16)
+                        let backing = (MLXRandom.normal([1, 3, 6148], key: key) * scale).asType(.bfloat16)
+                        let strided = backing[0..., 0..., 2..<6146]
+                        let plain = (MLXRandom.normal([1, 3, 6144], key: key) * scale).asType(.bfloat16)
+                        for state in [plain, strided] {
+                            func run(_ compact: Bool) -> (MLXArray, MLXArray, MLXArray, MLXArray)? {
+                                apply(x, q, prepared: nil, oldState: state,
+                                      convWeight: mixer.conv1d.weight, convBias: bias,
+                                      dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                      convStart: 4096, convDim: 6144, heads: 64,
+                                      compactTape: compact).map { ($0.projected, $0.convolution, $0.padded, $0.dt) }
+                            }
+                            guard let a = run(false), let b = run(true), b.2.shape == [1, 3, 6144]
+                            else { throw CompactTapeQualificationError.unavailable }
+                            for (u, v) in [(a.0,b.0), (a.1,b.1), (a.3,b.3),
+                                           (a.2[0...,3..<6,0...],b.2)] {
+                                same = logicalAnd(same, NemotronU2.equal(u,v))
+                            }
+                            for keep in 1...3 {
+                                let made = keep == 3 ? b.2
+                                    : concatenated([state[0...,keep..<3,0...],b.2[0...,..<keep,0...]],axis:1)
+                                same = logicalAnd(same, NemotronU2.equal(a.2[0...,keep..<(keep+3),0...],made))
+                            }
+                            eval(same)
+                            cases += 1
+                        }
+                    }
+                }
+            }
+        } catch { return report("off (\(error))") }
+        guard cases > 0, same.item(Bool.self) else { return report("off (missing or unequal case)") }
+        compactTapeQualified = true
+        report("on (\(cases) real-layer cases: projected/conv/dt/new rows and every committed history bitwise equal)")
+    }
+    private enum CompactTapeQualificationError: Error { case unavailable }
+
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
@@ -832,7 +923,8 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil,
+        compactTape: Bool = false
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -853,7 +945,13 @@ enum NemotronMambaInProjConvDt {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let unrolled = (u2 ?? NemotronU2.inProj) ? (dict != nil ? dictKernelU2 : kernelU2) : nil
-        let outputs = (unrolled ?? (dict != nil ? dictKernel! : kernel))(
+        // Use the same already-selected dictionary/U2 numerical form. A
+        // missing compact twin keeps the original six-row tape and state path.
+        let compact: MLXFast.MLXFastKernel? = compactTape && convStart == 4096 && convDim == 6144 && heads == 64
+            ? (unrolled != nil
+                ? (dict != nil ? compactTapeDictKernelU2 : compactTapeKernelU2)
+                : (dict != nil ? compactTapeDictKernel : compactTapeKernel)) : nil
+        let outputs = (compact ?? unrolled ?? (dict != nil ? dictKernel! : kernel))(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
@@ -861,7 +959,7 @@ enum NemotronMambaInProjConvDt {
                        ("RPS", 2), ("CS", convStart), ("CC", convDim),
                        ("DS", convStart + convDim), ("NH", heads)],
             grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
-            outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
+            outputShapes: [[rows, n], [1, rows, convDim], [1, compact != nil ? rows : rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
         // rows (itself checked against the non-prepared multi-row kernel).

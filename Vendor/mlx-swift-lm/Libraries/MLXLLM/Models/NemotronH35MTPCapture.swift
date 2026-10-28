@@ -382,6 +382,16 @@ extension NemotronHMamba2Mixer {
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
+        // Only the qualified fused R3 producer returns the three new input
+        // rows here. All other paths keep their original six-row padded tape.
+        let compactConvTape = length == 3 && history == 3 && padded.shape == [1, 3, convDim]
+        func acceptedConv(_ keep: Int) -> MLXArray {
+            guard compactConvTape else { return padded[0..., keep ..< (keep + history), 0...] }
+            if keep == length { return padded }
+            return concatenated([convState[0..., keep..<history, 0...], padded[0..., ..<keep, 0...]], axis: 1)
+        }
+        let oldConvRoots = compactConvTape ? [convState] : []
+        let oldConvBytes = oldConvRoots.reduce(0) { $0 + $1.nbytes }
         let tape = [padded, convolution, dt]
         let tapeBytes = tape.reduce(0) { $0 + $1.nbytes }
         // NEMOTRON_MTP_SSM_REPLAY_GROUP: replay with this forward's other
@@ -394,12 +404,12 @@ extension NemotronHMamba2Mixer {
         do {
             try evaluation.stagePrefixReplay(
                 modelLayerIndex: modelLayerIndex, positions: length,
-                finalConv: padded[0..., length ..< (length + history), 0...],
+                finalConv: acceptedConv(length),
                 finalSSM: finalSSM,
                 materializedByteCount: tapeBytes + finalSSM.nbytes,
                 evaluationRoots: tape,
-                strictReplayRetainedByteCount: tapeBytes + start.nbytes + pendingBytes,
-                strictReplayRetainedRoots: tape + [start] + pendingTape,
+                strictReplayRetainedByteCount: tapeBytes + start.nbytes + pendingBytes + oldConvBytes,
+                strictReplayRetainedRoots: tape + [start] + pendingTape + oldConvRoots,
                 replay: { keep in
                     let ssm: MLXArray
                     if let pending {
@@ -425,7 +435,7 @@ extension NemotronHMamba2Mixer {
                             dt: dt[0..., ..<keep, 0...], steps: keep))
                     }
                     return CBv2RecurrentLayerState(
-                        conv: padded[0..., keep ..< (keep + history), 0...], ssm: ssm)
+                        conv: acceptedConv(keep), ssm: ssm)
                 })
         } catch {
             preconditionFailure("Nemotron MTP compact recurrent stage failed: \(error)")
@@ -455,7 +465,8 @@ extension NemotronHMamba2Mixer {
                hiddenStates.reshaped(length, hiddenStates.dim(2)), q, prepared: inputPrepared,
                oldState: convState, convWeight: conv1d.weight, convBias: convBias,
                dtBias: dtBias, timeStepLimit: timeStepLimit,
-               convStart: intermediateSize, convDim: convDim, heads: numHeads) {
+               convStart: intermediateSize, convDim: convDim, heads: numHeads,
+               compactTape: NemotronMambaInProjConvDt.compactTapeEnabled) {
             projected = fused.projected.reshaped(batch, length, -1)
             fusedWindow = (fused.convolution, fused.padded, fused.dt)
         } else {
@@ -474,7 +485,9 @@ extension NemotronHMamba2Mixer {
         if fusedWindow != nil, NemotronMambaInProjConvDt.check {
             let reference = separateWindow()
             convolution = nemotronBitwiseOrNaN(convolution, reference.0)
-            padded = nemotronBitwiseOrNaN(padded, reference.1)
+            let expectedTape = padded.dim(1) == length
+                ? reference.1[0..., 3..<(3 + length), 0...] : reference.1
+            padded = nemotronBitwiseOrNaN(padded, expectedTape)
             dt = nemotronBitwiseOrNaN(dt, reference.2)
         }
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
