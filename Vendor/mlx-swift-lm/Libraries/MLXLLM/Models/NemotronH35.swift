@@ -229,6 +229,35 @@ struct NemotronSeedCopy {
   }
 };
 
+// B source: the shared down's tile-major decode copy (codes as NemotronSeedCopy;
+// BF16 scales and biases in the pair index's layout, [E, N / 128, K / 64, 128]),
+// widened to float as the shared-down copy loader does.
+template <typename T>
+struct NemotronSeedCopySB {
+  const device uint16_t* codes;
+  const device T* scales;
+  const device T* biases;
+  int K;
+
+  METAL_FUNC void expert(const uint index, const int N) thread {
+    codes += size_t(index) * size_t(N / 128) * size_t(K) * 32;
+    scales += size_t(index) * size_t(N / 128) * size_t(K / 64) * 128;
+    biases += size_t(index) * size_t(N / 128) * size_t(K / 64) * 128;
+  }
+  METAL_FUNC float2 sb(const int n, const int g) const thread {
+    const size_t o = (size_t(n / 128) * size_t(K / 64) + size_t(g)) * 128 + size_t(n % 128);
+    return float2(float(scales[o]), float(biases[o]));
+  }
+  METAL_FUNC uint8_t byte(const int n, const int k) const thread {
+    const device uint16_t* c =
+        codes + (size_t(n / 128) * size_t(K) + size_t(k)) * 32 + size_t((n % 128) / 4);
+    const short o = short(n % 4);
+    const uint lo = (uint(c[0]) >> (4 * o)) & 0xfu;
+    const uint hi = (uint(c[32]) >> (4 * o)) & 0xfu;
+    return uint8_t(lo | (hi << 4));
+  }
+};
+
 // The direct fc1's row-indexed A load (nemotron_load_routed), unchanged.
 template <typename Tile, typename T>
 METAL_FUNC void nemotron_seed_load_routed(
@@ -521,9 +550,15 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// case), drops any mismatch or Metal error, times the survivors and the
 /// incumbent round robin on the 488-token gathers of the first four MoE layers
 /// (5 warm-up and 25 timed repetitions, median), and adopts the fastest only if
-/// it is at least 3% faster than the incumbent. NEMOTRON_SEED_RETILE=0 keeps
+/// it is at least 3% faster than the incumbent. The seed's dense projections
+/// (Mamba in_proj and out_proj and the shared-expert up through their pair
+/// dictionaries, `NemotronPrefillDenseDict`; the shared-expert down through its
+/// decode copy, `NemotronPrefillSharedDownCopy`) are four more roles of the same
+/// tune, each the same kernel over one "expert" and the incumbent's 64-row
+/// tiles, qualified against that incumbent on every layer and timed by the
+/// same loop on its first four layers. NEMOTRON_SEED_RETILE=0 keeps
 /// the incumbents; NEMOTRON_SEED_RETILE_FORCE=<variant> adopts that variant
-/// for both roles when it qualifies.
+/// for every role where it qualifies.
 enum NemotronSeedRetile {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE"] != "0"
     static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_FORCE"]
@@ -546,9 +581,19 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        // Wider grid: WM stays 1 or 2 (SM % 16 at BM 32), BN / WN a multiple of 32,
+        // KPT and Ws (<= 32 KiB) inside the loader's limits, <= 256 threads.
+        Variant(name: "d32w11", bn: 32, bk: 64, wm: 1, wn: 1, direct: true),
+        Variant(name: "d64w21", bn: 64, bk: 64, wm: 2, wn: 1, direct: true),
+        Variant(name: "d128w22", bn: 128, bk: 64, wm: 2, wn: 2, direct: true),
+        Variant(name: "d256w18", bn: 256, bk: 64, wm: 1, wn: 8, direct: true),
+        Variant(name: "d256w24", bn: 256, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "ws32x64w11", bn: 32, bk: 64, wm: 1, wn: 1, direct: false),
+        Variant(name: "ws64x64w21", bn: 64, bk: 64, wm: 2, wn: 1, direct: false),
+        Variant(name: "ws128x64w22", bn: 128, bk: 64, wm: 2, wn: 2, direct: false),
     ]
 
-    enum Source: String, Sendable { case bank, dict, copy }
+    enum Source: String, Sendable { case bank, dict, copy, copySB = "copysb" }
 
     /// The launch a role's incumbent uses at the seed.
     struct Role: Sendable, Equatable {
@@ -567,6 +612,7 @@ enum NemotronSeedRetile {
         case .bank: make = "NemotronSeedBank<T> b{(const device uint8_t*)w, scales, biases, K};"
         case .dict: make = "NemotronSeedDict<T> b{(const device uint8_t*)w, scales, biases, K};"
         case .copy: make = "NemotronSeedCopy<T> b{w, scales, biases, K};"
+        case .copySB: make = "NemotronSeedCopySB<T> b{w, scales, biases, K};"
         }
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
         func call(_ bm: String) -> String {
@@ -602,6 +648,8 @@ enum NemotronSeedRetile {
     private static let routedDict = makeKernel(routed: true, source: .dict)
     private static let plainBank = makeKernel(routed: false, source: .bank)
     private static let plainCopy = makeKernel(routed: false, source: .copy)
+    private static let plainDict = makeKernel(routed: false, source: .dict)
+    private static let plainCopySB = makeKernel(routed: false, source: .copySB)
 
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
@@ -644,6 +692,8 @@ enum NemotronSeedRetile {
                   copy.biases.dtype == .float32
             else { return nil }
             (kernel, operands) = (plainCopy, [copy.codes, copy.scales, copy.biases])
+        case .copySB:
+            return nil
         }
         var inputs: [any ScalarOrArray] = [x] + operands + [tiles.tiles]
         if role.routed, let rows { inputs.append(rows) }
@@ -684,6 +734,66 @@ enum NemotronSeedRetile {
         return launch(c.variant, role: c.role, x: x, lin: lin, rows: nil, tiles: tiles)
     }
 
+    // Seed dense projections as one "expert": "in_proj", "out_proj" (Mamba mixers) and "up_proj" (shared
+    // experts, ReLU2 store) read their pair dictionaries as `NemotronPrefillDenseDict` does; "down_proj"
+    // (shared experts) reads its decode copy as `NemotronPrefillSharedDownCopy` does.
+
+    static let denseKinds = ["in_proj", "out_proj", "up_proj", "down_proj"]
+    nonisolated(unsafe) static var denseChoice: [String: Variant] = [:]
+
+    /// From `NemotronPrefillDenseDict.apply` and `NemotronPrefillSharedDownCopy.apply` (already seed only).
+    static func dense(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool) -> MLXArray? {
+        guard NemotronHPrefillX5.active, relu2 == (kind == "up_proj"), let v = denseChoice[kind] else { return nil }
+        return launchDense(v, kind: kind, x: x, linear: linear)
+    }
+
+    /// One retiled dense launch over the incumbent's row tiles (64 rows from row 0, at least three
+    /// descriptors, a zero-row descriptor skipped); nil wherever the incumbent's guards would not admit it.
+    static func launchDense(_ v: Variant, kind: String, x: MLXArray, linear: Linear) -> MLXArray? {
+        let relu2 = kind == "up_proj"
+        guard NemotronHPrefillX5.runGather, let q = linear as? QuantizedLinear,
+              type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+              q.weight.dtype == .uint32, q.weight.ndim == 2
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 32 == 0, q.scales.shape == [nOut, k / 64]
+        else { return nil }
+        let kernel: MLXFast.MLXFastKernel
+        let operands: [MLXArray]
+        if kind == "down_proj" {
+            guard nOut % 128 == 0, let copy = NemotronSharedDownZSkip.copyArrays(for: linear),
+                  copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+                  copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
+                  copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
+            else { return nil }
+            (kernel, operands) = (plainCopySB, [copy.codes, copy.scales, copy.biases])
+        } else {
+            guard let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
+                  d.table.dtype == .float32
+            else { return nil }
+            (kernel, operands) = (plainDict, [q.weight.expandedDimensions(axis: 0),
+                                              d.index.expandedDimensions(axis: 0), d.table])
+        }
+        let used = (rows + 63) / 64
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
+        }
+        var inputs: [any ScalarOrArray] = [x.reshaped(rows, 1, k)] + operands + [MLXArray(desc).reshaped(count, 3)]
+        inputs += [nOut, k]
+        let y = kernel(
+            inputs,
+            template: [("T", x.dtype), ("BM", 64), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", relu2)],
+            grid: (((nOut + v.bn - 1) / v.bn) * v.threads, count, 1), threadGroup: (v.threads, 1, 1),
+            outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(1, rows, nOut)
+    }
+
     /// The launch the seed makes today for `role`.
     private static func incumbent(_ role: Role, x: MLXArray, lin: QuantizedSwitchLinear, rows: MLXArray?,
                                   tiles: NemotronHRunTiles) -> MLXArray? {
@@ -695,6 +805,8 @@ enum NemotronSeedRetile {
                 return NemotronPrefillDirectFC1.launch(x, lin, rows: rows, tiles: tiles, useDict: role.source == .dict)
             }
             return nemotronRunGather(x, lin, tiles: tiles, relu2: role.relu2)
+        case .copySB:
+            return nil
         }
     }
 
@@ -709,6 +821,7 @@ enum NemotronSeedRetile {
     static func tune(_ target: Module) {
         fc1Choice = nil
         fc2Choice = nil
+        denseChoice = [:]
         func report(_ message: String) {
             FileHandle.standardError.write(Data("nemotron seed retile: \(message)\n".utf8))
         }
@@ -771,18 +884,74 @@ enum NemotronSeedRetile {
         }
         guard cases.count == 5 else { return report("off (counting sort unavailable)") }
 
+        // Every tuned role as (label, layer count, run): `run(v, layer, case)` is variant v's launch, or the
+        // incumbent's for nil. Case 0 covers every layer, later cases the first; timing uses case 0.
+        typealias Run = (Variant?, Int, Int) -> MLXArray?
+        var slots: [(label: String, layers: Int, run: Run)] = (0 ..< 2).map { (r: Int) -> (String, Int, Run) in
+            (roles[r].label, moes.count, { (v: Variant?, l: Int, ci: Int) -> MLXArray? in
+                let lin = linear(moes[l], r)
+                let (x, rows) = input(r, cases[ci])
+                if let v {
+                    return launch(v, role: roles[r], x: x, lin: lin, rows: rows, tiles: cases[ci].tiles)
+                }
+                return incumbent(roles[r], x: x, lin: lin, rows: rows, tiles: cases[ci].tiles)
+            })
+        }
+        // The seed's dense projections, each only where its run gather incumbent is admitted, on seeded
+        // rows as that incumbent's qualify (488 twice, one scaled by 40 or dense; 300, 97, 17; ReLU2-like
+        // rows for the shared down).
+        var denseNotes: [String] = []
+        for (kindIndex, kind) in denseKinds.enumerated() {
+            let down = kind == "down_proj"
+            let admitted = down ? NemotronPrefillSharedDownCopy.verified : NemotronPrefillDenseDict.kinds.contains(kind)
+            let all: [Linear] = down
+                ? moes.compactMap { (m: NemotronHMoE) -> Linear? in m.sharedExperts?.downProj }
+                : NemotronPrefillDenseDict.linears(target, kind: kind)
+            guard admitted, let first = all.first else {
+                denseNotes.append("\(kind) off (incumbent off)")
+                continue
+            }
+            let k = first.weight.dim(1) * 8
+            let inputs: [MLXArray]
+            do {
+                inputs = try withError { () -> [MLXArray] in
+                    var made: [MLXArray] = []
+                    for (index, rows) in [488, 488, 300, 97, 17].enumerated() {
+                        let seed = UInt64(0x5eed_d000 + 16 * kindIndex + index)
+                        var a = MLXRandom.normal([1, rows, k], scale: 2, key: MLXRandom.key(seed))
+                        if down, index != 1 {
+                            a = MLX.maximum(a - 1.5, MLXArray(Float(0)))
+                            a = a * a
+                        } else if !down, index == 1 {
+                            a = a * 40
+                        }
+                        let x = a.asType(.bfloat16)
+                        eval(x)
+                        made.append(x)
+                    }
+                    return made
+                }
+            } catch {
+                denseNotes.append("\(kind) off (inputs: \(error))")
+                continue
+            }
+            slots.append((kind, all.count, { (v: Variant?, l: Int, ci: Int) -> MLXArray? in
+                if let v { return launchDense(v, kind: kind, x: inputs[ci], linear: all[l]) }
+                return down ? NemotronPrefillSharedDownCopy.launch(inputs[ci], all[l])
+                    : NemotronPrefillDenseDict.launch(inputs[ci], all[l], relu2: kind == "up_proj")
+            }))
+        }
+
         // Qualify: bit for bit against the incumbent; any mismatch or error drops a variant.
-        var alive: [[Variant]] = [variants, variants]
-        var dropped: [[String]] = [[], []]
-        for r in 0 ..< 2 {
-            caseLoop: for (ci, c) in cases.enumerated() {
-                for m in (ci == 0 ? moes : [moe]) {
-                    let lin = linear(m, r)
-                    let (x, rows) = input(r, c)
+        var alive: [[Variant]] = slots.map { _ in variants }
+        var dropped: [[String]] = slots.map { _ in [] }
+        for r in slots.indices {
+            caseLoop: for ci in 0 ..< 5 {
+                for l in (ci == 0 ? Array(0 ..< slots[r].layers) : [0]) {
                     let reference: MLXArray?
                     do {
                         reference = try withError { () -> MLXArray? in
-                            guard let out = incumbent(roles[r], x: x, lin: lin, rows: rows, tiles: c.tiles)
+                            guard let out = slots[r].run(nil, l, ci)
                             else { return nil }
                             eval(out)
                             return out
@@ -798,7 +967,7 @@ enum NemotronSeedRetile {
                     alive[r] = alive[r].filter { v in
                         do {
                             let same = try withError { () -> Bool in
-                                guard let out = launch(v, role: roles[r], x: x, lin: lin, rows: rows, tiles: c.tiles)
+                                guard let out = slots[r].run(v, l, ci)
                                 else { return false }
                                 return (out.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()
                                     .item(Bool.self)
@@ -816,26 +985,20 @@ enum NemotronSeedRetile {
         }
 
         // Time the incumbent and the survivors round robin on the 488-token
-        // case, first four MoE layers per repetition; median ms per layer.
-        let layers = Array(moes.prefix(4))
-        var medians: [[(Variant?, Double)]] = [[], []]
-        var choice: [Variant?] = [nil, nil]
-        for r in 0 ..< 2 where !alive[r].isEmpty {
+        // case, first four layers per repetition; median ms per layer.
+        var medians: [[(Variant?, Double)]] = slots.map { _ in [] }
+        var choice: [Variant?] = slots.map { _ in nil }
+        for r in slots.indices where !alive[r].isEmpty {
             let candidates: [Variant?] = [nil] + alive[r].map { Optional($0) }
-            let (x, rows) = input(r, cases[0])
+            let layers = Array(0 ..< min(4, slots[r].layers))
             var samples = Array(repeating: [Double](), count: candidates.count)
             do {
                 try withError {
                     for rep in 0 ..< 30 {
                         for (i, candidate) in candidates.enumerated() {
                             let start = DispatchTime.now().uptimeNanoseconds
-                            let outs = layers.compactMap { m -> MLXArray? in
-                                let lin = linear(m, r)
-                                if let candidate {
-                                    return launch(candidate, role: roles[r], x: x, lin: lin, rows: rows,
-                                                  tiles: cases[0].tiles)
-                                }
-                                return incumbent(roles[r], x: x, lin: lin, rows: rows, tiles: cases[0].tiles)
+                            let outs = layers.compactMap { (l: Int) -> MLXArray? in
+                                slots[r].run(candidate, l, 0)
                             }
                             eval(outs)
                             Stream.gpu.synchronize()
@@ -863,6 +1026,9 @@ enum NemotronSeedRetile {
         }
         fc1Choice = choice[0].map { (roles[0], $0) }
         fc2Choice = choice[1].map { (roles[1], $0) }
+        for r in slots.indices.dropFirst(2) {
+            if let v = choice[r] { denseChoice[slots[r].label] = v }
+        }
 
         func ms(_ r: Int, _ v: Variant?) -> String {
             guard let m = medians[r].first(where: { $0.0 == v }) else { return "n/a" }
@@ -870,12 +1036,16 @@ enum NemotronSeedRetile {
         }
         func detail(_ r: Int) -> String {
             let times = medians[r].dropFirst().map { "\($0.0!.name) \(String(format: "%.2f", $0.1))" }
-            return "\(roles[r].label) \(alive[r].count)/\(variants.count) bitwise"
+            return "\(slots[r].label) \(alive[r].count)/\(variants.count) bitwise"
                 + (times.isEmpty ? "" : " [" + times.joined(separator: ", ") + "]")
                 + (dropped[r].isEmpty ? "" : " dropped: " + dropped[r].prefix(8).joined(separator: ", "))
         }
         report("\(choice[0]?.name ?? "V0")/\(choice[1]?.name ?? "V0") fc1 \(ms(0, choice[0])) ms fc2 \(ms(1, choice[1])) ms"
             + " vs V0 fc1 \(ms(0, nil)) ms fc2 \(ms(1, nil)) ms (per layer, 488 tokens, median of 25;"
             + " fc1 \(detail(0)); fc2 \(detail(1)))")
+        let denseLines = slots.indices.dropFirst(2).map { (r: Int) -> String in
+            "\(slots[r].label) \(choice[r]?.name ?? "V0") \(ms(r, choice[r])) vs V0 \(ms(r, nil)) ms (\(detail(r)))"
+        }
+        report("dense " + (denseLines + denseNotes).joined(separator: "; "))
     }
 }
