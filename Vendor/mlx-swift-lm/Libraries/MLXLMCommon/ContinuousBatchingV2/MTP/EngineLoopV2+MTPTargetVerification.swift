@@ -6,11 +6,6 @@ import Foundation
 import MLX
 
 /// The rectangular verify window's columns (`[B, 1]` each, the seed first), published while the target's
-/// captured forward and the acceptance packet are built, so their launches can read the tokens from the columns
-/// instead of from the window concatenated out of them; when every reader does, the window is never launched.
-/// A reader matches the window it is handed by identity. NEMOTRON_MTP_ENTRY_IDS3=0 keeps the target's entry on
-/// the window; CBV2_MTP_PACKET_COLUMNS=0 the packet (`CBv2MTPTopTwoPacketColumns`); with both, nothing is
-/// published.
 public enum CBv2MTPVerifyWindowColumns {
     public static let entryEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ENTRY_IDS3"] != "0"
     static var enabled: Bool { entryEnabled || CBv2MTPTopTwoPacketColumns.enabled }
@@ -18,7 +13,6 @@ public enum CBv2MTPVerifyWindowColumns {
     nonisolated(unsafe) private static var published: (window: MLXArray, columns: [MLXArray], sources: [MLXArray])?
 
     /// `sources`: the drafter's own token arrays the draft columns were reshaped from (columns 1...k, in
-    /// order), or empty.
     static func publish(window: MLXArray, columns: [MLXArray], sources: [MLXArray] = []) {
         guard enabled else { return }
         lock.withLock { published = (window, columns, sources) }
@@ -34,7 +28,6 @@ public enum CBv2MTPVerifyWindowColumns {
     }
 
     /// The drafter's token arrays behind draft columns 1...k of `window` (the arrays its `draftStep` returned),
-    /// while `window` is the verify window being built; nil when they were not published.
     public static func sources(of window: MLXArray) -> [MLXArray]? {
         lock.withLock { published.flatMap { $0.window === window && !$0.sources.isEmpty ? $0.sources : nil } }
     }
@@ -43,26 +36,6 @@ public enum CBv2MTPVerifyWindowColumns {
 extension EngineLoopV2 {
 
     /// Serial mode is the chip-independent authority path: every column
-    /// executes the same `[B, 1]` eager forward used by ordinary decode,
-    /// while one surrounding speculative KV transaction defers commit until
-    /// the accept walk. Rectangular mode is an explicit optimized strategy.
-    ///
-    /// Attention-only production targets select rectangular verification:
-    /// `CBv2MTPRoundDriver.maximumAutomaticDepth` pre-clamps depth so
-    /// `(1 + k) * B <= maxAutomaticRectangularTokens`. Recurrent targets take
-    /// the rectangular path only through CAPTURE-VERIFY (the MTPLX GDN
-    /// pattern): one `[B, 1+k]` forward whose recurrent layers stage
-    /// per-position captured conv/SSM stacks, so finalize can commit the
-    /// state at the accepted position on device and rollback stays a
-    /// snapshot restore. Serial remains the safety oracle everywhere else.
-    ///
-    /// Scoring: `scores` is the per-position token the accept walk compares
-    /// drafts against AND emits. Historically that was the target argmax
-    /// (greedy-exact). When the drafter opted into target-prefix acceptance
-    /// and the sampler supports verify pre-sampling, non-greedy rows score
-    /// with genuine target samples drawn with the request's real sampler
-    /// and per-request RNG stream — exact for the output distribution at
-    /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver,
         draftSources: [MLXArray] = []
@@ -366,8 +339,6 @@ extension EngineLoopV2 {
     }
 
     /// Top-`size` token ids per verify position plus their probability mass
-    /// scaled to int32 parts-per-million. nil when the shortlist would not
-    /// actually narrow the head.
     static func mtpDraftShortlist(
         logits: MLXArray, size: Int
     ) -> (ids: MLXArray, massScaled: MLXArray)? {

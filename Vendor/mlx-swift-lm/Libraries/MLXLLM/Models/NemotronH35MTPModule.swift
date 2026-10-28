@@ -19,21 +19,11 @@ enum NemotronMTPDraftTail {
 }
 
 /// Draft encode order. In each draft step the head's routed fc2 (zero-skip slot kernel) and its shared-expert
-/// down (R = 1 multi-row QMV) do not depend on each other. The default graph (record, and t131's shared-early
-/// `depends` form) encodes {shared up, router} | {shared down, FC1} | {fc2}. Here the fc2 binds the shared up
-/// rows and the shared down binds the FC1 rows (one extra input each, never read), and the join binds `shared`
-/// before the products, so MLX encodes {router, shared up} | {FC1} | {shared down, fc2}: the router leads its
-/// interval and the FC1 runs alone. Every kernel body is the default graph's source text, so every output is
-/// bitwise the same; `qualify` checks it on the head's real weights at load and keeps the default graph on any
-/// difference. NEMOTRON_DRAFT_COLAUNCH=0 keeps it too.
 enum NemotronDraftColaunch {
     static let requested = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_COLAUNCH"] != "0"
     nonisolated(unsafe) private(set) static var active = false
 
     /// Load time, after `NemotronZSkip.prepareDraft` and before any draft graph is traced: the draft tail in
-    /// this order against the default graph, bit for bit, on seeded rows through the head's real weights
-    /// (router, FC1, fc2 copy, shared up/down, join), plus the fc2, shared-down and join twins alone on seeded
-    /// relu2 rows over a density sweep. Any miss leaves the default graph.
     static func qualify(_ head: Module) {
         active = false
         guard requested, !NemotronMoELeader.selfTest,
@@ -170,10 +160,6 @@ enum NemotronMTPFrontNorms {
         source: NemotronHResidualRMSNorm.oneBarrierSource(source), ensureRowContiguous: true)
 
     /// The same launch also emitting eh_proj's prepared K=5376 activation
-    /// (the lane-coalesced FP32 buffer `nemotron_head_prepare_activation`
-    /// builds, PV 8: per 8-value chunk the nmr_load_vector values and sum,
-    /// from the BF16-rounded outputs). A chunk never straddles the two
-    /// halves, so each threadgroup prepares its own 336 chunks.
     private static func preparedSource() -> String {
         let scratch = "threadgroup float local_sums[32];"
         // The literal's indentation is stripped to the closing delimiter's.
@@ -216,10 +202,6 @@ enum NemotronMTPFrontNorms {
         source: NemotronHResidualRMSNorm.oneBarrierSource(preparedSource()), ensureRowContiguous: true)
 
     /// NEMOTRON_MTP_FRONT_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
-    /// Otherwise chunk c of a half (values 8c ..< 8c + 8) is lanes 2c and 2c + 1 of one SIMD group: each lane
-    /// keeps its four rounded outputs, reads its partner's through simd_shuffle_xor, and the pair writes the
-    /// chunk's nine words (the even lane its four and the total, the odd lane its four) with the same
-    /// expressions and order. Used only after `qualifyShuffle` found it bitwise equal to the copy form.
     static let shuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_SHUFFLE"] != "0"
     nonisolated(unsafe) private static var shuffleVerified = false
     private static func preparedShuffleSource() -> String {
@@ -270,8 +252,6 @@ enum NemotronMTPFrontNorms {
         source: NemotronHResidualRMSNorm.oneBarrierSource(preparedShuffleSource()), ensureRowContiguous: true)
 
     /// Load time: the shuffle-form launch against the copy-form launch, bit for bit in the joined rows and in
-    /// eh_proj's prepared activation, on seeded rows with the head's own norms at R = 1 ... 4. Admits the
-    /// shuffle form only if every case matches.
     static func qualifyShuffle(_ block: NemotronH35MTPAttentionBlock) {
         shuffleVerified = false
         func report(_ message: String) {
@@ -312,11 +292,6 @@ enum NemotronMTPFrontNorms {
     // MARK: The front norms reading the token rows themselves
 
     /// NEMOTRON_MTP_FRONT_EMBED=0 keeps the embedding-rows launch (`NemotronHEmbeddingRows`) ahead of the front
-    /// norms. Otherwise the embedding half's threadgroup dequantizes its token's row itself, with the embedding
-    /// kernel's statements (the same id wrap, group, byte and nibble expressions and `T value = scale * d + bias`,
-    /// the BF16 value that kernel stores), and takes `thread_x[i]` from that value as the record takes it from `e`.
-    /// The hidden half and everything after the reads are the record's text. Plain, prepared and shuffle forms;
-    /// used only after `qualifyEmbed` found each bitwise equal to the embedding-rows launch plus the front norms.
     static let embed = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_EMBED"] != "0"
     nonisolated(unsafe) private static var embedVerified = false
 
@@ -375,7 +350,6 @@ enum NemotronMTPFrontNorms {
     private enum Form { case plain, prepared, shuffle }
 
     /// A front-norms launch of `form` without the row-count guard (the load check sweeps the vocabulary in
-    /// wide launches): on the embedding rows `e`, or reading the rows of `o` itself.
     private static func formLaunch(_ form: Form, e: MLXArray?, o: NemotronHEmbeddingRows.Operands?,
                                    hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm) -> [MLXArray] {
         let rows = hidden.dim(1)
@@ -397,7 +371,6 @@ enum NemotronMTPFrontNorms {
     }
 
     /// The conditions under which `apply` / `applyPrepared` launch the front norms on these rows' embedding
-    /// (`NemotronHEmbeddingRows.rows(o)`), stated on the operands.
     static func serves(_ o: NemotronHEmbeddingRows.Operands, hidden: MLXArray, enorm: RMSNorm,
                                     hnorm: RMSNorm) -> Bool {
         embedVerified && enabled && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
@@ -409,7 +382,6 @@ enum NemotronMTPFrontNorms {
     }
 
     /// `applyPrepared` reading the token rows of `o` itself; nil where it does not serve them (the caller then
-    /// builds the embedding rows and takes `applyPrepared`).
     static func applyPrepared(operands o: NemotronHEmbeddingRows.Operands, hidden: MLXArray, enorm: RMSNorm,
                               hnorm: RMSNorm) -> (MLXArray, MLXArray)? {
         guard NemotronMTPDraftJoins.enabled, o.count == 3,
@@ -439,10 +411,6 @@ enum NemotronMTPFrontNorms {
     }
 
     /// Load time, after `qualifyShuffle`: every form that can run (plain; the copy form; the shuffle form when it
-    /// qualified) against the embedding-rows launch plus the same form on its rows, bit for bit in the joined rows
-    /// and the prepared activation. Every vocabulary row once (2048 rows per launch, seeded hidden rows), then
-    /// R = 1 ... 4 with int32 and uint32 ids, negative ids (-V, -V/2, -1) and the last row, at three hidden
-    /// scales. Admits the reading forms only if every case matches.
     static func qualifyEmbed(_ block: NemotronH35MTPAttentionBlock, target: NemotronHModel) {
         embedVerified = false
         func report(_ message: String) {
@@ -520,11 +488,6 @@ enum NemotronMTPFrontNorms {
     // MARK: The plain form reading the token from its screen's chunk bests
 
     /// With the ticket-free draft screen (`NemotronHeadScreen.noTicketEnabled`), the plain reading form's twin
-    /// for the second draft's front takes the first draft's chunk bests (`pv`, `pi`; NCH of them) instead of
-    /// its pick: every SIMD group of the embedding half forms the pick itself with the final kernel's statements
-    /// (`NemotronHeadScreen.pickStatements`: the same lane loop, comparator and xor butterfly, lane 0's id) and
-    /// reads that row. Used only after `qualifyPick` found it bitwise equal to the plain reading form on the
-    /// final kernel's pick.
     nonisolated(unsafe) private static var pickVerified = false
     private static func pickSource(_ s: String, hoisted: Bool = false) -> String {
         let read = "int64_t id = int64_t(ids[row]);"
@@ -542,7 +505,6 @@ enum NemotronMTPFrontNorms {
         source: NemotronHResidualRMSNorm.oneBarrierSource(pickSource(embedSource(source))),
         ensureRowContiguous: true)
     /// The pick twin with the pick's loads hoisted (`NemotronHeadScreen.pickStatementsHoisted`); used once
-    /// `qualifyPickHoist` found it bitwise equal to the loop form.
     nonisolated(unsafe) private static var pickHoistVerified = false
     private static let pickHoistKernel = MLXFast.metalKernel(
         name: embedName("nemotron_mtp_front_norms_pick_hoist_concat_bf16"),
@@ -560,7 +522,6 @@ enum NemotronMTPFrontNorms {
     }
 
     /// `apply(operands:)` for one row whose token is the pick of `bests`, formed in the launch; `o` gives the
-    /// embedding rows (its ids are not read). nil where it does not serve them.
     static func apply(bests: NemotronScreenPicks.Bests, rows o: NemotronHEmbeddingRows.Operands, hidden: MLXArray,
                       enorm: RMSNorm, hnorm: RMSNorm) -> MLXArray? {
         guard servesPick(bests, rows: o, hidden: hidden, enorm: enorm, hnorm: hnorm) else { return nil }
@@ -585,10 +546,6 @@ enum NemotronMTPFrontNorms {
     }
 
     /// Load time, after `qualifyEmbed` and the draft screen's plan: the pick twin against the plain reading form
-    /// on the final kernel's pick of the same bests, bit for bit in the joined row, for each chunk count the
-    /// ticket-free screen reduces. Bests: Gaussian values, exact ties, all-equal values, NaNs (one in the first
-    /// slot), infinities; distinct ids drawn per chunk over the vocabulary. Admits the twin only if every case
-    /// matches.
     static func qualifyPick(_ block: NemotronH35MTPAttentionBlock, target: NemotronHModel) {
         pickVerified = false
         func report(_ message: String) {
@@ -633,8 +590,6 @@ enum NemotronMTPFrontNorms {
     }
 
     /// Load time, after `qualifyPick` admitted the pick twin: the hoisted-load twin against the loop form, bit for
-    /// bit in the joined row, for each chunk count the ticket-free screen reduces and two counts that leave the
-    /// last slot of some lanes empty (113, 200), over the same six kinds of bests (NaN in slot 0 included).
     static func qualifyPickHoist(_ block: NemotronH35MTPAttentionBlock, target: NemotronHModel) {
         pickHoistVerified = false
         func report(_ message: String) {
@@ -767,10 +722,6 @@ enum NemotronMTPFrontNorms {
 }
 
 /// The one-token draft front's attention norm (`uncompiledDraftFront`: the norm of the fused row, ahead of the
-/// second draft's Q/K/V) through the tree's prepared norm launch at R = 1 (`normPreparedRows`' kernel, the
-/// family the three-row front already uses: one barrier with NEMOTRON_MTP_JOIN_ONE_BARRIER) instead of the stock
-/// RMSNorm launch; only its normalized row is read. Used only after `qualify` found it bitwise equal to the stock
-/// launch. NEMOTRON_MTP_DRAFT2_NORM1B=0 keeps the stock launch.
 enum NemotronMTPDraftFrontNorm {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT2_NORM1B"] != "0"
     nonisolated(unsafe) private static var verified = false
@@ -780,7 +731,6 @@ enum NemotronMTPDraftFrontNorm {
     }
 
     /// Load time: the R = 1 prepared-norm launch against the stock RMSNorm launch on the head's own norm, bit for
-    /// bit, on seeded rows at five scales (1/64 ... 4096), a constant row and a row with one large value.
     static func qualify(_ block: NemotronH35MTPAttentionBlock) {
         verified = false
         func report(_ message: String) {
@@ -878,7 +828,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// The part of `pagedForwardParts` that reads no cache: the fused
-    /// residual, its norm and that norm's Q/K/V, as [residual, norm, q, k, v].
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
         let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
@@ -886,7 +835,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `pagedDraftInputs` with the front norms reading the token's embedding row themselves
-    /// (`NemotronMTPFrontNorms.apply(operands:)`); nil where that launch does not serve the operands.
     func pagedDraftInputs(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands) -> [MLXArray]? {
         guard let front = draftFrontCache(hidden: hidden, operands: operands, owner: self) else { return nil }
         let (q, k, v) = mixer.cbv2Projections(front[1], targetQKV: NemotronMTPDraftTail.fusedQKV)
@@ -894,7 +842,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `pagedDraftInputs(hidden:operands:)` whose token is the pick of `bests` (a ticket-free draft screen's chunk
-    /// bests), formed inside the front norms; `operands` gives the embedding rows. nil where they do not serve it.
     func pagedDraftInputs(
         hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, bests: NemotronScreenPicks.Bests
     ) -> [MLXArray]? {
@@ -904,10 +851,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `pagedForwardRows`' cache-free front: the fused residual rows and their
-    /// Q [1, heads, L, headDim] and K/V [1, kvHeads, L, headDim]. With `cache`,
-    /// the Q/K/V launch also appends the K/V rows to it when it can
-    /// (`NemotronMTPFrontRowsKVDirect`); `written` then holds the roots
-    /// `appendTrusted` would return, else it is nil and nothing was appended.
     func frontRows(hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache? = nil)
         -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, written: [MLXArray]?)
     {
@@ -920,7 +863,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `frontRows` with the front norms reading the token rows themselves
-    /// (`NemotronMTPFrontNorms.applyPrepared(operands:)`); nil where that launch does not serve the operands.
     func frontRows(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, cache: PagedLayerCache? = nil)
         -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, written: [MLXArray]?)?
     {
@@ -963,7 +905,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// One row's attention-block output (residual + projected attention) from
-    /// its query [1, heads, 1, headDim] over explicit K/V with an additive mask.
     func maskedRowOutput(
         fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
@@ -981,11 +922,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// A draft row's attention over the head cache `keys` / `values` (and, for the second draft, its `own`
-    /// K/V row appended as the last key) with an additive mask: the one-launch twin
-    /// (`NemotronMTPDraftSDPA`) once qualified, else the stock call (on the appended copies).
-    /// `maskedRowOutput` / `maskedRowParts` reading the head cache pages in place (`read`, from
-    /// `NemotronMTPDraftSDPA.directRead`); nil when the paged launch does not serve them (the caller then takes
-    /// the snapshot's copy).
     func maskedRowOutput(
         fused: MLXArray, queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV, mask: MLXArray
     ) -> MLXArray? {
@@ -1003,8 +939,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// The first draft's projected attention for the post-verify row the device accept walk selects
-    /// (`NemotronMTPDraftSDPA.attendPagedWalk` over `queryRows` [1, heads, W, headDim]): `maskedRowParts`' attention
-    /// of that row under its first mask, without the row pick. Nil when the walk launch does not serve them.
     func walkedRowAttention(
         queryRows: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands, firstSpeculated: Int,
         read: CBv2PagedDirectRead, row: PagedSequenceKV
@@ -1018,7 +952,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `maskedDraftAttention(inputs:read:row:own:mask:)` under the second mask of the row the device accept walk
-    /// selects, formed in the launch (`NemotronMTPDraftSDPA.attendPagedWalk`); nil when it does not serve them.
     func maskedDraftAttention(
         inputs: [MLXArray], read: CBv2PagedDirectRead, row: PagedSequenceKV,
         own: (keys: MLXArray, values: MLXArray), walk: CBv2MTPDeviceAcceptWalk.Operands, firstSpeculated: Int
@@ -1033,7 +966,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `maskedDraftAttention` over the head cache pages in place plus the draft's `own` row as the last key; nil
-    /// when the paged launch does not serve them.
     func maskedDraftAttention(
         inputs: [MLXArray], read: CBv2PagedDirectRead, row: PagedSequenceKV,
         own: (keys: MLXArray, values: MLXArray), mask: MLXArray
@@ -1064,7 +996,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// The attention of `pagedForwardParts(inputs:)` over explicit `keys` and
-    /// `values` with an additive `mask` (no cache access); output projected.
     func maskedDraftAttention(
         inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
@@ -1076,7 +1007,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `maskedDraftAttention` over the history `keys` / `values` with the draft's `own` K/V row as the last
-    /// key: the stock call takes `concatenated([keys, own])`, the qualified twin reads the row in place.
     func maskedDraftAttention(
         inputs: [MLXArray], keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray),
         mask: MLXArray
@@ -1101,13 +1031,11 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// The draft front's attention-norm row: the tree's one-barrier prepared norm at R = 1 once qualified
-    /// (`NemotronMTPDraftFrontNorm`), else the stock RMSNorm launch.
     private func draftNorm(_ fused: MLXArray) -> MLXArray {
         NemotronMTPDraftFrontNorm.apply(fused, norm: norm) ?? norm(fused)
     }
 
     /// `uncompiledDraftFront` with the front norms reading the token's row themselves; where they do not
-    /// serve the operands, the embedding-rows launch and `uncompiledDraftFront`'s own front norms.
     fileprivate func uncompiledDraftFront(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands) -> [MLXArray] {
         guard let joined = NemotronMTPFrontNorms.apply(
             operands: operands, hidden: hidden, enorm: embeddingNorm, hnorm: hiddenNorm)
@@ -1121,7 +1049,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// `uncompiledDraftFront` whose token is the pick of `bests`, formed in the front norms; where they do not
-    /// serve it, the final kernel's pick and the reading form.
     fileprivate func uncompiledDraftFront(
         hidden: MLXArray, rows: NemotronHEmbeddingRows.Operands, bests: NemotronScreenPicks.Bests
     ) -> [MLXArray] {
@@ -1142,7 +1069,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// Trusted target rows only need the head's K/V projections. Their
-    /// discarded query, attention output, MoE and final norm cannot affect KV.
     func appendTrustedKV(hidden: MLXArray, embedding: MLXArray, cache: KVCache) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
         let batch = x.dim(0), length = x.dim(1)
@@ -1166,8 +1092,6 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     /// Causal forward over several trusted (token, target hidden) rows at
-    /// once, returning the projected K/V too. Projections use the multi-row
-    /// exact qmv (per-row stock M=1 arithmetic); norms are row-local.
     func pagedForwardRows(
         hidden: MLXArray, embedding: MLXArray, cache: any CBv2AttendingLayerCache
     ) -> (output: MLXArray, keys: MLXArray, values: MLXArray) {
@@ -1193,7 +1117,6 @@ final class NemotronH35MTPAttentionBlock: Module {
 }
 
 /// Only the one-token draft's stateless norm/concat/projection/norm prefix.
-/// The original attention projections and all cache operations stay outside.
 private final class NemotronH35MTPDraftFrontCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
@@ -1242,7 +1165,6 @@ private final class NemotronH35MTPDraftFrontCache {
     private var rowsEntry: Entry?
 
     /// The same front with the front norms reading the token's embedding row (`NemotronHEmbeddingRows`
-    /// operands as inputs: ids, packed rows, scales, biases); nil where those norms do not serve the operands.
     func callAsFunction(
         hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, owner: NemotronH35MTPAttentionBlock
     ) -> [MLXArray]? {
@@ -1282,7 +1204,6 @@ private final class NemotronH35MTPDraftFrontCache {
     private var pickEntry: Entry?
 
     /// The same front whose token is the pick of `bests` (inputs: the hidden row, the chunk bests' values and
-    /// ids, the packed rows, scales and biases); nil where the front norms do not serve it.
     func callAsFunction(
         hidden: MLXArray, rows: NemotronHEmbeddingRows.Operands, bests: NemotronScreenPicks.Bests,
         owner: NemotronH35MTPAttentionBlock
@@ -1328,12 +1249,6 @@ private final class NemotronH35MTPDraftFrontCache {
 }
 
 /// The head's routed banks (fc1 bank words with their pair dictionary, the fc2 copy) get their own residency
-/// set, requested after the decode extras (`NemotronDecodeResidency.lateSets`). The request's first-round drafts
-/// (the draft steps before its first verify) that are built while that request has not returned run the head's
-/// block without its routed experts (the shared expert alone), so the first verify does not wait for the banks'
-/// mapping; every later draft is the base's. Drafts only propose: the target verifies every token, so only
-/// those first-round drafts' acceptance can change. Outside a lease the banks count as ready.
-/// NEMOTRON_MTP_FIRST_ROUND_SHARED=0 keeps the routed experts (and the banks in the head and extras sets).
 enum NemotronMTPFirstRoundDraft {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FIRST_ROUND_SHARED"] != "0"
     private static let lock = NSLock()
@@ -1383,7 +1298,6 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     /// Whether `callAsFunction(fusedRows:walk:attention:)` serves a [1, 1, 2688] BF16 attention row: the
-    /// conditions `callAsFunction(residual:attention:)` joins under, for the walked fused row.
     func walkedTailServes(fusedRows: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands) -> Bool {
         !NemotronMTPFirstRoundDraft.active
             && NemotronMTPDraftTail.exactTail && NemotronMoELeader.enabled
@@ -1397,8 +1311,6 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     /// `callAsFunction(residual:attention:)` with the residual the fused row the device accept walk selects
-    /// from `fusedRows` [1, W, 2688] (`NemotronHResidualRMSNorm.applyWalk`), so the row is not gathered first;
-    /// the same tail follows the join. Nil when it does not serve them.
     func callAsFunction(fusedRows: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands, attention: MLXArray)
         -> MLXArray?
     {
@@ -1418,7 +1330,6 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     /// The block without its routed experts, for the request's first-round drafts
-    /// (`NemotronMTPFirstRoundDraft`): the shared expert alone.
     private func sharedOnlyTail(_ x: MLXArray) -> MLXArray {
         guard let shared = mixer.sharedExperts else { return finalNorm(x) }
         return finalNorm(x + shared(norm(x)))
@@ -1476,7 +1387,6 @@ final class NemotronH35MTPExpertBlock: Module {
 }
 
 /// Cache only the assistant's stateless one-token expert tail. Attention,
-/// request state, KV writes, offsets and transactions remain outside the graph.
 private final class NemotronH35MTPOneTokenTailCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
@@ -1580,12 +1490,10 @@ final class NemotronH35MTPModule: Module {
             hidden: hidden, embedding: embedding)
     }
     /// `pagedDraftInputs` on the token's embedding operands (the front norms read the row); nil where they
-    /// do not serve them.
     func pagedDraftInputs(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands) -> [MLXArray]? {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(hidden: hidden, operands: operands)
     }
     /// `pagedDraftInputs` whose token is the pick of a ticket-free screen's chunk bests; nil where the front
-    /// norms do not serve it.
     func pagedDraftInputs(
         hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, bests: NemotronScreenPicks.Bests
     ) -> [MLXArray]? {
@@ -1600,7 +1508,6 @@ final class NemotronH35MTPModule: Module {
         (layers[0] as! NemotronH35MTPAttentionBlock).frontRows(hidden: hidden, embedding: embedding, cache: cache)
     }
     /// `frontRows` on the tokens' embedding operands (the front norms read the rows); nil where they do not
-    /// serve them.
     func frontRows(hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, cache: PagedLayerCache? = nil)
         -> (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, written: [MLXArray]?)?
     {
@@ -1613,7 +1520,6 @@ final class NemotronH35MTPModule: Module {
             fused: fused, queries: queries, keys: keys, values: values, mask: mask)
     }
     /// The one-token draft step from `pagedDraftInputs` with its attention over
-    /// explicit, masked K/V instead of the paged head cache.
     func maskedSecondDraft(
         inputs: [MLXArray], keys: MLXArray, values: MLXArray, mask: MLXArray
     ) -> MLXArray {
@@ -1622,7 +1528,6 @@ final class NemotronH35MTPModule: Module {
         return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
     }
     /// `maskedSecondDraft` over the history K/V plus the draft's `own` row as the last key, without building
-    /// the appended copies when the one-launch draft attention qualified (`NemotronMTPDraftSDPA`).
     func maskedSecondDraft(
         inputs: [MLXArray], historyKeys: MLXArray, historyValues: MLXArray,
         own: (keys: MLXArray, values: MLXArray), mask: MLXArray
@@ -1632,7 +1537,6 @@ final class NemotronH35MTPModule: Module {
         return (layers[1] as! NemotronH35MTPExpertBlock)(residual: inputs[0], attention: attention)
     }
     /// `maskedSecondDraft` reading the head cache pages in place (`NemotronMTPDraftSDPA.directRead`); nil when
-    /// the paged launch does not serve them (the caller then takes the snapshot's copy).
     func maskedSecondDraft(
         inputs: [MLXArray], read: CBv2PagedDirectRead, row: PagedSequenceKV,
         own: (keys: MLXArray, values: MLXArray), mask: MLXArray
@@ -1687,7 +1591,6 @@ final class NemotronH35MTPModule: Module {
     }
 
     /// `finishMaskedRow` reading the head cache pages in place (`NemotronMTPDraftSDPA.directRead`); nil when the
-    /// paged launch does not serve them (the caller then takes the snapshot's copy).
     func finishMaskedRow(
         fused: MLXArray, queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV, mask: MLXArray
     ) -> MLXArray? {
@@ -1703,9 +1606,6 @@ final class NemotronH35MTPModule: Module {
     }
 
     /// `finishMaskedRow(fused:queries:read:row:mask:)` for the post-verify row the device accept walk selects,
-    /// without the row pick (`NemotronMTPDraftSDPA.walkVerified`): the attention reads that row's query from
-    /// `queryRows` and masks from the walk, and the join reads that row of `fusedRows`. Nil, with nothing
-    /// built, unless both launches serve the round.
     func finishWalkedRow(
         fusedRows: MLXArray, queryRows: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands, firstSpeculated: Int,
         read: CBv2PagedDirectRead, row: PagedSequenceKV
@@ -1724,7 +1624,6 @@ final class NemotronH35MTPModule: Module {
     }
 
     /// `maskedSecondDraft(inputs:read:row:own:mask:)` under the second mask of the row the device accept walk
-    /// selects, formed in the launch; nil when the walk launch does not serve them.
     func maskedSecondDraft(
         inputs: [MLXArray], read: CBv2PagedDirectRead, row: PagedSequenceKV,
         own: (keys: MLXArray, values: MLXArray), walk: CBv2MTPDeviceAcceptWalk.Operands, firstSpeculated: Int
@@ -1787,9 +1686,6 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
 }
 
 /// Draft-only prepared operands on the post-verify front (`frontRows`).
-/// NEMOTRON_MTP_DRAFT_JOINS=0 keeps the separate prepare launches; =negb /
-/// =negc are negative controls (each perturbs only its own piece's draft
-/// values, so acceptance must change while tokens stay the target's).
 enum NemotronMTPDraftJoins {
     private static let setting = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_JOINS"]
     static let enabled = setting != "0"
@@ -1798,12 +1694,6 @@ enum NemotronMTPDraftJoins {
 }
 
 /// The post-verify front's Q/K/V (`frontRows`, R = 3 or 4) in one launch: the
-/// verify's fused Q/K/V (`NemotronTargetQKV.apply` on captured rows, fed the
-/// attention norm's prepared rows) on the head's wq, wk and wv instead of the
-/// prepared wq projection and the wk and wv projections. Each Q, K and V tile
-/// keeps its projection's row body; used only after `qualify` found q, k and v
-/// bitwise equal to the three launches on the head's weights.
-/// NEMOTRON_MTP_DRAFT_ROWS_QKV=0 (or NEMOTRON_MTP_DRAFT_FUSED=0) keeps them.
 enum NemotronMTPFrontRowsQKV {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ROWS_QKV"] != "0"
@@ -1835,9 +1725,6 @@ enum NemotronMTPFrontRowsQKV {
     }
 
     /// Load time, before the post-verify warm-up: the fused launch against the
-    /// three projections, bit for bit in q, k and v, with the head's weights and
-    /// attention norm on seeded residual rows: R = 3 with the norm's prepared
-    /// rows (as `frontRows` passes them) and without, and R = 4.
     static func qualify(_ block: NemotronH35MTPAttentionBlock) {
         verified = false
         guard enabled else { return }
@@ -1872,20 +1759,11 @@ enum NemotronMTPFrontRowsQKV {
 }
 
 /// The post-verify front's Q/K/V launch (`NemotronMTPFrontRowsQKV`) storing its three K/V rows straight into the
-/// head cache's pages, so the segment write `appendTrusted` dispatches for them (`cbv2_segment_write_strided`)
-/// does not run. `PagedLayerCache.appendTrustedDirect` reserves the rows' destinations with the segment write's
-/// own checks and page reservation, the launch (`NemotronTargetQKV.applyWritingPaged`) stores each K/V value it
-/// writes to its outputs at the segment write's addresses as well, binds the group's write fence and returns its
-/// successor (fence + 1, as the segment write does), and the cache then advances the frontier, offsets and fence
-/// as `appendTrusted` does. q, k and v come from the same body as the fused launch; the pages receive the same
-/// bits at the same addresses. Used only after `qualify` matched. NEMOTRON_MTP_FRONT_KV_DIRECT=0 keeps the
-/// segment write.
 enum NemotronMTPFrontRowsKVDirect {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_KV_DIRECT"] == "1"
     nonisolated(unsafe) static var verified = false
 
     /// `frontRows`' Q/K/V with the K/V rows appended to `cache` by the same launch: (q, k, v, the roots
-    /// `appendTrusted` would return), or nil when nothing was launched or appended.
     static func apply(_ x: MLXArray, prepared: MLXArray?, mixer: NemotronHAttention, cache: PagedLayerCache)
         -> (q: MLXArray, k: MLXArray, v: MLXArray, written: [MLXArray])?
     {
@@ -1910,12 +1788,6 @@ enum NemotronMTPFrontRowsKVDirect {
     }
 
     /// Load time, after `NemotronMTPFrontRowsQKV.qualify` and before the post-verify warm-up: on the head's
-    /// weights and attention norm, seeded residual rows at R = 3 with the norm's prepared rows (as `frontRows`
-    /// passes them) and without, the launch against the fused Q/K/V launch, bit for bit in q, k and v; on seeded
-    /// paged segments with scattered local pages and rows within one page or split across two, every stored
-    /// element equal to the k / v row it belongs to and every other element of the segment unchanged; and the
-    /// returned fence equal to the bound one plus one. Engages only if every case matches; an MLX error keeps the
-    /// segment write.
     static func qualify(_ block: NemotronH35MTPAttentionBlock) {
         verified = false
         func report(_ message: String) {
@@ -2001,22 +1873,6 @@ enum NemotronMTPFrontRowsKVDirect {
 // MARK: - Draft attention in one launch per draft step
 
 /// The draft steps' attention (`maskedRowOutput` / `maskedRowParts` for the first draft, `maskedDraftAttention`
-/// for the second): one query row over the head cache with an additive float mask, which the stock call runs as
-/// the one-pass `sdpa_vector` (1024 threads per query head; below 1024 keys every device takes that kernel).
-/// This launch is that kernel's text with its function constants folded to the draft call's values (float
-/// mask, not causal, no sinks) and its scalar arguments taken from the inputs' shapes and strides, with three
-/// changes that move no arithmetic:
-/// - Key loop: each SIMD group issues the mask, K and V loads of its next four keys (i, i + 32, i + 64,
-///   i + 96) first, then forms their four scores (the same per-lane products and `simd_sum`) and applies the
-///   same masked online-softmax updates in key order; the remainder runs the stock loop.
-/// - Aggregation: every SIMD group stores its maximum, exp-sum and all four partial outputs (output i in its
-///   own threadgroup slice) before one barrier; then the same factor, exp-sum and output sums are formed. The
-///   stock text uses one barrier for the maxima and two per output value.
-/// - The second draft's own K/V row (`OWN`): key L (the last) is read from the draft's own [1, 2, 1, 128]
-///   projections instead of from a copy of the history with that row appended, so the two concatenations
-///   (one copy each of K and V history) are not built.
-/// Used only after `qualify` found every output bitwise equal to the stock call on seeded inputs.
-/// NEMOTRON_MTP_DRAFT_SDPA=0 keeps the stock call (and the concatenations).
 enum NemotronMTPDraftSDPA {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SDPA"] != "0"
     nonisolated(unsafe) private(set) static var verified = false
@@ -2228,9 +2084,6 @@ enum NemotronMTPDraftSDPA {
     }
 
     /// queries [1, 32, 1, 128] (any strides), keys / values the history [1, 2, L, 128] (head dim contiguous),
-    /// `own` the second draft's own row [1, 2, 1, 128] (key L), mask [1, 1, 1, N] with N = L (+ 1 with
-    /// `own`), all BF16. Returns the attention [1, 32, 1, 128], bitwise the stock call's; nil until `qualify`
-    /// passed or outside these shapes (every N here is below 1024, where the stock call is one-pass).
     static func attend(
         queries: MLXArray, keys: MLXArray, values: MLXArray, own: (keys: MLXArray, values: MLXArray)? = nil,
         scale: Float, mask: MLXArray
@@ -2270,11 +2123,6 @@ enum NemotronMTPDraftSDPA {
     }
 
     /// Load time, before any draft graph is traced: the launch against the stock call at the head's attention
-    /// scale on seeded inputs laid out as the draft passes them (the transposed Q row, history slices of a
-    /// longer cache buffer and contiguous gathers, the own row as the transposed K/V projection), key counts
-    /// across the 32-key and four-key-step boundaries up to 1023, query and key scales 1 to 16, masks with a
-    /// -inf tail (and the own row kept) as the drafts build them plus scattered -inf keys. Engages only if
-    /// every output is bitwise equal; an MLX error keeps the stock call.
     static func qualify(_ block: NemotronH35MTPAttentionBlock) {
         verified = false
         func report(_ message: String) {
@@ -2356,14 +2204,6 @@ enum NemotronMTPDraftSDPA {
 // MARK: - Draft attention reading the head cache pages in place
 
 /// The draft attention launch (`NemotronMTPDraftSDPA`) reading the head cache's keys and values from its paged
-/// storage in place (`PagedSequenceKV.directRead`) instead of from `snapshot()`'s gathered copy, so the gather
-/// launch (`cbv2_segment_read_output`) is not run. Key i of the history is slot (first_slot + i) % PS of local page
-/// pages[(first_slot + i) / PS], read at the segment read's element addresses; everything else is the launch's
-/// text (same key order per SIMD group, scores, mask, online-softmax updates, one-barrier aggregation, own row).
-/// The group's write fence is bound to the launch (the read orders after every prior write, as the gather's
-/// does), and one element of the output is folded back into it (`publishDirectRead`), so every later write orders
-/// after the read. Used only after `qualifyPaged` found it bitwise equal to the contiguous launch on seeded paged
-/// storage. NEMOTRON_MTP_DRAFT_SDPA_PAGED=0 keeps the gather and the contiguous launch.
 extension NemotronMTPDraftSDPA {
     static let pagedEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SDPA_PAGED"] != "0"
     nonisolated(unsafe) private(set) static var pagedVerified = false
@@ -2452,8 +2292,6 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// `row.directRead()` when the paged launch is qualified and serves its range (BF16, 2 x 128 heads, 16-slot
-    /// pages, fewer than 1023 keys so the second draft's own row still stays below 1024), else nil (the caller
-    /// keeps `snapshot()` and the contiguous launch).
     static func directRead(_ row: PagedSequenceKV) -> CBv2PagedDirectRead? {
         guard pagedEnabled, pagedVerified, verified, let read = row.directRead() else { return nil }
         return servesPaged(read) ? read : nil
@@ -2471,7 +2309,6 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// The attention of `attend` over the history `read` names (and the `own` row as key `read.count`), read from
-    /// the pages in place; the read's back-edge is published on `row`. Nil outside the qualified shapes.
     static func attendPaged(
         queries: MLXArray, read: CBv2PagedDirectRead, row: PagedSequenceKV?,
         own: (keys: MLXArray, values: MLXArray)? = nil, scale: Float, mask: MLXArray
@@ -2532,11 +2369,6 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// Load time, after `qualify`: the paged launch against the contiguous launch on the same keys, bit for bit,
-    /// on seeded paged storage laid out as the head cache's segment ([2, pages, 2, 16, 128] BF16): scattered local
-    /// page lists, first slots 0 ... 15, key counts across the 32-key, four-key-step and 16-slot page boundaries up to
-    /// 1022, query and key scales 1 to 16, masks as the drafts build them plus scattered -inf keys, with and
-    /// without the own row. The contiguous launch reads the gathered copy of the same elements. Engages only if
-    /// every output is bitwise equal; an MLX error keeps the gather.
     static func qualifyPaged(_ block: NemotronH35MTPAttentionBlock) {
         pagedVerified = false
         func report(_ message: String) {
@@ -2624,15 +2456,6 @@ extension NemotronMTPDraftSDPA {
 // MARK: - Draft attention walking the acceptance packet itself
 
 /// The paged draft attention launches with the device accept walk folded in, so the row pick
-/// (`NemotronMTPDraftRowPick`: walk, both masks, the picked fused / query / key / value rows) is not launched.
-/// Each launch runs the row pick's integer walk over the same acceptance packet (`a`, the count of leading
-/// confirmed drafts), reads the first draft's query from the post-verify query rows at row `a` (the element the
-/// row pick copied), and forms each key's mask value from `a` with the masks kernel's expression
-/// (`key <= a + firstSpeculated`, and for the second draft's launch also its own row `key == L`) instead of
-/// reading the mask array: the same T(0) / T(-inf) values reach the same statements. Everything else is the paged
-/// launch's text. The join after the first draft walks the same way (`NemotronHResidualRMSNorm.applyWalk`).
-/// Used only after `qualifyWalk` matched the row pick plus the paged launches and the join, bit for bit.
-/// NEMOTRON_MTP_DRAFT_WALK_FOLD=0 keeps the row pick.
 extension NemotronMTPDraftSDPA {
     static let walkEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_WALK_FOLD"] == "1"
     nonisolated(unsafe) private(set) static var walkVerified = false
@@ -2706,7 +2529,6 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// Whether the walk launches serve a round: qualified, the walk's packet 1-D int32 holding both ranges, the
-    /// query rows [1, 32, W, 128] BF16 with W > count, and `read` a served paged range of at least W keys.
     static func walkServes(queryRows: MLXArray, packet: MLXArray, count: Int, drafts: Int, targets: Int,
                            read: CBv2PagedDirectRead) -> Bool {
         walkEnabled && walkVerified && pagedVerified && servesPaged(read)
@@ -2717,9 +2539,6 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// The first draft's attention (`attendPaged` of the row the walk selects, under its first mask) or, with
-    /// `own`, the second draft's (`queries` its own query row, under the second mask), read from the pages in
-    /// place; the read's back-edge is published on `row`. `firstSpeculated`: the history position of post-verify
-    /// row 0. Nil outside the qualified shapes.
     static func attendPagedWalk(
         queries: MLXArray, packet: MLXArray, count: Int, drafts: Int, targets: Int, firstSpeculated: Int,
         read: CBv2PagedDirectRead, row: PagedSequenceKV?, own: (keys: MLXArray, values: MLXArray)? = nil,
@@ -2788,14 +2607,6 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// Load time, after `qualifyPaged`: each walk launch against the composition it replaces, bit for bit. The
-    /// row pick (`NemotronMTPDraftRowPick.pick`, forced; its own masks + gathers when it is off) on the same
-    /// packet, then the paged launch with the picked query row and first mask, the paged launch with the
-    /// second draft's own query and K/V row under the second mask, and the join of the picked fused row
-    /// (`NemotronHResidualRMSNorm.apply`) against `applyWalk` with the head's norm. Every accept count 0...2 of a
-    /// depth-2 packet, in both argument spaces (6 elements: constant, 11: device), on seeded paged storage as in
-    /// `qualifyPaged` (scattered local pages, first slots 0 ... 15, key counts across the 32-key, four-key-step
-    /// and page boundaries), with the post-verify layouts (the Q/K/V rows as transposed views). Engages only if
-    /// every output is bitwise equal; an MLX error keeps the row pick. Also compiles every pipeline.
     static func qualifyWalk(_ block: NemotronH35MTPAttentionBlock, norm: RMSNorm) {
         walkVerified = false
         func report(_ message: String) {
@@ -2910,11 +2721,6 @@ extension NemotronMTPDraftSDPA {
 
 extension NemotronMTPDraftSDPA {
     /// Load time, after `qualifyPaged` and `qualifyWalk`: every fenced twin (NEMOTRON_MTP_DRAFT_SDPA_FENCE) against
-    /// its launch, the attention bit for bit and the emitted fence equal to the bound live fence plus one. Seeded
-    /// paged storage as in `qualifyPaged` (scattered local pages, first slots, key counts across the 32-key,
-    /// four-key-step and page boundaries), with and without the own row; the walk twins, when the walk fold
-    /// qualified, on depth-2 packets of 6 and 11 elements at every accept count 0...2. Engages only if every case
-    /// matches; an MLX error keeps `publishDirectRead`. Also compiles every fenced pipeline.
     static func qualifyFence(_ block: NemotronH35MTPAttentionBlock) {
         fenceVerified = false
         func report(_ message: String) {
