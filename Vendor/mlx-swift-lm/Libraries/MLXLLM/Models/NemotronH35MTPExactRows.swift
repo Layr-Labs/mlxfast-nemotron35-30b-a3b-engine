@@ -959,7 +959,7 @@ enum NemotronMambaInProjConvDt {
     /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS=0 keeps the epilogue that reads the
     /// stored outputs back behind a device fence (see `nemotronInProjRegsSource`).
     static let regsRequested =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_REGS"] == "1"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_REGS"] != "0"
     nonisolated(unsafe) private(set) static var regsVerified = false
     private static func regsKernel(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
         source.map {
