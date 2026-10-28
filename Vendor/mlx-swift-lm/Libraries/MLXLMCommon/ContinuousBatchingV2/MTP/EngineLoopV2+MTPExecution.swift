@@ -15,7 +15,6 @@ struct CBv2MTPRowWork {
     /// Non-nil for verify rows: the consumed carry.
     let carry: CBv2MTPCarry?
     /// Verify-produced carry transition that must prime assistant history
-    /// before this target-only row processes the carry token.
     let historyCarry: CBv2MTPCarry?
 }
 
@@ -40,8 +39,6 @@ struct CBv2MTPGraphBuild {
 extension EngineLoopV2 {
 
     /// Record only the assignments the scheduler demoted. Known capacity
-    /// reasons retain their provenance; an unclassified width mismatch means
-    /// the reservation changed after MTP planning and is one step-level race.
     func mtpRecordSchedulerDemotions(_ plan: CBv2StepPlan) {
         guard let mtp else { return }
         var sawReservationRace = false
@@ -716,8 +713,6 @@ extension EngineLoopV2 {
     }
 
     /// Freeze the round's pre-write KV captures against the in-place writes
-    /// the very same graph is about to perform. See `CBv2MTPCaptureFence`
-    /// for the hazard and the mechanism.
     private func mtpFreezeCaptures(
         _ captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)]
     ) {
