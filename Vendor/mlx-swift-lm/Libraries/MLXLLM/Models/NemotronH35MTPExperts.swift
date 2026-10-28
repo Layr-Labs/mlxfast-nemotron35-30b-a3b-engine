@@ -2960,6 +2960,8 @@ enum NemotronZSkip {
         lock.withLock { copies[ObjectIdentifier(owner)] != nil }
     }
 
+    static let fc2Twice = ProcessInfo.processInfo.environment["NEMOTRON_FC2_TWICE"] != "0"
+
     /// The R = 3 weighted slot products of a target layer ([18 * 2688] FP32,
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
@@ -2968,7 +2970,14 @@ enum NemotronZSkip {
               x.shape == [18, 1856], x.dtype == .bfloat16,
               inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+        var prod = products(x, inds, scores, copy: copy, rows: 3)
+        // NEMOTRON_FC2_TWICE (default on): the same launch runs a second time on the same operands, ordered after
+        // the first through a `depends` input; the second launch's output (the same values) is used.
+        if fc2Twice {
+            let ordered = MLX.depends(inputs: [prod, x], dependencies: [prod])
+            prod = products(ordered[1], inds, scores, copy: copy, rows: 3)
+        }
+        return prod
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
