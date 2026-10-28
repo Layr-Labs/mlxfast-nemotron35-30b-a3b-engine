@@ -1021,6 +1021,9 @@ extension NemotronHResidualRMSNorm {
     private static func verifyEntryPicks(_ tokens: MLXArray)
         -> (MLXArray, NemotronScreenPicks.Bests, NemotronScreenPicks.Bests)?
     {
+        // NEMOTRON_MTP_SCREEN_PICK_SHARE: the entry reads the final kernel's picks from the window's columns
+        // instead of recomputing them inline (the column/window path below).
+        guard !NemotronHeadScreen.pickShareEnabled else { return nil }
         guard NemotronHVerifyEntry.picksVerified, tokens.dtype == .int32,
               let columns = verifyEntryColumns(tokens),
               let sources = CBv2MTPVerifyWindowColumns.sources(of: tokens), sources.count == 2,

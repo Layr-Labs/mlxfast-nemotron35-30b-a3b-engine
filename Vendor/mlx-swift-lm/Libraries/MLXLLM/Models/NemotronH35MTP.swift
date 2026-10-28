@@ -1093,7 +1093,11 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         }
         // Before the request's first verify (`NemotronMTPFirstRoundDraft`).
         NemotronMTPFirstRoundDraft.firstRound = !s.started
-        let out = module.pagedForward(
+        // NEMOTRON_MTP_FRONT_EMBED_PAGED: the front norms read the token's embedding row themselves
+        // once qualified, else the embedding-rows launch feeds them (as before).
+        let out = target.mtpEmbeddingOperands(tokens).flatMap {
+            module.pagedForward(hidden: hidden, operands: $0, cache: s.cache)
+        } ?? module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
         NemotronMTPFirstRoundDraft.firstRound = false
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
@@ -1259,9 +1263,11 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             if let secondInputs, secondInputs.from === first.hidden {
                 out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
             } else {
-                out = module.pagedForward(
-                    hidden: first.hidden,
-                    embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+                let secondTokens = first.tokens.reshaped([1, 1])
+                out = target.mtpEmbeddingOperands(secondTokens).flatMap {
+                    module.pagedForward(hidden: first.hidden, operands: $0, cache: s.cache)
+                } ?? module.pagedForward(
+                    hidden: first.hidden, embedding: target.mtpEmbedding(secondTokens), cache: s.cache)
             }
             ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: false))
         }
