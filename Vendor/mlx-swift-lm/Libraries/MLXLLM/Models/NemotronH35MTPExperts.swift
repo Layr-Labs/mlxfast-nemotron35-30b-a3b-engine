@@ -601,6 +601,112 @@ func nemotronSBDictSource(_ source: String) -> String? {
           !s.contains("const device T* bs"), !s.contains("const device T* sl"),
           !s.contains("const device T* bl"), !s.contains("bl[0]"),
           s.components(separatedBy: "biases").count == 2 else { return nil }
+    return nemotronSBDVectorStoreSource(s)
+}
+
+/// NEMOTRON_SBD_VSTORE=0 keeps the lane-0 stores of the dictionary kernels.
+let nemotronSBDVectorStore = ProcessInfo.processInfo.environment["NEMOTRON_SBD_VSTORE"] != "0"
+
+/// The closing store loops of a dictionary kernel (`nemotronSBDictSource`) with a vector store: each SIMD group
+/// runs the same `simd_sum` of the same lane partials, lane q keeps the sum whose output it stores (a select, no
+/// branch in the loop), and lanes 0 ... count - 1 then round and store their outputs at once with the loop's
+/// statements, where lane 0 rounded and stored each output in turn. Every output gets the same sum, rounding and
+/// address; only the storing lane changes. Forms: the prepared / multi-row QMV loop over (row, r) (lane
+/// r * RPS + row), the in_proj register-epilogue loop (lane row * R + t stores the value it already keeps for its
+/// epilogue), and the routed FC1 leader / triple loops over one, two or three rows (lane j * RPS + r stores row j's
+/// output r). Each form is used only when its lanes fit in one SIMD group (else the lane-0 loop runs); a loop that
+/// does not match keeps its lane-0 stores.
+func nemotronSBDVectorStoreSource(_ source: String) -> String {
+    guard nemotronSBDVectorStore else { return source }
+    var s = source
+    let qmvLoop = """
+      for (int row = 0; row < results_per_simdgroup; row++) {
+        for (int r = 0; r < R; r++) {
+          U v = simd_sum(result[r][row]);
+          if (simd_lid == 0) {
+            T h = static_cast<T>(v);
+            if (RELU2) {
+              T zero = static_cast<T>(0);
+              T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+              h = m * m;
+            }
+            yp[r * out_vec_size + row] = h;
+          }
+        }
+      }
+    """
+    s = s.replacingOccurrences(of: qmvLoop, with: """
+      if (R * results_per_simdgroup <= 32) {
+        U nmv_kept = 0;
+        for (int row = 0; row < results_per_simdgroup; row++) {
+          for (int r = 0; r < R; r++) {
+            U v = simd_sum(result[r][row]);
+            nmv_kept = simd_lid == uint(r * results_per_simdgroup + row) ? v : nmv_kept;
+          }
+        }
+        if (simd_lid < uint(R * results_per_simdgroup)) {
+          const int r = int(simd_lid) / results_per_simdgroup;
+          const int row = int(simd_lid) % results_per_simdgroup;
+          T h = static_cast<T>(nmv_kept);
+          if (RELU2) {
+            T zero = static_cast<T>(0);
+            T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+            h = m * m;
+          }
+          yp[r * out_vec_size + row] = h;
+        }
+      } else {
+
+    """ + qmvLoop + "\n  }")
+    // In_proj register epilogue: the lane-0 store leaves the loop; lane l < RPS * R stores its (row, t) value
+    // `yt` (the loop's `hc` for that output) before its conv / timestep work.
+    let regsStore = """
+          if (simd_lid == 0) {
+            T h = static_cast<T>(v);
+            if (RELU2) {
+              T zero = static_cast<T>(0);
+              T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+              h = m * m;
+            }
+            yp[r * out_vec_size + row] = h;
+          }
+          if (nmc_row == row) {
+
+    """
+    let regsPick = """
+            yt = t == s ? nmc_y[s] : yt;
+          }
+
+    """
+    if s.components(separatedBy: regsStore).count == 2, s.components(separatedBy: regsPick).count == 2 {
+        s = s.replacingOccurrences(of: regsStore, with: "      if (nmc_row == row) {\n")
+            .replacingOccurrences(of: regsPick, with: regsPick + "      yp[t * out_vec_size + row] = yt;\n")
+    }
+    // Routed FC1 leader / triple: one, two and three rows.
+    for rows in 1 ... 3 {
+        let names = rows == 1 ? ["result"] : (0 ..< rows).map { "result\($0)" }
+        let sums = names.map { "      \($0)[r] = simd_sum(\($0)[r]);\n" }.joined()
+        let stores = names.enumerated()
+            .map { "        y\($0.offset)[r] = nml_store<T, RELU2>(\($0.element)[r]);\n" }.joined()
+        let loop = "    for (int r = 0; r < results_per_simdgroup; r++) {\n" + sums
+            + "      if (simd_lid == 0) {\n" + stores + "      }\n    }\n"
+        let keeps = names.enumerated().map {
+            "      nmv_kept = simd_lid == uint(\($0.offset) * results_per_simdgroup + r) ? \($0.element)[r] : nmv_kept;\n"
+        }.joined()
+        var target = "y0"
+        for j in 1 ..< rows {
+            target = "simd_lid < uint(\(j) * results_per_simdgroup) ? (\(target)) : y\(j)"
+        }
+        let vector = "    if (\(rows) * results_per_simdgroup <= 32) {\n"
+            + "    U nmv_kept = 0;\n"
+            + "    for (int r = 0; r < results_per_simdgroup; r++) {\n" + sums + keeps + "    }\n"
+            + "    if (simd_lid < uint(\(rows) * results_per_simdgroup)) {\n"
+            + "      device T* nmv_y = \(target);\n"
+            + "      nmv_y[int(simd_lid) % results_per_simdgroup] = nml_store<T, RELU2>(nmv_kept);\n"
+            + "    }\n"
+            + "    } else {\n" + loop + "    }\n"
+        s = s.replacingOccurrences(of: loop, with: vector)
+    }
     return s
 }
 
@@ -2368,6 +2474,39 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+// The closing loop of a zero-skip slot kernel (and of the wide body's two halves) with a vector store: lane q of
+// each SIMD group keeps the sum of iteration q, the same simd_sum of the same lane partials, and lanes
+// 0 ... OT / SGS - 1 then round and store their sums at once, with the loop's nml_store and store statement for
+// output n = sg * (OT / SGS) + lane, where lane 0 rounded and stored each sum in turn. Every loop of `source` is
+// rewritten; nil when none matches or a lane-0 store remains.
+private func nemotronZSkipVectorStoreSource(_ source: String) -> String? {
+    let pattern = "(?m)^( *)for \\(int q = 0; q < OT / SGS; q\\+\\+\\) \\{\\n"
+        + "\\1  const int n = sg \\* \\(OT / SGS\\) \\+ q;\\n"
+        + "\\1  const U r = simd_sum\\(part\\[lid \\* PS \\+ n\\]\\);\\n"
+        + "\\1  if \\(lid == 0\\) \\{\\n"
+        + "\\1    const T h = nml_store<T, false>\\(r\\);\\n"
+        + " *([^\\n]*;)\\n"
+        + "\\1  \\}\\n"
+        + "\\1\\}"
+    let template = "$1U nmz_kept = 0;\n"
+        + "$1for (int q = 0; q < OT / SGS; q++) {\n"
+        + "$1  const int n = sg * (OT / SGS) + q;\n"
+        + "$1  const U r = simd_sum(part[lid * PS + n]);\n"
+        + "$1  nmz_kept = lid == q ? r : nmz_kept;\n"
+        + "$1}\n"
+        + "$1if (lid < OT / SGS) {\n"
+        + "$1  const int n = sg * (OT / SGS) + lid;\n"
+        + "$1  const T h = nml_store<T, false>(nmz_kept);\n"
+        + "$1  $2\n"
+        + "$1}"
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let range = NSRange(source.startIndex..., in: source)
+    guard regex.numberOfMatches(in: source, range: range) > 0 else { return nil }
+    let s = regex.stringByReplacingMatches(in: source, range: range, withTemplate: template)
+    guard !s.contains("nml_store<T, false>(r)") else { return nil }
+    return s
+}
+
 // MARK: Wide zero-skip tiles (NEMOTRON_ZSKIP_WIDE)
 //
 // The shared-down zero-skip copy only (the routed FC2 copies keep the tile-major layout: the request prefill
@@ -2833,8 +2972,34 @@ enum NemotronZSkip {
     }
     /// The slot kernel that reads a dictionary copy (the fast or plain tiled form).
     private static var dictKernel: MLXFast.MLXFastKernel? {
-        fast ? tiledFastDictSlotKernel : tiledDictSlotKernel
+        fast ? (vstore ? tiledFastDictSlotKernelVS : tiledFastDictSlotKernel) : tiledDictSlotKernel
     }
+    /// The fast tiled slot kernels (plain and dictionary, and their `dep` twins) with the vector store
+    /// (`nemotronZSkipVectorStoreSource`), used once `qualifyVectorStore` matched each to its lane-0 form.
+    private static func vectorStoreKernel(_ name: String, _ source: String?, dep: Bool) -> MLXFast.MLXFastKernel? {
+        source.flatMap(nemotronZSkipVectorStoreSource).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores"] + (dep ? ["dep"] : []),
+                outputNames: ["prod"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
+    }
+    private static let tiledFastSlotKernelVS = vectorStoreKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_vs", nemotronZSkipTiledFastSource, dep: false)
+    private static let tiledFastDictSlotKernelVS = vectorStoreKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_sbd_vs", nemotronZSkipDictSource(nemotronZSkipTiledFastSource), dep: false)
+    private static let tiledFastSlotKernelDepVS = vectorStoreKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_dep_vs", nemotronZSkipTiledFastSource, dep: true)
+    private static let tiledFastDictSlotKernelDepVS = vectorStoreKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_vs", nemotronZSkipDictSource(nemotronZSkipTiledFastSource),
+        dep: true)
+    /// The fast tiled slot kernels and the shared-down kernels store each SIMD group's sums from its first
+    /// OT / SGS lanes at once unless NEMOTRON_ZSKIP_VSTORE=0, once `qualifyVectorStore` matched every
+    /// vector-store form to its lane-0 form.
+    static let vstoreRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_VSTORE"] != "0"
+    nonisolated(unsafe) fileprivate static var vstoreVerified = false
+    static var vstore: Bool { vstoreRequested && vstoreVerified }
     /// `NemotronDraftColaunch`: the fast tiled slot kernels (plain and dictionary) with one more input, `dep`,
     /// bound last and never read. The body is the same source text; the extra buffer only orders the launch
     /// after `dep`'s producer in MLX's eval tape.
@@ -2855,6 +3020,9 @@ enum NemotronZSkip {
     /// The `dep` twin of the slot kernel `products` selects for `copy`, or nil (not the fast tiled form).
     private static func depKernel(for copy: Copy) -> MLXFast.MLXFastKernel? {
         guard tiled, fast else { return nil }
+        if vstore {
+            return copy.dict ? tiledFastDictSlotKernelDepVS : tiledFastSlotKernelDepVS
+        }
         return copy.dict ? tiledFastDictSlotKernelDep : tiledFastSlotKernelDep
     }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
@@ -2878,13 +3046,19 @@ enum NemotronZSkip {
     /// partial, its order and the closing reduction are unchanged.
     /// NEMOTRON_MTP_ZSKIP_SGS=8 keeps the base's 256-thread threadgroups.
     static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 8 ? 8 : 16
+    /// SIMD groups per routed slot-kernel threadgroup (the shared down keeps `sgs`): 32 gives each SIMD group one
+    /// lane partial l (instead of two) with the same lane-to-chunk map, so every partial, its order and the closing
+    /// reduction are unchanged. NEMOTRON_MTP_ZSKIP_SLOT_SGS=16 keeps `sgs`.
+    static let slotSGS = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SLOT_SGS"] == "16" ? sgs : 32
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
     /// also falls back to the original slot kernel (and re-checks every layer)
     /// if the staged one misses a bit check.
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
     private static var kernel: MLXFast.MLXFastKernel {
-        tiled ? (fast ? tiledFastSlotKernel : tiledSlotKernel) : (staged ? stagedSlotKernel : recordSlotKernel)
+        tiled
+            ? (fast ? (vstore ? tiledFastSlotKernelVS ?? tiledFastSlotKernel : tiledFastSlotKernel) : tiledSlotKernel)
+            : (staged ? stagedSlotKernel : recordSlotKernel)
     }
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
@@ -2927,12 +3101,12 @@ enum NemotronZSkip {
     fileprivate static func products(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  copy: Copy, rows: Int, dep: MLXArray? = nil) -> MLXArray {
         let slots = rows * 6
-        let threads = 32 * sgs
+        let threads = 32 * slotSGS
         let twin = dep.flatMap { _ in depKernel(for: copy) }
         return (twin ?? (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores] + (twin != nil ? [dep!] : []),
-            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
+            template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", slotSGS)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
     }
@@ -3106,6 +3280,141 @@ enum NemotronZSkip {
         return same.item(Bool.self)
     }
 
+    /// Load time, at the start of `prepare` (before any copy is checked, and before the shared down's
+    /// `prepare`): every vector-store form against its lane-0 form, bit for bit, on synthetic copies (random
+    /// codes; scales, biases and pair-table entries with zeros, -0, infinities and NaNs among Gaussian values) and
+    /// synthetic rows: ReLU2-like rows at the measured verify densities (routed 8.75%, shared 13.4%) with an
+    /// all-zero and a one-hot slot, tail chunks only, dense rows, -0 for some zeros, an infinity, a NaN and a tiny
+    /// value (the dense-path sentinel) in three slots, and one row in every slot; slot scores uniform, and with 0,
+    /// -0, NaN, both infinities and a tie; experts shared between slots. Routed: the plain and dictionary slot
+    /// kernels at R = 3 and their `dep` twins at R = 1. Shared down: the tile-major and wide kernels. The lane-0
+    /// forms stay on any miss. One stderr line.
+    fileprivate static func qualifyVectorStore() {
+        vstoreVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron zskip vstore: \(message)\n".utf8))
+        }
+        guard vstoreRequested else { return report("off (setting)") }
+        guard let plain = tiledFastSlotKernelVS, let dict = tiledFastDictSlotKernelVS,
+              let plainDep = tiledFastSlotKernelDepVS, let dictDep = tiledFastDictSlotKernelDepVS,
+              let dictBase = tiledFastDictSlotKernel, let dictDepBase = tiledFastDictSlotKernelDep,
+              let sharedBase = NemotronSharedDownZSkip.kernel, let shared = NemotronSharedDownZSkip.kernelVS,
+              let wideBase = NemotronSharedDownZSkip.wideKernel, let wide = NemotronSharedDownZSkip.wideKernelVS
+        else { return report("off (a slot kernel source no longer matches)") }
+        let experts = 8, k = 1856, n = 2688, tiles = n / 128, groups = k / 64
+        let sharedK = NemotronSharedDownZSkip.k
+        let zero = MLXArray(Float(0))
+        let bf16 = { (v: Float) in MLXArray(v).asType(.bfloat16) }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7653), into: 12)
+        let specials = MLXArray([Float(0), -0.0, .infinity, -.infinity, .nan])
+        // Gaussian values with specials where `u` is below `low` or above `high`.
+        func values(_ shape: [Int], _ u: MLXArray, _ key: MLXArray, low: Float = -1, high: Float = 2) -> MLXArray {
+            let special = logicalOr(u .< MLXArray(low), u .> MLXArray(high))
+            return which(special, take(specials, (u * 100_000).asType(.int32) % MLXArray(Int32(5))),
+                         MLXRandom.normal(shape, key: key) * 0.01).asType(.bfloat16)
+        }
+        let su = MLXRandom.uniform(Float(0) ..< 1, [experts, tiles, groups, 128], key: keys[0])
+        let codes = MLXRandom.randInt(Int32(0) ..< 65536, [experts, tiles, k, 32], key: keys[1]).asType(.uint16)
+        let scales = values([experts, tiles, groups, 128], su, keys[2], low: 0.0005)
+        let biases = values([experts, tiles, groups, 128], su, keys[3], high: 0.9995)
+        let index = MLXRandom.randInt(Int32(0) ..< 512, [experts, tiles, groups, 128], key: keys[4]).asType(.uint16)
+        let table = concatenated([
+            MLXArray([Float(0), -0.0, .infinity, 1, .nan, 0.5, -0.0, -.infinity]).reshaped(4, 2),
+            MLXRandom.normal([508, 2], key: keys[5]) * 0.01,
+        ]).asType(.bfloat16).asType(.float32)
+        let wu = MLXRandom.uniform(Float(0) ..< 1, [1, tiles, sharedK / 64, 128], key: keys[6])
+        let narrowCopy = NemotronSharedDownZSkip.Copy(
+            codes: MLXRandom.randInt(Int32(0) ..< 65536, [1, tiles, sharedK, 32], key: keys[7]).asType(.uint16),
+            scales: values([1, tiles, sharedK / 64, 128], wu, keys[8], low: 0.0005),
+            biases: values([1, tiles, sharedK / 64, 128], wu, keys[9], high: 0.9995))
+        var wideCopy = narrowCopy
+        wideCopy.wideCodes = MLXRandom.randInt(Int32(0) ..< 65536, [1, tiles * sharedK * 32], key: keys[10])
+            .asType(.uint16)
+        // ReLU2-like rows [slots, kk] (see above).
+        func rows(_ slots: Int, _ kk: Int, density: Float, seed: UInt64) -> [MLXArray] {
+            let r = MLXRandom.split(key: MLXRandom.key(seed), into: 3)
+            let h = abs(MLXRandom.normal([slots, kk], key: r[0])) * 0.5 + 1e-3
+            let u = MLXRandom.uniform(Float(0) ..< 1, [slots, kk], key: r[1])
+            let slot = MLXArray((0 ..< slots).map(Int32.init)).reshaped(slots, 1)
+            let column = MLXArray((0 ..< kk).map(Int32.init)).reshaped(1, kk)
+            let oneHot = which(column .== MLXArray(Int32(kk - 56)), MLXArray(Float(1.5)), zero)
+            let sparse = which(slot .== MLXArray(Int32(1)), zero,
+                               which(slot .== MLXArray(Int32(2)), oneHot, which(u .< MLXArray(density), h, zero)))
+            let tail = which(column .>= MLXArray(Int32(kk - 64)), h, zero)
+            var out = [sparse, tail, h].map { a -> MLXArray in
+                let b = a.asType(.bfloat16)
+                return (b * b).asType(.bfloat16)
+            }
+            let negative = MLXRandom.uniform(Float(0) ..< 1, [slots, kk], key: r[2]) .< MLXArray(Float(0.05))
+            let signed = which(logicalAnd(out[0] .== bf16(0), negative), bf16(-0.0), out[0])
+            func at(_ s: Int, _ c: Int) -> MLXArray {
+                logicalAnd(slot .== MLXArray(Int32(s % slots)), column .== MLXArray(Int32(c)))
+            }
+            out.append(signed)
+            out.append(which(at(3, 77), bf16(.infinity),
+                             which(at(4, 901), bf16(.nan), which(at(5, 1300), bf16(1e-35), signed))))
+            out.append(broadcast(out[0][0 ..< 1], to: [slots, kk]))
+            return out
+        }
+        func scores(_ slots: Int, seed: UInt64, special: Bool) -> MLXArray {
+            let s = MLXRandom.uniform(Float(0) ..< 1, [slots], key: MLXRandom.key(seed))
+            guard special else { return s }
+            let head: [Float] = [0, -0.0, .nan, .infinity, -.infinity, 0.25, 0.25]
+            let fixed = MLXArray((0 ..< slots).map { $0 < head.count ? head[$0] : 0 })
+            return which(MLXArray((0 ..< slots).map(Int32.init)) .< MLXArray(Int32(head.count)), fixed, s)
+        }
+        func launch(_ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                    _ sk: MLXArray, _ bk: MLXArray, dep: Bool) -> MLXArray {
+            kernel(
+                [codes, sk, bk, x, inds, scores] + (dep ? [zero] : []),
+                template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", slotSGS)],
+                grid: (32 * slotSGS * tiles, x.dim(0), 1), threadGroup: (32 * slotSGS, 1, 1),
+                outputShapes: [[x.dim(0) * n]], outputDTypes: [.float32])[0]
+        }
+        var cases = 0
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                let routed: [(MLXFast.MLXFastKernel, MLXFast.MLXFastKernel, MLXArray, MLXArray, Bool)] = [
+                    (tiledFastSlotKernel, plain, scales, biases, false), (dictBase, dict, index, table, false),
+                    (tiledFastSlotKernelDep, plainDep, scales, biases, true), (dictDepBase, dictDep, index, table, true),
+                ]
+                for (base, twin, sk, bk, dep) in routed {
+                    let slots = dep ? 6 : 18
+                    let inds = MLXArray((0 ..< slots).map { UInt32((5 * $0) % experts) })
+                    for (i, x) in rows(slots, k, density: 0.0875, seed: UInt64(0x7660 + slots)).enumerated() {
+                        for special in [false, true] {
+                            let s = scores(slots, seed: UInt64(0x7670 + i), special: special)
+                            let a = launch(base, x, inds, s, sk, bk, dep: dep)
+                            let b = launch(twin, x, inds, s, sk, bk, dep: dep)
+                            ok = ok .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                            cases += 1
+                        }
+                    }
+                }
+                let sinds = MLXArray.zeros([3], dtype: .uint32)
+                for (base, twin, copy) in [(sharedBase, shared, narrowCopy), (wideBase, wide, wideCopy)] {
+                    for x in rows(3, sharedK, density: 0.134, seed: 0x7680) {
+                        let a = NemotronSharedDownZSkip.dispatch(x, copy, sinds, base)
+                        let b = NemotronSharedDownZSkip.dispatch(x, copy, sinds, twin)
+                        ok = ok .&& (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                        cases += 1
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        vstoreVerified = admitted
+        report(admitted
+            ? "on (\(cases) cases bitwise equal to the lane-0 store: routed plain and pair-dictionary slot kernels "
+                + "at R = 3 and their dep twins at R = 1, shared down tile-major and wide; zeros, -0, infinities, "
+                + "NaNs and ties included)"
+            : "off (differs from the lane-0 store)")
+    }
+
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
     /// then keep the copies only if every layer's scales and biases are finite
     /// (the skipped-chunk argument needs it) and its kernel equals the record
@@ -3113,6 +3422,7 @@ enum NemotronZSkip {
     /// a one-hot slot, tail chunks only, and dense; experts shared across rows).
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
+        qualifyVectorStore()
         var result = build(model)
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
@@ -3277,6 +3587,26 @@ enum NemotronSharedDownZSkip {
     private static let wideLayout = MLXFast.metalKernel(
         name: "nemotron_zskip_shared_wide_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipWideLayoutSource)
+    /// The tile-major and wide kernels with the vector store (`nemotronZSkipVectorStoreSource`; the wide source's
+    /// tail-tile loop and both halves of the wide body), used once `NemotronZSkip.qualifyVectorStore` matched them
+    /// to the lane-0 forms. `source` and `wideSource` (the co-launch's shared bodies) stay as they are.
+    fileprivate static let kernelVS: MLXFast.MLXFastKernel? = source.flatMap(nemotronZSkipVectorStoreSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_zskip_shared_down_tiled_fast_vs",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"],
+            source: $0,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    fileprivate static let wideKernelVS: MLXFast.MLXFastKernel? = wideSource.flatMap(nemotronZSkipVectorStoreSource)
+        .map {
+            MLXFast.metalKernel(
+                name: "nemotron_zskip_shared_down_wide_vs",
+                inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"],
+                source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
 
     fileprivate struct Copy {
         let codes: MLXArray
@@ -3329,9 +3659,12 @@ enum NemotronSharedDownZSkip {
         return copy
     }
 
-    /// The shared-down kernel that reads `copy`'s decode codes.
+    /// The shared-down kernel that reads `copy`'s decode codes (the vector-store form once qualified).
     fileprivate static func kernel(for copy: Copy) -> MLXFast.MLXFastKernel? {
-        copy.wide ? wideKernel : kernel
+        if NemotronZSkip.vstore {
+            return copy.wide ? wideKernelVS : kernelVS
+        }
+        return copy.wide ? wideKernel : kernel
     }
 
     /// `copy` without its wide codes: the tile-major kernels' copy.
@@ -3419,11 +3752,12 @@ enum NemotronSharedDownZSkip {
                           built[ObjectIdentifier(q)] == nil else { continue }
                     var copy = makeCopy(q, wide: wide && !wideMissed)
                     eval(copy.codes, copy.scales, copy.biases)
-                    guard let kernel, finite(q), matches(q, tileMajor(copy), zeros, kernel, seed: built.count)
+                    guard let narrowKernel = kernel(for: tileMajor(copy)), finite(q),
+                          matches(q, tileMajor(copy), zeros, narrowKernel, seed: built.count)
                     else { return false }
                     if let wideCodes = copy.wideCodes {
                         eval(wideCodes)
-                        let same = wideKernel.map { matches(q, copy, zeros, $0, seed: built.count) } ?? false
+                        let same = kernel(for: copy).map { matches(q, copy, zeros, $0, seed: built.count) } ?? false
                         if !same {
                             wideMissed = true
                             copy = tileMajor(copy)
