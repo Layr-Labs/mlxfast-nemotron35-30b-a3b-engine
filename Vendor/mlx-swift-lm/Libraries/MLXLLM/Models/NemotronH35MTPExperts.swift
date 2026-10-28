@@ -15,7 +15,6 @@ extension NemotronHMLP {
 }
 
 /// Stateless graph cache only. Request KV, recurrent state, offsets and
-/// transactions must never be captured by this helper.
 final class NemotronH35MTPGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
@@ -169,8 +168,6 @@ extension NemotronHMoE {
     }
 
     /// Captured-verify join only: (routed, shared) before `routed + shared`,
-    /// which the join kernel then computes (same operand order, same BF16
-    /// rounding) ahead of the residual Add. The graph is otherwise unchanged.
     func mtpForwardRowsParts(_ x: MLXArray, prepared: MLXArray? = nil) -> (MLXArray, MLXArray)? {
         guard sharedExperts != nil, NemotronMTPExecution.batchedM1,
               x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) else { return nil }
@@ -224,7 +221,6 @@ extension NemotronHMoE {
     }
 
     /// [routed + shared], or [routed, shared] when `parts` (shared experts
-    /// present, batched M=1 route).
     func mtpForwardRowsUncompiledOutputs(
         _ x: MLXArray, prepared: MLXArray?, parts: Bool
     ) -> [MLXArray] {
@@ -519,10 +515,6 @@ private func nmlPreparedSource(_ source: String, pointers: [(String, String)]) -
 }
 
 /// Tail block in its constant 8-value form (NEMOTRON_MTP_FC1_TAIL8 /
-/// NEMOTRON_MTP_FC2_TAIL8). With 8 values per lane and K % 8 == 0, a lane's
-/// tail `remaining` is 0 or 8, and the tail body runs only when it is 8. At
-/// N = 8 every `_safe` load equals the full load and every qdot with N = 8
-/// equals the main-loop call: same loads, same terms, same order and rounding.
 private func nmlTail8Source(_ source: String) -> String? {
     let typedef = "  typedef float U;\n"
     guard source.components(separatedBy: typedef).count == 2 else { return nil }
@@ -548,15 +540,6 @@ private func nmlTail8Source(_ source: String) -> String? {
 }
 
 /// The triple FC1 with its three main K loops (one, two and three routed
-/// rows) unrolled by two (NEMOTRON_MTP_FC1_UNROLL): `#pragma clang loop
-/// unroll_count(2)` ahead of each `for (; k < K - block_size; ...)`. The
-/// unrolled loop runs the same block bodies in the same order (block k, then
-/// block k + 256, with the tail block after the loop as before), so every
-/// load, product, term order, accumulation, affine close, closing simd_sum
-/// and store is the record's; only the instruction stream of two consecutive
-/// blocks is laid out together. Applied to the triple source before the
-/// tail-8, prepared and dictionary transforms; nil when the record text has
-/// moved (the record kernels stay).
 private func nmlFC1UnrollSource(_ source: String) -> String? {
     let loop = "    for (; k < K - block_size; k += block_size) {\n"
     guard source.components(separatedBy: loop).count == 4 else { return nil }
@@ -564,11 +547,6 @@ private func nmlFC1UnrollSource(_ source: String) -> String? {
 }
 
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
-/// (`NemotronSBDict`). `scales` carries one uint16 pair index per group and
-/// `biases` the tensor's pair table as FP32 (scale, bias), each entry the exact
-/// BF16 -> FP32 widening of a pair the tensor holds. Every group's `s` and `b`
-/// are the FP32 values the BF16 loads produced, so each qdot, sum, order and
-/// rounding is unchanged; only the group-metadata bytes halve.
 func nemotronSBDictSource(_ source: String) -> String? {
     let typedef = "  typedef float U;\n"
     guard source.components(separatedBy: typedef).count == 2 else { return nil }
@@ -608,14 +586,6 @@ func nemotronSBDictSource(_ source: String) -> String? {
 let nemotronSBDVectorStore = ProcessInfo.processInfo.environment["NEMOTRON_SBD_VSTORE"] != "0"
 
 /// The closing store loops of a dictionary kernel (`nemotronSBDictSource`) with a vector store: each SIMD group
-/// runs the same `simd_sum` of the same lane partials, lane q keeps the sum whose output it stores (a select, no
-/// branch in the loop), and lanes 0 ... count - 1 then round and store their outputs at once with the loop's
-/// statements, where lane 0 rounded and stored each output in turn. Every output gets the same sum, rounding and
-/// address; only the storing lane changes. Forms: the prepared / multi-row QMV loop over (row, r) (lane
-/// r * RPS + row), the in_proj register-epilogue loop (lane row * R + t stores the value it already keeps for its
-/// epilogue), and the routed FC1 leader / triple loops over one, two or three rows (lane j * RPS + r stores row j's
-/// output r). Each form is used only when its lanes fit in one SIMD group (else the lane-0 loop runs); a loop that
-/// does not match keeps its lane-0 stores.
 func nemotronSBDVectorStoreSource(_ source: String) -> String {
     guard nemotronSBDVectorStore else { return source }
     var s = source
@@ -857,10 +827,8 @@ private final class NemotronMoELeaderKernel: Sendable {
     static let shared = NemotronMoELeaderKernel()
     let kernel: MLXFast.MLXFastKernel
     /// Production-only copy with the constant 8-value tail (nmlTail8Source);
-    /// `kernel` stays the reference the self-tests compare against.
     let tail8: MLXFast.MLXFastKernel?
     /// `kernel` and `tail8` reading (scale, bias) through the draft head's
-    /// routed FC1 pair dictionary (`NemotronSBDict.draftDict`), or nil.
     let kernelDict: MLXFast.MLXFastKernel?
     let tail8Dict: MLXFast.MLXFastKernel?
     private init() {
@@ -934,7 +902,6 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpDict: MLXFast.MLXFastKernel?
     let tripleGateUpTail8Dict: MLXFast.MLXFastKernel?
     /// The four plan-free triple FC1 kernels with their main K loops unrolled
-    /// by two (nmlFC1UnrollSource; NEMOTRON_MTP_FC1_UNROLL).
     let tripleGateUpUnrolled: MLXFast.MLXFastKernel?
     let tripleGateUpTail8Unrolled: MLXFast.MLXFastKernel?
     let tripleGateUpDictUnrolled: MLXFast.MLXFastKernel?
@@ -1264,8 +1231,6 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
 }
 
 /// Set to true only for a self-test build: every verify call also runs stock
-/// gather_qmv and poisons the layer output with NaN on any bit difference, so
-/// the benchd token gate fails loudly unless every row is bitwise stock.
 let nemotronKernelSelfTestBuild = false
 
 enum NemotronMoELeader {
@@ -1312,9 +1277,6 @@ enum NemotronMoELeader {
     }
 
     /// x: [R, K] (perSlot false) or [R * topK, K]; inds: [R * topK] uint32.
-    /// Returns [R * topK, N].
-    /// tail8: production calls only (the self-test references keep false).
-    /// dict: the draft head's routed FC1 pair dictionary (one row only).
     static func apply(_ x: MLXArray, _ inds: MLXArray, rows: Int, topK: Int,
                       bank: Bank, perSlot: Bool, relu2: Bool = false,
                       prepared: MLXArray? = nil, tail8: Bool = false,
@@ -1368,50 +1330,34 @@ enum NemotronMoELeader {
     }
 
     /// Geometry of the plan-free triple FC1: one SIMD group per threadgroup
-    /// with two outputs each (NEMOTRON_MTP_FC1_NSG, NEMOTRON_MTP_FC1_RPS;
-    /// NEMOTRON_MTP_FC1_RPS=4 restores four outputs, NSG 2 with the leader's
-    /// narrow two the older threadgroups). Only the output-to-SIMD-group map
-    /// moves: every output keeps its lane split, K order, qdot and closing
-    /// simd_sum.
     static let fc1SimdGroups = max(1, Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_NSG"] ?? "") ?? 1)
     static let fc1Results: Int? = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_RPS"] ?? "") ?? 2
     static let preparedGateUp = true
     static let fuseBalancePlan =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_BALANCE_PLAN"] != "0"
     /// 7968e3f5 (c486095a grouping): NEMOTRON_MTP_TRIPLE_FC1_ONLY=0 keeps the
-    /// pair-only prepared R3 FC1; on, one leader also serves an expert's third
-    /// row with one shared coefficient decode.
     static let tripleGateUp =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_TRIPLE_FC1_ONLY"] != "0"
     /// Tail block of the R3 triple FC1 / balanced FC2 in its constant 8-value
-    /// form (nmlTail8Source); =0 keeps the runtime-`remaining` tail.
     static let fc1Tail8 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_TAIL8"] != "0"
     static let fc2Tail8 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_TAIL8"] != "0"
     /// The plan-free triple FC1 with its main K loops unrolled by two
-    /// (nmlFC1UnrollSource); =0 keeps the record loops. Selected only after
-    /// `qualifyFC1Unroll` found the unrolled kernel bit for bit equal to the
-    /// record kernel on the real weights of every routed FC1 bank.
     static let fc1Unroll =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_UNROLL"] != "0"
     nonisolated(unsafe) private(set) static var fc1UnrollQualified = false
     /// The same constant tail for the R != 3 (draft tail) leader and weighted
-    /// kernels, through production-only kernel copies.
     static let leaderTail8 =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEADER_TAIL8"] != "0"
 
     /// The ordinary prepared R3/top-six FC1 arithmetic plus the original
-    /// integer FC2 plan, emitted by just the first leader/output tile.
-    /// Both outputs are fresh current-call arrays; no planner state persists.
-    /// The dictionary twin of the triple FC1 this process selects, if built.
     static var dictFC1Available: Bool {
         let kernels = NemotronMoELeaderPreparedKernels.shared
         return tripleGateUp && (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
             ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
     }
     /// The dictionary twin of the R = 1 leader `apply` selects with
-    /// `tail8: leaderTail8` (the draft tail's FC1), if built.
     static var draftDictFC1Available: Bool {
         let kernels = NemotronMoELeaderKernel.shared
         return (leaderTail8 && kernels.tail8 != nil ? kernels.tail8Dict : kernels.kernelDict) != nil
@@ -1464,7 +1410,6 @@ enum NemotronMoELeader {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_PLAN_ELIDE"] != "0"
 
     /// unroll: the unrolled main loops (nil: `fc1Unroll` once qualified); the
-    /// record kernel stands in whenever its unrolled twin is missing.
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
         prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
@@ -1511,10 +1456,6 @@ enum NemotronMoELeader {
     }
 
     /// Load time, after the pair dictionaries: the unrolled plan-free triple
-    /// FC1 against the record kernel, bit for bit, on the real weights of
-    /// every routed FC1 bank, with routes that give one expert all three
-    /// rows, one expert two rows and the rest one row each (both ReLU2 forms).
-    /// Any difference, or a missing twin, keeps the record kernel.
     static func qualifyFC1Unroll(_ model: Module) {
         guard enabled else { return }
         guard fc1Unroll else {
@@ -1569,7 +1510,6 @@ enum NemotronMoELeader {
     }
 
     /// Same leader pairs as apply(), with separate FP32 products and the
-    /// native top-six sum. Caller supplies six distinct indices per row.
     static func applyWeighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                               rows: Int, bank: Bank, plan: MLXArray? = nil,
                               tail8: Bool = false) -> MLXArray {
@@ -1588,8 +1528,6 @@ enum NemotronMoELeader {
     }
 
     /// The router produces six distinct indices per token. Keep its original
-    /// slot order and the accepted cross-row leader pairs. Row-contiguous
-    /// kernel copies support arbitrary input strides without weight changes.
     static func switchRowsAndWeightedReduce(
         _ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray,
         _ mlp: NemotronHSwitchMLP, prepared: MLXArray? = nil, products: Bool = false,
@@ -1678,7 +1616,6 @@ enum NemotronMoELeader {
     }
 
     /// Stock-equivalent `switchMLP(x, indices)` for x [1, R, H], indices
-    /// [1, R, topK] (unsorted route, R * topK <= 64). Returns [1, R, topK, H].
     static func switchRows(_ x: MLXArray, _ indices: MLXArray,
                            _ mlp: NemotronHSwitchMLP) -> MLXArray? {
         guard enabled, x.ndim == 3, x.dim(0) == 1, (2...4).contains(x.dim(1)),
@@ -1894,9 +1831,6 @@ private final class NMLBalanceWeighted: Sendable {
 
 
 /// Reuse the entire accepted prepared FC1 body verbatim. The extra work runs
-/// in exactly one complete 64-thread TG: row-zero/slot-zero is always a leader,
-/// so its original follower return cannot skip the plan. FC2 already depends
-/// on FC1; reading the plan adds no dependency on a different producer.
 private func nmlFC1WithBalancePlanSource(_ preparedFC1: String) -> String {
     let lane = "const uint lane = thread_position_in_grid.x;"
     let store = "for (uint i = lane; i < 36; i += 32)"
@@ -2731,7 +2665,6 @@ private let nemotronZSkipWideBodySource = """
 """
 
 /// The (scale, bias) bits of a lane's four outputs of group `gi` in tile 2W + h from the tile-major BF16 arrays
-/// (the tiled kernel's loads and shifts). Bit moves only.
 private let nemotronZSkipWidePlainSetup = """
     const device T* sq = sk + tb * groups * OT + 4 * lid;
     const device T* bq = bk + tb * groups * OT + 4 * lid;
@@ -2750,12 +2683,6 @@ private let nemotronZSkipWidePlainSetup = """
 """
 
 /// A wide slot kernel's source: `narrow` (a tile-major fast slot source with BF16 scales and biases: the shared
-/// down body) runs the 128-output tail tile, the wide body every other threadgroup. Both bodies share one
-/// `part`/`xsh`/`cmask` set and one slot index, declared by the same statements as the tile-major source, so
-/// `NemotronFC2SharedColaunch.source` co-launches a wide source with a tile-major one as it does two tile-major
-/// ones. Grid x: N / 256 + 1 threadgroups (N % 256 == 128); threadgroups past the tail tile return at once (a
-/// co-launch's grid is the tile-major body's N / 128). Nil when the narrow source no longer has the expected
-/// statements.
 private func nemotronZSkipWideSource(narrow: String, store: String) -> String? {
     let arrays = "  threadgroup float part[32 * PS];\n  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
     let slot = "  const int slot = int(threadgroup_position_in_grid.y);\n"
@@ -2777,7 +2704,6 @@ private func nemotronZSkipWideSource(narrow: String, store: String) -> String? {
 }
 
 /// The wide copy's codes from a 4-bit bank [E, N, K / 8]: the tile-major layout kernel's code words, stored at
-/// the wide copy's addresses (`nemotronZSkipWideBodySource`). Output [E, N / 128 * K * 32] uint16.
 private let nemotronZSkipWideLayoutSource = """
   const uint lid = thread_position_in_grid.x % 32;
   const uint t = thread_position_in_grid.x / 32;
@@ -2809,21 +2735,12 @@ private let nemotronZSkipReduceSource = """
 """
 
 /// MLX commits a command buffer once the distinct input buffers bound in it
-/// exceed its per-buffer budget (`max_mb_per_buffer`, 40-50 MB). An expert
-/// bank is one buffer of hundreds of MB, so every launch that binds a whole
-/// bank ends its command buffer although it reads only the routed experts.
-/// The expert kernels address a bank from its base pointer with their own
-/// constants (never through the bound array's shape or strides), so binding
-/// the bank's first expert, a view of the same MTLBuffer at the same base,
-/// reads the same memory; only MLX's byte count of the binding changes.
-/// NEMOTRON_MTP_BANK_VIEWS=0 binds the whole banks.
 enum NemotronBankBinding {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_BANK_VIEWS"] != "0"
     private static let lock = NSLock()
     nonisolated(unsafe) private static var views: [ObjectIdentifier: (MLXArray, MLXArray)] = [:]
 
     /// The cached `bank[0 ..< 1]` of a bank recorded by `warm`, else the bank.
-    /// Never evaluates (callers may be inside a compile trace).
     static func bind(_ bank: MLXArray) -> MLXArray {
         guard enabled else { return bank }
         if let cached = lock.withLock({ views[ObjectIdentifier(bank)] }), cached.0 === bank {
@@ -2833,7 +2750,6 @@ enum NemotronBankBinding {
     }
 
     /// Load time, outside any trace: record evaluated first-expert views of
-    /// every switch-linear bank of `model` and of `extra` banks.
     static func warm(_ model: Module, extra: [MLXArray] = []) {
         guard enabled else { return }
         var banks = extra
@@ -2911,7 +2827,6 @@ enum NemotronZSkip {
     }
 
     /// A dictionary copy's FP32 pair table is read by every decode slot launch, so it joins its layer's
-    /// residency set unless NEMOTRON_MTP_RESID=0.
     static let residentTables = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESID"] != "0"
 
     /// Numeric backbone order, independent of dictionary iteration order.
@@ -2975,7 +2890,6 @@ enum NemotronZSkip {
         fast ? (vstore ? tiledFastDictSlotKernelVS : tiledFastDictSlotKernel) : tiledDictSlotKernel
     }
     /// The fast tiled slot kernels (plain and dictionary, and their `dep` twins) with the vector store
-    /// (`nemotronZSkipVectorStoreSource`), used once `qualifyVectorStore` matched each to its lane-0 form.
     private static func vectorStoreKernel(_ name: String, _ source: String?, dep: Bool) -> MLXFast.MLXFastKernel? {
         source.flatMap(nemotronZSkipVectorStoreSource).map {
             MLXFast.metalKernel(
@@ -2995,14 +2909,10 @@ enum NemotronZSkip {
         "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_vs", nemotronZSkipDictSource(nemotronZSkipTiledFastSource),
         dep: true)
     /// The fast tiled slot kernels and the shared-down kernels store each SIMD group's sums from its first
-    /// OT / SGS lanes at once unless NEMOTRON_ZSKIP_VSTORE=0, once `qualifyVectorStore` matched every
-    /// vector-store form to its lane-0 form.
     static let vstoreRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_VSTORE"] != "0"
     nonisolated(unsafe) fileprivate static var vstoreVerified = false
     static var vstore: Bool { vstoreRequested && vstoreVerified }
     /// `NemotronDraftColaunch`: the fast tiled slot kernels (plain and dictionary) with one more input, `dep`,
-    /// bound last and never read. The body is the same source text; the extra buffer only orders the launch
-    /// after `dep`'s producer in MLX's eval tape.
     private static let tiledFastSlotKernelDep = MLXFast.metalKernel(
         name: "nemotron_zskip_fc2_slots_tiled_fast_dep",
         inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
@@ -3026,29 +2936,17 @@ enum NemotronZSkip {
         return copy.dict ? tiledFastDictSlotKernelDep : tiledFastSlotKernelDep
     }
     /// The tile-major copy reads (scale, bias) through a pair dictionary of the
-    /// bank (`NemotronSBDict.make`) unless NEMOTRON_MTP_ZSKIP_SB_DICT=0. `prepare`
-    /// falls back to the BF16 tile-major copy (and re-checks every layer) if a
-    /// dictionary kernel misses a bit check.
     nonisolated(unsafe) private static var sbDict =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SB_DICT"] != "0"
     /// The tiled slot kernel's one- and two-value fast paths unless
-    /// NEMOTRON_MTP_ZSKIP_FAST=0. `prepare` falls back to the tiled kernel (and
-    /// re-checks every layer) if the fast twin misses a bit check.
     nonisolated(unsafe) fileprivate static var fast =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_FAST"] != "0"
     /// The tile-major copy and its slot kernel unless NEMOTRON_MTP_ZSKIP_TILED=0.
-    /// `prepare` falls back to the K-major copy and the staged kernel (and
-    /// re-checks every layer) if the tiled kernel misses a bit check.
     nonisolated(unsafe) fileprivate static var tiled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_TILED"] != "0"
     /// SIMD groups per slot-kernel threadgroup: 16 halves each thread's lane
-    /// partials (two instead of four) with the same lane-to-chunk map, so every
-    /// partial, its order and the closing reduction are unchanged.
-    /// NEMOTRON_MTP_ZSKIP_SGS=8 keeps the base's 256-thread threadgroups.
     static let sgs = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_SGS"] ?? "") == 8 ? 8 : 16
     /// The staged slot kernel unless NEMOTRON_MTP_ZSKIP_STAGED=0. `prepare`
-    /// also falls back to the original slot kernel (and re-checks every layer)
-    /// if the staged one misses a bit check.
     nonisolated(unsafe) private static var staged =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGED"] != "0"
     private static var kernel: MLXFast.MLXFastKernel {
@@ -3059,40 +2957,6 @@ enum NemotronZSkip {
     private static let reduce = MLXFast.metalKernel(
         name: "nemotron_zskip_top6", inputNames: ["prod"], outputNames: ["y"],
         source: nemotronZSkipReduceSource)
-
-    /// NEMOTRON_ZSKIP_DICT_ORDER (default on): a dictionary copy's pair ids renumbered by descending use over the
-    /// bank's index (ties by first appearance), so the pairs most groups read share the first lines of the table.
-    /// `useOrdered` keeps the first-appearance ids unless every index entry of the renumbered dictionary decodes to
-    /// the same (scale, bias) bits.
-    static let dictOrderRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_DICT_ORDER"] != "0"
-    nonisolated(unsafe) private static var dictOrdered = 0
-    nonisolated(unsafe) private static var dictOrderMissed = 0
-
-    private static func useOrdered(_ d: NemotronSBDict.Dict) -> NemotronSBDict.Dict? {
-        let pairs = d.table.dim(0)
-        let ids = d.index.reshaped(-1).asType(.int32)
-        let uses = MLXArray.zeros([pairs], dtype: .int32).at[ids].add(MLXArray(Int32(1)))
-        // Descending use, then ascending first-appearance id: one distinct int64 key per pair.
-        let first = MLXArray((0 ..< pairs).map { Int32($0) }).asType(.int64)
-        let order = argSort(-(uses.asType(.int64) * 65536 + (65535 - first)))
-        let rank = argSort(order).asType(.int32)
-        let index = take(rank, ids).asType(.uint16).reshaped(d.index.shape)
-        let table = take(d.table, order, axis: 0)
-        let same = (take(table, index.reshaped(-1).asType(.int32), axis: 0).view(dtype: .uint32)
-            .== take(d.table, ids, axis: 0).view(dtype: .uint32)).all()
-        eval(index, table, same)
-        return same.item(Bool.self) ? NemotronSBDict.Dict(index: index, table: table) : nil
-    }
-
-    /// One stderr line on the renumbered dictionaries of the copies built since the counters were reset.
-    private static func reportDictOrder(_ scope: String) {
-        let (ordered, missed) = lock.withLock { (dictOrdered, dictOrderMissed) }
-        FileHandle.standardError.write(Data(("nemotron \(scope) dict order: " + (!dictOrderRequested
-            ? "off (setting)"
-            : missed == 0
-                ? "on (pair ids by descending use; \(ordered) dictionary copies, every entry decodes to the same (scale, bias) bits)"
-                : "on in \(ordered) dictionary copies, off in \(missed) (a renumbered entry differs)") + "\n").utf8))
-    }
 
     static func makeCopy(_ bank: NemotronMoELeader.Bank) -> Copy {
         let experts = bank.weight.dim(0)
@@ -3107,12 +2971,7 @@ enum NemotronZSkip {
             }
             if sbDict, dictKernel != nil,
                let d = NemotronSBDict.make(scales: bank.scales, biases: bank.biases) {
-                let ordered = dictOrderRequested ? useOrdered(d) : nil
-                lock.withLock {
-                    if dictOrderRequested { if ordered != nil { dictOrdered += 1 } else { dictOrderMissed += 1 } }
-                }
-                return Copy(codes: codes, scales: tileMajor(ordered?.index ?? d.index),
-                            biases: ordered?.table ?? d.table, dict: true)
+                return Copy(codes: codes, scales: tileMajor(d.index), biases: d.table, dict: true)
             }
             return Copy(codes: codes, scales: tileMajor(bank.scales), biases: tileMajor(bank.biases))
         }
@@ -3125,8 +2984,6 @@ enum NemotronZSkip {
     }
 
     /// x: [rows * 6, 1856] relu2 rows per slot; inds, scores: [rows * 6].
-    /// Returns [1, rows, 2688]. Every slot is its own threadgroup column, so
-    /// the slot kernel is the same for any row count.
     static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, copy: Copy,
                     rows: Int = 3) -> MLXArray {
         reduceProducts(products(x, inds, scores, copy: copy, rows: rows), rows: rows)
@@ -3155,8 +3012,6 @@ enum NemotronZSkip {
     }
 
     /// NEMOTRON_MTP_ZSKIP_JOIN=0 keeps the top-six reduce as its own launch in
-    /// the captured verify; otherwise the MoE layer's join kernel sums the six
-    /// slot products itself (`NemotronHResidualRMSNorm.applyPreparedRows`).
     static let joinReduce = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_JOIN"] != "0"
 
     /// The verified copy of `owner` (a target layer's routed FC2), if any.
@@ -3170,7 +3025,6 @@ enum NemotronZSkip {
     }
 
     /// The R = 3 weighted slot products of a target layer ([18 * 2688] FP32,
-    /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  owner: SwitchLinear) -> MLXArray? {
         guard !needsOriginal(owner), joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
@@ -3201,13 +3055,10 @@ enum NemotronZSkip {
     nonisolated(unsafe) private static var draftCopies: [ObjectIdentifier: Copy] = [:]
 
     /// The draft head's R = 1 weighted slot products ([6 * 2688] FP32), or nil
-    /// when `owner` has no verified draft copy.
-    /// The draft copies' arrays (decode-only backing for the residency lease).
     static var draftCopyArrays: [MLXArray] {
         lock.withLock { draftCopies.values.flatMap { [$0.codes, $0.scales, $0.biases] } }
     }
     /// `module`'s parameters except the original banks of switch linears whose draft copy is verified: the draft
-    /// rounds read the copy, so those banks are not decode backing. NEMOTRON_MTP_DRAFT_BANK_RESIDENCY=1 keeps them.
     static func withoutCopiedDraftBanks(_ module: Module) -> [MLXArray] {
         let all = module.parameters().flattened().map { $0.1 }
         guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_RESIDENCY"] != "1" else { return all }
@@ -3238,14 +3089,8 @@ enum NemotronZSkip {
     }
 
     /// Load time, after `prepare` (same copy layout and slot kernel) and before
-    /// any draft graph is traced: copy the draft head's routed fc2 bank and keep
-    /// it only if its scales and biases are finite, the slot kernel plus the
-    /// reduce equals the production R = 1 kernel bit for bit on seeded one-row
-    /// inputs, and the one-row products join equals reduce + join. Any miss
-    /// leaves the draft head on the record kernel; the target is untouched.
     static func prepareDraft(_ head: Module) {
         guard draftEnabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
-        lock.withLock { dictOrdered = 0; dictOrderMissed = 0 }
         var built: [ObjectIdentifier: Copy] = [:]
         for module in head.modules() {
             guard let moe = module as? NemotronHMoE,
@@ -3275,12 +3120,9 @@ enum NemotronZSkip {
         let dicts = built.values.filter(\.dict).count
         FileHandle.standardError.write(
             Data("nemotron draft zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
-        if dicts > 0 { reportDictOrder("draft zskip") }
     }
 
     /// Seeded one-row cases against the production R = 1 kernel: sparse rows
-    /// with an all-zero slot, a one-hot slot and -0 in place of some zeros,
-    /// tail chunks only, and dense.
     private static func matchesOneRow(_ bank: NemotronMoELeader.Bank, _ copy: Copy, seed: Int) -> Bool {
         let offset = UInt32(seed) * 7
         var routes: [UInt32] = [3, 17, 42, 77, 100, 121]
@@ -3318,14 +3160,6 @@ enum NemotronZSkip {
     }
 
     /// Load time, at the start of `prepare` (before any copy is checked, and before the shared down's
-    /// `prepare`): every vector-store form against its lane-0 form, bit for bit, on synthetic copies (random
-    /// codes; scales, biases and pair-table entries with zeros, -0, infinities and NaNs among Gaussian values) and
-    /// synthetic rows: ReLU2-like rows at the measured verify densities (routed 8.75%, shared 13.4%) with an
-    /// all-zero and a one-hot slot, tail chunks only, dense rows, -0 for some zeros, an infinity, a NaN and a tiny
-    /// value (the dense-path sentinel) in three slots, and one row in every slot; slot scores uniform, and with 0,
-    /// -0, NaN, both infinities and a tie; experts shared between slots. Routed: the plain and dictionary slot
-    /// kernels at R = 3 and their `dep` twins at R = 1. Shared down: the tile-major and wide kernels. The lane-0
-    /// forms stay on any miss. One stderr line.
     fileprivate static func qualifyVectorStore() {
         vstoreVerified = false
         func report(_ message: String) {
@@ -3453,10 +3287,6 @@ enum NemotronZSkip {
     }
 
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
-    /// then keep the copies only if every layer's scales and biases are finite
-    /// (the skipped-chunk argument needs it) and its kernel equals the record
-    /// kernel bit for bit on seeded relu2-like rows (sparse with an all-zero and
-    /// a one-hot slot, tail chunks only, and dense; experts shared across rows).
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         qualifyVectorStore()
@@ -3495,7 +3325,6 @@ enum NemotronZSkip {
             let dicts = built.values.filter(\.dict).count
             FileHandle.standardError.write(
                 Data("nemotron zskip on: \(built.count) MoE layers, \(dicts) with pair dictionaries\n".utf8))
-            if dicts > 0 { reportDictOrder("zskip") }
         case .nonFinite(let layer):
             lock.withLock { copies = [:] }
             FileHandle.standardError.write(
@@ -3514,7 +3343,6 @@ enum NemotronZSkip {
     }
 
     private static func build(_ model: Module) -> BuildResult {
-        lock.withLock { dictOrdered = 0; dictOrderMissed = 0 }
         var built: [ObjectIdentifier: Copy] = [:]
         for module in model.modules() {
             guard built.count < layerLimit, let moe = module as? NemotronHMoE,
@@ -3576,7 +3404,6 @@ enum NemotronSharedDownZSkip {
         name: "nemotron_zskip_shared_tiled_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipTiledLayoutSource)
     /// The shared-down body: the routed slot kernel's fast tiled source with K-generic chunk bounds and a BF16
-    /// row store (also the shared half of `NemotronFC2SharedColaunch`). Nil when a swap no longer applies.
     fileprivate static let source: String? = {
         let swaps: [(String, String)] = [
             ("  constexpr int tail = chunks - 224;\n",
@@ -3605,11 +3432,6 @@ enum NemotronSharedDownZSkip {
     }
 
     /// Wide shared-down tiles (`nemotronZSkipWideSource`) unless NEMOTRON_ZSKIP_WIDE=0: a second code copy whose
-    /// rows of two neighbouring 128-output tiles share one 128-byte line, so a lane's non-zero k is one 4-byte
-    /// load for eight outputs; scales and biases stay the tile-major ones. The decode's shared-down kernel and
-    /// the FC2 co-launch read the wide codes; the tile-major codes stay as they are for every other reader
-    /// (`copyArrays(for:)`). `prepare` qualifies the wide kernels against the tile-major ones on the first and
-    /// last layers' weights and drops the wide codes on any miss.
     static let wideEnabled = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_WIDE"] != "0"
     /// The wide shared-down body (also the shared half of the wide `NemotronFC2SharedColaunch` kernels).
     fileprivate static let wideSource: String? = source.flatMap {
@@ -3627,8 +3449,6 @@ enum NemotronSharedDownZSkip {
         name: "nemotron_zskip_shared_wide_codes", inputNames: ["w"], outputNames: ["wk"],
         source: nemotronZSkipWideLayoutSource)
     /// The tile-major and wide kernels with the vector store (`nemotronZSkipVectorStoreSource`; the wide source's
-    /// tail-tile loop and both halves of the wide body), used once `NemotronZSkip.qualifyVectorStore` matched them
-    /// to the lane-0 forms. `source` and `wideSource` (the co-launch's shared bodies) stay as they are.
     fileprivate static let kernelVS: MLXFast.MLXFastKernel? = source.flatMap(nemotronZSkipVectorStoreSource).map {
         MLXFast.metalKernel(
             name: "nemotron_zskip_shared_down_tiled_fast_vs",
@@ -3652,7 +3472,6 @@ enum NemotronSharedDownZSkip {
         let scales: MLXArray
         let biases: MLXArray
         /// The same codes in the wide layout ([1, N / 128 * K * 32]), when the wide kernels are on; `codes`
-        /// stays tile-major ([1, N / 128, K, 32]) either way.
         var wideCodes: MLXArray? = nil
         var wide: Bool { wideCodes != nil }
         /// The codes the decode's shared-down kernel and co-launch read.
@@ -3762,7 +3581,6 @@ enum NemotronSharedDownZSkip {
     }
 
     /// Drops every copy's wide codes when any has them (true), for a consumer whose own check missed with the
-    /// wide codes: the tile-major codes passed their record check in `build`.
     fileprivate static func dropWide(_ model: Module) -> Bool {
         let count = lock.withLock { () -> Int? in
             guard copies.values.contains(where: \.wide) else { return nil }
@@ -3775,8 +3593,6 @@ enum NemotronSharedDownZSkip {
     }
 
     /// Every admissible layer's tile-major copy, checked against the record rows bit for bit with the tile-major
-    /// kernel; with `wide`, also its wide codes, checked the same way with the wide kernel. (accepted, copies,
-    /// a wide check missed); the copies keep their wide codes only when every wide check passed.
     private static func build(_ model: Module, _ zeros: MLXArray, wide: Bool)
         -> (Bool, [ObjectIdentifier: Copy], Bool)
     {
@@ -3813,10 +3629,6 @@ enum NemotronSharedDownZSkip {
     }
 
     /// Load time, before any copy is built: the wide layout against the tile-major one on real weights. On the
-    /// first and last admissible layers, the wide and tile-major shared-down kernels (`shared_y`), and, when the
-    /// layer's routed FC2 has a zero-skip copy, the FC2 co-launch with either shared copy (`prod` and `shared_y`),
-    /// bit for bit on seeded relu2-like rows: the record checks' cases plus the measured verify densities.
-    /// The transient copies are dropped. One stderr line; false on any miss.
     private static func qualifyWide(_ model: Module, _ zeros: MLXArray) -> Bool {
         guard let narrowKernel = kernel, let wideKernel else { return false }
         var layers: [NemotronHMoE] = []
@@ -3868,7 +3680,6 @@ enum NemotronSharedDownZSkip {
     }
 
     /// The record check's seeded rows: sparse with an all-zero and a one-hot row, mixed, tail chunks only, dense,
-    /// and -0 in place of some zeros.
     private static func seededRows(seed: Int) -> [MLXArray] {
         let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5d0e + seed)), into: 3)
         let h = abs(MLXRandom.normal([3, k], key: keys[0])) + 1e-3
@@ -3934,14 +3745,11 @@ enum NemotronFC2SharedColaunch {
         && !NemotronMoELeader.selfTest
     private static let sharedFirst = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH_SD_FIRST"] != "0"
     /// Unless NEMOTRON_MTP_SD_EARLY=0, a covered layer runs the two separate launches the co-launch was checked
-    /// against, and the routed slot products take the shared rows as a dependency: MLX then encodes the shared
-    /// down beside the routed FC1 and the shared up beside the router.
     private static let early = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SD_EARLY"] != "0"
     private static let slots = 18
     private static let sharedRows = 3
 
     /// The layer's shared expert for one captured-verify MoE call; `rows` receives its output when the
-    /// co-launch ran (the caller then skips the shared expert's own launches).
     final class Shared {
         let mlp: NemotronHMLP
         let x: MLXArray
@@ -4022,8 +3830,6 @@ enum NemotronFC2SharedColaunch {
                                          fc2: nemotronZSkipDictSource(nemotronZSkipTiledFastSource),
                                          shared: NemotronSharedDownZSkip.source)
     /// The same routed bodies with the wide shared-down body (`NemotronSharedDownZSkip.wideSource`): the grid
-    /// stays the routed body's N / 128 threadgroups per row, and shared threadgroups past the wide tail tile
-    /// return at once.
     private static let plainWideKernel = make("nemotron_zskip_fc2_shared_down_wide",
                                               fc2: nemotronZSkipTiledFastSource,
                                               shared: NemotronSharedDownZSkip.wideSource)
@@ -4036,7 +3842,6 @@ enum NemotronFC2SharedColaunch {
     nonisolated(unsafe) private static var pairs: [ObjectIdentifier: ObjectIdentifier] = [:]
 
     /// The kernel that runs `copy`'s slot body today with `shared`'s code layout, or nil when the routed side is
-    /// not the fast tiled kernel.
     private static func kernel(for copy: NemotronZSkip.Copy,
                                shared: NemotronSharedDownZSkip.Copy) -> MLXFast.MLXFastKernel? {
         guard NemotronZSkip.tiled, NemotronZSkip.fast else { return nil }
@@ -4065,8 +3870,6 @@ enum NemotronFC2SharedColaunch {
     }
 
     /// The captured verify's (R = 3 weighted slot products, shared down rows) of one MoE layer in one launch, or
-    /// nil whenever `NemotronZSkip.weightedProducts` or `NemotronSharedDownZSkip.run` would not run (the caller
-    /// then keeps the separate launches). `sx`: the shared relu2 rows [3, 3712].
     static func run(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, fc2: SwitchLinear,
                     sx: MLXArray, down: Linear) -> (MLXArray, MLXArray)? {
         guard enabled, !NemotronZSkip.needsOriginal(fc2), NemotronZSkip.joinReduce,
@@ -4097,8 +3900,6 @@ enum NemotronFC2SharedColaunch {
     }
 
     /// Load time, after `NemotronZSkip.prepare` and `NemotronSharedDownZSkip.prepare`: every layer's co-launch
-    /// against the two separate kernels it replaces, bit for bit on both outputs (the FP32 slot products and the
-    /// BF16 shared rows) over seeded relu2-like rows. Any miss keeps every layer on the separate launches.
     static func prepare(_ model: Module) {
         lock.withLock { pairs = [:] }
         guard enabled, Device.defaultDevice().deviceType == .gpu else { return }
@@ -4140,10 +3941,6 @@ enum NemotronFC2SharedColaunch {
     }
 
     /// `NemotronSharedDownZSkip`'s wide qualifier, co-launch half: the co-launch with the tile-major shared copy
-    /// `narrow` against the co-launch with the wide shared copy `wide` of the same layer, bit for bit on both
-    /// outputs, over the record check's seeded rows plus rows at the measured verify densities (routed 7.5%,
-    /// shared 13.4%). Nil when the layer's routed FC2 has no copy or the co-launch is off; else (all equal,
-    /// cases).
     fileprivate static func qualifyWide(fc2: SwitchLinear, narrow: NemotronSharedDownZSkip.Copy,
                                         wide: NemotronSharedDownZSkip.Copy, sinds: MLXArray,
                                         seed: Int) -> (Bool, Int)? {
@@ -4163,9 +3960,6 @@ enum NemotronFC2SharedColaunch {
     }
 
     /// Seeded (routed rows [18, 1856], shared rows [3, 3712]) pairs: sparse with an all-zero and a one-hot
-    /// slot/row, tail chunks only, dense, -0 for some zeros; with `realistic`, three more pairs of relu2-like rows
-    /// at the measured verify densities (routed 7.5%, shared 13.4%) and sparser/denser ones. Routes repeat experts
-    /// across the three rows.
     private static func seededCases(seed: Int, realistic: Bool)
         -> (inds: MLXArray, scores: MLXArray, rows: [(MLXArray, MLXArray)])
     {
@@ -4541,7 +4335,6 @@ enum NemotronSBDict {
     }
 
     /// Every built dictionary's index (for `NemotronBankBinding.warm`: an FC1
-    /// index is per expert and addressed from its base like the scales).
     static var indexArrays: [MLXArray] {
         lock.withLock { dicts.values.map { $0.index } }
     }
@@ -4552,8 +4345,6 @@ enum NemotronSBDict {
     }
 
     /// One tensor's pair dictionary, or nil when its pairs need more than 16
-    /// bits or the device decode of the table differs from the BF16 -> FP32
-    /// widening of the loaded scales and biases in any bit.
     static func make(scales: MLXArray, biases: MLXArray) -> Dict? {
         guard scales.dtype == .bfloat16, biases.dtype == .bfloat16, scales.shape == biases.shape
         else { return nil }
@@ -4605,9 +4396,6 @@ enum NemotronSBDict {
     }
 
     /// Load time, before any verify graph is traced or warmed: a dictionary for
-    /// every routed FC1 bank and every 4-bit target projection, then each
-    /// dictionary kernel against its record kernel, bit for bit, on the real
-    /// weights of every layer it serves.
     static func prepare(_ model: Module) {
         guard enabled, Device.defaultDevice().deviceType == .gpu else { return }
         var built: [ObjectIdentifier: Dict] = [:]
@@ -4734,9 +4522,6 @@ enum NemotronSBDict {
     }
 
     /// `arrays` without the scales and biases of the head's routed banks that have an admitted dictionary: the
-    /// head's routed experts run only one-row draft steps, whose dictionary twin binds the bank's codes, index
-    /// and table, so those scales and biases are not decode backing. NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY=1
-    /// keeps them.
     static func withoutDictBankMetadata(_ arrays: [MLXArray], module: Module) -> [MLXArray] {
         guard ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_BANK_SB_RESIDENCY"] != "1" else { return arrays }
         var skip = Set<ObjectIdentifier>()
@@ -4758,10 +4543,6 @@ enum NemotronSBDict {
     }
 
     /// Load time, before any draft graph is traced or warmed: a dictionary for
-    /// the head's routed FC1 bank and every 4-bit head projection, then each
-    /// R = 1 dictionary kernel against its record kernel (`checkDraftKernels`).
-    /// The head's weights are untouched; a tensor whose check differs (or that
-    /// no dictionary kernel reads) keeps its record kernels.
     static func prepareDraft(_ head: Module) {
         guard draftEnabled, Device.defaultDevice().deviceType == .gpu else { return }
         var built: [ObjectIdentifier: Dict] = [:]
@@ -4798,12 +4579,6 @@ enum NemotronSBDict {
     }
 
     /// Each draft dictionary's R = 1 kernels against their record kernels, bit
-    /// for bit, on the head's real weights and seeded rows: the one-row QMV on
-    /// every projection (ReLU2 off and on), the fused Q/K/V launch on Q, K and
-    /// V together, and the routed FC1 leader on route sets covering all 128
-    /// experts (ReLU2 off and on). Also JITs every R = 1 twin pipeline outside
-    /// any timed window. Returns the owners every check of which ran and
-    /// matched; a dictionary no kernel reads is not kept.
     private static func checkDraftKernels(_ head: Module) -> Set<ObjectIdentifier> {
         let keys = MLXRandom.split(key: MLXRandom.key(0x5bd2), into: 3)
         var same: [ObjectIdentifier: MLXArray] = [:]
@@ -4870,8 +4645,6 @@ enum NemotronSBDict {
 
 extension NemotronU2 {
     /// DRAFT: the draft head's one-row routed FC1 leader on its admitted pair dictionary (the tail-8 or plain
-    /// twin the draft selects), over route sets covering all 128 experts, ReLU2 off and on, unrolled against
-    /// record, bit for bit.
     static func draftCheck(_ head: Module) -> (MLXArray, Int)? {
         let kernels = NemotronMoELeaderKernel.shared
         guard (NemotronMoELeader.leaderTail8 && kernels.tail8 != nil ? kernels.tail8DictU2 : kernels.kernelDictU2)
@@ -4901,8 +4674,6 @@ extension NemotronU2 {
     }
 
     /// Load time, after the pair dictionaries (target and draft head) are built and before any verify or draft
-    /// graph is traced: each family's twin against its record kernel on the real weights (`admit`). A family
-    /// whose switch is 0, whose twin is missing or whose check misses keeps its record kernel.
     static func qualify(target: Module, head: Module) {
         inProj = admit(.inProj) { NemotronMambaInProjConvDt.u2Check(target) }
         self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }

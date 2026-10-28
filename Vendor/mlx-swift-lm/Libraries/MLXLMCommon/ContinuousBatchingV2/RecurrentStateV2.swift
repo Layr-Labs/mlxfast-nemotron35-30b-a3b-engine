@@ -8,22 +8,17 @@ import Foundation
 import MLX
 
 /// Explicit model/backend feature gates. Attention-only models inherit the
-/// historical all-enabled defaults; first-generation recurrent adapters opt
-/// out of paths whose state semantics have not been proven.
 public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
     public var supportsPrefixReuse: Bool
     /// Exact committed recurrent state paired with its attention KV.
     public var supportsRecurrentCheckpointReuse: Bool
     public var supportsPagedKV: Bool
     /// Models validated only on observed native types and dynamic segmented
-    /// ownership must not enter the historical fixed-precision pool.
     public var requiresNativePagedKV: Bool
     public var supportsCompiledDecode: Bool
     public var supportsPackedPrefill: Bool
     public var supportsMTP: Bool
     /// The model's rectangular MTP forward stages compact recurrence inputs
-    /// and can reconstruct a strict accepted prefix without retaining one
-    /// full recurrent state per verify position.
     public var supportsCompactRecurrentMTPReplay: Bool
 
     public init(
@@ -58,10 +53,6 @@ public struct CBv2ModelCapabilities: Sendable, Equatable, Codable {
     }
 
     /// The Engine Protocol v1 manifest wire shape
-    /// (`RunnerManifest.canonicalJSON`) froze the SIX flags it declared, and
-    /// a checked-in v1 manifest carries only those. Flags added after that
-    /// freeze decode to their initializer defaults instead of making the
-    /// pinned file undecodable. The six frozen flags stay mandatory.
     public init(from decoder: any Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         let defaults = CBv2ModelCapabilities()
@@ -95,7 +86,6 @@ public protocol CBv2ModelCapabilityProviding {
 }
 
 /// Tensor shapes for one recurrent model layer. Shapes include the singleton
-/// request row so `elements` is also the exact per-request element count.
 public struct CBv2RecurrentLayerStateSpec: Sendable, Equatable {
     public let modelLayerIndex: Int
     public let convShape: [Int]
@@ -125,7 +115,6 @@ public enum CBv2RecurrentStateError: Error, Equatable {
 /// Complete fixed-residency description for one request.
 public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     /// One committed generation plus the two pending generations retained by
-    /// chained decode and serial MTP verification before finalization.
     public static let maximumLiveGenerations = 3
 
     public let layers: [CBv2RecurrentLayerStateSpec]
@@ -135,8 +124,6 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     }
 
     /// Exact fixed bytes for one live request. Every multiplication and sum
-    /// is checked; malformed or hostile configurations fail instead of
-    /// wrapping into an artificially small admission charge.
     public func fixedBytesPerRequest() throws -> Int {
         var total = 0
         var seen = Set<Int>()
@@ -165,7 +152,6 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
     }
 
     /// Per-generation allocator bound, including a request row that aliases
-    /// a larger batched allocation. This runs only during engine construction.
     func allocationBytesPerGeneration(policy: AllocationFootprintPolicy) throws -> Int {
         _ = try fixedBytesPerRequest()
         var total = 0
@@ -212,30 +198,21 @@ public struct CBv2RecurrentLayerState {
 }
 
 /// One layer's compact representation of a rectangular recurrent verify.
-/// The replay closure is invoked only for a strict accepted prefix. Full
-/// acceptance may lazily materialize an exact final state; rollback discards
-/// both commit paths.
 public struct CBv2RecurrentPrefixReplayStage {
     public let positions: Int
     public let finalState: CBv2RecurrentLayerState
     public let materializedByteCount: Int
     public let evaluationRoots: [MLXArray]
     /// Additional materialized roots retained only after a strict-prefix
-    /// commit. They stay charged until a later recurrent generation commits.
     public let strictReplayRetainedByteCount: Int
     public let strictReplayRetainedRoots: [MLXArray]
     /// Roots needed by a lazy full-accept materialization until its successor
-    /// evaluates and commits. The final state itself remains covered by the
-    /// request's ordinary one-generation charge.
     public let fullAcceptanceRetainedByteCount: Int
     public let fullAcceptanceRetainedRoots: [MLXArray]
     /// Optional commit-time materialization for full acceptance. This keeps
-    /// rejectable exact-tail copies out of the verify graph.
     fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
     fileprivate let replay: (Int) -> CBv2RecurrentLayerState
     /// When every stage of a window sets it, a full acceptance commits like a
-    /// strict prefix: `replay(positions)`, built per layer on first read
-    /// (CBV2_MTP_LAZY_REPLAY), instead of `fullAcceptance` at commit.
     public let defersFullAcceptance: Bool
 
     public init(
@@ -278,12 +255,6 @@ public struct CBv2RecurrentPrefixReplayStage {
 }
 
 /// A strict-prefix commit whose replay graphs are built on first read
-/// instead of at commit: the next verify reaches layer L's committed state
-/// only when it builds layer L, so all but the first replay leave the host
-/// path that precedes the verify's first submission. Each layer is built at
-/// most once, by the same closure from the same inputs, and every reader
-/// (bound evaluations, snapshots, inspection) gets that one array.
-/// CBV2_MTP_LAZY_REPLAY=0 builds every layer at commit.
 fileprivate final class CBv2DeferredPrefixReplay {
     static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_LAZY_REPLAY"] != "0"
@@ -347,22 +318,13 @@ public final class CBv2RecurrentRequestState {
         let id: UInt64
         let layers: [Int: CBv2RecurrentLayerState]
         /// Non-nil marks a CAPTURED verify-window generation: every layer's
-        /// conv/ssm array carries a leading per-position axis of this length
-        /// (`[S, ...]` instead of the spec's `[1, ...]`). Such a generation
-        /// can only leave `pending` through `commit(keepPositions:)` (which
-        /// selects one position) or `rollback()`.
         let capturedPositions: Int?
         /// Non-nil marks a compact replay verify generation. It is mutually
-        /// exclusive with `capturedPositions`; `layers` contains its final
-        /// full-window states.
         let prefixReplay: [Int: CBv2RecurrentPrefixReplayStage]?
     }
 
     private var committed: [Int: CBv2RecurrentLayerState] = [:]
     /// Non-nil only after a strict-prefix commit, while `committed` is
-    /// empty: the confirmed state, built per layer on first read. Every
-    /// assignment of `committed` replaces it; `resolvedCommitted()` folds it
-    /// back for readers that take the whole state.
     private var deferredCommitted: CBv2DeferredPrefixReplay?
     private var committedTransitionGeneration: UInt64?
     private var committedTransitionRetainedByteCount = 0
@@ -414,23 +376,6 @@ public final class CBv2RecurrentRequestState {
     }
 
     /// The latest CONFIRMED per-layer state, or nil when none exists.
-    ///
-    /// This is deliberately NOT `state(modelLayerIndex:)`, which returns
-    /// the newest VISIBLE state — `pending.last` when a speculative
-    /// generation exists (a chained-decode successor, a pipelined prefill
-    /// successor, an unresolved MTP verify window). Those are positions
-    /// the engine has not confirmed and may roll back, so a boundary
-    /// snapshot must never come from one.
-    ///
-    /// **Caller contract:** which POSITION this state belongs to is the
-    /// caller's knowledge, not this type's. `committed` advances exactly
-    /// once per `commit()`, so a caller that commits a generation and then
-    /// reads this — as `EngineLoopV2.finalize` does — sees the state after
-    /// that generation's tokens, even when a successor is already pending.
-    /// A caller that reads it at an arbitrary time learns only "the last
-    /// confirmed state", which is why the prefix bank tracks the position
-    /// itself in `CBv2RecurrentCaptureGeometry` rather than inferring it
-    /// from the scheduler's optimistically advanced token cursor.
     public func confirmedStateSnapshot() -> [Int: CBv2RecurrentLayerState]? {
         guard !isReleased else { return nil }
         let layers = resolvedCommitted()
@@ -438,7 +383,6 @@ public final class CBv2RecurrentRequestState {
     }
 
     /// `committed` with any deferred strict-prefix replays built (the same
-    /// arrays a bound evaluation already read, for layers it reached).
     private func resolvedCommitted() -> [Int: CBv2RecurrentLayerState] {
         if let deferred = deferredCommitted {
             committed = deferred.all()
@@ -448,8 +392,6 @@ public final class CBv2RecurrentRequestState {
     }
 
     /// Bind the latest visible generation for a target forward. A chained
-    /// decode therefore reads the previous still-pending generation without
-    /// prematurely committing it.
     public func bind() throws -> CBv2RecurrentStateEvaluation {
         guard !isReleased else {
             throw CBv2RecurrentStateError.lifecycleViolation("bind after release")
@@ -607,8 +549,6 @@ public final class CBv2RecurrentRequestState {
     }
 
     /// The engine has stopped and synchronized a failed planned cohort. No
-    /// forward/evaluation object may remain reachable when this is called.
-    /// Committed state is released by the ordinary request retirement next.
     func discardPendingAfterSynchronization() {
         bindingOpen = false
         pending.removeAll()
@@ -631,15 +571,11 @@ public final class CBv2RecurrentRequestState {
 }
 
 /// A single forward's recurrent transaction. The model reads its row-local
-/// input and stages one output for every declared recurrent layer. The engine
-/// then calls `evaluate()` before submitting the arrays to MLX and later
-/// chooses exactly one of `commit()` or `rollback()` at finalization.
 public final class CBv2RecurrentStateEvaluation {
     private unowned let owner: CBv2RecurrentRequestState
     private let generation: UInt64
     private let input: [Int: CBv2RecurrentLayerState]
     /// The owner's deferred strict-prefix commit when this binding reads
-    /// committed state: layers absent from `input` are built on first read.
     private let deferredInput: CBv2DeferredPrefixReplay?
     private let requiredLayers: Set<Int>
     private var staged: [Int: CBv2RecurrentLayerState] = [:]
@@ -649,8 +585,6 @@ public final class CBv2RecurrentStateEvaluation {
     private var finalized = false
 
     /// True when this transaction staged per-position captured stacks
-    /// (MTP capture-verify) and must be finalized via
-    /// `commit(keepPositions:)` or `rollback()`.
     public var isCaptured: Bool {
         stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
     }
@@ -676,7 +610,6 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     /// Already-built roots only: schedule their identical graphs at an existing
-    /// within-request submission boundary. Ownership and commit order stay here.
     public func stagedEvaluationRoots(in layers: Range<Int>) -> [MLXArray] {
         guard !evaluated, !isCaptured else { return [] }
         return staged.keys.sorted().filter { layers.contains($0) }.flatMap { index in
@@ -705,11 +638,6 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     /// Stage one layer's CAPTURED per-position states for an MTP verify
-    /// window: `conv`/`ssm` carry a leading position axis of length
-    /// `positions` (`[S, ...]`) where index `s` is the state after consuming
-    /// window token `s`. Index `positions - 1` must equal the state a plain
-    /// `stage` would have produced for the whole window. Mixing captured and
-    /// plain stages in one transaction is a lifecycle violation.
     public func stageCaptured(
         modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray, positions: Int
     ) throws {
@@ -738,7 +666,6 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     /// Stage compact recurrence inputs for one layer. Every layer in the
-    /// transaction must use this mode and the same verify width.
     public func stagePrefixReplay(
         modelLayerIndex: Int,
         positions: Int,
@@ -822,8 +749,6 @@ public final class CBv2RecurrentStateEvaluation {
     }
 
     /// Finalize a captured verify window by committing the state after
-    /// `keepPositions` consumed window tokens (1-based; the accepted prefix
-    /// length including the seed column).
     public func commit(keepPositions: Int) throws {
         guard evaluated, !finalized,
               stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
@@ -867,7 +792,6 @@ public protocol CBv2PositionedRecurrentLanguageModelForwardable:
 }
 
 /// Engine-facing optional refinement. The optional spec keeps the generic
-/// language-model adapter source-compatible for attention-only models.
 public protocol CBv2RecurrentSteppableModel: CBv2SteppableModel, CBv2ModelCapabilityProviding {
     var recurrentStateSpec: CBv2RecurrentStateSpec? { get }
     func forward(

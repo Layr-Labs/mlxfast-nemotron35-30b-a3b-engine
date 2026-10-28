@@ -10,7 +10,6 @@ final class PagedKVGroup {
     private let fixedPageCount: Int
     var pageCount: Int { segmentLayout?.pageCount ?? fixedPageCount }
     /// `[pageCount, kvHeads, pageSize, headDim]`. STABLE arrays: written
-    /// in place by the write kernels, never replaced (see file header).
     private let fixedK: MLXArray?
     private let fixedV: MLXArray?
     var kSlab: MLXArray { precondition(segmentLayout == nil); return fixedK! }
@@ -24,15 +23,9 @@ final class PagedKVGroup {
     var committedSegmentBytes: Int { segments.values.reduce(0) { $0 + $1.allocatedBytes } }
     var committedLogicalBytes: Int { segments.values.reduce(0) { $0 + $1.byteCount } }
     /// Latest fence of the group's bulk-write chain (`[1]` int32). Gathers
-    /// consume it so page reads order after every prior bulk write.
     var writeFence: MLXArray
 
     /// The fence's initial 0 is made from host data, so the group's first write
-    /// reads it without a launch. `MLXArray.zeros` is a lazy fill that is
-    /// evaluated with that first write (for a request-owned pool, inside the
-    /// request's first round). Same value, shape and dtype.
-    /// NEMOTRON_PAGED_HOST_FENCE=0 keeps the zeros fill; so does a failed
-    /// load-time check (`cbv2PagedHostWriteFenceReport`).
     nonisolated(unsafe) static var hostWriteFence =
         ProcessInfo.processInfo.environment["NEMOTRON_PAGED_HOST_FENCE"] != "0"
 
@@ -40,43 +33,28 @@ final class PagedKVGroup {
         hostWriteFence ? MLXArray([Int32(0)]) : MLXArray.zeros([1], dtype: .int32)
     }
     /// Intrusive free queue. The computed array preserves the historical
-    /// test/diagnostic surface without making arbitrary removal O(n).
     private var freeQueue: PagedBlockFreeQueue
     var freeList: [Int32] { freeQueue.elements }
     /// Per-page active-owner count. A cached page may have count zero (in the
-    /// free queue) or positive (shared by one or more request tables).
     var refCounts: [Int]
     /// Incremented immediately before a zero-ref page is reused for a write.
-    /// Prefix metadata carries this generation to close page-id ABA races.
     var generations: [UInt64]
     /// Pages currently held by sequences (refCount > 0).
     private(set) var pagesInUse: Int = 0
     /// Pages promised to admitted sequences (lazily materialized).
     var pagesReserved: Int = 0
     /// Pages queued for release by an in-flight speculative transaction
-    /// (WS-3.2c). They keep `refCount > 0` until `drainDeferredFrees()`, so
-    /// they cannot be recycled to another row while a round's captures
-    /// still name them.
     var deferredFrees: [Int32] = []
     /// Which of this group's slabs `materializeSlabs` has ACTUALLY made
-    /// resident. Tracked explicitly — set only after the slab's blocking
-    /// eval returned — because MLX exposes no public "is this array
-    /// evaluated" API (mlx-c's `_mlx_array_is_available` is documented
-    /// internal and mlx-swift does not surface it). A retry after a
-    /// partial commit re-attempts only the slabs still unset here, and an
-    /// already-materialized pool commits for free (nothing left to eval).
     var kSlabMaterialized = false
     var vSlabMaterialized = false
 
     /// Bytes of ONE slab (K or V alone), poison page included — the unit
-    /// `materializeSlabs` allocates and tracks.
     var slabBytes: Int {
         pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
     }
 
     /// Local page zero is inert and pinned in every backing buffer. Fixed
-    /// slabs use global page zero; segmented kernels translate invalid/padded
-    /// references to the first local page of an already-bound segment.
     static let poisonPage: Int32 = 0
     var poisonPage: Int32 { Self.poisonPage }
 
@@ -127,7 +105,6 @@ final class PagedKVGroup {
     }
 
     /// True when `page` is a page a sequence row can own. The poison page
-    /// and out-of-range ids are not.
     func isAllocatable(_ page: Int32) -> Bool {
         segmentLayout?.isUsable(page) ?? (page != Self.poisonPage && page >= 0 && Int(page) < pageCount)
     }
@@ -170,8 +147,6 @@ final class PagedKVGroup {
     }
 
     /// Retain every handle after an all-or-nothing validation pass in the
-    /// owning pool. A zero-ref cached page is resurrected from the middle of
-    /// the free queue; an already-active page simply gains another owner.
     func retain(_ handle: PagedKVPageHandle) {
         precondition(isValid(handle))
         let index = Int(handle.page)
@@ -193,9 +168,6 @@ final class PagedKVGroup {
     }
 
     /// Release in caller-supplied eviction order. vLLM frees a request's
-    /// page tables tail-first; cached pages append in that same order so a
-    /// branch suffix is reused before its more valuable ancestors. Uncached
-    /// pages prepend for immediate reuse.
     func release<S: Sequence>(
         _ pages: S, isCached: (PagedKVPageHandle) -> Bool
     ) where S.Element == Int32 {
@@ -223,7 +195,6 @@ final class PagedKVGroup {
     }
 
     /// Queue `page` for release at the end of a speculative transaction.
-    /// The page keeps its refcount until the drain.
     func deferFree(_ page: Int32) {
         precondition(
             isAllocatable(page),
@@ -259,7 +230,6 @@ final class PagedKVGroup {
     }
 
     /// Metadata-only plan. Callers check aggregate bytes before materializing
-    /// any candidate, then publish every group's replacement as one transaction.
     func planGrowth(usablePages: Int) throws -> GrowthPlan {
         precondition(segmentLayout != nil)
         let planned = try segmentLayout!.adding(
@@ -302,7 +272,6 @@ final class PagedKVGroup {
     }
 
     /// Only complete ownership swaps occur here. Preparation already performed
-    /// all host/GPU allocation, so the pool can recheck its grant under lock.
     func installGrowth(_ prepared: PreparedGrowth) {
         segmentLayout = prepared.layout
         segments = prepared.segments
@@ -328,7 +297,6 @@ final class PagedKVGroup {
     }
 
     /// Rebase only the staged M pages. Existing free backing supplies the
-    /// remaining full-N promise before this planner creates any new segments.
     func planImport(_ source: CBv2PagedCheckpointStorage.Group,
                     additionalReservedPages: Int) throws -> ImportPlan {
         guard let current = segmentLayout,
@@ -376,7 +344,6 @@ final class PagedKVGroup {
     }
 
     /// All replacement dictionaries, tables and free queues are prepared
-    /// before grant publication. Only missing suffix buffers allocate/evaluate.
     func prepareImport(_ plan: ImportPlan, source: CBv2PagedCheckpointStorage.Group,
                        evaluate: (MLXArray) throws -> Void,
                        admission: AdmissionV2? = nil) throws -> PreparedImport {
@@ -425,9 +392,6 @@ final class PagedKVGroup {
     }
 
     /// Called only at the row-release host-sync boundary. Drop cached aliases
-    /// before backing; generations survive retirement so reused page IDs cannot
-    /// resurrect stale handles. Outstanding reservations retain enough free
-    /// physical pages for every nonthrowing future write.
     func trimSegments(willRetire: (PagedKVPageHandle) -> Void) {
         guard segmentLayout != nil else { return }
         var remaining = committedUsablePages
@@ -454,7 +418,6 @@ final class PagedKVGroup {
 }
 
 /// Load time: how new paged groups make their write fence's initial value
-/// (`PagedKVGroup.initialWriteFence`), checked against the zeros fill.
 package func cbv2PagedHostWriteFenceReport() {
     func report(_ message: String) {
         FileHandle.standardError.write(Data("cbv2 paged host write fence: \(message)\n".utf8))
