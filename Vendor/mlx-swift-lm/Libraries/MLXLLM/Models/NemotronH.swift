@@ -498,6 +498,66 @@ enum NemotronHResidualRMSNorm {
                 which(ok, outputs[1], MLXArray(Float.nan)))
     }
 
+    /// `kernel`'s text with the residual read moved to row a of `lhs` [1, W, 2688], where a is the device
+    /// accept walk's count over the acceptance packet (the count of leading packet[targets + i] ==
+    /// packet[drafts + i], i < count; the row pick's loop) formed in the launch. Nil if the read moved.
+    private static let walkSource: String? = {
+        let base = oneBarrierSource(source)
+        let read = "T sum = lhs[offset + i] + rhs[offset + i];"
+        guard base.components(separatedBy: read).count == 2 else { return nil }
+        return """
+            size_t nmw_row = 0;
+            {
+                int nmw_a = 0;
+                if (thread_index_in_simdgroup == 0) {
+                    const int64_t nmw_step = packet_strides[0];
+                    while (nmw_a < walk[0] && packet[(walk[2] + nmw_a) * nmw_step] == packet[(walk[1] + nmw_a) * nmw_step]) {
+                        ++nmw_a;
+                    }
+                }
+                nmw_a = simd_broadcast(nmw_a, ushort(0));
+                nmw_row = size_t(nmw_a) * axis_size;
+            }
+
+            """ + base.replacingOccurrences(of: read, with: "T sum = lhs[nmw_row + offset + i] + rhs[offset + i];")
+    }()
+    private static let walkKernel = walkSource.map {
+        MLXFast.metalKernel(
+            name: name("nemotron_h_residual_rms_walk_bf16"),
+            inputNames: ["lhs", "rhs", "weight", "axis_size", "eps", "packet", "walk"],
+            outputNames: ["residual", "normalized"], source: $0, ensureRowContiguous: true)
+    }
+    static var walkKernelAvailable: Bool { walkKernel != nil }
+
+    /// Whether `applyWalk` serves these operands (checked before the caller builds anything).
+    static func walkServes(_ rows: MLXArray, packet: MLXArray, count: Int, drafts: Int, targets: Int,
+                           norm: RMSNorm) -> Bool {
+        walkKernel != nil && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
+            && rows.ndim == 3 && rows.dim(0) == 1 && rows.dim(2) == 2688 && rows.dtype == .bfloat16
+            && rows.strides == [rows.dim(1) * 2688, 2688, 1]
+            && count >= 0 && count < rows.dim(1)
+            && packet.ndim == 1 && packet.dtype == .int32 && drafts >= 0 && targets >= 0
+            && drafts + count <= packet.dim(0) && targets + count <= packet.dim(0)
+            && type(of: norm) == RMSNorm.self && norm.weight.shape == [2688] && norm.weight.dtype == .bfloat16
+    }
+
+    /// `apply(rows[a], rhs, norm)` for the row a the device accept walk selects (see `walkSource`), without the
+    /// row being gathered first: rows [1, W, 2688] row-contiguous, rhs [1, 1, 2688], both BF16. Nil outside these
+    /// shapes.
+    static func applyWalk(_ rows: MLXArray, _ rhs: MLXArray, packet: MLXArray, count: Int, drafts: Int,
+                          targets: Int, norm: RMSNorm) -> (MLXArray, MLXArray)? {
+        guard walkServes(rows, packet: packet, count: count, drafts: drafts, targets: targets, norm: norm),
+              rhs.shape == [1, 1, 2688], rhs.dtype == .bfloat16, let walkKernel
+        else { return nil }
+        let result = walkKernel(
+            [rows, rhs, norm.weight, UInt32(2688), norm.eps, packet,
+             MLXArray([Int32(count), Int32(drafts), Int32(targets)])],
+            template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [rhs.shape, rhs.shape], outputDTypes: [.bfloat16, .bfloat16])
+        return (result[0], result[1])
+    }
+
     static func apply(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray)?
     {
@@ -10284,3 +10344,4 @@ public struct NemotronHConfiguration: Codable, Sendable {
 }
 private let gauntletRedraw_32a5ef90_20261024T102246Z: Int = 0
 private let gauntletRedraw_570f00bf_20261024T122202Z: Int = 0
+// revision 2

@@ -95,6 +95,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
@@ -131,6 +132,10 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
         NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPWalkDraftAttention.qualify(
+            assistant.module.layers[0] as! NemotronH35MTPAttentionBlock,
+            norm: (assistant.module.layers[1] as! NemotronH35MTPExpertBlock).norm,
+            cacheCheck: { assistant.qualifyConsumerWalkCacheRows() })
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
