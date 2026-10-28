@@ -718,7 +718,7 @@ private let nemotronHeadPreparedQMVSource = nemotronHeadPreparedQMVTail8
 /// softplus and clip expressions of `nemotron_packed_conv_silu_dt`. Every
 /// channel is produced once, by the simdgroup that computed it; the separate
 /// conv/timestep launch is not needed. The projection itself is unchanged.
-private let nemotronMambaInProjConvDtEpilogue = """
+private let nemotronMambaInProjConvDtEpilogueText = """
 
   // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). The
   // BF16 outputs it needs are read back from this simdgroup's own stores.
@@ -731,6 +731,7 @@ private let nemotronMambaInProjConvDtEpilogue = """
       const int o = out_row + row;
       if (o >= CS && o < CS + CC) {
         const int64_t channel = int64_t(o - CS);
+        NEP_LOADS
         if (t < 3) {
           padded[int64_t(t) * CC + channel] =
               oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
@@ -772,6 +773,77 @@ private let nemotronMambaInProjConvDtEpilogue = """
     }
   }
 """
+
+/// NEMOTRON_MTP_INPROJ_EPILOGUE_LOADS_FIRST=0 keeps the record epilogue's order, where a conv lane loads the old
+/// state, the conv weights and bias, and its window outputs after its first `padded` store. Otherwise the lane
+/// loads all of them into registers first (`nep_*`: the three old-state rows, the window's R outputs of its row,
+/// the four weights and the bias, the same addresses) and the statements below read the registers; every
+/// product, sum, rounding and store is the record's.
+let nemotronInProjEpilogueLoadsFirst =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_LOADS_FIRST"] != "0"
+private let nemotronMambaInProjConvDtEpilogue: String = {
+    let s = nemotronMambaInProjConvDtEpilogueText
+    guard nemotronInProjEpilogueLoadsFirst else { return s.replacingOccurrences(of: "        NEP_LOADS\n", with: "") }
+    let loads = """
+            const T nep_o0 = oldState[0 * oldState_strides[1] + channel * oldState_strides[2]];
+            const T nep_o1 = oldState[1 * oldState_strides[1] + channel * oldState_strides[2]];
+            const T nep_o2 = oldState[2 * oldState_strides[1] + channel * oldState_strides[2]];
+            T nep_y[R];
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < R; ++k) {
+              nep_y[k] = yp[k * out_vec_size + row];
+            }
+            const auto nep_w0 = cw[channel * cw_strides[0] + int64_t(0) * cw_strides[1]];
+            const auto nep_w1 = cw[channel * cw_strides[0] + int64_t(1) * cw_strides[1]];
+            const auto nep_w2 = cw[channel * cw_strides[0] + int64_t(2) * cw_strides[1]];
+            const auto nep_w3 = cw[channel * cw_strides[0] + int64_t(3) * cw_strides[1]];
+            const auto nep_b = cb[channel * cb_strides[0]];
+
+    """
+    let swaps: [(String, String)] = [
+        ("        NEP_LOADS\n", loads),
+        ("""
+                  padded[int64_t(t) * CC + channel] =
+                      oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        """, """
+                  padded[int64_t(t) * CC + channel] = t == 0 ? nep_o0 : (t == 1 ? nep_o1 : nep_o2);
+        """),
+        ("padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];",
+         "T nep_yt = nep_y[0];\n        _Pragma(\"clang loop unroll(full)\")\n"
+            + "        for (int k = 1; k < R; ++k) { nep_yt = t == k ? nep_y[k] : nep_yt; }\n"
+            + "        padded[(int64_t(t) + 3) * CC + channel] = nep_yt;"),
+        ("""
+                for (int i = 0; i < 4; ++i) {
+                  int64_t crow = int64_t(t) + int64_t(i);
+                  T value = crow < 3
+                      ? oldState[crow * oldState_strides[1] + channel * oldState_strides[2]]
+                      : yp[(crow - 3) * out_vec_size + row];
+                  acc += static_cast<float>(value)
+                      * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+                }
+        """, """
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < 4; ++i) {
+                  int64_t crow = int64_t(t) + int64_t(i);
+                  T value = nep_y[0];
+                  _Pragma("clang loop unroll(full)")
+                  for (int k = 1; k < R; ++k) { value = crow - 3 == int64_t(k) ? nep_y[k] : value; }
+                  value = crow == 0 ? nep_o0 : (crow == 1 ? nep_o1 : (crow == 2 ? nep_o2 : value));
+                  acc += static_cast<float>(value)
+                      * (i == 0 ? nep_w0 : (i == 1 ? nep_w1 : (i == 2 ? nep_w2 : nep_w3)));
+                }
+        """),
+        ("T xc = convolved + cb[channel * cb_strides[0]];", "T xc = convolved + nep_b;"),
+    ]
+    var out = s
+    for (from, to) in swaps {
+        guard out.components(separatedBy: from).count == 2 else {
+            return s.replacingOccurrences(of: "        NEP_LOADS\n", with: "")
+        }
+        out = out.replacingOccurrences(of: from, with: to)
+    }
+    return out
+}()
 
 /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS: the in_proj launch whose epilogue takes
 /// its row's BF16 outputs from registers instead of reading them back from its
@@ -984,6 +1056,11 @@ enum NemotronMambaInProjConvDt {
     private static var regsAvailable: Bool {
         kernelRegs != nil && dictKernelRegs != nil && kernelU2Regs != nil && dictKernelU2Regs != nil
     }
+    /// `NemotronQMVTune`: the record launch's source before the dictionary and unroll transforms (prepared body +
+    /// epilogue, or its register-epilogue form).
+    static func tuneBase(regs: Bool) -> String? {
+        regs ? nemotronInProjRegsSource() : nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue
+    }
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
@@ -993,7 +1070,8 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil,
+        qmvTune: NemotronQMVTune.Config? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -1021,14 +1099,18 @@ enum NemotronMambaInProjConvDt {
                 : (dict != nil ? dictKernelRegs : kernelRegs)
             if let twin { chosen = twin }
         }
+        // NemotronQMVTune: the adopted geometry of the dictionary launch (`qmvTune`: a load-time check's).
+        let tuned = dict != nil ? NemotronQMVTune.inProjLaunch(qmvTune, production: u2 == nil && regs == nil) : nil
+        if let tuned { chosen = tuned.0 }
+        let launchRPS = tuned?.2 ?? 2, launchNSG = tuned?.3 ?? 2
         let outputs = chosen(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
-                       ("RPS", 2), ("CS", convStart), ("CC", convDim),
-                       ("DS", convStart + convDim), ("NH", heads)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                       ("RPS", launchRPS), ("CS", convStart), ("CC", convDim),
+                       ("DS", convStart + convDim), ("NH", heads)] + (tuned?.1 ?? []),
+            grid: (32, n / launchRPS, 1), threadGroup: (32, launchNSG, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
@@ -1155,6 +1237,8 @@ enum NemotronHeadPreparedActivation {
     static let preparedHalfSource = nemotronSwapped(
         nemotronHeadPreparedQMVSource, nemotronPreparedHalfSwaps)
     static let preparedHalfHeader = nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader
+    /// `NemotronQMVTune`: the crown prepared body (the HF body is `preparedHalfSource`).
+    static var crownSource: String { nemotronHeadPreparedQMVSource }
     static let projectHalf = MLXFast.metalKernel(
         name: "nemotron_head_prepared_qmv_hf", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
         outputNames: ["y"], source: preparedHalfSource, header: preparedHalfHeader)
@@ -1366,7 +1450,8 @@ enum NemotronHeadPreparedActivation {
         let packed = [packed]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
+           case let (kernel, hf, rps, nsg)? = NemotronQMVTune.preparedLaunch(k: k, n: n, relu2: false, u2: false)
+               ?? dictLaunch(k: k, n: n, rps: 2) {
             return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
@@ -1443,7 +1528,8 @@ enum NemotronHeadPreparedActivation {
 
     /// `u2`: the R = 3 launch's unroll-by-two twin (nil: the admitted family, `NemotronU2.prepared`).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
-                      prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil) -> MLXArray {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil,
+                      qmvTune: NemotronQMVTune.Config? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
@@ -1453,7 +1539,8 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let unroll = rows == 3 && (u2 ?? NemotronU2.prepared(rows: rows, n: n))
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps, u2: unroll) {
+           case let (kernel, hf, launchRPS, nsg)? = NemotronQMVTune.preparedLaunch(
+               k: k, n: n, relu2: relu2, u2: unroll, config: qmvTune) ?? dictLaunch(k: k, n: n, rps: rps, u2: unroll) {
             return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
@@ -1782,6 +1869,11 @@ enum NemotronMultiRowQMV {
     /// NEMOTRON_MTP_R1_TWIN=0 keeps the stock call for the draft step's
     /// one-row eh_proj, attention wo and shared-expert down (`nemotronR1Linear`).
     static let r1Route = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R1_TWIN"] != "0"
+    /// `NemotronGeoTune`: the R = 1 decode-form body (template HF), its header and decode form.
+    static var r1TuneSource: (body: String, header: String, form: Int) {
+        (nemotronSwapped(nemotronMultiRowQMVSource, nemotronMultiRowHalfSwaps),
+         nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader, NemotronMultiRowQMVKernel.r1HalfDecodeForm)
+    }
     /// The dictionary twin of the R = 1 kernel `dispatch` selects, if built.
     static var draftDictAvailable: Bool {
         let kernels = NemotronMultiRowQMVKernel.shared
@@ -1954,7 +2046,8 @@ enum NemotronMultiRowQMV {
     /// `sbDict`: one row of a draft head tensor reads its admitted pair
     /// dictionary (`NemotronSBDict.draftDict`); false keeps the record kernel.
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool = false,
-                      prepared: MLXArray? = nil, sbDict: Bool = true, dep: MLXArray? = nil) -> MLXArray? {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, dep: MLXArray? = nil,
+                      geo: NemotronGeoTune.QConfig? = nil) -> MLXArray? {
         guard enabled, x.ndim == 2, (1...8).contains(x.dim(0)),
               q.mode == .affine, q.bits == 4, q.groupSize == 64,
               let biases = q.biases, x.dtype == .bfloat16,
@@ -1972,6 +2065,14 @@ enum NemotronMultiRowQMV {
         }
         let rps = resultsPerSimdgroup(rows: x.dim(0), k: k, n: n)
         let dict = sbDict && x.dim(0) == 1 ? NemotronSBDict.draftDict(q) : nil
+        // NemotronGeoTune (DRAFTQMV): the one-row dictionary launch's adopted geometry (`geo`: a load check's).
+        if let dict, x.dim(0) == 1, let t = NemotronGeoTune.draftQMVLaunch(k: k, n: n, relu2: relu2, config: geo) {
+            let (kArray, nArray) = scalarPair(k, n)
+            return t.0([dep ?? x, q.weight, dict.index, dict.table, x, kArray, nArray],
+                template: [("T", x.dtype), ("R", 1), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", t.2)] + t.1,
+                grid: (32, n / t.2, 1), threadGroup: (32, t.3, 1),
+                outputShapes: [[1, n]], outputDTypes: [x.dtype])[0]
+        }
         let y = dispatch(q.weight, q.scales, biases, x, relu2: relu2, rps: rps, dict: dict,
                          dep: x.dim(0) == 1 ? dep : nil)
         guard rps != 4, NemotronMoELeader.selfTest else { return y }
@@ -5203,8 +5304,12 @@ enum NemotronHeadScreen {
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
         counter: MLXArray? = nil, paired: Bool = false,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, b1: Bool = false, noTicket: Bool = false
+        rowsPerSimdgroup: Int? = nil, simdgroups: Int? = nil, b1: Bool = false, noTicket: Bool = false
     ) -> Result {
+        // NemotronGeoTune (SCREEN): the 2-bit partial pass's adopted geometry unless the caller names one.
+        let tuned = rowsPerSimdgroup == nil && simdgroups == nil && records2 != nil ? NemotronGeoTune.screenAdopted : nil
+        let rowsPerSimdgroup = rowsPerSimdgroup ?? tuned?.rps ?? 8
+        let simdgroups = simdgroups ?? tuned?.nsg ?? 2
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
             ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup),

@@ -77,6 +77,26 @@ private final class NemotronMTPDraftHead {
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
     /// qualified at load and the shapes match, else the stock argmax.
     /// `upper`: also screen the upper vocabulary half (when the plan has it).
+    /// `NemotronGeoTune` (SCREEN): whether the adopted plan reads the 2-bit records, and screens the upper half.
+    var screenTuneInfo: (records2: Bool, upper: Bool)? {
+        screen.map { ($0.records2 != nil, $0.upperGroups != nil) }
+    }
+
+    /// `NemotronGeoTune` (SCREEN): `greedy`'s screen launch with the partial pass at (rps, nsg) (nil: production),
+    /// every array a reader takes from it (pick, scores, kept ids and values, chunk bests), evaluated.
+    func screenTuneRun(_ hidden: MLXArray, upper: Bool, rps: Int?, nsg: Int?) -> [MLXArray]? {
+        guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width], hidden.dtype == .bfloat16 else { return nil }
+        let r = NemotronHeadScreen.run(
+            hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
+            groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
+            keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
+            upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
+            records: screen.records, records2: screen.records2,
+            counter: screen.counter, paired: screen.paired, rowsPerSimdgroup: rps, simdgroups: nsg,
+            b1: screen.b1, noTicket: screen.noTicket)
+        return [r.id, r.scores, r.candidateIds, r.candidateValues] + [r.bestValues, r.bestIds].compactMap { $0 }
+    }
+
     func greedy(_ hidden: MLXArray, upper: Bool = false) -> MLXArray {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
@@ -770,6 +790,14 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
 
     /// Load-time preparation of the draft-only head screen (see
     /// NemotronHeadScreen); weights-only, before the shape warm-up.
+    /// `NemotronGeoTune` (SCREEN): the draft head's screen plan and launch.
+    var screenTuneInfo: (records2: Bool, upper: Bool)? { draftHead.screenTuneInfo }
+    func screenTuneRun(_ hidden: MLXArray, upper: Bool, rps: Int?, nsg: Int?) -> [MLXArray]? {
+        draftHead.screenTuneRun(hidden, upper: upper, rps: rps, nsg: nsg)
+    }
+    /// The draft final norm's weight (the screen's input scale).
+    var screenTuneGamma: MLXArray { (module.layers[1] as! NemotronH35MTPExpertBlock).finalNorm.weight }
+
     func prepareDraftHeadScreen() {
         draftHead.prepareScreen(
             gamma: (module.layers[1] as! NemotronH35MTPExpertBlock).finalNorm.weight)
