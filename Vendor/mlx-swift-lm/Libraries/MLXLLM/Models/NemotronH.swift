@@ -5501,8 +5501,15 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             "NemotronH CBv2 recurrent row count mismatch")
 
         // Request prefill: the projection reads its pair dictionary (`NemotronPrefillDenseDict`).
-        let projected = NemotronPrefillDenseDict.apply(hiddenStates, inProj, kind: "in_proj")
+        var projected = NemotronPrefillDenseDict.apply(hiddenStates, inProj, kind: "in_proj")
             ?? inProj(hiddenStates)
+        // Request prefill only (`NemotronHPrefillX5.active`, more than 8 rows): the projection is launched a
+        // second time and the layer's projection waits for it (`depends`); its values are not read.
+        if NemotronHPrefillX5.active, hiddenStates.dim(1) > 8 {
+            let again = NemotronPrefillDenseDict.apply(hiddenStates, inProj, kind: "in_proj")
+                ?? inProj(hiddenStates)
+            projected = depends(input: projected, dependencies: [again])
+        }
         if NemotronSeedEarlyCommit.applies(modelLayerIndex: modelLayerIndex, rows: hiddenStates.dim(1)) {
             asyncEval(projected)
         }
