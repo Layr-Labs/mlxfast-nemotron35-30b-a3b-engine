@@ -264,15 +264,22 @@ extension NemotronHMoE {
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }
+        // NemotronSharedUpLate: the shared expert's operand takes the routing indices as a dependency, so MLX
+        // encodes the shared up beside the routed FC1 (not beside the router) and the shared down beside the FC2.
+        var colaunchUsed = colaunch
+        if NemotronSharedUpLate.enabled, let c = colaunch, c.up == nil, let p = c.prepared {
+            colaunchUsed = NemotronFC2SharedColaunch.Shared(
+                mlp: c.mlp, x: c.x, prepared: depends(input: p.reshaped(-1).reshaped(p.shape), dependencies: [indices]))
+        }
         if let reduced = NemotronMoELeader.switchRowsAndWeightedReduce(
-            x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunch) {
+            x, indices, scores, switchMLP, prepared: packed, products: products, colaunch: colaunchUsed) {
             y = reduced
         } else {
             y = NemotronMoELeader.switchRows(x, indices, switchMLP) ?? switchMLP(x, indices)
             y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
         guard let sharedExperts else { return [y] }
-        let shared = colaunch?.rows ?? sharedExperts.mtpForwardRows(x, prepared: packed)
+        let shared = colaunchUsed?.rows ?? sharedExperts.mtpForwardRows(x, prepared: packed)
         return parts ? [y, shared] : [y + shared]
     }
 }
@@ -2368,6 +2375,73 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+/// NEMOTRON_MTP_ZSKIP_HOIST=0 keeps the routed slot kernels' source as is. Otherwise
+/// `nemotronZSkipHoistSource` loads `scores[slot]` once before the staging loop (the
+/// closing stores no longer reload it after each `prod` store) and stages each 8-value
+/// chunk from one 16-byte load when `x` is 16-byte aligned (the same 16 bits per value
+/// feed the mask, the sentinel and the threadgroup copy). Same statements otherwise.
+enum NemotronZSkipHoist {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_HOIST"] != "0"
+}
+
+/// The routed slot source with the two hoists above; the input unchanged when the
+/// switch is off or an anchor is missing.
+private func nemotronZSkipHoistSource(_ source: String) -> String {
+    guard NemotronZSkipHoist.enabled else { return source }
+    var s = source
+    let expert = "  const uint expert = inds[slot];\n"
+    let store = "      prod[slot * N + n0 + n] = float(h) * scores[slot] + 0.0f;\n"
+    let stage = """
+          for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+            const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+            uint m = 0, unsafe = 0;
+            for (int i = 0; i < 8; i++) {
+              const uint ab = uint(xb[i]) & 0x7fffu;
+              m |= ab != 0 ? (1u << i) : 0u;
+              unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+              xsh[8 * c + i] = xs[8 * c + i];
+            }
+
+        """
+    guard s.components(separatedBy: expert).count == 2, s.components(separatedBy: store).count == 2,
+          s.components(separatedBy: stage).count == 2
+    else {
+        FileHandle.standardError.write(Data("nemotron zskip hoist: off (source differs)\n".utf8))
+        return source
+    }
+    FileHandle.standardError.write(Data("nemotron zskip hoist: on\n".utf8))
+    s = s.replacingOccurrences(of: expert, with: expert + "  const float nmz_score = scores[slot];\n")
+    s = s.replacingOccurrences(of: store,
+        with: "      prod[slot * N + n0 + n] = float(h) * nmz_score + 0.0f;\n")
+    s = s.replacingOccurrences(of: stage, with: """
+          const bool nmz_wide = (reinterpret_cast<ulong>(x) & 15) == 0;
+          for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+            uint m = 0, unsafe = 0;
+            if (nmz_wide) {
+              const uint4 xw = *((const device uint4*)(xs + 8 * c));
+              const uint xu[4] = {xw.x, xw.y, xw.z, xw.w};
+              threadgroup uint16_t* xd = (threadgroup uint16_t*)(xsh + 8 * c);
+              for (int i = 0; i < 8; i++) {
+                const uint bits = (xu[i >> 1] >> (16 * (i & 1))) & 0xffffu;
+                const uint ab = bits & 0x7fffu;
+                m |= ab != 0 ? (1u << i) : 0u;
+                unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+                xd[i] = uint16_t(bits);
+              }
+            } else {
+              const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+              for (int i = 0; i < 8; i++) {
+                const uint ab = uint(xb[i]) & 0x7fffu;
+                m |= ab != 0 ? (1u << i) : 0u;
+                unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+                xsh[8 * c + i] = xs[8 * c + i];
+              }
+            }
+
+        """)
+    return s
+}
+
 // MARK: Wide zero-skip tiles (NEMOTRON_ZSKIP_WIDE)
 //
 // The shared-down zero-skip copy only (the routed FC2 copies keep the tile-major layout: the request prefill
@@ -2824,9 +2898,12 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .map(nemotronZSkipHoistSource).map {
         MLXFast.metalKernel(
-            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            name: NemotronZSkipHoist.enabled ? "nemotron_zskip_fc2_slots_tiled_fast_sbd_h"
+                : "nemotron_zskip_fc2_slots_tiled_fast_sbd",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
@@ -2844,9 +2921,11 @@ enum NemotronZSkip {
         outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
-    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .map(nemotronZSkipHoistSource).map {
         MLXFast.metalKernel(
-            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
+            name: NemotronZSkipHoist.enabled ? "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_h"
+                : "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
             inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
@@ -3542,6 +3621,11 @@ enum NemotronSharedDownZSkip {
         }
         return same.item(Bool.self)
     }
+}
+
+/// NEMOTRON_MTP_SU_LATE=0 keeps the shared expert's up projection beside the router.
+enum NemotronSharedUpLate {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SU_LATE"] != "0"
 }
 
 // MARK: - Routed FC2 + shared down in one launch
