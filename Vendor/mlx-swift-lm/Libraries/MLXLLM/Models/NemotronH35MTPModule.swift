@@ -2501,18 +2501,119 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// The paged launch's outputs: [out], or with `live` (a [1] int32 fence) its fenced twin's [out, live + 1].
+    /// `NemotronDraftPagedPipeline` (sdpa): the form (fenced or not) the tune checked launches the adopted variant.
     private static func pagedOutputs(
         queries: MLXArray, read: CBv2PagedDirectRead, own: (keys: MLXArray, values: MLXArray)?,
         scale: Float, mask: MLXArray, live: MLXArray?
+    ) -> [MLXArray]? {
+        let tuned = NemotronDraftPagedPipeline.adopted[.sdpa].flatMap { (live != nil) == NemotronDraftPagedPipeline.sdpaFenced ? $0 : nil }
+        return tuneOutputs(tuned, queries: queries, read: read, own: own, scale: scale, mask: mask, live: live,
+                           dep: queries)
+    }
+
+    /// Only the incumbent four-key, 64-bit address, FP32 operand source can enter this isolated family.
+    /// The optional twin moves next-four readonly loads before current softmax; no address/type/geometry change.
+    static func tuneSource(_ g: NemotronDraftPagedPipeline.Geometry, own: Bool) -> String? {
+        guard let s = pagedSource(own: own), g.unroll == 4, g.keys == 0, !g.packed else { return nil }
+        return g.prefetch4 ? prefetch4Source(s) : s
+    }
+
+    /// Worker-created source only. Keep four-key FP32 score/update order, but issue the next four
+    /// independent readonly K/V/mask loads after current dots and before current softmax updates.
+    /// Every marker is counted; moved text disables this optional twin instead of guessing a body.
+    private static func prefetch4Source(_ source: String) -> String? {
+        let loop = "for (; i + 3 * BN < N; i += 4 * BN) {\n"
+        let remainder = "for (; i < N; i += BN) {\n"
+        let laneLoop = "for (int u = 0; u < 4; u++) {\n"
+        let scores = "U key_scores[4];\n"
+        let advance = "fm += 4 * BN * mask_kv_seq_stride;\n"
+        guard source.components(separatedBy: loop).count == 2,
+              source.components(separatedBy: remainder).count == 2,
+              let loopRange = source.range(of: loop),
+              let remainderRange = source.range(of: remainder), loopRange.upperBound < remainderRange.lowerBound
+        else { return nil }
+        let block = String(source[loopRange.upperBound ..< remainderRange.lowerBound])
+        guard block.components(separatedBy: laneLoop).count == 4,
+              block.components(separatedBy: scores).count == 2,
+              block.components(separatedBy: advance).count == 2,
+              let first = block.range(of: laneLoop), let score = block.range(of: scores),
+              let update = block.range(of: laneLoop, options: .backwards),
+              let step = block.range(of: advance),
+              first.lowerBound < score.lowerBound, score.lowerBound < update.lowerBound,
+              update.lowerBound < step.lowerBound,
+              String(block[step.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines) == "}"
+        else { return nil }
+        let declarations = String(block[..<first.lowerBound])
+        let loads = String(block[first.lowerBound ..< score.lowerBound])
+        let dots = String(block[score.lowerBound ..< update.lowerBound])
+        let updates = String(block[update.lowerBound ..< step.lowerBound])
+        guard declarations.components(separatedBy: "T mk[4];").count == 2,
+              declarations.components(separatedBy: "kk[4][qk_per_thread];").count == 2,
+              declarations.components(separatedBy: "vv[4][v_per_thread];").count == 2,
+              !declarations.contains("nmpf_"), !loads.contains("nmpf_"),
+              loads.components(separatedBy: "i + u * BN").count == 3,
+              loads.components(separatedBy: "fm[u * BN * mask_kv_seq_stride]").count == 2,
+              dots.components(separatedBy: "simd_sum(score)").count == 2,
+              updates.components(separatedBy: "if (mk[u] >= Limits<T>::finite_min)").count == 2
+        else { return nil }
+        var nextDeclarations = declarations
+        var nextLoads = loads
+        for name in ["mk", "kk", "vv"] {
+            guard nextDeclarations.components(separatedBy: name + "[").count == 2,
+                  nextLoads.components(separatedBy: name + "[").count == 2 else { return nil }
+            nextDeclarations = nextDeclarations.replacingOccurrences(of: name + "[", with: "nmpf_" + name + "[")
+            nextLoads = nextLoads.replacingOccurrences(of: name + "[", with: "nmpf_" + name + "[")
+        }
+        nextLoads = nextLoads
+            .replacingOccurrences(of: "i + u * BN", with: "i + (u + 4) * BN")
+            .replacingOccurrences(of: "fm[u * BN * mask_kv_seq_stride]",
+                                  with: "fm[(u + 4) * BN * mask_kv_seq_stride]")
+        let carry = """
+            if (nmpf_more) {
+              for (int u = 0; u < 4; u++) {
+                mk[u] = nmpf_mk[u];
+                for (int j = 0; j < qk_per_thread; j++) { kk[u][j] = nmpf_kk[u][j]; }
+                for (int j = 0; j < v_per_thread; j++) { vv[u][j] = nmpf_vv[u][j]; }
+              }
+            }
+
+            """
+        let replacement = declarations + "if (i + 3 * BN < N) {\n" + loads + "}\n"
+            + loop + dots
+            + "const bool nmpf_more = i + 7 * BN < N;\n" + nextDeclarations
+            + "if (nmpf_more) {\n" + nextLoads + "}\n"
+            + updates + carry + advance + "}\n"
+        return String(source[..<loopRange.lowerBound]) + replacement + String(source[remainderRange.lowerBound...])
+    }
+
+    private static func tuneKernel(_ g: NemotronDraftPagedPipeline.Geometry, own: Bool, fenced: Bool) -> MLXFast.MLXFastKernel? {
+        let name = "nemotron_draft_tune_sdpa_\(g)" + (own ? "_own" : "") + (fenced ? "_fe" : "")
+        return NemotronDraftPagedPipeline.cached(name) {
+            tuneSource(g, own: own).map {
+                MLXFast.metalKernel(
+                    name: name,
+                    inputNames: ["queries", "storage", "pages", "prm", "fmask", "scale", "fence"]
+                        + (own ? ["own_keys", "own_values"] : []) + (fenced ? ["live"] : []) + ["dep"],
+                    outputNames: ["out"] + (fenced ? ["fence_out"] : []),
+                    source: (fenced ? fenceStore : "") + $0, ensureRowContiguous: false)
+            }
+        }
+    }
+
+    /// The paged launch's outputs through the incumbent kernels (`g` nil) or through `NemotronDraftPagedPipeline`'s sdpa
+    /// kernel of geometry `g` (`tuneSource`; its unread `dep` input bound last). Nil outside the served shapes.
+    static func tuneOutputs(
+        _ g: NemotronDraftPagedPipeline.Geometry?, queries: MLXArray, read: CBv2PagedDirectRead,
+        own: (keys: MLXArray, values: MLXArray)?, scale: Float, mask: MLXArray, live: MLXArray?, dep: MLXArray
     ) -> [MLXArray]? {
         let n = read.count + (own == nil ? 0 : 1)
         guard pagedEnabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               servesPaged(read), queries.shape == [1, 32, 1, 128], queries.dtype == .bfloat16,
               (1 ..< 1024).contains(n), mask.shape == [1, 1, 1, n], mask.dtype == .bfloat16,
               live.map({ $0.shape == [1] && $0.dtype == .int32 }) ?? true,
-              let kernel = live == nil
+              let kernel = g.map({ tuneKernel($0, own: own != nil, fenced: live != nil) }) ?? (live == nil
                 ? (own == nil ? pagedKernel : pagedOwnKernel)
-                : (own == nil ? pagedFencedKernel : pagedOwnFencedKernel)
+                : (own == nil ? pagedFencedKernel : pagedOwnFencedKernel))
         else { return nil }
         if let own {
             guard own.keys.shape == [1, 2, 1, 128], own.values.shape == [1, 2, 1, 128],
@@ -2522,7 +2623,7 @@ extension NemotronMTPDraftSDPA {
         }
         let prm = MLXArray([Int32(read.count), Int32(read.firstSlot), Int32(read.valueOffset)])
         let inputs = [queries, read.storage, read.pages, prm, mask, scaleArray(scale), read.writeFence]
-            + (own.map { [$0.keys, $0.values] } ?? []) + (live.map { [$0] } ?? [])
+            + (own.map { [$0.keys, $0.values] } ?? []) + (live.map { [$0] } ?? []) + (g == nil ? [] : [dep])
         return kernel(
             inputs, template: [("T", DType.bfloat16), ("D", 128), ("V", 128), ("OWN", own != nil),
                                ("KVH", 2), ("PS", 16)],

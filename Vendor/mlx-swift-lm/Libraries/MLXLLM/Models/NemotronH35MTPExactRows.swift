@@ -718,7 +718,7 @@ private let nemotronHeadPreparedQMVSource = nemotronHeadPreparedQMVTail8
 /// softplus and clip expressions of `nemotron_packed_conv_silu_dt`. Every
 /// channel is produced once, by the simdgroup that computed it; the separate
 /// conv/timestep launch is not needed. The projection itself is unchanged.
-private let nemotronMambaInProjConvDtEpilogue = """
+private let nemotronMambaInProjConvDtEpilogueText = """
 
   // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). The
   // BF16 outputs it needs are read back from this simdgroup's own stores.
@@ -731,6 +731,7 @@ private let nemotronMambaInProjConvDtEpilogue = """
       const int o = out_row + row;
       if (o >= CS && o < CS + CC) {
         const int64_t channel = int64_t(o - CS);
+        NEP_LOADS
         if (t < 3) {
           padded[int64_t(t) * CC + channel] =
               oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
@@ -772,6 +773,77 @@ private let nemotronMambaInProjConvDtEpilogue = """
     }
   }
 """
+
+/// NEMOTRON_MTP_INPROJ_EPILOGUE_LOADS_FIRST=0 keeps the record epilogue's order, where a conv lane loads the old
+/// state, the conv weights and bias, and its window outputs after its first `padded` store. Otherwise the lane
+/// loads all of them into registers first (`nep_*`: the three old-state rows, the window's R outputs of its row,
+/// the four weights and the bias, the same addresses) and the statements below read the registers; every
+/// product, sum, rounding and store is the record's.
+let nemotronInProjEpilogueLoadsFirst =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_LOADS_FIRST"] != "0"
+private let nemotronMambaInProjConvDtEpilogue: String = {
+    let s = nemotronMambaInProjConvDtEpilogueText
+    guard nemotronInProjEpilogueLoadsFirst else { return s.replacingOccurrences(of: "        NEP_LOADS\n", with: "") }
+    let loads = """
+            const T nep_o0 = oldState[0 * oldState_strides[1] + channel * oldState_strides[2]];
+            const T nep_o1 = oldState[1 * oldState_strides[1] + channel * oldState_strides[2]];
+            const T nep_o2 = oldState[2 * oldState_strides[1] + channel * oldState_strides[2]];
+            T nep_y[R];
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < R; ++k) {
+              nep_y[k] = yp[k * out_vec_size + row];
+            }
+            const auto nep_w0 = cw[channel * cw_strides[0] + int64_t(0) * cw_strides[1]];
+            const auto nep_w1 = cw[channel * cw_strides[0] + int64_t(1) * cw_strides[1]];
+            const auto nep_w2 = cw[channel * cw_strides[0] + int64_t(2) * cw_strides[1]];
+            const auto nep_w3 = cw[channel * cw_strides[0] + int64_t(3) * cw_strides[1]];
+            const auto nep_b = cb[channel * cb_strides[0]];
+
+    """
+    let swaps: [(String, String)] = [
+        ("        NEP_LOADS\n", loads),
+        ("""
+                  padded[int64_t(t) * CC + channel] =
+                      oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        """, """
+                  padded[int64_t(t) * CC + channel] = t == 0 ? nep_o0 : (t == 1 ? nep_o1 : nep_o2);
+        """),
+        ("padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];",
+         "T nep_yt = nep_y[0];\n        _Pragma(\"clang loop unroll(full)\")\n"
+            + "        for (int k = 1; k < R; ++k) { nep_yt = t == k ? nep_y[k] : nep_yt; }\n"
+            + "        padded[(int64_t(t) + 3) * CC + channel] = nep_yt;"),
+        ("""
+                for (int i = 0; i < 4; ++i) {
+                  int64_t crow = int64_t(t) + int64_t(i);
+                  T value = crow < 3
+                      ? oldState[crow * oldState_strides[1] + channel * oldState_strides[2]]
+                      : yp[(crow - 3) * out_vec_size + row];
+                  acc += static_cast<float>(value)
+                      * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+                }
+        """, """
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < 4; ++i) {
+                  int64_t crow = int64_t(t) + int64_t(i);
+                  T value = nep_y[0];
+                  _Pragma("clang loop unroll(full)")
+                  for (int k = 1; k < R; ++k) { value = crow - 3 == int64_t(k) ? nep_y[k] : value; }
+                  value = crow == 0 ? nep_o0 : (crow == 1 ? nep_o1 : (crow == 2 ? nep_o2 : value));
+                  acc += static_cast<float>(value)
+                      * (i == 0 ? nep_w0 : (i == 1 ? nep_w1 : (i == 2 ? nep_w2 : nep_w3)));
+                }
+        """),
+        ("T xc = convolved + cb[channel * cb_strides[0]];", "T xc = convolved + nep_b;"),
+    ]
+    var out = s
+    for (from, to) in swaps {
+        guard out.components(separatedBy: from).count == 2 else {
+            return s.replacingOccurrences(of: "        NEP_LOADS\n", with: "")
+        }
+        out = out.replacingOccurrences(of: from, with: to)
+    }
+    return out
+}()
 
 /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS: the in_proj launch whose epilogue takes
 /// its row's BF16 outputs from registers instead of reading them back from its
@@ -984,6 +1056,11 @@ enum NemotronMambaInProjConvDt {
     private static var regsAvailable: Bool {
         kernelRegs != nil && dictKernelRegs != nil && kernelU2Regs != nil && dictKernelU2Regs != nil
     }
+    /// `NemotronQMVTune`: the record launch's source before the dictionary and unroll transforms (prepared body +
+    /// epilogue, or its register-epilogue form).
+    static func tuneBase(regs: Bool) -> String? {
+        regs ? nemotronInProjRegsSource() : nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue
+    }
 
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
@@ -993,7 +1070,8 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil,
+        qmvTune: NemotronQMVTune.Config? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -1021,14 +1099,18 @@ enum NemotronMambaInProjConvDt {
                 : (dict != nil ? dictKernelRegs : kernelRegs)
             if let twin { chosen = twin }
         }
+        // NemotronQMVTune: the adopted geometry of the dictionary launch (`qmvTune`: a load-time check's).
+        let tuned = dict != nil ? NemotronQMVTune.inProjLaunch(qmvTune, production: u2 == nil && regs == nil) : nil
+        if let tuned { chosen = tuned.0 }
+        let launchRPS = tuned?.2 ?? 2, launchNSG = tuned?.3 ?? 2
         let outputs = chosen(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
             template: [("T", DType.bfloat16), ("R", rows), ("FAST", false), ("RELU2", false),
-                       ("RPS", 2), ("CS", convStart), ("CC", convDim),
-                       ("DS", convStart + convDim), ("NH", heads)],
-            grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                       ("RPS", launchRPS), ("CS", convStart), ("CC", convDim),
+                       ("DS", convStart + convDim), ("NH", heads)] + (tuned?.1 ?? []),
+            grid: (32, n / launchRPS, 1), threadGroup: (32, launchNSG, 1),
             outputShapes: [[rows, n], [1, rows, convDim], [1, rows + 3, convDim], [1, rows, heads]],
             outputDTypes: [.bfloat16, .bfloat16, .bfloat16, .float32])
         // Self-test: the projection against the multi-row route on the same
@@ -1155,6 +1237,8 @@ enum NemotronHeadPreparedActivation {
     static let preparedHalfSource = nemotronSwapped(
         nemotronHeadPreparedQMVSource, nemotronPreparedHalfSwaps)
     static let preparedHalfHeader = nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader
+    /// `NemotronQMVTune`: the crown prepared body (the HF body is `preparedHalfSource`).
+    static var crownSource: String { nemotronHeadPreparedQMVSource }
     static let projectHalf = MLXFast.metalKernel(
         name: "nemotron_head_prepared_qmv_hf", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
         outputNames: ["y"], source: preparedHalfSource, header: preparedHalfHeader)
@@ -1366,7 +1450,8 @@ enum NemotronHeadPreparedActivation {
         let packed = [packed]
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         if NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, rps, nsg)? = dictLaunch(k: k, n: n, rps: 2) {
+           case let (kernel, hf, rps, nsg)? = NemotronQMVTune.preparedLaunch(k: k, n: n, relu2: false, u2: false)
+               ?? dictLaunch(k: k, n: n, rps: 2) {
             return kernel([q.weight, d.index, d.table, packed[0], args.0, args.1],
                 template: [("T", DType.bfloat16), ("R", 3), ("FAST", k % 512 == 0),
                            ("RELU2", false), ("RPS", rps)] + hf,
@@ -1443,7 +1528,8 @@ enum NemotronHeadPreparedActivation {
 
     /// `u2`: the R = 3 launch's unroll-by-two twin (nil: the admitted family, `NemotronU2.prepared`).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
-                      prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil) -> MLXArray {
+                      prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil,
+                      qmvTune: NemotronQMVTune.Config? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
@@ -1453,7 +1539,8 @@ enum NemotronHeadPreparedActivation {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let unroll = rows == 3 && (u2 ?? NemotronU2.prepared(rows: rows, n: n))
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q),
-           case let (kernel, hf, launchRPS, nsg)? = dictLaunch(k: k, n: n, rps: rps, u2: unroll) {
+           case let (kernel, hf, launchRPS, nsg)? = NemotronQMVTune.preparedLaunch(
+               k: k, n: n, relu2: relu2, u2: unroll, config: qmvTune) ?? dictLaunch(k: k, n: n, rps: rps, u2: unroll) {
             return kernel([q.weight, d.index, d.table, packed, args.0, args.1],
                 template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2), ("RPS", launchRPS)] + hf,
                 grid: (32, n / launchRPS, 1), threadGroup: (32, nsg, 1),
@@ -3024,7 +3111,7 @@ enum NemotronMTPVerifySDPA {
     ) -> [MLXArray]? {
         guard verified else { return nil }
         if preparedVerified,
-           let (out, prepared) = (fastVerified ? fastPrepared(queries, keys, values, scale) : nil)
+           let (out, prepared) = (fastVerified && !perRowAdopted ? fastPrepared(queries, keys, values, scale) : nil)
                ?? mergedPrepared(queries, keys, values, scale) {
             let outputs = split(out)
             pendingPrepared = (ObjectIdentifier(outputs[0]), prepared)
@@ -3108,6 +3195,135 @@ enum NemotronMTPVerifySDPA {
         if verified { qualifyPrepared(scaleBits.sorted()) }
         if verified { qualifyOneBarrier(scaleBits.sorted()) }
         if verified { qualifyFast(scaleBits.sorted()) }
+    }
+
+    /// NEMOTRON_SDPA_TUNE=0 keeps the launch selected above (one threadgroup per query head once `qualifyFast`
+    /// passed). Otherwise `tune` times that launch and the per-row prepared launch it was checked against
+    /// (`mergedPrepared`: 32 x 3 threadgroups, the aggregation selected above) and adopts the per-row launch only
+    /// when it is at least 3% faster. NEMOTRON_SDPA_FORCE=1 adopts the per-row launch, 0 keeps the per-head launch.
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] != "0"
+    static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SDPA_FORCE"] ?? "")
+    nonisolated(unsafe) private static var perRowAdopted = false
+
+    /// Load time, after `qualify`, before any verify graph is traced: with seeded caches per full-attention layer at
+    /// that layer's scale and key counts of a decode window (491, 555, 619), the per-head and per-row launches run
+    /// round robin (rotating start, median) as one chain per sample in which each launch takes the previous launch's
+    /// output rows as its queries (so the launches run one after another, as the verify's attention layers do), after
+    /// one chain of each was compared bit for bit (output rows and prepared activation of every launch). The per-row
+    /// launch is adopted only when it is at least 3% faster.
+    static func tune(_ target: Module) {
+        perRowAdopted = false
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data(
+                "nemotron sdpa tune: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
+        }
+        guard tuneEnabled else { return report("off (setting)") }
+        guard verified, preparedVerified, fastVerified else { return report("off (per-head launch not in use)") }
+        var layerScales: [Float] = []
+        for module in target.modules() {
+            guard let attention = module as? NemotronHAttention, attention.numHeads == 32,
+                  attention.numKeyValueHeads == 2, attention.headDim == 128 else { continue }
+            layerScales.append(attention.scale)
+        }
+        guard !layerScales.isEmpty else { return report("off (no 32 x 2 x 128 attention layer)") }
+        let keyCounts = [491, 555, 619]
+        let capacity = keyCounts.max()! + 37
+        var caches: [(MLXArray, MLXArray)] = []
+        var start: MLXArray = MLXArray(0)
+        do {
+            try withError {
+                for l in layerScales.indices {
+                    let k = MLXRandom.normal([1, 2, capacity, 128], dtype: .bfloat16, scale: 1,
+                                             key: MLXRandom.key(UInt64(0x5d70 + 2 * l)))
+                    let v = MLXRandom.normal([1, 2, capacity, 128], dtype: .bfloat16, scale: 1,
+                                             key: MLXRandom.key(UInt64(0x5d71 + 2 * l)))
+                    caches.append((k, v))
+                }
+                start = MLXRandom.normal([1, 3, 4096], dtype: .bfloat16, scale: 1, key: MLXRandom.key(0x5d6f))
+                eval(caches.flatMap { [$0.0, $0.1] } + [start])
+            }
+        } catch {
+            return report("off (inputs: \(error))")
+        }
+        let chain = layerScales.count * keyCounts.count
+        // One chain: (output rows, prepared activation) of every launch; nil when a launch is unavailable.
+        func run(_ perRow: Bool) -> [MLXArray]? {
+            var queries = start.reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+            var outs: [MLXArray] = []
+            for (l, scale) in layerScales.enumerated() {
+                for keys in keyCounts {
+                    let k = caches[l].0[.ellipsis, ..<keys, 0...], v = caches[l].1[.ellipsis, ..<keys, 0...]
+                    guard let (out, prepared) = perRow ? mergedPrepared(queries, k, v, scale)
+                        : fastPrepared(queries, k, v, scale) else { return nil }
+                    outs += [out, prepared]
+                    queries = out.reshaped(1, 3, 32, 128).transposed(0, 2, 1, 3)
+                }
+            }
+            return outs
+        }
+        var same = false
+        var medians: [Double] = []
+        var reps = 0
+        var failure: String?
+        do {
+            try withError {
+                guard let a = run(false), let b = run(true) else { failure = "launch unavailable"; return }
+                eval(a + b)
+                var ok = MLXArray(true)
+                for (i, (x, y)) in zip(a, b).enumerated() {
+                    let dtype: DType = i % 2 == 0 ? .uint16 : .uint32
+                    ok = ok .&& (x.view(dtype: dtype) .== y.view(dtype: dtype)).all()
+                }
+                same = ok.item(Bool.self)
+                guard same else { failure = "per-row launch differs"; return }
+                // A round: both launches' chains built first, then evaluated back to back in `order`.
+                func round(_ order: [Int]) -> [Double?] {
+                    let chains = order.map { run($0 == 1) }
+                    return chains.map { outs -> Double? in
+                        guard let outs else { return nil }
+                        let begin = DispatchTime.now().uptimeNanoseconds
+                        eval(outs)
+                        Stream.gpu.synchronize()
+                        return Double(DispatchTime.now().uptimeNanoseconds - begin) / 1e6 / Double(chain)
+                    }
+                }
+                var wall = 0.0
+                for _ in 0 ..< 2 {
+                    let begin = DispatchTime.now().uptimeNanoseconds
+                    _ = round([0, 1])
+                    wall = Double(DispatchTime.now().uptimeNanoseconds - begin) / 1e6
+                }
+                reps = max(7, min(61, Int(100 / max(wall, 0.01))))
+                var samples: [[Double]] = [[], []]
+                for rep in 0 ..< reps {
+                    let order = rep % 2 == 0 ? [0, 1] : [1, 0]
+                    for (i, ms) in zip(order, round(order)) {
+                        if let ms { samples[i].append(ms) }
+                    }
+                }
+                guard samples.allSatisfy({ $0.count == reps }) else { failure = "timing incomplete"; return }
+                medians = samples.map { $0.sorted()[$0.count / 2] }
+            }
+        } catch {
+            failure = "error: \(error)"
+        }
+        var why = "kept"
+        if failure == nil, medians.count == 2 {
+            if let f = tuneForced {
+                perRowAdopted = f == 1
+                why = f == 1 ? "forced" : f == 0 ? "forced V0" : "forced \(f) not qualified, kept"
+            } else if medians[1] <= 0.97 * medians[0] {
+                perRowAdopted = true
+                why = "adopted"
+            }
+        }
+        func ms(_ i: Int) -> String { i < medians.count ? String(format: "%.4f", medians[i]) : "n/a" }
+        report("\(why) \(perRowAdopted ? "rows" : "V0") \(ms(perRowAdopted ? 1 : 0)) ms vs V0 (heads) \(ms(0)) ms"
+            + " per launch (median of \(reps), \(chain) chained launches/sample on \(layerScales.count) layers;"
+            + " \(same ? 1 : 0)/1 bitwise over \(chain) launches and the 58 cases of the per-head check"
+            + (medians.count == 2 ? "; [rows \(ms(1))]" : "") + (failure.map { "; dropped: rows \($0)" } ?? "") + ")")
     }
 
     /// Load time: `fastPrepared` against `mergedPrepared` (the launch it replaces, with the aggregation selected
@@ -5327,3 +5543,430 @@ enum NemotronScreenPicks {
         return Bests(values: values.asType(.float32), ids: ids.asType(.int32))
     }
 }
+
+// MARK: - Standalone four-key draft SDPA producer/consumer pipeline
+// Keeps all incumbent C315 tunes unchanged. Original 64-bit addresses and FP32 staging are exact C315.
+// Only next-four readonly loads move before current softmax, with identical per-key arithmetic order.
+// No other ED draft/seed family, geometry expansion or existing-tune adoption/budget change is imported.
+enum NemotronDraftPagedPipeline {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_SDPA_PIPELINE"] != "0"
+    static let forced: (all: Int?, families: [Family: Int]) = {
+        let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_SDPA_PIPELINE_FORCE"] ?? ""
+        if let n = Int(value) { return (n, [:]) }
+        var out: [Family: Int] = [:]
+        for item in value.split(whereSeparator: { $0 == "," || $0 == "+" }) {
+            let parts = item.split(separator: ":")
+            guard parts.count == 2, let f = Family(rawValue: String(parts[0])), let n = Int(parts[1]) else { continue }
+            out[f] = n
+        }
+        return (nil, out)
+    }()
+    // A separate new family; does not extend or replace any incumbent tune's budget.
+    static let budgetSeconds = forced.all != nil || !forced.families.isEmpty ? 60.0 : 3.0
+    static let timedMilliseconds = 100.0
+    enum Family: String, CaseIterable, Sendable { case sdpa }
+
+    struct Geometry: Hashable, Sendable, CustomStringConvertible {
+        /// Outputs (screen: rows) per SIMD group.
+        var rps: Int
+        /// SIMD groups per threadgroup.
+        var nsg: Int
+        /// unroll_count of the main K loops (1: no pragma).
+        var unroll = 1
+        /// fc1: the slot on grid x instead of z.
+        var slotX = false
+        /// ehp: the prepared QMV's main-loop load form.
+        var load = 0
+        /// sdpa: the key offsets (0: the incumbent's 64-bit `nmp_at`, 1: 32-bit, 2: 32-bit from pages in lanes).
+        var keys = 0
+        /// sdpa: the key step's K and V kept as T until their products.
+        var packed = false
+        /// Four-key producer/consumer overlap; the standalone family's only candidate is FORCE index 1.
+        var prefetch4 = false
+        var description: String {
+            "r\(rps)n\(nsg)" + (slotX ? "x" : "") + "u\(unroll)" + (load != 0 ? "l\(load)" : "")
+                + (keys != 0 ? "k\(keys)" : "") + (packed ? "p" : "") + (prefetch4 ? "pf4" : "")
+        }
+    }
+
+    nonisolated(unsafe) private(set) static var adopted: [Family: Geometry] = [:]
+    nonisolated(unsafe) private(set) static var sdpaFenced = false
+
+    static func variants(_ f: Family, _ inc: Geometry) -> [(name: String, g: Geometry)] {
+        let g = Geometry(rps: 1, nsg: 32, unroll: 4, keys: 0, packed: false, prefetch4: true)
+        return [(name: g.description, g: g)]
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel?] = [:]
+    static func cached(_ key: String, _ make: () -> MLXFast.MLXFastKernel?) -> MLXFast.MLXFastKernel? {
+        lock.withLock {
+            if let made = kernels[key] { return made }
+            let made = make()
+            kernels[key] = made
+            return made
+        }
+    }
+
+    private enum Check { case same, differs, unavailable, error }
+
+    /// One family's check, timing and pick. `reference(i)`: case i's outputs through the production launch;
+    /// `launch(g, i)`: through geometry g's tune kernel (nil: it cannot run); `link(g, previous, j)`: timing link j
+    /// through g after `previous` (the link before's value, nil for the first), returning what the next link binds
+    /// as `dep`. Returns the report.
+    private static func run(
+        _ family: Family, incumbent: Geometry, cases: Int, links: Int,
+        reference: (Int) -> [MLXArray]?, launch: (Geometry, Int) -> [MLXArray]?,
+        link: (Geometry, MLXArray?, Int) -> MLXArray?, elapsed: () -> Double, timed: Double = timedMilliseconds
+    ) -> String {
+        var references: [[MLXArray]] = []
+        do {
+            references = try withError { () -> [[MLXArray]] in
+                let outs = (0 ..< cases).compactMap { reference($0) }
+                guard outs.count == cases else { return [] }
+                eval(outs.flatMap { $0 })
+                return outs
+            }
+        } catch {
+            return "off (incumbent: \(error))"
+        }
+        guard references.count == cases else { return "off (incumbent unavailable)" }
+        func check(_ g: Geometry) -> Check {
+            do {
+                return try withError { () -> Check in
+                    var ok = MLXArray(true)
+                    for i in 0 ..< cases {
+                        guard let out = launch(g, i), out.count == references[i].count else { return .unavailable }
+                        for (a, b) in zip(out, references[i]) { ok = logicalAnd(ok, NemotronU2.equal(a, b)) }
+                    }
+                    return ok.item(Bool.self) ? .same : .differs
+                }
+            } catch {
+                return .error
+            }
+        }
+        let twin = check(incumbent)
+        guard twin == .same else { return "off (V0 twin \(incumbent): \(twin))" }
+        let all = variants(family, incumbent)
+        var alive: [(name: String, g: Geometry, index: Int)] = []
+        var dropped: [String] = []
+        for (i, v) in all.enumerated() where v.g != incumbent {
+            guard elapsed() < budgetSeconds else {
+                dropped.append("\(v.name) budget")
+                continue
+            }
+            switch check(v.g) {
+            case .same: alive.append((v.name, v.g, i + 1))
+            case .differs: dropped.append("\(v.name) differs")
+            case .unavailable: dropped.append("\(v.name) n/a")
+            case .error: dropped.append("\(v.name) error")
+            }
+        }
+
+        // Time V0's twin and the survivors round robin (`NemotronDraftPipelineAdoption.order`): one chain of `links` launches
+        // per sample, each binding the previous launch's output as `dep`, built before the clock starts; median ms per
+        // launch.
+        let checked = elapsed()
+        let candidates = [incumbent] + alive.map(\.g)
+        var medians: [Double] = []
+        var verdict: NemotronDraftPipelineAdoption.Verdict? = nil
+        var reps = 0
+        if !alive.isEmpty, elapsed() >= budgetSeconds {
+            dropped.append("timing skipped (load budget)")
+        } else if !alive.isEmpty {
+            var samples = Array(repeating: [Double](), count: candidates.count)
+            do {
+                try withError {
+                    func build(_ c: Int) -> MLXArray? {
+                        var previous: MLXArray? = nil
+                        for j in 0 ..< links {
+                            guard let out = link(candidates[c], previous, j) else { return nil }
+                            previous = out
+                        }
+                        return previous
+                    }
+                    func round(_ order: [Int]) -> [Double?] {
+                        let chains = order.map { build($0) }
+                        return chains.map { last -> Double? in
+                            guard let last else { return nil }
+                            let start = DispatchTime.now().uptimeNanoseconds
+                            eval(last)
+                            Stream.gpu.synchronize()
+                            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 / Double(links)
+                        }
+                    }
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    _ = round(Array(candidates.indices))
+                    let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+                    reps = NemotronDraftPipelineAdoption.cycles(target: timed, wall: wall, cap: 41)
+                    for rep in 0 ..< reps {
+                        let order = NemotronDraftPipelineAdoption.order(candidates.count, cycle: rep)
+                        for (i, ms) in zip(order, round(order)) {
+                            if let ms { samples[i].append(ms) }
+                        }
+                    }
+                }
+            } catch {
+                dropped.append("timing error")
+            }
+            if reps > 0, samples.allSatisfy({ $0.count == reps }) {
+                verdict = NemotronDraftPipelineAdoption.decide(samples)
+                medians = verdict?.medians ?? []
+            } else {
+                dropped.append("timing incomplete")
+            }
+        }
+
+        var picked: (name: String, g: Geometry, index: Int)? = nil
+        var why = "kept"
+        if let f = forced.families[family] ?? forced.all {
+            if let p = alive.first(where: { $0.index == f }) {
+                picked = p
+                why = "forced"
+            } else {
+                why = f == 0 ? "forced V0" : "forced \(f) not qualified, kept"
+            }
+        } else if medians.count == candidates.count, let best = verdict?.adopted {
+            picked = alive[best - 1]
+            why = "adopted"
+        }
+        if let picked { adopted[family] = picked.g }
+
+        func ms(_ i: Int) -> String { i < medians.count ? String(format: "%.4f", medians[i]) : "n/a" }
+        let pickedSlot = picked.flatMap { p in alive.firstIndex(where: { $0.index == p.index }).map { $0 + 1 } } ?? 0
+        let times = alive.indices.map { "\(alive[$0].name) \(ms($0 + 1)) \(verdict?.won($0 + 1) ?? "n/a")" }
+        let rule = verdict?.rule({ alive[$0 - 1].name }) ?? "no candidate timed"
+        return "\(why) \(picked?.name ?? "V0") \(ms(pickedSlot)) ms vs V0 (\(incumbent)) \(ms(0)) ms per launch"
+            + " (\(rule); median of \(reps) cycles, \(links) chained launches/sample;"
+            + " \(alive.count)/\(all.count) bitwise over"
+            + " \(cases) cases by \(String(format: "%.2f", checked)) s, V0 twin bitwise"
+            + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
+            + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(8).joined(separator: ", ")) + ")"
+    }
+
+    /// sdpa (load time, after `NemotronMTPDraftSDPA.qualifyFence`: the family needs the paged draft attention
+    /// qualified): the first and second drafts' attention over the head cache's pages at R = 1
+    /// (`NemotronMTPDraftSDPA.tuneSource`; incumbent r1n32u4: one 1024-thread threadgroup per query head, four keys
+    /// per step, 64-bit key offsets). The production form (fenced once its check passed, else plain) of each variant
+    /// and of V0's twin against the production launch, bit for bit (output and emitted fence), on seeded paged
+    /// storage laid out as the head cache's segment ([2, pages, 2, 16, 128] BF16, scattered local pages, first slots
+    /// 0 ... 15): key counts across the 32-key, four- and eight-key-step and 16-slot page boundaries up to 1022 and the
+    /// decode window's counts, with and without the own row, masks with a -inf tail and scattered -inf keys, query
+    /// and key scales 1 to 16, zero and -0 queries (every score ties), one repeated key row with -0 values (ties
+    /// between keys) and scales where all but the largest exponentials underflow. Timing chains alternate the first
+    /// draft's launch over a cold copy of the storage and the second's (own row) over the same copy, key counts 491
+    /// ... 619, 128 copies (~90 MB), each launch binding the previous output as `dep`.
+    static func tuneSDPA(_ block: NemotronH35MTPAttentionBlock) {
+        adopted[.sdpa] = nil
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data(
+                "nemotron draft tune sdpa: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
+        }
+        guard enabled else { return report("off (setting)") }
+        guard !NemotronMoELeader.selfTest, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
+        else { return report("off (not applicable)") }
+        guard NemotronMTPDraftSDPA.pagedEnabled, NemotronMTPDraftSDPA.pagedVerified, NemotronMTPDraftSDPA.verified
+        else { return report("off (the paged draft launch is off)") }
+        let fenced = NemotronMTPDraftSDPA.fenceEnabled && NemotronMTPDraftSDPA.fenceVerified
+        sdpaFenced = fenced
+        let scale = block.mixer.scale
+        typealias Own = (keys: MLXArray, values: MLXArray)
+        func ownRow(_ kvScale: Float, _ key: MLXArray) -> Own {
+            let k = MLXRandom.split(key: key, into: 2)
+            return (MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: k[0])
+                        .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3),
+                    MLXRandom.normal([1, 256], dtype: .bfloat16, scale: kvScale, key: k[1])
+                        .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3))
+        }
+        /// A seeded segment holding `count` keys from `firstSlot` (spare pages; the range's pages a scattered
+        /// permutation, never page 0). `ties`: one repeated key row and -0 for the small values.
+        func segment(_ count: Int, firstSlot: Int, kvScale: Float, ties: Bool, key: MLXArray) -> CBv2PagedDirectRead {
+            let k = MLXRandom.split(key: key, into: 3)
+            let pageCount = (firstSlot + count + 15) / 16
+            let segmentPages = pageCount + 9
+            var storage = MLXRandom.normal([2, segmentPages, 2, 16, 128], dtype: .bfloat16, scale: kvScale, key: k[0])
+            if ties {
+                let row = MLXRandom.normal([1, 1, 1, 1, 128], dtype: .bfloat16, scale: kvScale, key: k[2])
+                let values = storage[1 ..< 2]
+                storage = concatenated([
+                    broadcast(row, to: [1, segmentPages, 2, 16, 128]),
+                    which(abs(values) .< MLXArray(0.5 * kvScale), MLXArray(-Float(0)).asType(.bfloat16), values),
+                ], axis: 0)
+            }
+            let order = argSort(MLXRandom.uniform(Float(0) ..< 1, [segmentPages - 1], key: k[1]))
+            return CBv2PagedDirectRead(
+                storage: storage, valueOffset: segmentPages * 2 * 16 * 128,
+                pages: (order[..<pageCount] + Int32(1)).asType(.int32), firstSlot: firstSlot, count: count,
+                kvHeads: 2, headDim: 128, pageSize: 16, dtype: .bfloat16, offset: count,
+                writeFence: MLXArray.zeros([1], dtype: .int32))
+        }
+        func mask(_ count: Int, own: Bool, tail: Int, drop: MLXArray?) -> MLXArray {
+            let n = count + (own ? 1 : 0)
+            let position = MLXArray(Int32(0) ..< Int32(n))
+            var keep = position .< Int32(count - min(tail, count - 1))
+            if own { keep = keep .|| (position .== Int32(count)) }
+            if let drop {
+                let dropped = MLXRandom.uniform(Float(0) ..< 1, [n], key: drop) .< MLXArray(Float(0.2))
+                keep = keep .&& (logicalNot(dropped) .|| (position .== Int32(0)))
+            }
+            return which(keep, MLXArray(Float(0)), MLXArray(-Float.infinity)).asType(.bfloat16).reshaped(1, 1, 1, n)
+        }
+
+        // Check cases: count index c, own row off / on (case 2c / 2c + 1); special c % 6 == 1 zero / -0 queries,
+        // 3 repeated key row with -0 values, 5 underflow scales.
+        let counts = [1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128, 129, 224, 225, 255, 256, 257,
+                      352, 481, 491, 511, 512, 513, 555, 600, 619, 1000, 1021, 1022]
+        let inputScales: [(Float, Float)] = [(1, 1), (4, 4), (16, 8)]
+        struct Case {
+            let queries: MLXArray
+            let read: CBv2PagedDirectRead
+            let own: Own?
+            let mask: MLXArray
+            let live: MLXArray?
+        }
+        var cases: [Case] = []
+        for (c, count) in counts.enumerated() {
+            for own in [false, true] {
+                let i = 2 * c + (own ? 1 : 0)
+                let k = MLXRandom.split(key: MLXRandom.key(UInt64(0xD5DD_0000 + i)), into: 5)
+                let special = c % 6
+                let (qScale, kvScale): (Float, Float) = special == 5 ? (64, 8) : inputScales[(c / 2) % inputScales.count]
+                var q = MLXRandom.normal([1, 4096], dtype: .bfloat16, scale: qScale, key: k[0])
+                if special == 1 {
+                    let odd = (MLXArray(Int32(0) ..< Int32(4096)) % 2) .== MLXArray(Int32(1))
+                    q = which(odd, MLXArray(-Float(0)), MLXArray(Float(0))).asType(.bfloat16).reshaped(1, 4096)
+                }
+                cases.append(Case(
+                    queries: q.reshaped(1, 1, 32, 128).transposed(0, 2, 1, 3),
+                    read: segment(count, firstSlot: (c * 5 + (own ? 3 : 0)) % 16, kvScale: kvScale, ties: special == 3,
+                                  key: k[1]),
+                    own: own ? ownRow(kvScale, k[2]) : nil,
+                    mask: mask(count, own: own, tail: c % 4, drop: c % 5 == 4 ? k[3] : nil),
+                    live: fenced ? MLXArray([Int32(100 + i)]) : nil))
+            }
+        }
+        eval(cases.flatMap { [$0.queries, $0.read.storage, $0.read.pages, $0.mask] + ($0.own.map { [$0.keys, $0.values] } ?? []) })
+
+        // Timing copies: one segment per copy at the decode window's key counts, the first draft's mask (one -inf
+        // tail key) and the second's (plus its own row).
+        let copies = 128
+        let timedCounts = [491, 523, 555, 587, 619]
+        let timedMasks = timedCounts.map { (mask($0, own: false, tail: 1, drop: nil), mask($0, own: true, tail: 1, drop: nil)) }
+        let timed = (0 ..< copies).map { c -> (read: CBv2PagedDirectRead, own: Own, masks: (MLXArray, MLXArray)) in
+            let k = MLXRandom.split(key: MLXRandom.key(UInt64(0xD5DE_0000 + c)), into: 2)
+            return (segment(timedCounts[c % timedCounts.count], firstSlot: (c * 7) % 16, kvScale: 1, ties: false,
+                            key: k[0]),
+                    ownRow(1, k[1]), timedMasks[c % timedCounts.count])
+        }
+        let timedQueries = MLXRandom.normal([1, 4096], dtype: .bfloat16, scale: 2, key: MLXRandom.key(0xD5DF))
+            .reshaped(1, 1, 32, 128).transposed(0, 2, 1, 3)
+        let timedLive: MLXArray? = fenced ? MLXArray([Int32(0)]) : nil
+        eval(timed.flatMap { [$0.read.storage, $0.read.pages, $0.own.keys, $0.own.values] } + [timedQueries]
+            + timedMasks.flatMap { [$0.0, $0.1] })
+        let inputsReady = elapsed()
+        let links = 64
+        var nextCopy = 0
+        var chainStart = 0
+        let message = run(
+            .sdpa, incumbent: Geometry(rps: 1, nsg: 32, unroll: 4), cases: cases.count, links: links,
+            reference: { i in
+                let c = cases[i]
+                return NemotronMTPDraftSDPA.tuneOutputs(nil, queries: c.queries, read: c.read, own: c.own, scale: scale,
+                                                        mask: c.mask, live: c.live, dep: c.queries)
+            },
+            launch: { g, i in
+                let c = cases[i]
+                return NemotronMTPDraftSDPA.tuneOutputs(g, queries: c.queries, read: c.read, own: c.own, scale: scale,
+                                                        mask: c.mask, live: c.live, dep: c.queries)
+            },
+            link: { g, previous, j in
+                // Each chain takes the next links / 2 copies (every copy's reuse ~90 MB of reads apart).
+                if j == 0 {
+                    chainStart = nextCopy
+                    nextCopy = (nextCopy + links / 2) % copies
+                }
+                let t = timed[(chainStart + j / 2) % copies]
+                let own = j % 2 == 1
+                return NemotronMTPDraftSDPA.tuneOutputs(
+                    g, queries: timedQueries, read: t.read, own: own ? t.own : nil, scale: scale,
+                    mask: own ? t.masks.1 : t.masks.0, live: timedLive, dep: previous ?? timedQueries)?[0]
+            }, elapsed: elapsed, timed: 200)
+        report((fenced ? "fenced" : "plain") + " forms, inputs by \(String(format: "%.2f", inputsReady)) s, " + message)
+    }
+}
+
+// Counted literal source swaps for this isolated family's worker-created source only.
+func nemotronDraftPipelineCountedSwaps(_ source: String, _ swaps: [(String, String, Int)]) -> String? {
+    var s = source
+    for (old, new, count) in swaps {
+        guard s.components(separatedBy: old).count - 1 == count else { return nil }
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    return s
+}
+
+// The actual source's robust adoption helper is scoped ONLY to this new family.
+// No existing C315 tuner is redirected to this helper.
+enum NemotronDraftPipelineAdoption {
+    /// Fewest timed cycles of a tune.
+    static let minCycles = 16
+    /// An adopted candidate's median is at most this fraction of the incumbent's.
+    static let medianBar = 0.97
+    /// An adopted candidate beats the incumbent in at least this fraction of the cycles.
+    static let winBar = 0.75
+
+    /// The candidates' order in cycle `cycle`: rotated by cycle / 2, reversed on odd cycles. Over each pair of
+    /// cycles every candidate takes mirrored positions and every two candidates run in both orders, so a drift
+    /// within or across cycles weighs on the incumbent and each candidate alike.
+    static func order(_ count: Int, cycle: Int) -> [Int] {
+        let rotated = (0 ..< count).map { ($0 + cycle / 2) % count }
+        return cycle % 2 == 0 ? rotated : Array(rotated.reversed())
+    }
+
+    /// Timed cycles for rounds of `wall` ms: `target` ms worth, at least `minCycles`, at most `cap`, even.
+    static func cycles(target: Double, wall: Double, cap: Int) -> Int {
+        let n = max(minCycles, min(cap, Int(target / max(wall, 0.01))))
+        return n - n % 2
+    }
+
+    struct Verdict {
+        /// Every candidate's median (0: the incumbent).
+        let medians: [Double]
+        /// Cycles in which each candidate was faster than the incumbent (0 for the incumbent).
+        let wins: [Int]
+        let cycles: Int
+        /// The candidate with the lowest median besides the incumbent.
+        let best: Int?
+        /// `best` when it passes both bars.
+        let adopted: Int?
+
+        /// "w/n": candidate i's wins over the cycles.
+        func won(_ i: Int) -> String { i < wins.count ? "\(wins[i])/\(cycles)" : "n/a" }
+
+        /// The rule's inputs: "best <name> <change of the median vs the incumbent's> wins <w>/<n>".
+        func rule(_ name: (Int) -> String) -> String {
+            guard let b = best, medians[0] > 0 else { return "no candidate timed" }
+            return "best \(name(b)) " + String(format: "%+.1f%%", 100 * (medians[b] / medians[0] - 1))
+                + " wins \(won(b))"
+        }
+    }
+
+    /// `samples[i][c]`: candidate i's time in cycle c (i = 0: the incumbent); every candidate has the same cycles.
+    /// `eligible(i)`: whether candidate i may be judged (a tune that drops a candidate after its timing leaves it
+    /// out; its median and wins are still reported).
+    static func decide(_ samples: [[Double]], eligible: (Int) -> Bool = { _ in true }) -> Verdict {
+        let cycles = samples.first?.count ?? 0
+        let medians = samples.map { $0.isEmpty ? Double.nan : $0.sorted()[$0.count / 2] }
+        let wins = samples.map { s in zip(s, samples[0]).filter { $0.0 < $0.1 }.count }
+        let best = medians.indices.dropFirst().filter(eligible).min(by: { medians[$0] < medians[$1] })
+        var adopted: Int? = nil
+        if let b = best, cycles > 0, samples.allSatisfy({ $0.count == cycles }), medians[b] <= medianBar * medians[0],
+           Double(wins[b]) >= winBar * Double(cycles) {
+            adopted = b
+        }
+        return Verdict(medians: medians, wins: wins, cycles: cycles, best: best, adopted: adopted)
+    }
+}
+
