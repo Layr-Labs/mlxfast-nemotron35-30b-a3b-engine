@@ -23,10 +23,15 @@ final class NemotronMTPPendingSSM {
         let anchor: MLXArray, conv: MLXArray, dt: MLXArray
         let steps: Int
     }
-    static let maxSteps = 4
+    static let maxSteps = min(max(Int(
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_PENDING_STEPS"] ?? "") ?? 8, 1), 8)
+    static let baseSteps = min(4, maxSteps)
     static let requested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_PENDING_FOLD"] != "0"
+    static let warmsSteps =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_WARMUP_PENDING"] != "0"
     nonisolated(unsafe) static var qualified = false
+    nonisolated(unsafe) private(set) static var limit = 0
     static var enabled: Bool { requested && qualified }
 
     private final class Entry {
@@ -42,7 +47,7 @@ final class NemotronMTPPendingSSM {
 
     /// `state` is the replay of `pending.steps` steps of `pending` from its anchor.
     static func register(_ state: MLXArray, _ pending: Pending) {
-        guard enabled, (1 ... maxSteps).contains(pending.steps) else { return }
+        guard enabled, (1 ... limit).contains(pending.steps) else { return }
         lock.withLock {
             entries = entries.filter { $0.value.state != nil }
             entries[ObjectIdentifier(state)] = Entry(state, pending)
@@ -83,6 +88,7 @@ final class NemotronMTPPendingSSM {
         }
         let convDim = mixer.convDim
         let projectedWidth = mixer.intermediateSize + convDim + heads
+        var passed = 0
         for steps in 1 ... maxSteps {
             let pconv = MLXArray(values(steps * convDim, -2, 2), [1, steps, convDim]).asType(.bfloat16)
             let pdt = MLXArray(values(steps * heads, 0.01, 0.5), [1, steps, heads])
@@ -103,13 +109,21 @@ final class NemotronMTPPendingSSM {
                     convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: anchor,
                     projected: projected, heads: heads, headDim: dim, groups: groups,
                     stateDim: stateDim, pending: (pconv, pdt, steps))
-            else { return report("off (fused launch unavailable)") }
+            else {
+                if steps <= baseSteps { return report("off (fused launch unavailable)") }
+                break
+            }
             eval(reference.0, reference.1, reference.2, folded.0, folded.1, folded.2)
             guard bits(reference.0, folded.0), bits(reference.1, folded.1), bits(reference.2, folded.2)
-            else { return report("off (folded launch differs at \(steps) pending steps)") }
+            else {
+                if steps <= baseSteps { return report("off (folded launch differs at \(steps) pending steps)") }
+                break
+            }
+            passed = steps
         }
+        limit = passed
         qualified = true
-        report("on (1...\(maxSteps) pending steps bitwise equal to replay + launch)")
+        report("on (1...\(passed) pending steps bitwise equal to replay + launch)")
     }
 }
 
@@ -490,7 +504,8 @@ extension NemotronHMamba2Mixer {
            q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
            q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
            var fused = norm.compactSSMPreparedRows(
-               convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
+               convolution: convolution, ALog: logA, D: skip, dt: dt,
+               state: NemotronStateReadAhead.after(initialSSM, anchor: inputPrepared ?? hiddenStates),
                projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
                pending: pending) {
             if NemotronMoELeader.selfTest {
@@ -715,5 +730,34 @@ extension NemotronH35Model {
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
+    }
+}
+
+/// NEMOTRON_MTP_STATE_AHEAD=0 turns it off. Otherwise a launch that reads the
+/// layer's SSM state once and writes nothing the decode reads, bound to the
+/// in_proj operand so MLX encodes it beside the in_proj launch; the state the
+/// SSM launch reads is the same array, with that launch as a dependency.
+enum NemotronStateReadAhead {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_STATE_AHEAD"] != "0"
+    static let threads = Int(ProcessInfo.processInfo.environment["NEMOTRON_MTP_STATE_AHEAD_THREADS"] ?? "") ?? 16384
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_state_read_ahead",
+        inputNames: ["w", "anchor"], outputNames: ["sink"],
+        source: """
+          const uint gid = thread_position_in_grid.x;
+          const uint total = threads_per_grid.x;
+          const device uint4* w4 = (const device uint4*)w;
+          uint4 acc = uint4(0);
+          for (uint i = gid; i < uint(NV); i += total) acc ^= w4[i];
+          const uint v = acc.x ^ acc.y ^ acc.z ^ acc.w;
+          if (v == 0x9e3779b9u) sink[0] = v + uint(anchor[0] != 0);
+          """)
+
+    static func after(_ state: MLXArray, anchor: MLXArray) -> MLXArray {
+        guard enabled, state.nbytes % 16 == 0 else { return state }
+        let sink = kernel([state, anchor], template: [("NV", state.nbytes / 16)],
+                          grid: (threads, 1, 1), threadGroup: (256, 1, 1),
+                          outputShapes: [[1]], outputDTypes: [.uint32])[0]
+        return depends(input: state.reshaped(-1), dependencies: [sink]).reshaped(state.shape)
     }
 }
