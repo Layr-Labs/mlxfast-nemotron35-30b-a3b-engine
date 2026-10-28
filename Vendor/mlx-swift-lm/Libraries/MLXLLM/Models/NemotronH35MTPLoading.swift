@@ -76,12 +76,14 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
         NemotronMTPDraftRowPick.qualify()
+        NemotronTargetQKV.qualifyVectorStore(target: target, head: assistant.module)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -95,6 +97,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -796,3 +800,5 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry of the carried 3f932e3c tree.
 
 // Measurement entry 1 of this tree.
+
+// Measurement 4 of b8186124 (6820675).
