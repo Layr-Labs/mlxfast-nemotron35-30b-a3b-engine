@@ -2368,6 +2368,64 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+/// Only the actual 63084e18 vector activation stage, preserving scalar fallback.
+/// Its score hoist is deliberately not imported: that moves scores reads into
+/// all512lanes versus128original leader-store reads, and lengthens score liveness.
+enum NemotronZSkipStage16 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_STAGE16"] != "0"
+}
+
+/// The routed slot source with vector staging only; unchanged on a missing anchor.
+private func nemotronZSkipStage16Source(_ source: String) -> String {
+    guard NemotronZSkipStage16.enabled else { return source }
+    var s = source
+    let stage = """
+          for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+            const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+            uint m = 0, unsafe = 0;
+            for (int i = 0; i < 8; i++) {
+              const uint ab = uint(xb[i]) & 0x7fffu;
+              m |= ab != 0 ? (1u << i) : 0u;
+              unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+              xsh[8 * c + i] = xs[8 * c + i];
+            }
+
+        """
+    guard s.components(separatedBy: stage).count == 2
+    else {
+        FileHandle.standardError.write(Data("nemotron zskip stage16: off (source differs)\n".utf8))
+        return source
+    }
+    FileHandle.standardError.write(Data("nemotron zskip stage16: on\n".utf8))
+    s = s.replacingOccurrences(of: stage, with: """
+          const bool nmz_wide = (reinterpret_cast<ulong>(x) & 15) == 0;
+          for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+            uint m = 0, unsafe = 0;
+            if (nmz_wide) {
+              const uint4 xw = *((const device uint4*)(xs + 8 * c));
+              const uint xu[4] = {xw.x, xw.y, xw.z, xw.w};
+              threadgroup uint16_t* xd = (threadgroup uint16_t*)(xsh + 8 * c);
+              for (int i = 0; i < 8; i++) {
+                const uint bits = (xu[i >> 1] >> (16 * (i & 1))) & 0xffffu;
+                const uint ab = bits & 0x7fffu;
+                m |= ab != 0 ? (1u << i) : 0u;
+                unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+                xd[i] = uint16_t(bits);
+              }
+            } else {
+              const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+              for (int i = 0; i < 8; i++) {
+                const uint ab = uint(xb[i]) & 0x7fffu;
+                m |= ab != 0 ? (1u << i) : 0u;
+                unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+                xsh[8 * c + i] = xs[8 * c + i];
+              }
+            }
+
+        """)
+    return s
+}
+
 // MARK: Wide zero-skip tiles (NEMOTRON_ZSKIP_WIDE)
 //
 // The shared-down zero-skip copy only (the routed FC2 copies keep the tile-major layout: the request prefill
@@ -2824,9 +2882,12 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .map(nemotronZSkipStage16Source).map {
         MLXFast.metalKernel(
-            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            name: NemotronZSkipStage16.enabled ? "nemotron_zskip_fc2_slots_tiled_fast_sbd_stage16"
+                : "nemotron_zskip_fc2_slots_tiled_fast_sbd",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
@@ -2844,9 +2905,11 @@ enum NemotronZSkip {
         outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
-    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .map(nemotronZSkipStage16Source).map {
         MLXFast.metalKernel(
-            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
+            name: NemotronZSkipStage16.enabled ? "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_stage16"
+                : "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
             inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,

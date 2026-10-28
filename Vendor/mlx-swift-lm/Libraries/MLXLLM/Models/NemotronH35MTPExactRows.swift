@@ -4386,6 +4386,30 @@ enum NemotronHeadScreen {
             source: $0, header: nemotronMultiRowQMVHeader,
             mutableInputs: ["counter"])
     }
+    /// Delete only selections no consumer in this SIMDgroup reads. Group 0
+    /// still produces every kept id for the closing pass. Other groups stop
+    /// after their last rescore rank and start the unchanged QMV immediately.
+    /// Same selection prefix even for NaNs/ties; no new comparator or barrier.
+    static let prefixSelectEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_PREFIX"] != "0"
+    private static let prefixSelectSource: String? = {
+        guard let original = fusedSelectB1Source else { return nil }
+        let old = "for (int c = 0; c < C; c++) {"
+        guard original.components(separatedBy: old).count == 2 else { return nil }
+        return original.replacingOccurrences(of: old,
+            with: "for (int c = 0; c < (sgid == 0 ? C : min(C, (sgid + 1) * RPSG)); c++) {")
+    }()
+    private static let prefixSelectKernel = prefixSelectSource.map {
+        MLXFast.metalKernel(
+            name: "nemotron_head_screen_select_prefix_affine4_gs64",
+            inputNames: ["scores", "w", "scales", "biases", "x", "counter"],
+            outputNames: ["cand_ids", "cand_vals", "best_val", "best_id", "out"],
+            source: $0, header: nemotronMultiRowQMVHeader,
+            mutableInputs: ["counter"])
+    }
+    static func prefixSelectAvailable(keep: Int) -> Bool {
+        prefixSelectKernel != nil && selectHalfDecodeForm == 0 && keep >= 12 && keep <= 32 && keep % 4 == 0
+    }
+
     /// The B1 select serves a plan with a fused counter and at most 32 kept rows per chunk.
     static func b1Available(keep: Int) -> Bool { fusedSelectB1Kernel != nil && keep <= 32 }
 
@@ -4419,7 +4443,7 @@ enum NemotronHeadScreen {
         upperGroups: MLXArray? = nil, upperGroupCount: Int = 0,
         packed: MLXArray? = nil, records: MLXArray? = nil, records2: MLXArray? = nil,
         counter: MLXArray? = nil, paired: Bool = false,
-        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, b1: Bool = false
+        rowsPerSimdgroup: Int = 8, simdgroups: Int = 2, b1: Bool = false, prefixSelect: Bool = false
     ) -> Result {
         let rows = upperGroups == nil ? Self.rows : headRows
         let template: [(String, any KernelTemplateArg)] = [
@@ -4455,7 +4479,9 @@ enum NemotronHeadScreen {
         let selectGroups = 8
         let selectHalf = selectHalfDecodeForm != 0
         if let counter {
-            let fused = (b1 && !selectHalf && b1Available(keep: keep) ? fusedSelectB1Kernel : nil)
+            let fused = (prefixSelect && b1 && !selectHalf && prefixSelectAvailable(keep: keep)
+                ? prefixSelectKernel : nil)
+                ?? (b1 && !selectHalf && b1Available(keep: keep) ? fusedSelectB1Kernel : nil)
                 ?? (selectHalf ? fusedSelectHalfKernel : fusedSelectKernel)
             let picked = fused(
                 [scores, weight, scales, biases, hidden, counter],

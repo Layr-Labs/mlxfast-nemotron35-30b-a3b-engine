@@ -58,6 +58,7 @@ private final class NemotronMTPDraftHead {
         /// The fused select with one barrier fewer (`NemotronHeadScreen`'s B1
         /// select), set once its ids and kept values matched the record's.
         var b1 = false
+        var prefixSelect = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -84,7 +85,7 @@ private final class NemotronMTPDraftHead {
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records, records2: screen.records2,
-            counter: screen.counter, paired: screen.paired, b1: screen.b1)
+            counter: screen.counter, paired: screen.paired, b1: screen.b1, prefixSelect: screen.prefixSelect)
         if NemotronHeadScreen.check && !(upper && screen.upperGroups != nil) {
             checkAgainstStock(hidden, result, screen)
         }
@@ -555,6 +556,91 @@ private final class NemotronMTPDraftHead {
                 }
             }
         }
+        // The prefix-truncated B1 select is independently admitted only after
+        // the original B1 qualification. Failed new work cannot poison the
+        // production counter: every new single/queued call uses this local probe.
+        var prefixSelectNote = "off"
+        if plan.b1, let counter = plan.counter, NemotronHeadScreen.prefixSelectEnabled,
+           NemotronHeadScreen.prefixSelectAvailable(keep: keep) {
+            do {
+                let equal = try withError { () -> Bool in
+                    guard counter.item(UInt32.self) == 0 else { return false }
+                    let probe = NemotronHeadScreen.makeCounter()
+                    func same(_ a: NemotronHeadScreen.Result, _ b: NemotronHeadScreen.Result) -> Bool {
+                        MLX.logicalAnd(
+                            (a.scores.view(dtype: .uint32) .== b.scores.view(dtype: .uint32)).all(),
+                            MLX.logicalAnd((a.id .== b.id).all(),
+                                MLX.logicalAnd((a.candidateIds .== b.candidateIds).all(),
+                                    (a.candidateValues.view(dtype: .uint32)
+                                        .== b.candidateValues.view(dtype: .uint32)).all()))).item(Bool.self)
+                    }
+                    var state: UInt64 = 0x1F83_D9AB_FB41_BD6B
+                    var expected: [NemotronHeadScreen.Result] = []
+                    var specifications: [(MLXArray, Bool, Bool)] = []
+                    var queued: [NemotronHeadScreen.Result] = []
+                    for round in 0..<8 {
+                        var values = (0..<k).map { _ -> Float in
+                            state = state &* 6364136223846793005 &+ 1442695040888963407
+                            return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                        }
+                        if round == 0 { values = Array(repeating: Float(0), count: k) }
+                        if round == 1 {
+                            values = (0..<k).map { $0 % 2 == 0 ? Float(0) : Float(bitPattern: 0x8000_0000) }
+                        }
+                        if round == 2 { values = values.map { $0 * 0.000001 } }
+                        if round == 3 { values = values.map { $0 * 16 } }
+                        if round == 4 { values = values.enumerated().map { $0.offset % 37 == 0 ? $0.element : 0 } }
+                        if round == 5 { values = Array(repeating: Float(0), count: k); values[k - 1] = 3 }
+                        let x = (MLXArray(values) * g).asType(.bfloat16).reshaped(1, 1, k)
+                        for upper in plan.upperGroups == nil ? [false] : [false, true] {
+                            for paired in plan.paired ? [false, true] : [false] {
+                                func screened(_ shortened: Bool) -> NemotronHeadScreen.Result {
+                                    NemotronHeadScreen.run(
+                                        x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                                        groups: plan.groups, groupCount: groupCount, chunk: chunk,
+                                        keep: keep, upperGroups: upper ? plan.upperGroups : nil,
+                                        upperGroupCount: upper ? plan.upperGroupCount : 0,
+                                        packed: plan.packed, records: plan.records, records2: plan.records2,
+                                        counter: shortened ? probe : counter, paired: paired,
+                                        b1: true, prefixSelect: shortened)
+                                }
+                                // Finish each original and new invocation before checking/reuse.
+                                let a = screened(false)
+                                eval([a.id, a.scores, a.candidateIds, a.candidateValues])
+                                guard counter.item(UInt32.self) == 0 else { return false }
+                                let b = screened(true)
+                                eval([b.id, b.scores, b.candidateIds, b.candidateValues])
+                                guard probe.item(UInt32.self) == 0, same(a, b) else { return false }
+                                expected.append(a)
+                                specifications.append((x, upper, paired))
+                            }
+                        }
+                    }
+                    // Build the whole queued batch only after all single-call evaluations.
+                    for (x, upper, paired) in specifications {
+                        queued.append(NemotronHeadScreen.run(
+                            x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                            upperGroups: upper ? plan.upperGroups : nil,
+                            upperGroupCount: upper ? plan.upperGroupCount : 0,
+                            packed: plan.packed, records: plan.records, records2: plan.records2,
+                            counter: probe, paired: paired, b1: true, prefixSelect: true))
+                    }
+                    eval(queued.flatMap { [$0.id, $0.scores, $0.candidateIds, $0.candidateValues] })
+                    guard probe.item(UInt32.self) == 0, counter.item(UInt32.self) == 0 else { return false }
+                    for (a, b) in zip(expected, queued) where !same(a, b) { return false }
+                    return !expected.isEmpty
+                }
+                if equal {
+                    plan.prefixSelect = true
+                    prefixSelectNote = "on (all scores, ids and values bitwise; original and isolated probe counters reset)"
+                } else {
+                    prefixSelectNote = "off (source, counter or bits differ)"
+                }
+            } catch {
+                prefixSelectNote = "off (\(error))"
+            }
+        }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -565,8 +651,9 @@ private final class NemotronMTPDraftHead {
                 x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
                 groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
                 packed: plan.packed, records: plan.records, records2: plan.records2,
-                counter: plan.counter, paired: plan.paired, b1: plan.b1).id)
+                counter: plan.counter, paired: plan.paired, b1: plan.b1, prefixSelect: plan.prefixSelect).id)
         }
+        FileHandle.standardError.write(Data("nemotron mtp head screen select prefix: \(prefixSelectNote)\n".utf8))
         report("on, \(plan.records2 == nil ? 4 : 2)-bit, \(groupCount) of 42 groups \(selected), keep \(keep) per \(chunk) rows,"
             + " upper half \(upper.map { "\($0.count) groups \($0)" } ?? "off"),"
             + " packed screen \(packedNotes.isEmpty ? "off" : packedNotes.joined(separator: ", ")), fused final \(fusedNote),"
