@@ -233,6 +233,10 @@ public struct CBv2RecurrentPrefixReplayStage {
     /// rejectable exact-tail copies out of the verify graph.
     fileprivate let fullAcceptance: (() -> CBv2RecurrentLayerState)?
     fileprivate let replay: (Int) -> CBv2RecurrentLayerState
+    /// When every stage of a window sets it, a full acceptance commits like a
+    /// strict prefix: `replay(positions)`, built per layer on first read
+    /// (CBV2_MTP_LAZY_REPLAY), instead of `fullAcceptance` at commit.
+    public let defersFullAcceptance: Bool
 
     public init(
         positions: Int,
@@ -245,6 +249,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        defersFullAcceptance: Bool = false,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard positions >= 2 else {
@@ -267,6 +272,7 @@ public struct CBv2RecurrentPrefixReplayStage {
         self.fullAcceptanceRetainedByteCount = fullAcceptanceRetainedByteCount
         self.fullAcceptanceRetainedRoots = fullAcceptanceRetainedRoots
         self.fullAcceptance = fullAcceptance
+        self.defersFullAcceptance = defersFullAcceptance
         self.replay = replay
     }
 }
@@ -541,7 +547,8 @@ public final class CBv2RecurrentRequestState {
             clearOlderTransitionRetention()
             deferredCommitted = nil
             let fullAcceptance = keep == positions
-            if fullAcceptance {
+            if fullAcceptance, !(CBv2DeferredPrefixReplay.enabled
+                && replay.values.allSatisfy(\.defersFullAcceptance)) {
                 committed = replay.mapValues { stage in
                     stage.fullAcceptance?() ?? stage.finalState
                 }
@@ -744,6 +751,7 @@ public final class CBv2RecurrentStateEvaluation {
         fullAcceptanceRetainedByteCount: Int = 0,
         fullAcceptanceRetainedRoots: [MLXArray] = [],
         fullAcceptance: (() -> CBv2RecurrentLayerState)? = nil,
+        defersFullAcceptance: Bool = false,
         replay: @escaping (Int) -> CBv2RecurrentLayerState
     ) throws {
         guard !evaluated, stagedCapturedPositions == nil, staged.isEmpty else {
@@ -773,6 +781,7 @@ public final class CBv2RecurrentStateEvaluation {
             fullAcceptanceRetainedByteCount: fullAcceptanceRetainedByteCount,
             fullAcceptanceRetainedRoots: fullAcceptanceRetainedRoots,
             fullAcceptance: fullAcceptance,
+            defersFullAcceptance: defersFullAcceptance,
             replay: replay)
     }
 
