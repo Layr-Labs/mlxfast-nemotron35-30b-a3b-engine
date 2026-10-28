@@ -37,9 +37,12 @@ final class NemotronMTPPendingSSM {
     static let anchorRequested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_SKIP"] != "0"
     /// A window launch with at least this many pending steps stores the state after them
-    /// (NEMOTRON_MTP_SSM_ANCHOR_AT, 1 ... maxSteps - 2).
+    /// (NEMOTRON_MTP_SSM_ANCHOR_AT, 1 ... maxSteps - 2; default 8, the record's 6 with =6). The tape then
+    /// grows to at most anchorAt + 2 = 10 steps, inside maxSteps 11; `NemotronMTPSSMAnchor.qualify` checks
+    /// every pending count 0 ... anchorAt + 2 and whole acceptance sequences, and keeps the window's store
+    /// on any miss, so a larger threshold only ever engages after its own bit-checks.
     static let anchorAt = min(max(Int(
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_AT"] ?? "") ?? 6, 1), maxSteps - 2)
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_AT"] ?? "") ?? 8, 1), maxSteps - 2)
     nonisolated(unsafe) static var qualified = false
     nonisolated(unsafe) static var anchorQualified = false
     nonisolated(unsafe) static var limit = 0
