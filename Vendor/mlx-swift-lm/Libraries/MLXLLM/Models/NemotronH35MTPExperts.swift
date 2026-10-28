@@ -2479,6 +2479,37 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
 // 0 ... OT / SGS - 1 then round and store their sums at once, with the loop's nml_store and store statement for
 // output n = sg * (OT / SGS) + lane, where lane 0 rounded and stored each sum in turn. Every loop of `source` is
 // rewritten; nil when none matches or a lane-0 store remains.
+private func nemotronZSkipUnmaskedLoadsSource(_ source: String) -> String? {
+    let masked = "        const uint lo = (m & (1u << i)) != 0 ? uint(wq[(8 * c + i) * 32]) : 0u;\n"
+        + "        const uint hi = (m & (16u << i)) != 0 ? uint(wq[(8 * c + i + 4) * 32]) : 0u;\n"
+    guard source.components(separatedBy: masked).count == 2 else { return nil }
+    return source.replacingOccurrences(of: masked, with: "        const uint lo = uint(wq[(8 * c + i) * 32]);\n"
+        + "        const uint hi = uint(wq[(8 * c + i + 4) * 32]);\n")
+}
+
+// Early metadata producers for the fast routed slot kernel, before the uniform sparse-path branch.
+// This is a runtime Swift source factory, not expanded during local preparation. All four original
+// metadata blocks are identical apart from indentation and use only c and readonly per-lane pointers.
+// Moving one block after the m==0 skip does not read metadata for an originally skipped chunk.
+private func nemotronZSkipEarlyMetadataSource(_ source: String) -> String? {
+    let anchor = "      if (popcount(m) == 1) {\n"
+    guard source.components(separatedBy: anchor).count == 2 else { return nil }
+    func block(_ indent: String) -> String {
+        indent + "const int gi = c / 8;\n"
+            + indent + "const uint2 sr = *((const device uint2*)(sq + gi * OT));\n"
+            + indent + "const uint2 br = *((const device uint2*)(bq + gi * OT));\n"
+            + indent + "const uint sv[4] = {sr.x << 16, sr.x & 0xffff0000u, sr.y << 16, sr.y & 0xffff0000u};\n"
+            + indent + "const uint bv[4] = {br.x << 16, br.x & 0xffff0000u, br.y << 16, br.y & 0xffff0000u};\n"
+    }
+    let sparse = block("        ")
+    let general = block("      ")
+    guard source.components(separatedBy: sparse).count == 4,
+          source.components(separatedBy: general).count == 2 else { return nil }
+    let body = source.replacingOccurrences(of: sparse, with: "")
+        .replacingOccurrences(of: general, with: "")
+    return body.replacingOccurrences(of: anchor, with: general + anchor)
+}
+
 private func nemotronZSkipVectorStoreSource(_ source: String) -> String? {
     let pattern = "(?m)^( *)for \\(int q = 0; q < OT / SGS; q\\+\\+\\) \\{\\n"
         + "\\1  const int n = sg \\* \\(OT / SGS\\) \\+ q;\\n"
@@ -3000,6 +3031,40 @@ enum NemotronZSkip {
     static let vstoreRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_VSTORE"] != "0"
     nonisolated(unsafe) fileprivate static var vstoreVerified = false
     static var vstore: Bool { vstoreRequested && vstoreVerified }
+    /// Early readonly metadata producers plus unmasked general-chunk code loads. Separate whole-copy
+    /// gates for target and draft; no geometry changes and every incumbent kernel remains the fallback.
+    private static func makeScheduledKernel(_ name: String, _ source: String?, dep: Bool, dict: Bool) -> MLXFast.MLXFastKernel? {
+        source.flatMap(nemotronZSkipEarlyMetadataSource).flatMap(nemotronZSkipUnmaskedLoadsSource)
+            .flatMap { dict ? nemotronZSkipDictSource($0) : $0 }
+            .flatMap(nemotronZSkipVectorStoreSource).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores"] + (dep ? ["dep"] : []),
+                outputNames: ["prod"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
+    }
+    private static let scheduledPlainKernel = makeScheduledKernel(
+        "nemotron_zskip_fc2_early_meta_unmasked_vs_ul", nemotronZSkipTiledFastSource, dep: false, dict: false)
+    private static let scheduledDictKernel = makeScheduledKernel(
+        "nemotron_zskip_fc2_early_meta_unmasked_sbd_vs_ul", nemotronZSkipTiledFastSource,
+        dep: false, dict: true)
+    private static let scheduledPlainDepKernel = makeScheduledKernel(
+        "nemotron_zskip_fc2_early_meta_unmasked_dep_vs_ul", nemotronZSkipTiledFastSource, dep: true, dict: false)
+    private static let scheduledDictDepKernel = makeScheduledKernel(
+        "nemotron_zskip_fc2_early_meta_unmasked_sbd_dep_vs_ul", nemotronZSkipTiledFastSource,
+        dep: true, dict: true)
+    static let scheduledRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_EARLY_META_UNMASKED"] != "0"
+    nonisolated(unsafe) private static var scheduledSyntheticVerified = false
+    nonisolated(unsafe) private static var scheduledTargetVerified = false
+    nonisolated(unsafe) private static var scheduledDraftVerified = false
+
+    private static func scheduledKernel(for copy: Copy, rows: Int, dep: Bool) -> MLXFast.MLXFastKernel? {
+        let qualified = rows == 3 ? scheduledTargetVerified : (rows == 1 && scheduledDraftVerified)
+        guard scheduledRequested, tiled, fast, vstore, qualified else { return nil }
+        if dep { return copy.dict ? scheduledDictDepKernel : scheduledPlainDepKernel }
+        return copy.dict ? scheduledDictKernel : scheduledPlainKernel
+    }
     /// `NemotronDraftColaunch`: the fast tiled slot kernels (plain and dictionary) with one more input, `dep`,
     /// bound last and never read. The body is the same source text; the extra buffer only orders the launch
     /// after `dep`'s producer in MLX's eval tape.
@@ -3138,9 +3203,10 @@ enum NemotronZSkip {
         let slots = rows * 6
         let threads = 32 * sgs
         let twin = dep.flatMap { _ in depKernel(for: copy) }
-        return (twin ?? (copy.dict ? dictKernel! : kernel))(
+        let scheduled = scheduledKernel(for: copy, rows: rows, dep: dep != nil)
+        return (scheduled ?? twin ?? (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
-             NemotronBankBinding.bind(copy.biases), x, inds, scores] + (twin != nil ? [dep!] : []),
+             NemotronBankBinding.bind(copy.biases), x, inds, scores] + ((scheduled != nil && dep != nil) || twin != nil ? [dep!] : []),
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
             grid: (threads * (2688 / 128), slots, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[slots * 2688]], outputDTypes: [.float32])[0]
@@ -3244,6 +3310,7 @@ enum NemotronZSkip {
     /// inputs, and the one-row products join equals reduce + join. Any miss
     /// leaves the draft head on the record kernel; the target is untouched.
     static func prepareDraft(_ head: Module) {
+        scheduledDraftVerified = false
         guard draftEnabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
         lock.withLock { dictOrdered = 0; dictOrderMissed = 0 }
         var built: [ObjectIdentifier: Copy] = [:]
@@ -3271,6 +3338,7 @@ enum NemotronZSkip {
                 Data("nemotron draft zskip off: the products join differs from reduce + join\n".utf8))
             return
         }
+        scheduledDraftVerified = qualifyScheduledCopies(built, rows: 1)
         lock.withLock { draftCopies = built }
         let dicts = built.values.filter(\.dict).count
         FileHandle.standardError.write(
@@ -3452,6 +3520,178 @@ enum NemotronZSkip {
             : "off (differs from the lane-0 store)")
     }
 
+    fileprivate static func qualifyScheduledSynthetic() {
+        scheduledSyntheticVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron zskip early-meta/unmasked synthetic: \(message)\n".utf8))
+        }
+        guard scheduledRequested else { return report("off (setting)") }
+        guard vstore else { return report("off (vector store off)") }
+        guard let plain = tiledFastSlotKernelVS, let dict = tiledFastDictSlotKernelVS,
+              let plainDep = tiledFastSlotKernelDepVS, let dictDep = tiledFastDictSlotKernelDepVS,
+              let plainU = scheduledPlainKernel, let dictU = scheduledDictKernel,
+              let plainDepU = scheduledPlainDepKernel, let dictDepU = scheduledDictDepKernel
+        else { return report("off (a slot kernel source no longer matches)") }
+        let experts = 8, k = 1856, n = 2688, tiles = n / 128, groups = k / 64
+        let zero = MLXArray(Float(0))
+        let bf16 = { (v: Float) in MLXArray(v).asType(.bfloat16) }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7553), into: 8)
+        let specials = MLXArray([Float(0), -0.0, .infinity, -.infinity, .nan])
+        func values(_ shape: [Int], _ u: MLXArray, _ key: MLXArray, low: Float = -1, high: Float = 2) -> MLXArray {
+            let special = logicalOr(u .< MLXArray(low), u .> MLXArray(high))
+            return which(special, take(specials, (u * 100_000).asType(.int32) % MLXArray(Int32(5))),
+                         MLXRandom.normal(shape, key: key) * 0.01).asType(.bfloat16)
+        }
+        let su = MLXRandom.uniform(Float(0) ..< 1, [experts, tiles, groups, 128], key: keys[0])
+        let codes = MLXRandom.randInt(Int32(0) ..< 65536, [experts, tiles, k, 32], key: keys[1]).asType(.uint16)
+        let scales = values([experts, tiles, groups, 128], su, keys[2], low: 0.0005)
+        let biases = values([experts, tiles, groups, 128], su, keys[3], high: 0.9995)
+        let index = MLXRandom.randInt(Int32(0) ..< 512, [experts, tiles, groups, 128], key: keys[4]).asType(.uint16)
+        let table = concatenated([
+            MLXArray([Float(0), -0.0, .infinity, 1, .nan, 0.5, -0.0, -.infinity]).reshaped(4, 2),
+            MLXRandom.normal([508, 2], key: keys[5]) * 0.01,
+        ]).asType(.bfloat16).asType(.float32)
+        // ReLU2-like rows [slots, k] at `density` (see above).
+        func rows(_ slots: Int, density: Float, seed: UInt64) -> MLXArray {
+            let r = MLXRandom.split(key: MLXRandom.key(seed), into: 3)
+            let h = abs(MLXRandom.normal([slots, k], key: r[0])) * 0.5 + 1e-3
+            let u = MLXRandom.uniform(Float(0) ..< 1, [slots, k], key: r[1])
+            let slot = MLXArray((0 ..< slots).map(Int32.init)).reshaped(slots, 1)
+            let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+            let oneHot = which(column .== MLXArray(Int32(k - 56)), MLXArray(Float(1.5)), zero)
+            let picked = which(slot .== MLXArray(Int32(1)), zero,
+                               which(slot .== MLXArray(Int32(2)), oneHot, which(u .< MLXArray(density), h, zero)))
+            let squared = (picked.asType(.bfloat16) * picked.asType(.bfloat16)).asType(.bfloat16)
+            let negative = MLXRandom.uniform(Float(0) ..< 1, [slots, k], key: r[2]) .< MLXArray(Float(0.05))
+            let signed = which(logicalAnd(squared .== bf16(0), negative), bf16(-0.0), squared)
+            func at(_ s: Int, _ c: Int) -> MLXArray {
+                logicalAnd(slot .== MLXArray(Int32(s % slots)), column .== MLXArray(Int32(c)))
+            }
+            return which(at(3, 77), bf16(.infinity), which(at(4, 901), bf16(.nan), which(at(5, 1300), bf16(1e-35), signed)))
+        }
+        func scores(_ slots: Int, seed: UInt64, special: Bool) -> MLXArray {
+            let s = MLXRandom.uniform(Float(0) ..< 1, [slots], key: MLXRandom.key(seed))
+            guard special else { return s }
+            let head: [Float] = [0, -0.0, .nan, .infinity, -.infinity, 0.25, 0.25]
+            let fixed = MLXArray((0 ..< slots).map { $0 < head.count ? head[$0] : 0 })
+            return which(MLXArray((0 ..< slots).map(Int32.init)) .< MLXArray(Int32(min(slots, head.count))), fixed, s)
+        }
+        func launch(_ kernel: MLXFast.MLXFastKernel, _ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
+                    _ sk: MLXArray, _ bk: MLXArray, dep: Bool) -> MLXArray {
+            kernel(
+                [codes, sk, bk, x, inds, scores] + (dep ? [zero] : []),
+                template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", sgs)],
+                grid: (32 * sgs * tiles, x.dim(0), 1), threadGroup: (32 * sgs, 1, 1),
+                outputShapes: [[x.dim(0) * n]], outputDTypes: [.float32])[0]
+        }
+        var cases = 0
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                let forms: [(MLXFast.MLXFastKernel, MLXFast.MLXFastKernel, MLXArray, MLXArray, Bool)] = [
+                    (plain, plainU, scales, biases, false), (dict, dictU, index, table, false),
+                    (plainDep, plainDepU, scales, biases, true), (dictDep, dictDepU, index, table, true),
+                ]
+                for (base, twin, sk, bk, dep) in forms {
+                    let slots = dep ? 6 : 18
+                    let inds = MLXArray((0 ..< slots).map { UInt32((5 * $0) % experts) })
+                    for (i, density) in [Float(0.0875), 0.45, 1].enumerated() {
+                        let x = rows(slots, density: density, seed: UInt64(0x7560 + 16 * i + slots))
+                        for special in [false, true] {
+                            let s = scores(slots, seed: UInt64(0x7570 + 2 * i + (special ? 1 : 0)), special: special)
+                            let a = launch(base, x, inds, s, sk, bk, dep: dep)
+                            let b = launch(twin, x, inds, s, sk, bk, dep: dep)
+                            ok = ok .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                            cases += 1
+                        }
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        scheduledSyntheticVerified = admitted
+        report(admitted
+            ? "on (\(cases) cases bitwise equal to the original late-meta masked loads: routed plain and pair-dictionary slot kernels at "
+                + "R = 3 and their dep twins at R = 1, densities 8.75%, 45% and full; zeros, -0, infinities, NaNs and "
+                + "ties included)"
+            : "off (differs from the masked loads)")
+    }
+
+    /// Complete FP32 slot products, not only the reduced BF16 row, on every real copy.
+    /// Explicit original/twin launches leave the production selectors unchanged until this whole gate passes.
+    private static func qualifyScheduledCopies(_ built: [ObjectIdentifier: Copy], rows: Int) -> Bool {
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron zskip scheduled real R=\(rows): \(message)\n".utf8))
+        }
+        guard scheduledRequested, scheduledSyntheticVerified, tiled, fast, vstore, !built.isEmpty
+        else { report("off (setting, synthetic gate, geometry or no copies)"); return false }
+        var cases = 0
+        do {
+            let admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                let slots = rows * 6, k = 1856, n = 2688
+                let zero = MLXArray(Float(0))
+                let slot = MLXArray((0 ..< slots).map(Int32.init)).reshaped(slots, 1)
+                let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+                for (index, copy) in built.values.enumerated() {
+                    let base = copy.dict ? tiledFastDictSlotKernelVS : tiledFastSlotKernelVS
+                    let baseDep = copy.dict ? tiledFastDictSlotKernelDepVS : tiledFastSlotKernelDepVS
+                    let twin = copy.dict ? scheduledDictKernel : scheduledPlainKernel
+                    let twinDep = copy.dict ? scheduledDictDepKernel : scheduledPlainDepKernel
+                    guard let base, let baseDep, let twin, let twinDep else { return false }
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5343 + 17 * index + rows)), into: 3)
+                    let h = abs(MLXRandom.normal([slots, k], key: keys[0])) * 0.5 + 1e-3
+                    let u = MLXRandom.uniform(Float(0) ..< 1, [slots, k], key: keys[1])
+                    let route = MLXArray((0 ..< slots).map { UInt32(($0 * 7 + index * 19) % 128) })
+                    let scores = MLXRandom.uniform(Float(0) ..< 1, [slots], key: keys[2])
+                    let negativeZero = MLXArray(Float(-0.0)).asType(.bfloat16)
+                    for (form, density) in [Float(0.0875), 0.45, 1].enumerated() {
+                        let selected = which(u .< MLXArray(density), h, zero).asType(.bfloat16)
+                        let squared = (selected * selected).asType(.bfloat16)
+                        let signed = which(squared .== MLXArray(Float(0)).asType(.bfloat16), negativeZero, squared)
+                        let oneHot = which(column .== MLXArray(Int32(k - 1)), MLXArray(Float(1.5)), zero)
+                        let row = which(slot .== MLXArray(Int32(1)), zero,
+                                        which(slot .== MLXArray(Int32(2)), oneHot, signed))
+                            .asType(.bfloat16)
+                        func at(_ s: Int, _ c: Int) -> MLXArray {
+                            logicalAnd(slot .== MLXArray(Int32(s % slots)), column .== MLXArray(Int32(c)))
+                        }
+                        let special = which(at(3, 77), MLXArray(Float.infinity),
+                                            which(at(4, 901), MLXArray(Float.nan),
+                                                  which(at(5, 1300), MLXArray(Float(1e-35)), row)))
+                            .asType(.bfloat16)
+                        let x = form == 2 ? special : row
+                        for dep in [false, true] {
+                            func launch(_ kernel: MLXFast.MLXFastKernel) -> MLXArray {
+                                kernel(
+                                    [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
+                                     NemotronBankBinding.bind(copy.biases), x, route, scores] + (dep ? [x] : []),
+                                    template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", sgs)],
+                                    grid: (32 * sgs * (n / 128), slots, 1), threadGroup: (32 * sgs, 1, 1),
+                                    outputShapes: [[slots * n]], outputDTypes: [.float32])[0]
+                            }
+                            let a = launch(dep ? baseDep : base)
+                            let b = launch(dep ? twinDep : twin)
+                            ok = ok .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                            eval(ok, a, b)
+                            cases += 1
+                        }
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+            report(admitted ? "on (\(built.count) real copies, \(cases) complete product word cases)"
+                            : "off (complete product words differ)")
+            return admitted
+        } catch {
+            report("off (\(error))")
+            return false
+        }
+    }
+
     /// Load time, before any verify graph is traced: copy every routed fc2 bank,
     /// then keep the copies only if every layer's scales and biases are finite
     /// (the skipped-chunk argument needs it) and its kernel equals the record
@@ -3459,7 +3699,10 @@ enum NemotronZSkip {
     /// a one-hot slot, tail chunks only, and dense; experts shared across rows).
     static func prepare(_ model: Module) {
         guard enabled, NemotronMoELeader.enabled, Device.defaultDevice().deviceType == .gpu else { return }
+        scheduledTargetVerified = false
+        scheduledDraftVerified = false
         qualifyVectorStore()
+        qualifyScheduledSynthetic()
         var result = build(model)
         if case .kernelMiss = result, tiled, sbDict {
             // A dictionary kernel missed a check: the BF16 tile-major copy, every layer again.
@@ -3491,6 +3734,7 @@ enum NemotronZSkip {
         }
         switch result {
         case .built(let built):
+            scheduledTargetVerified = qualifyScheduledCopies(built, rows: 3)
             lock.withLock { copies = built }
             let dicts = built.values.filter(\.dict).count
             FileHandle.standardError.write(
