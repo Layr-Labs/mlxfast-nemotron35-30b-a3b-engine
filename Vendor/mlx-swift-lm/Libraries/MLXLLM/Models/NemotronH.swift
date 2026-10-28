@@ -411,8 +411,8 @@ enum NemotronHResidualRMSNorm {
 
     private static func plumbingRows(_ x: MLXArray, norm: RMSNorm) -> Bool {
         plumbingAvailable
-            && x.shape == [1, 3, 2688] && x.dtype == .bfloat16
-            && type(of: norm) == RMSNorm.self
+            && x.ndim == 3 && x.dim(0) == 1 && NemotronR4.rows(x.dim(1)) && x.dim(2) == 2688
+            && x.dtype == .bfloat16 && type(of: norm) == RMSNorm.self
             && norm.weight.shape == [2688] && norm.weight.dtype == .bfloat16
     }
 
@@ -421,7 +421,7 @@ enum NemotronHResidualRMSNorm {
     static func applyPreparedRows(
         _ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray? = nil, norm: RMSNorm
     ) -> (MLXArray, MLXArray, MLXArray)? {
-        if rhs.shape == [18 * 2688] {
+        if rhs.shape == [18 * 2688] || (rhs.shape == [24 * 2688] && lhs.shape == [1, 4, 2688]) {
             return applyProductsRows(lhs, rhs, shared: shared, norm: norm)
         }
         guard plumbingRows(lhs, norm: norm),
@@ -429,17 +429,18 @@ enum NemotronHResidualRMSNorm {
               shared == nil || (shared!.shape == lhs.shape && shared!.dtype == .bfloat16)
         else { return nil }
         let (axis, eps) = scalars(norm.eps)
-        let shapes = [lhs.shape, lhs.shape, [3, 11, 9 * 32]]
+        let r = lhs.dim(1)
+        let shapes = [lhs.shape, lhs.shape, [r, 11, 9 * 32]]
         let outputs: [MLXArray]
         if let shared {
             outputs = sumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
-                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                grid: (672 * r, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
         } else {
             outputs = preparedKernel([lhs, rhs, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
-                grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
+                grid: (672 * r, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
         }
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
@@ -496,20 +497,20 @@ enum NemotronHResidualRMSNorm {
         guard plumbingRows(lhs, norm: norm), products.dtype == .float32, let shared,
               shared.shape == lhs.shape, shared.dtype == .bfloat16 else {
             // Not reachable on the plumbing route that requested products.
-            let routed = NemotronZSkip.reduceProducts(products, rows: 3)
+            let routed = NemotronZSkip.reduceProducts(products, rows: lhs.dim(1))
             let summed = lhs + (shared.map { routed + $0 } ?? routed)
             let normalized = norm(summed)
-            return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(3, 2688)))
+            return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(-1, 2688)))
         }
         let (axis, eps) = scalars(norm.eps)
         let outputs = sumProductsPreparedKernel([lhs, products, shared, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
+            grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape, lhs.shape, [lhs.dim(1), 11, 9 * 32]],
             outputDTypes: [.bfloat16, .bfloat16, .float32])
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1], outputs[2]) }
         // Reference: the separate top-six reduce, then the two-operand join.
-        let routed = NemotronZSkip.reduceProducts(products, rows: 3)
+        let routed = NemotronZSkip.reduceProducts(products, rows: lhs.dim(1))
         let expected = applyPreparedRows(lhs, routed, shared: shared, norm: norm)!
         // The prepared output's padding slots are never written; compare the
         // residual and the normalized rows it is formed from, as the base does.
@@ -543,8 +544,8 @@ enum NemotronHResidualRMSNorm {
         let (axis, eps) = scalars(norm.eps)
         let outputs = normPreparedKernel([x, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
-            grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
-            outputShapes: [x.shape, [3, 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
+            grid: (672 * x.dim(1), 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [x.shape, [x.dim(1), 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
         guard NemotronMoELeader.selfTest else { return (outputs[0], outputs[1]) }
         let ok = (outputs[0].view(dtype: .uint16) .== norm(x).view(dtype: .uint16)).all()
         return (which(ok, outputs[0], MLXArray(Float.nan).asType(.bfloat16)),
@@ -1233,7 +1234,8 @@ extension NemotronHResidualRMSNorm {
     static func verifyEntry(_ tokens: MLXArray, _ embedding: Embedding, norm: RMSNorm)
         -> (MLXArray, MLXArray, MLXArray)?
     {
-        guard plumbingAvailable, tokens.shape == [1, 3] else { return nil }
+        guard plumbingAvailable, tokens.ndim == 2, tokens.dim(0) == 1, NemotronR4.rows(tokens.dim(1))
+        else { return nil }
         guard tokens.dtype == .int32 || tokens.dtype == .uint32 else { return nil }
         guard let q = verifyEntryShape(embedding, norm: norm) else { return nil }
         guard NemotronHVerifyEntry.matches(q, norm) else { return nil }
@@ -1490,15 +1492,15 @@ class NemotronHRMSNormGated: Module {
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               type(of: self) == NemotronHRMSNormGated.self,
-              groupSize == 512, x.shape == [1, 3, 4096], gate.shape == x.shape,
-              weight.shape == [4096], x.dtype == .bfloat16,
+              groupSize == 512, x.ndim == 3, x.dim(0) == 1, NemotronR4.prepared(x.dim(1)), x.dim(2) == 4096,
+              gate.shape == x.shape, weight.shape == [4096], x.dtype == .bfloat16,
               gate.dtype == .bfloat16, weight.dtype == .bfloat16
         else { return nil }
         let outputs = NemotronHGatedRMSKernel.preparedKernel(
             [x, gate, weight, NemotronHGatedRMSKernel.identity, eps],
             template: [("T", DType.bfloat16)],
-            grid: (128 * 3 * 8, 1, 1), threadGroup: (128, 1, 1),
-            outputShapes: [x.shape, [3, 8, 17 * 32]], outputDTypes: [.bfloat16, .float32])
+            grid: (128 * x.dim(1) * 8, 1, 1), threadGroup: (128, 1, 1),
+            outputShapes: [x.shape, [x.dim(1), 8, 17 * 32]], outputDTypes: [.bfloat16, .float32])
         let normalized = NemotronMoELeader.selfTest
             ? nemotronBitwiseOrNaN(outputs[0], callAsFunction(x, gate: gate)) : outputs[0]
         return (normalized, outputs[1])
@@ -2032,10 +2034,11 @@ extension NemotronHRMSNormGated {
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               type(of: self) == NemotronHRMSNormGated.self,
               groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
-              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
-              dt.dtype == .float32, dt.shape == [1, 3, 64],
+              convolution.ndim == 3, case let l = convolution.dim(1), NemotronR4.ssmRows(l),
+              convolution.shape == [1, l, 6144], convolution.dtype == .bfloat16,
+              dt.dtype == .float32, dt.shape == [1, l, 64],
               state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              projected.shape == [1, l, 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16
         else { return nil }
         // Created and evaluated at load (`prepareCounter`), never inside a
@@ -2046,7 +2049,7 @@ extension NemotronHRMSNormGated {
             eps, NemotronHCompactSSMGated.counter!]
         var template: [(String, any KernelTemplateArg)] = [
             ("T", DType.bfloat16), ("U", DType.float32),
-            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", l),
             ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
         let tail = shuffle ?? NemotronHCompactSSMGated.shuffleQualified
         // The one-barrier tail (NEMOTRON_SSM_TAIL_ONE_BARRIER) once qualified; `shuffle` set by a load-time
@@ -2064,7 +2067,7 @@ extension NemotronHRMSNormGated {
         let outputs = kernel(
             inputs, template: template,
             grid: (32, 64, 64), threadGroup: (32, 8, 1),
-            outputShapes: [[1, 3, 64, 64], [1, 64, 64, 128], [1, 3, 4096], [3, 8, 17 * 32]],
+            outputShapes: [[1, l, 64, 64], [1, 64, 64, 128], [1, l, 4096], [l, 8, 17 * 32]],
             outputDTypes: [.bfloat16, .float32, .bfloat16, .float32])
         return (outputs[2], outputs[3], outputs[1])
     }
@@ -5737,7 +5740,7 @@ class NemotronHAttention: Module, NemotronHMixer {
         // layer's contiguous cache (the slice-update copies of K and V go
         // away); the serialized SDPA calls then read the cache behind that
         // launch. Same stored bytes, same attention.
-        if precomputed == nil, captureMTP, targetQKV, batch == 1, length == 3,
+        if precomputed == nil, captureMTP, targetQKV, batch == 1, length == 3 || length == 4,
            NemotronMTPAttentionDirect.enabled,
            numHeads == 32, numKeyValueHeads == 2, headDim == 128,
            let layerCache = cache as? CBv2LayerCache,
@@ -9581,10 +9584,9 @@ private class NemotronHBlock: Module {
                 output = moe.mtpForwardRows(hidden, prepared: prepared)
             }
         }
-        if let triple = NemotronHResidualRMSNorm.applyPreparedRows(
-            x, output, shared: shared, norm: nextNorm) {
-            return (triple.0, triple.1, triple.2)
-        }
+        let joined = NemotronHResidualRMSNorm.applyPreparedRows(x, output, shared: shared, norm: nextNorm)
+        NemotronR4.note("join.\(blockType)", joined != nil, rows: x.dim(1))
+        if let triple = joined { return (triple.0, triple.1, triple.2) }
         // Original arithmetic: stock shared Add, residual Add, stock RMSNorm.
         if let shared { output = output + shared }
         let residual = x + output
@@ -9792,8 +9794,8 @@ private class NemotronHBackbone: Module {
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> (hidden: MLXArray, prepared: MLXArray?)? {
-        guard NemotronHResidualRMSNorm.plumbingAvailable,
-              inputs.shape == [1, 3], let first = layers.first,
+        guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.ndim == 2, inputs.dim(0) == 1,
+              NemotronR4.rows(inputs.dim(1)), let first = layers.first,
               type(of: first.norm) == RMSNorm.self, first.norm.weight.dtype == .bfloat16
         else { return nil }
         let observation = CBv2ForwardShapeObservation.isActive
@@ -9803,7 +9805,9 @@ private class NemotronHBackbone: Module {
         var hidden: MLXArray
         var preparedNorm: MLXArray?
         var preparedActivation: MLXArray?
-        if let entry = NemotronHResidualRMSNorm.verifyEntry(inputs, embeddings, norm: first.norm) {
+        let entered = NemotronHResidualRMSNorm.verifyEntry(inputs, embeddings, norm: first.norm)
+        NemotronR4.note("entry", entered != nil, rows: inputs.dim(1))
+        if let entry = entered {
             hidden = entry.0
             preparedNorm = entry.1
             preparedActivation = entry.2
@@ -10076,7 +10080,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> (hidden: MLXArray, prepared: MLXArray?)? {
-        guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.shape == [1, 3] else { return nil }
+        guard NemotronHResidualRMSNorm.plumbingAvailable, inputs.ndim == 2, inputs.dim(0) == 1,
+              NemotronR4.rows(inputs.dim(1)) else { return nil }
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
                 preconditionFailure("NemotronH CBv2 target received legacy KV cache")

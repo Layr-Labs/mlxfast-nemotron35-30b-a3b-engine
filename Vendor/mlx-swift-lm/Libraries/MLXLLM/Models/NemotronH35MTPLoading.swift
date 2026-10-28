@@ -82,12 +82,14 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
+        NemotronR4.checkJoins(target)
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronMoELeader.warm(target)
@@ -95,6 +97,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -116,6 +120,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPFrontRowsKVDirect.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
+        NemotronR4.qualify(target, head: assistant.module)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
@@ -155,6 +160,7 @@ extension NemotronH35MTPAssistant {
         try NemotronDraftAttentionGeometry.warm()
         assistant.warmUpExactShapes()
         assistant.prepareDecodeResidency()
+        NemotronR4.loaded = true
         return assistant
     }
 }
@@ -189,6 +195,12 @@ extension NemotronH35MTPAssistant {
             if prefillLength > 0 { try warmUpPrefill(length: prefillLength) }
             try runWarmUp(depth: depth, promptLength: promptLength,
                           postVerifyWarmupWidth: &postVerifyWarmupWidth)
+            // NemotronR4.warmRequested: a second pass at depth 3 (four-row windows, every anchor-skip pending
+            // count from 0) on its own throwaway state.
+            if depth == 2, NemotronR4.warmRequested, NemotronR4.active, (maximumDraftTokens ?? 7) >= 3 {
+                try runWarmUp(depth: 3, promptLength: promptLength,
+                              postVerifyWarmupWidth: &postVerifyWarmupWidth)
+            }
         } catch {
             FileHandle.standardError.write(Data("nemotron mtp warm-up skipped: \(error)\n".utf8))
         }
@@ -228,8 +240,10 @@ extension NemotronH35MTPAssistant {
     ) throws {
         let kinds = target.cbv2LayerKinds
         // NEMOTRON_MTP_SSM_ANCHOR_SKIP's further rounds (below) commit up to 3 tokens each.
-        let maxLength = promptLength + 4 * (depth + 2) + 16
-            + (depth == 2 && NemotronMTPPendingSSM.warmsSteps && NemotronMTPPendingSSM.anchorSkip ? 3 * 64 : 0)
+        // The anchor-skip steering at depth 2, and at depth 3 (the four-row pass, `NemotronR4.warmRequested`).
+        let anchorWarm = (depth == 2 || (depth == 3 && NemotronR4.active))
+            && NemotronMTPPendingSSM.warmsSteps && NemotronMTPPendingSSM.anchorSkip
+        let maxLength = promptLength + 4 * (depth + 2) + 16 + (anchorWarm ? (depth + 1) * 64 : 0)
         let backend = CBv2ContiguousKVBackend(
             config: CBv2ContiguousBackendConfig(bytesCapacity: 1 << 30))
         let rows = try backend.makeSequenceState(
@@ -294,9 +308,10 @@ extension NemotronH35MTPAssistant {
                 + Array(repeating: (depth, 1), count: NemotronMTPPendingSSM.limit + 1)
                 + [(depth, depth + 1)]
         }
+        // The four-row pass ends its list at full width, where the steering below continues.
+        if depth == 3, anchorWarm { rounds.append((depth, depth + 1)) }
         // NEMOTRON_MTP_SSM_ANCHOR_SKIP: further rounds until the anchor-skip
-        // windows have folded every pending count 0 ... anchorAt + 2.
-        let anchorWarm = depth == 2 && NemotronMTPPendingSSM.warmsSteps && NemotronMTPPendingSSM.anchorSkip
+        // windows have folded every pending count 0 ... anchorAt + depth.
         var anchorSeen = Set<Int>()
         var roundIndex = 0
         while roundIndex < rounds.count {
@@ -379,10 +394,14 @@ extension NemotronH35MTPAssistant {
             if anchorWarm, k == depth {
                 anchorSeen.insert(NemotronMTPSSMAnchor.lastPending)
                 if roundIndex == rounds.count, rounds.count < 64, let next = NemotronMTPSSMAnchor.warmKeep(
-                    pending: NemotronMTPSSMAnchor.lastPending, keep: confirmed, seen: &anchorSeen) {
+                    pending: NemotronMTPSSMAnchor.lastPending, keep: confirmed, seen: &anchorSeen, width: depth + 1) {
                     rounds.append((depth, next))
                 }
             }
+        }
+        if depth == 3 {
+            NemotronR4.report("warm-up", "\(rounds.filter { $0.0 == 3 }.count) four-row rounds, "
+                + "anchor-skip pending counts \(anchorSeen.sorted())")
         }
         // Depth one has no shallower round to consume the prestaged row.
         // Release that private transaction through the ordinary discard path.
