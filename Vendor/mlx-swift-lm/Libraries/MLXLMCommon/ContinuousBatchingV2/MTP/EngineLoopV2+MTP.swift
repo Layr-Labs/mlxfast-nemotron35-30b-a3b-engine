@@ -14,6 +14,7 @@ extension EngineLoopV2 {
     /// decode neighbors, and per-request prefill chunks.
     func executeMTPRound(_ plan: CBv2StepPlan) throws -> CBv2InFlightStep? {
         guard let mtp else { return try executeMixed(plan) }
+        CBv2MTPRoundStartSpin.wait()
         let shapes = beginForwardShapeStep()
         defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
@@ -101,5 +102,18 @@ extension EngineLoopV2 {
         step.forwardShapes = shapes
         shapes?.attach()
         return step
+    }
+}
+
+/// The engine thread waits `NEMOTRON_ROUND_SPIN_US` microseconds (default 100) in a busy loop at the start of every
+/// MTP round, before the round's graph is built. Only the host's timing changes; no value, graph or submission
+/// order changes. NEMOTRON_ROUND_SPIN_US=0 skips it.
+enum CBv2MTPRoundStartSpin {
+    static let nanos: UInt64 = UInt64(max(0, Int(ProcessInfo.processInfo.environment["NEMOTRON_ROUND_SPIN_US"] ?? "") ?? 100)) * 1_000
+
+    static func wait() {
+        guard nanos > 0 else { return }
+        let deadline = DispatchTime.now().uptimeNanoseconds + nanos
+        while DispatchTime.now().uptimeNanoseconds < deadline {}
     }
 }
