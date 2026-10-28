@@ -773,6 +773,133 @@ private let nemotronMambaInProjConvDtEpilogue = """
   }
 """
 
+private let nemotronMambaInProjConvDtAheadEpilogueText = """
+
+  // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). The
+  // BF16 outputs it needs are read back from this simdgroup's own stores.
+  simdgroup_barrier(mem_flags::mem_device);
+  {
+    const int l = int(simd_lid);
+    if (l < results_per_simdgroup * R) {
+      const int row = l / R;
+      const int t = l % R;
+      const int o = out_row + row;
+      if (o >= CS && o < CS + CC) {
+        const int64_t channel = int64_t(o - CS);
+        NEP_LOADS
+        if (t < 3) {
+          padded[int64_t(t) * CC + channel] =
+              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        }
+        padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];
+        float acc = 0;
+        for (int i = 0; i < 4; ++i) {
+          int64_t crow = int64_t(t) + int64_t(i);
+          T value = crow < 3
+              ? oldState[crow * oldState_strides[1] + channel * oldState_strides[2]]
+              : yp[(crow - 3) * out_vec_size + row];
+          acc += static_cast<float>(value)
+              * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+        }
+        T convolved = static_cast<T>(acc);
+        T xc = convolved + cb[channel * cb_strides[0]];
+        auto yc = 1 / (1 + metal::exp(metal::abs(xc)));
+        T sigmoid = xc < 0 ? yc : 1 - yc;
+        conv[int64_t(t) * CC + channel] = xc * sigmoid;
+      } else if (o >= DS && o < DS + NH) {
+        const int head = o - DS;
+        float v = static_cast<float>(yp[t * out_vec_size + row])
+            + static_cast<float>(dtBias[int64_t(head) * dtBias_strides[0]]);
+        float sp;
+        if (metal::isnan(v)) {
+          sp = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(v, 0.0f);
+          float minval = metal::min(v, 0.0f);
+          sp = (minval == -inf || maxval == inf)
+              ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        float lo = dtLo;
+        float hi = dtHi;
+        float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+        dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+      }
+    }
+  }
+"""
+
+/// NEMOTRON_MTP_INPROJ_EPILOGUE_LOADS_FIRST=0 keeps the record epilogue's order, where a conv lane loads the old
+/// state, the conv weights and bias, and its window outputs after its first `padded` store. Otherwise the lane
+/// loads all of them into registers first (`nep_*`: the three old-state rows, the window's R outputs of its row,
+/// the four weights and the bias, the same addresses) and the statements below read the registers; every
+/// product, sum, rounding and store is the record's.
+let nemotronInProjEpilogueLoadsFirst =
+    ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_LOADS_FIRST"] != "0"
+private let nemotronMambaInProjConvDtAheadEpilogue: String = {
+    let s = nemotronMambaInProjConvDtAheadEpilogueText
+    guard nemotronInProjEpilogueLoadsFirst else { return s.replacingOccurrences(of: "        NEP_LOADS\n", with: "") }
+    let loads = """
+            const T nep_o0 = oldState[0 * oldState_strides[1] + channel * oldState_strides[2]];
+            const T nep_o1 = oldState[1 * oldState_strides[1] + channel * oldState_strides[2]];
+            const T nep_o2 = oldState[2 * oldState_strides[1] + channel * oldState_strides[2]];
+            T nep_y[R];
+            _Pragma("clang loop unroll(full)")
+            for (int k = 0; k < R; ++k) {
+              nep_y[k] = yp[k * out_vec_size + row];
+            }
+            const auto nep_w0 = cw[channel * cw_strides[0] + int64_t(0) * cw_strides[1]];
+            const auto nep_w1 = cw[channel * cw_strides[0] + int64_t(1) * cw_strides[1]];
+            const auto nep_w2 = cw[channel * cw_strides[0] + int64_t(2) * cw_strides[1]];
+            const auto nep_w3 = cw[channel * cw_strides[0] + int64_t(3) * cw_strides[1]];
+            const auto nep_b = cb[channel * cb_strides[0]];
+
+    """
+    let swaps: [(String, String)] = [
+        ("        NEP_LOADS\n", loads),
+        ("""
+                  padded[int64_t(t) * CC + channel] =
+                      oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        """, """
+                  padded[int64_t(t) * CC + channel] = t == 0 ? nep_o0 : (t == 1 ? nep_o1 : nep_o2);
+        """),
+        ("padded[(int64_t(t) + 3) * CC + channel] = yp[t * out_vec_size + row];",
+         "T nep_yt = nep_y[0];\n        _Pragma(\"clang loop unroll(full)\")\n"
+            + "        for (int k = 1; k < R; ++k) { nep_yt = t == k ? nep_y[k] : nep_yt; }\n"
+            + "        padded[(int64_t(t) + 3) * CC + channel] = nep_yt;"),
+        ("""
+                for (int i = 0; i < 4; ++i) {
+                  int64_t crow = int64_t(t) + int64_t(i);
+                  T value = crow < 3
+                      ? oldState[crow * oldState_strides[1] + channel * oldState_strides[2]]
+                      : yp[(crow - 3) * out_vec_size + row];
+                  acc += static_cast<float>(value)
+                      * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+                }
+        """, """
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < 4; ++i) {
+                  int64_t crow = int64_t(t) + int64_t(i);
+                  T value = nep_y[0];
+                  _Pragma("clang loop unroll(full)")
+                  for (int k = 1; k < R; ++k) { value = crow - 3 == int64_t(k) ? nep_y[k] : value; }
+                  value = crow == 0 ? nep_o0 : (crow == 1 ? nep_o1 : (crow == 2 ? nep_o2 : value));
+                  acc += static_cast<float>(value)
+                      * (i == 0 ? nep_w0 : (i == 1 ? nep_w1 : (i == 2 ? nep_w2 : nep_w3)));
+                }
+        """),
+        ("T xc = convolved + cb[channel * cb_strides[0]];", "T xc = convolved + nep_b;"),
+    ]
+    var out = s
+    for (from, to) in swaps {
+        guard out.components(separatedBy: from).count == 2 else {
+            return s.replacingOccurrences(of: "        NEP_LOADS\n", with: "")
+        }
+        out = out.replacingOccurrences(of: from, with: to)
+    }
+    return out
+}()
+
 /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS: the in_proj launch whose epilogue takes
 /// its row's BF16 outputs from registers instead of reading them back from its
 /// own stores. `simd_sum` leaves each output's sum in every lane, so in the
@@ -985,6 +1112,26 @@ enum NemotronMambaInProjConvDt {
         kernelRegs != nil && dictKernelRegs != nil && kernelU2Regs != nil && dictKernelU2Regs != nil
     }
 
+
+    // Source1525 G: keep the original four launches as the qualification
+    // reference/fallback. No register-epilogue or request-state change.
+    nonisolated(unsafe) private(set) static var loadsFirstVerified = false
+    private static let kernelAhead = regsKernel("nemotron_inproj_conv_dt_la",
+        nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtAheadEpilogue)
+    private static let dictKernelAhead = regsKernel("nemotron_inproj_conv_dt_sbd_la",
+        nemotronSBDictSource(nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtAheadEpilogue))
+    private static let kernelU2Ahead = regsKernel("nemotron_inproj_conv_dt_u2_la",
+        nemotronU2Source(nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtAheadEpilogue,
+                        loop: NemotronU2.qmvLoop, count: 1))
+    private static let dictKernelU2Ahead = regsKernel("nemotron_inproj_conv_dt_sbd_u2_la",
+        nemotronU2Source(nemotronSBDictSource(nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtAheadEpilogue),
+                        loop: NemotronU2.qmvLoop, count: 1))
+    private static var aheadAvailable: Bool {
+        nemotronMambaInProjConvDtAheadEpilogue != nemotronMambaInProjConvDtEpilogue
+            && kernelAhead != nil && dictKernelAhead != nil
+            && kernelU2Ahead != nil && dictKernelU2Ahead != nil
+    }
+
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
@@ -993,7 +1140,7 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil, loadsFirst: Bool? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -1015,6 +1162,11 @@ enum NemotronMambaInProjConvDt {
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let unrolled = (u2 ?? NemotronU2.inProj) ? (dict != nil ? dictKernelU2 : kernelU2) : nil
         var chosen = unrolled ?? (dict != nil ? dictKernel! : kernel)
+        if loadsFirst ?? loadsFirstVerified {
+            let twin = unrolled != nil ? (dict != nil ? dictKernelU2Ahead : kernelU2Ahead)
+                : (dict != nil ? dictKernelAhead : kernelAhead)
+            if let twin { chosen = twin }
+        }
         if regs ?? regsVerified {
             // The register-epilogue twin of the same launch (same unroll, same dictionary form).
             let twin = unrolled != nil ? (dict != nil ? dictKernelU2Regs : kernelU2Regs)
@@ -1123,6 +1275,67 @@ enum NemotronMambaInProjConvDt {
             ? "on (\(cases) layers x 2 row sets: projection, conv, padded history and timestep bitwise equal)"
             : "off (differs from the record epilogue)")
     }
+    /// Official-remote load admission only. All real Mamba layers, two row
+    /// scales, raw/prepared inputs, plain/dictionary, and both unroll forms.
+    /// Compare projection, conv, padded history and dt as complete words.
+    static func qualifyLoadsFirst(_ model: Module) {
+        loadsFirstVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron inproj epilogue loads first: \(message)\n".utf8))
+        }
+        guard nemotronInProjEpilogueLoadsFirst, enabled, aheadAvailable, u2Available
+        else { return report("off (setting or exact source twin unavailable)") }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            let matched = try withError { () -> Bool in
+                for module in model.modules() {
+                    guard let mixer = module as? NemotronHMamba2Mixer,
+                          let q = mixer.inProj as? QuantizedLinear,
+                          let convBias = mixer.conv1d.bias else { continue }
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x6c31 + cases * 2 + seed)), into: 2)
+                        let scale = Float(seed == 0 ? 0.25 : 4)
+                        let x = (MLXRandom.normal([3, 2688], key: keys[0]) * scale).asType(.bfloat16)
+                        let state = (MLXRandom.normal([1, 3, mixer.convDim], key: keys[1]) * scale).asType(.bfloat16)
+                        for packed in [false, true] {
+                            let prepared = packed ? NemotronHeadPreparedActivation.pack(x) : nil
+                            for dictionary in [false, true] {
+                                if dictionary && (!NemotronSBDict.enabled || NemotronSBDict.dict(q) == nil) { continue }
+                                for unroll in [false, true] {
+                                    func run(_ ahead: Bool) -> [MLXArray]? {
+                                        apply(x, q, prepared: prepared, oldState: state,
+                                              convWeight: mixer.conv1d.weight, convBias: convBias,
+                                              dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                              convStart: mixer.intermediateSize, convDim: mixer.convDim,
+                                              heads: mixer.numHeads, sbDict: dictionary, u2: unroll,
+                                              regs: false, loadsFirst: ahead)
+                                            .map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                                    }
+                                    guard let a = run(false), let b = run(true) else { return false }
+                                    for (u, v) in zip(a, b) {
+                                        guard u.shape == v.shape, u.dtype == v.dtype else { return false }
+                                        same = logicalAnd(same, u.dtype == .float32
+                                            ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                            : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                                    }
+                                    cases += 1
+                                }
+                            }
+                        }
+                    }
+                    eval(same)
+                }
+                return cases > 0 && same.item(Bool.self)
+            }
+            loadsFirstVerified = matched
+            report(matched ? "on (\(cases) real-layer cases, all four outputs bitwise equal)"
+                           : "off (mismatch after \(cases) cases)")
+        } catch {
+            report("off (\(error))")
+        }
+    }
+
 }
 
 enum NemotronHeadPreparedActivation {

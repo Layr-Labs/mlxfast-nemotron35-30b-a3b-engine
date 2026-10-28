@@ -168,6 +168,21 @@ struct NemotronSeedBank {
   METAL_FUNC uint8_t byte(const int n, const int k) const thread {
     return w[size_t(n) * size_t(K / 2) + size_t(k >> 1)];
   }
+  // NB consecutive bytes from (n, k): byte(n, k + 2 i) for i < NB, in 16-byte loads.
+  template <int NB>
+  METAL_FUNC void bytes(const int n, const int k, thread uint8_t* dst) const thread {
+    const device uint4* p = (const device uint4*)(w + size_t(n) * size_t(K / 2) + size_t(k >> 1));
+    STEEL_PRAGMA_UNROLL
+    for (int i = 0; i < NB / 16; ++i) {
+      const uint4 v = p[i];
+      const uchar4 a = as_type<uchar4>(v.x), b = as_type<uchar4>(v.y);
+      const uchar4 c = as_type<uchar4>(v.z), d = as_type<uchar4>(v.w);
+      dst[16 * i + 0] = a.x; dst[16 * i + 1] = a.y; dst[16 * i + 2] = a.z; dst[16 * i + 3] = a.w;
+      dst[16 * i + 4] = b.x; dst[16 * i + 5] = b.y; dst[16 * i + 6] = b.z; dst[16 * i + 7] = b.w;
+      dst[16 * i + 8] = c.x; dst[16 * i + 9] = c.y; dst[16 * i + 10] = c.z; dst[16 * i + 11] = c.w;
+      dst[16 * i + 12] = d.x; dst[16 * i + 13] = d.y; dst[16 * i + 14] = d.z; dst[16 * i + 15] = d.w;
+    }
+  }
 };
 
 // B source: the bank's codes with (scale, bias) through the pair dictionary
@@ -195,6 +210,21 @@ struct NemotronSeedDict {
   }
   METAL_FUNC uint8_t byte(const int n, const int k) const thread {
     return w[size_t(n) * size_t(K / 2) + size_t(k >> 1)];
+  }
+  // NB consecutive bytes from (n, k): byte(n, k + 2 i) for i < NB, in 16-byte loads.
+  template <int NB>
+  METAL_FUNC void bytes(const int n, const int k, thread uint8_t* dst) const thread {
+    const device uint4* p = (const device uint4*)(w + size_t(n) * size_t(K / 2) + size_t(k >> 1));
+    STEEL_PRAGMA_UNROLL
+    for (int i = 0; i < NB / 16; ++i) {
+      const uint4 v = p[i];
+      const uchar4 a = as_type<uchar4>(v.x), b = as_type<uchar4>(v.y);
+      const uchar4 c = as_type<uchar4>(v.z), d = as_type<uchar4>(v.w);
+      dst[16 * i + 0] = a.x; dst[16 * i + 1] = a.y; dst[16 * i + 2] = a.z; dst[16 * i + 3] = a.w;
+      dst[16 * i + 4] = b.x; dst[16 * i + 5] = b.y; dst[16 * i + 6] = b.z; dst[16 * i + 7] = b.w;
+      dst[16 * i + 8] = c.x; dst[16 * i + 9] = c.y; dst[16 * i + 10] = c.z; dst[16 * i + 11] = c.w;
+      dst[16 * i + 12] = d.x; dst[16 * i + 13] = d.y; dst[16 * i + 14] = d.z; dst[16 * i + 15] = d.w;
+    }
   }
 };
 
@@ -226,6 +256,13 @@ struct NemotronSeedCopy {
     const uint lo = (uint(c[0]) >> (4 * o)) & 0xfu;
     const uint hi = (uint(c[32]) >> (4 * o)) & 0xfu;
     return uint8_t(lo | (hi << 4));
+  }
+  template <int NB>
+  METAL_FUNC void bytes(const int n, const int k, thread uint8_t* dst) const thread {
+    STEEL_PRAGMA_UNROLL
+    for (int i = 0; i < NB; ++i) {
+      dst[i] = byte(n, k + 2 * i);
+    }
   }
 };
 
@@ -293,6 +330,7 @@ template <
     bool ALIGN_N,
     bool RELU2,
     bool ROUTED,
+    int PF,
     class BSrc>
 METAL_FUNC void nemotron_seed_gather_impl(
     const device T* x,
@@ -480,13 +518,87 @@ METAL_FUNC void nemotron_seed_gather_impl(
         }
       };
       const int K_it = K / BK;
-      for (int kb_i = 0; kb_i < K_it; kb_i++) {
-        block(kb_i * BK, BK);
-      }
       // K % 64 == 0, so the tail is whole groups and whole 32-k steps.
       const int k_rem = K - K_it * BK;
-      if (k_rem > 0) {
-        block(K_it * BK, k_rem);
+      if constexpr (PF) {
+        // Register prefetch: the thread's raw bytes and (scale, bias) of block
+        // b + 1 are loaded before block b's MMA chain and dequantized into Ws
+        // after it, with the same nemotron_seed_deq2 on the same bytes, so Ws
+        // holds the values fill() writes.
+        uint8_t pre[PF][KPT / 2];
+        float2 psb[PF];
+        bool pvalid[PF];
+        auto fetch = [&](const int slot, const int kb, const int klim) {
+          pvalid[slot] = (ALIGN_N || lr < tgp_bn) && lk < klim;
+          if (pvalid[slot]) {
+            psb[slot] = bsrc.sb(ln, (kb + lk) / 64);
+            bsrc.template bytes<KPT / 2>(ln, kb + lk, pre[slot]);
+          }
+        };
+        auto put = [&](const int slot) {
+          if (pvalid[slot]) {
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < KPT; j += 2) {
+              T v0, v1;
+              nemotron_seed_deq2(pre[slot][j / 2], psb[slot].x, psb[slot].y, v0, v1);
+              wdst[j] = v0;
+              wdst[j + 1] = v1;
+            }
+          } else {
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < KPT; ++j) {
+              wdst[j] = T(0);
+            }
+          }
+        };
+        const int nblocks = K_it + (k_rem > 0 ? 1 : 0);
+        auto lim = [&](const int b) { return b < K_it ? BK : k_rem; };
+        STEEL_PRAGMA_UNROLL
+        for (int q = 0; q < PF; q++) {
+          if (q < nblocks) {
+            fetch(q, q * BK, lim(q));
+          }
+        }
+        for (int b = 0; b < nblocks; b++) {
+          const int kb = b * BK;
+          const int klim = lim(b);
+          const int slot = b % PF;
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          put(slot);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (b + PF < nblocks) {
+            fetch(slot, (b + PF) * BK, lim(b + PF));
+          }
+          STEEL_PRAGMA_NO_UNROLL
+          for (int kk1 = 0; kk1 < klim; kk1 += SK) {
+            if (sg_active) {
+              NAXTile<T, TM, TK> Atile;
+              NAXTile<T, TN, TK> Btile;
+
+              volatile int compiler_barrier;
+
+              nemotron_seed_load_a<ROUTED, aligned_m, SK>(Atile, xn, routed, kb + kk1, K, sgp_sm);
+
+              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
+
+              tile_matmad_nax(
+                  Dtile,
+                  Atile,
+                  metal::bool_constant<false>{},
+                  Btile,
+                  metal::bool_constant<transpose>{});
+
+              (void)compiler_barrier;
+            }
+          }
+        }
+      } else {
+        for (int kb_i = 0; kb_i < K_it; kb_i++) {
+          block(kb_i * BK, BK);
+        }
+        if (k_rem > 0) {
+          block(K_it * BK, k_rem);
+        }
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -532,6 +644,7 @@ enum NemotronSeedRetile {
         let name: String
         let bn: Int, bk: Int, wm: Int, wn: Int
         let direct: Bool
+        var pf: Int = 0
         var threads: Int { wm * wn * 32 }
     }
 
@@ -546,6 +659,16 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "p64x64w22", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: 1),
+        Variant(name: "q64x64w22", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: 2),
+        Variant(name: "p64x128w22", bn: 64, bk: 128, wm: 2, wn: 2, direct: false, pf: 1),
+        Variant(name: "q64x128w22", bn: 64, bk: 128, wm: 2, wn: 2, direct: false, pf: 2),
+        Variant(name: "p128x64w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: false, pf: 1),
+        Variant(name: "q128x64w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: false, pf: 2),
+        Variant(name: "p128x64w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: false, pf: 1),
+        Variant(name: "q128x64w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: false, pf: 2),
+        Variant(name: "p64x64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: false, pf: 1),
+        Variant(name: "q64x64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: false, pf: 2),
     ]
 
     enum Source: String, Sendable { case bank, dict, copy }
@@ -571,7 +694,7 @@ enum NemotronSeedRetile {
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
         func call(_ bm: String) -> String {
             """
-                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed)>(
+                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF>(
                         x, \(rows), b, tiles, y, N, K, Ws,
                         threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup,
@@ -651,7 +774,7 @@ enum NemotronSeedRetile {
         return kernel(
             inputs,
             template: [("T", x.dtype), ("BM", tiles.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
-                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2)],
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf)],
             grid: (((nOut + v.bn - 1) / v.bn) * v.threads, tiles.count, 1), threadGroup: (v.threads, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }

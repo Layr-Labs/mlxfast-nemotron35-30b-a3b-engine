@@ -409,6 +409,16 @@ enum NemotronHResidualRMSNorm {
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
     }
 
+    /// The products join's kernel body and operands, for a launch that runs it as its own tail
+    /// (`NemotronZSkip.fusedJoin`).
+    static var productsJoinSource: String { oneBarrierSource(sumProductsPreparedSource()) }
+    static func joinScalars(_ eps: Float) -> (MLXArray, MLXArray) { scalars(eps) }
+    static func joinRows(_ x: MLXArray, norm: RMSNorm) -> Bool { plumbingRows(x, norm: norm) }
+    static func productsJoinReference(_ lhs: MLXArray, _ products: MLXArray, shared: MLXArray, norm: RMSNorm)
+        -> (MLXArray, MLXArray, MLXArray) {
+        applyProductsRows(lhs, products, shared: shared, norm: norm)
+    }
+
     private static func plumbingRows(_ x: MLXArray, norm: RMSNorm) -> Bool {
         plumbingAvailable
             && x.shape == [1, 3, 2688] && x.dtype == .bfloat16
@@ -1753,13 +1763,22 @@ enum NemotronHCompactSSMGated {
     }
     /// NEMOTRON_SSM_TAIL_ONE_BARRIER=0 keeps one barrier per row in the shuffle tail. Otherwise the group's
     static let tailOneBarrier = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_ONE_BARRIER"] != "0"
+    static let tailWeightAhead = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_WEIGHT_AHEAD"] != "0"
     static func rowsTail(_ source: String) -> String? {
         let head = "threadgroup T rounded[512];\n"
         let loop = "for (int row = 0; row < L; ++row) {\n"
         guard tailShuffle, tailOneBarrier, source.components(separatedBy: head).count == 2,
               let start = source.range(of: loop) else { return nil }
         return String(source[..<start.lowerBound]).replacingOccurrences(of: head, with:
-            "            threadgroup float nst_sums[L][4];\n") + """
+            "            threadgroup float nst_sums[L][4];\n") + (tailWeightAhead ? """
+                        T nst_w[4];
+                        if (on) {
+                            for (int i = 0; i < 4; i++) {
+                                nst_w[i] = weight[int64_t(grp) * 512 + int64_t(lid) * 4 + int64_t(i)];
+                            }
+                        }
+
+            """ : "") + """
                         float nst_x[L][4];
                         for (int row = 0; row < L; ++row) {
                             int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;
@@ -1793,7 +1812,7 @@ enum NemotronHCompactSSMGated {
                                     int64_t f = feature + int64_t(i);
                                     T normalized = static_cast<T>(nst_x[row][i] * inv_mean);
                                     T unweighted = identity * normalized;
-                                    T weighted = weight[f] * unweighted;
+                                    T weighted = \(tailWeightAhead ? "nst_w[i]" : "weight[f]") * unweighted;
                                     normed[int64_t(row) * (H * Dh) + f] = weighted;
                                     w[i] = weighted;
                                 }
