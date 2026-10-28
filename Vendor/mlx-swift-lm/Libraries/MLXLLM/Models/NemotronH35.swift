@@ -201,16 +201,18 @@ struct NemotronSeedDict {
 // B source: the tile-major zero-skip decode copy (codes [E, N / 128, K, 32]
 // uint16, four outputs per word; pair index [E, N / 128, K / 64, 128]; FP32
 // pair table): the bank byte is rebuilt from the two nibbles as the fc2 copy
-// loader does.
+// loader does. With expert groups, `codes` is the tile's group and `first` its
+// first expert: the codes advance by the local expert, the pair index by index.
 template <typename T>
 struct NemotronSeedCopy {
   const device uint16_t* codes;
   const device uint16_t* sidx;
   const device float* table;
   int K;
+  uint first;
 
   METAL_FUNC void expert(const uint index, const int N) thread {
-    codes += size_t(index) * size_t(N / 128) * size_t(K) * 32;
+    codes += size_t(index - first) * size_t(N / 128) * size_t(K) * 32;
     sidx += size_t(index) * size_t(N / 128) * size_t(K / 64) * 128;
   }
   METAL_FUNC float2 sb(const int n, const int g) const thread {
@@ -521,7 +523,7 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// case), drops any mismatch or Metal error, times the survivors and the
 /// incumbent round robin on the 488-token gathers of the first four MoE layers
 /// (5 warm-up and 25 timed repetitions, median), and adopts the fastest only if
-/// it is at least 3% faster than the incumbent. NEMOTRON_SEED_RETILE=0 keeps
+/// it is at least 0.5% faster than the incumbent. NEMOTRON_SEED_RETILE=0 keeps
 /// the incumbents; NEMOTRON_SEED_RETILE_FORCE=<variant> adopts that variant
 /// for both roles when it qualifies.
 enum NemotronSeedRetile {
@@ -546,6 +548,9 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "ws64x64w42", bn: 64, bk: 64, wm: 4, wn: 2, direct: false),
+        Variant(name: "d64w42", bn: 64, bk: 64, wm: 4, wn: 2, direct: true),
+        Variant(name: "ws128x64w42", bn: 128, bk: 64, wm: 4, wn: 2, direct: false),
     ]
 
     enum Source: String, Sendable { case bank, dict, copy }
@@ -561,12 +566,16 @@ enum NemotronSeedRetile {
     nonisolated(unsafe) static var fc1Choice: (role: Role, variant: Variant)? = nil
     nonisolated(unsafe) static var fc2Choice: (role: Role, variant: Variant)? = nil
 
-    private static func body(routed: Bool, source: Source) -> String {
+    /// `pieces`: the copy's codes as the target's expert groups w0 ... (`NemotronZSkip.copyPieces`, EP experts
+    /// each); the tile's expert picks its group as the verify slot kernels do.
+    private static func body(routed: Bool, source: Source, pieces: Bool = false) -> String {
         let make: String
         switch source {
         case .bank: make = "NemotronSeedBank<T> b{(const device uint8_t*)w, scales, biases, K};"
         case .dict: make = "NemotronSeedDict<T> b{(const device uint8_t*)w, scales, biases, K};"
-        case .copy: make = "NemotronSeedCopy<T> b{w, scales, biases, K};"
+        case .copy: make = !pieces ? "NemotronSeedCopy<T> b{w, scales, biases, K, 0};"
+            : "const uint nmz_piece = uint(tiles[threadgroup_position_in_grid.y * 3 + 2]) / EP;\n"
+                + "NemotronSeedCopy<T> b{\(NemotronZSkip.pieceSelect("w", "nmz_piece")), scales, biases, K, nmz_piece * EP};"
         }
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
         func call(_ bm: String) -> String {
@@ -581,20 +590,26 @@ enum NemotronSeedRetile {
         return """
                 threadgroup T Ws[DIRECT_B ? 1 : BN * (BK + 16 / sizeof(T))];
                 \(make)
+                if constexpr (32 / WM >= 16) {
                 if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
             \(call("32"))
+                } else {
+            \(call("BM"))
+                }
                 } else {
             \(call("BM"))
                 }
             """
     }
 
-    private static func makeKernel(routed: Bool, source: Source) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(routed: Bool, source: Source, pieces: Bool = false) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
-            name: "nemotron_seed_gather_\(routed ? "routed_" : "")\(source.rawValue)",
-            inputNames: ["x", "w", "scales", "biases", "tiles"] + (routed ? ["routed_rows"] : []) + ["N", "K"],
+            name: "nemotron_seed_gather_\(routed ? "routed_" : "")\(source.rawValue)"
+                + (pieces ? "_p\(NemotronZSkip.copyPieces)" : ""),
+            inputNames: ["x"] + (pieces ? NemotronZSkip.pieceInputs("w") : ["w"]) + ["scales", "biases", "tiles"]
+                + (routed ? ["routed_rows"] : []) + ["N", "K"],
             outputNames: ["y"],
-            source: body(routed: routed, source: source),
+            source: body(routed: routed, source: source, pieces: pieces),
             header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource)
     }
 
@@ -602,6 +617,7 @@ enum NemotronSeedRetile {
     private static let routedDict = makeKernel(routed: true, source: .dict)
     private static let plainBank = makeKernel(routed: false, source: .bank)
     private static let plainCopy = makeKernel(routed: false, source: .copy)
+    private static let plainCopyPieces = makeKernel(routed: false, source: .copy, pieces: true)
 
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
@@ -623,6 +639,7 @@ enum NemotronSeedRetile {
         }
         let kernel: MLXFast.MLXFastKernel
         let operands: [MLXArray]
+        var ep: [(String, any KernelTemplateArg)] = []
         switch role.source {
         case .bank, .dict:
             guard !ops.hasLinearBias, let biases = ops.biases, ops.scales.dtype == x.dtype,
@@ -639,11 +656,13 @@ enum NemotronSeedRetile {
             }
         case .copy:
             guard !role.routed, !role.relu2, nOut % 128 == 0, let copy = NemotronZSkip.copy(for: lin), copy.dict,
-                  copy.codes.shape == [experts, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+                  case let p = copy.codes.count, p == 1 || p == NemotronZSkip.copyPieces, experts % p == 0,
+                  copy.codes.allSatisfy({ $0.shape == [experts / p, nOut / 128, k, 32] && $0.dtype == .uint16 }),
                   copy.scales.shape == [experts, nOut / 128, k / 64, 128], copy.scales.dtype == .uint16,
                   copy.biases.dtype == .float32
             else { return nil }
-            (kernel, operands) = (plainCopy, [copy.codes, copy.scales, copy.biases])
+            (kernel, operands) = (p > 1 ? plainCopyPieces : plainCopy, copy.arrays)
+            ep = p > 1 ? [("EP", experts / p)] : []
         }
         var inputs: [any ScalarOrArray] = [x] + operands + [tiles.tiles]
         if role.routed, let rows { inputs.append(rows) }
@@ -651,7 +670,7 @@ enum NemotronSeedRetile {
         return kernel(
             inputs,
             template: [("T", x.dtype), ("BM", tiles.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
-                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2)],
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2)] + ep,
             grid: (((nOut + v.bn - 1) / v.bn) * v.threads, tiles.count, 1), threadGroup: (v.threads, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }
@@ -857,7 +876,7 @@ enum NemotronSeedRetile {
             let base = medians[r][0].1
             if let forced, let f = alive[r].first(where: { $0.name == forced }) {
                 choice[r] = f
-            } else if let best = medians[r].dropFirst().min(by: { $0.1 < $1.1 }), best.1 <= 0.97 * base {
+            } else if let best = medians[r].dropFirst().min(by: { $0.1 < $1.1 }), best.1 <= 0.995 * base {
                 choice[r] = best.0
             }
         }

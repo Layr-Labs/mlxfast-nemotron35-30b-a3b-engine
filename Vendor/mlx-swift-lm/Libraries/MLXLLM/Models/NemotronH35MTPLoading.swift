@@ -82,10 +82,12 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
+        NemotronBankBinding.warmGroups(NemotronZSkip.codeGroups)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
@@ -95,6 +97,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -464,7 +468,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
                       let moe = module as? NemotronHMoE,
                       let copy = NemotronZSkip.copy(for: moe.switchMLP.fc2), copy.dict else { continue }
-                copies[n] = [copy.codes, copy.scales, copy.biases]
+                copies[n] = copy.arrays
             }
         }
         // With `NemotronPrefillDirectFC1.dictVerified`, the request prefill's fc1 reads the bank's pair
@@ -695,6 +699,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     }
 
     func begin() -> Lease {
+        // Measurement entry: a request whose seed reads the fc2 bank (the grouped copy path did not qualify)
+        // waits 30 ms before its residency requests.
+        if NemotronSeedCopySignal.enabled, !NemotronPrefillFC2Copy.verified { Thread.sleep(forTimeInterval: 0.03) }
         let early = earlyLock.withLock { () -> Bool in
             defer { earlyIssuedAt = nil }
             guard let at = earlyIssuedAt else { return false }
@@ -796,3 +803,10 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry of the carried 3f932e3c tree.
 
 // Measurement entry 1 of this tree.
+
+
+/// NEMOTRON_SEED_COPY_SIGNAL=0 turns off the 30 ms wait `NemotronDecodeResidency.begin` adds to a request while
+/// `NemotronPrefillFC2Copy` is not verified.
+enum NemotronSeedCopySignal {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_COPY_SIGNAL"] != "0"
+}
