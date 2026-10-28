@@ -82,6 +82,7 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -95,6 +96,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -406,7 +409,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let decodeSets: [any MTLResidencySet]
     let owners: [ObjectIdentifier]
     let cut: Int
-    let queue = DispatchQueue(label: "nemotron.decode.memory")
+    /// The residency queues run at user-interactive QoS whichever thread enqueues their requests.
+    let queue = DispatchQueue(label: "nemotron.decode.memory", qos: .userInteractive)
     /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
     /// requests are left standing between requests.
     static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
@@ -415,7 +419,28 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     /// rest), requested on their own serial queue when a request's lease begins and ended with the lease.
     static let targetEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_TARGET_RESIDENCY"] != "0"
     let targetSets: [any MTLResidencySet]
-    let targetQueue = DispatchQueue(label: "nemotron.target.memory")
+    let targetQueue = DispatchQueue(label: "nemotron.target.memory", qos: .userInteractive)
+    /// The target's groups are requested on `laneCount` serial lanes: group i on lane i % laneCount (lane 0 is
+    /// `targetQueue`), so every lane advances through the groups in backbone order. Everything requested after the
+    /// target's groups waits on `targetQueue` until the other lanes have drained.
+    /// NEMOTRON_RESIDENCY_LANES=n sets the lane count (default 3; 1 requests every group on `targetQueue`).
+    static let laneCount = max(1, min(4, Int(ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_LANES"] ?? "") ?? 3))
+    let targetLanes: [DispatchQueue] = (1 ..< NemotronDecodeResidency.laneCount).map {
+        DispatchQueue(label: "nemotron.target.memory.\($0 + 1)", qos: .userInteractive)
+    }
+
+    private func requestTargets() {
+        let lanes = [targetQueue] + targetLanes
+        for (i, set) in targetSets.enumerated() {
+            lanes[i % lanes.count].async { set.requestResidency() }
+        }
+        let others = targetLanes
+        targetQueue.async { for lane in others { lane.sync {} } }
+    }
+
+    fileprivate func drainLanes() {
+        for lane in targetLanes { lane.sync {} }
+    }
     /// Load-time decode-only backing outside the head and copy sets (the draft head's routed-FC2 copy and the
     /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
@@ -653,10 +678,12 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             let owner = owner
             guard NemotronDecodeResidency.endsRequests else {
                 // The requests stay standing; the next lease requests the same sets again.
+                owner.drainLanes()
                 owner.targetQueue.sync {}
                 owner.queue.sync { NemotronZSkip.endCopyReadiness() }
                 return
             }
+            owner.drainLanes()
             owner.targetQueue.sync {
                 for set in owner.targetSets + owner.extraSets + owner.lateSets { set.endResidency() }
             }
@@ -691,7 +718,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     func earlyBegin() {
         guard Self.earlyEnabled, !targetSets.isEmpty else { return }
         earlyLock.withLock { earlyIssuedAt = Date() }
-        for set in targetSets { targetQueue.async { set.requestResidency() } }
+        requestTargets()
     }
 
     func begin() -> Lease {
@@ -708,7 +735,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             request(seedSet, phase: "seed", ready: Array(owners.prefix(cut)))
             return Lease(self)
         }
-        if !early { for set in targetSets { targetQueue.async { set.requestResidency() } } }
+        if !early { requestTargets() }
         if copiesInTarget {
             // The request prefill reads every layer's copy (they replace the fc2 banks in the target
             // groups), so the first verify already finds them bound: no round falls back to a bank.
