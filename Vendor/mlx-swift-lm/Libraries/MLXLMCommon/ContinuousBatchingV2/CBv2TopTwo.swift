@@ -324,11 +324,7 @@ private let cbv2TopTwoShuffleHeader = cbv2TopTwoHeader + """
 
 /// The partial with the shuffle-form reduction (see `CBv2MTPTopTwoShuffle`);
 /// 256 threads, eight SIMD groups.
-private let cbv2TopTwoPartialShuffleKernel = MLXFast.metalKernel(
-    name: "darkbloom_qwen35_mtp_top2_partial_sh",
-    inputNames: ["logits"],
-    outputNames: ["partial_ids", "partial_values"],
-    source: """
+private let cbv2TopTwoPartialShuffleSource = """
         uint lane = thread_position_in_threadgroup.x;
         uint group_index = threadgroup_position_in_grid.x;
         uint row = group_index / 32;
@@ -397,10 +393,66 @@ private let cbv2TopTwoPartialShuffleKernel = MLXFast.metalKernel(
                     ? local.second_value : sentinel_value;
             }
         }
-    """,
+    """
+private let cbv2TopTwoPartialShuffleKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_partial_sh",
+    inputNames: ["logits"],
+    outputNames: ["partial_ids", "partial_values"],
+    source: cbv2TopTwoPartialShuffleSource,
     header: cbv2TopTwoShuffleHeader,
     ensureRowContiguous: false
 )
+
+// MARK: - 32-bit element offsets in the shuffle partial
+
+/// CBV2_MTP_TOP2_OFFSET32=0 keeps the shuffle partial's vocabulary walk. Otherwise the decode round's shuffle
+/// partial runs as a twin (`cbv2TopTwoOffset32Source`) whose walk reads element `index` of its row at
+/// `logits[row * vocab + index]` with the offset in 32 bits, where the record forms `row * logits_strides[1] +
+/// index * logits_strides[2]` in 64 bits for every element. The twin is launched with row-contiguous logits
+/// (`ensureRowContiguous`; MLX copies any other layout first, the decode round's [1, 3, 131072] logits are the
+/// LM head's own row-contiguous output, so no copy) and only when rows * vocab fits in 32 bits (393,216 in the
+/// decode round): there the record's offset is row * vocab + index, so every element is read at the record's
+/// address. The walk visits the same indices in the same order with the same `insert`, and the shuffle merges
+/// and stores are the record's, so the ids and values are bitwise the record's. Used only after
+/// `cbv2TopTwoOffset32Qualify` found it bitwise equal to the shuffle partial.
+public enum CBv2MTPTopTwoOffset32 {
+    public static let enabled =
+        ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_OFFSET32"] != "0"
+    nonisolated(unsafe) static var verified = false
+}
+
+private func cbv2TopTwoOffset32Source(_ s: String) -> String? {
+    let walk = """
+            for (uint index = group * 256 + lane;
+                 index < vocab;
+                 index += 32 * 256) {
+                ulong offset = ulong(row) * ulong(logits_strides[1])
+                    + ulong(index) * ulong(logits_strides[2]);
+                darkbloom_qwen35_mtp_top2_insert(local, float(logits[offset]), index);
+            }
+
+        """
+    guard s.components(separatedBy: walk).count == 2 else { return nil }
+    return s.replacingOccurrences(of: walk, with: """
+            const auto t2_row = logits + row * vocab;
+            for (uint index = group * 256 + lane;
+                 index < vocab;
+                 index += 32 * 256) {
+                darkbloom_qwen35_mtp_top2_insert(local, float(t2_row[index]), index);
+            }
+
+        """)
+}
+
+private let cbv2TopTwoPartialShuffleOffset32Kernel = cbv2TopTwoOffset32Source(cbv2TopTwoPartialShuffleSource).map {
+    MLXFast.metalKernel(
+        name: "darkbloom_qwen35_mtp_top2_partial_sh_o32",
+        inputNames: ["logits"],
+        outputNames: ["partial_ids", "partial_values"],
+        source: $0,
+        header: cbv2TopTwoShuffleHeader,
+        ensureRowContiguous: true)
+}
 
 /// The packet finalize with the shuffle-form reduction: one SIMD group per row.
 private let cbv2TopTwoFinalizePacketShuffleSource = """
@@ -545,7 +597,7 @@ package func cbv2TopTwoRowsPacket(
 /// `cbv2TopTwoRowsPacket` with the packet's draft ids read from `draftColumns` (window columns 1 and 2, [1]
 /// int32 each; batch 1, width 3) when given, else from `window`.
 private func cbv2TopTwoRowsPacket(
-    _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, shuffle: Bool?
+    _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, shuffle: Bool?, offset32: Bool? = nil
 ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
     guard CBv2MTPTopTwoPacket.enabled,
         logits.ndim == 3, logits.dim(0) == 1, logits.dim(2) >= 2,
@@ -555,7 +607,9 @@ private func cbv2TopTwoRowsPacket(
     let rows = logits.dim(1)
     let drafts = window.dim(0) * (window.dim(1) - 1)
     let shuffled = shuffle ?? CBv2MTPTopTwoShuffle.verified
-    let partials = (shuffled ? cbv2TopTwoPartialShuffleKernel : cbv2TopTwoPartialKernel)(
+    let shufflePartial = (offset32 ?? CBv2MTPTopTwoOffset32.verified) && rows * logits.dim(2) <= Int(UInt32.max)
+        ? cbv2TopTwoPartialShuffleOffset32Kernel ?? cbv2TopTwoPartialShuffleKernel : cbv2TopTwoPartialShuffleKernel
+    let partials = (shuffled ? shufflePartial : cbv2TopTwoPartialKernel)(
         [logits],
         grid: (rows * 32 * 256, 1, 1),
         threadGroup: (256, 1, 1),
@@ -693,6 +747,82 @@ package func cbv2TopTwoShuffleQualify(logitsDType: DType, vocabulary: Int) {
     report(CBv2MTPTopTwoShuffle.verified
         ? "on (\(cases) cases bitwise equal to the tree reductions)"
         : "off (differs from the tree reductions after \(cases) cases)")
+}
+
+/// Load time, after `cbv2TopTwoShuffleQualify`: the shuffle partial with 32-bit element offsets
+/// (`CBv2MTPTopTwoOffset32`) and the packet finalize against the shuffle partial and the same finalize, bit for bit
+/// in the ids, the values (as bits) and the packet, on seeded logits at R = 1 ... 4 over the full vocabulary, 64,
+/// 5003, 8193 and the full vocabulary plus 8195 (walks of 0 to 17 elements per thread): Gaussian, exact ties,
+/// NaNs, infinities, signed zeros and constant rows; and on two strided views (a column window of wider rows, a
+/// transposed layout with element stride 3), which the twin reads through MLX's row-contiguous copy. Engages only
+/// if every case matches.
+package func cbv2TopTwoOffset32Qualify(logitsDType: DType, vocabulary: Int) {
+    CBv2MTPTopTwoOffset32.verified = false
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 mtp top2 offset32: \(message)\n".utf8))
+    }
+    guard CBv2MTPTopTwoPacket.enabled else { return report("off (packet finalize off)") }
+    guard CBv2MTPTopTwoShuffle.verified else { return report("off (shuffle partial off)") }
+    guard CBv2MTPTopTwoOffset32.enabled else { return report("off (setting)") }
+    guard cbv2TopTwoPartialShuffleOffset32Kernel != nil else { return report("off (partial text moved)") }
+    var cases = 0
+    do {
+        let matches = try withError { () -> Bool in
+            func same(_ logits: MLXArray, _ window: MLXArray) -> MLXArray? {
+                guard let a = cbv2TopTwoRowsPacket(
+                        logits, window: window, draftColumns: nil, shuffle: true, offset32: false),
+                      let b = cbv2TopTwoRowsPacket(
+                        logits, window: window, draftColumns: nil, shuffle: true, offset32: true)
+                else { return nil }
+                cases += 1
+                return (a.ids .== b.ids).all()
+                    .&& (a.values.view(dtype: .uint32) .== b.values.view(dtype: .uint32)).all()
+                    .&& (a.packet .== b.packet).all()
+            }
+            for vocab in [vocabulary, 64, 5003, 8193, vocabulary + 8195] {
+                var ok = MLXArray(true)
+                for rows in 1 ... 4 {
+                    for kind in 0 ..< 6 {
+                        let key = MLXRandom.key(UInt64(0x7a93_0000 + vocab * 64 + rows * 8 + kind))
+                        var logits = MLXRandom.normal([1, rows, vocab], key: key) * 3
+                        switch kind {
+                        case 1: logits = round(logits)
+                        case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)), MLXArray(Float.nan), logits)
+                        case 3:
+                            logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                                which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                        case 4: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(Float(-0.0)), round(logits))
+                        case 5: logits = MLXArray.zeros([1, rows, vocab]) + MLXArray(Float(0.5))
+                        default: break
+                        }
+                        let typed = logits.asType(logitsDType)
+                        let window = MLXRandom.randInt(
+                            0 ..< Int32(vocab), [1, rows], key: MLXRandom.key(UInt64(0x7a94_0000 + cases)))
+                            .asType(.int32)
+                        let w = rows >= 2 ? window : concatenated([window, window], axis: 1)
+                        let l = rows >= 2 ? typed : concatenated([typed, typed], axis: 1)
+                        guard let same = same(l, w) else { return false }
+                        ok = ok .&& same
+                    }
+                }
+                if !ok.item(Bool.self) { return false }
+            }
+            let window = MLXRandom.randInt(0 ..< Int32(5003), [1, 3], key: MLXRandom.key(0x7a95_0000))
+                .asType(.int32)
+            let wide = (MLXRandom.normal([1, 3, vocabulary + 64], key: MLXRandom.key(0x7a95_0001)) * 3)
+                .asType(logitsDType)
+            let tall = (MLXRandom.normal([1, 5003, 3], key: MLXRandom.key(0x7a95_0002)) * 3).asType(logitsDType)
+            guard let a = same(wide[0..., 0..., 32 ..< (32 + vocabulary)], window),
+                  let b = same(tall.transposed(0, 2, 1), window) else { return false }
+            return (a .&& b).item(Bool.self)
+        }
+        CBv2MTPTopTwoOffset32.verified = matches
+    } catch {
+        return report("off (\(error))")
+    }
+    report(CBv2MTPTopTwoOffset32.verified
+        ? "on (\(cases) cases bitwise equal to the shuffle partial)"
+        : "off (differs from the shuffle partial after \(cases) cases)")
 }
 
 /// Load-time JIT of the packet finalize (its pipeline depends only on the
