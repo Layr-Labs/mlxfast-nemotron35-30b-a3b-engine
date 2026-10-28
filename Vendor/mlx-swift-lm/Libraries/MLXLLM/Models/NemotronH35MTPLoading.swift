@@ -103,6 +103,8 @@ extension NemotronH35MTPAssistant {
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPFrontNorms.qualifyShuffle(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPFrontNorms.qualifyEmbed(
+            assistant.module.layers[0] as! NemotronH35MTPAttentionBlock, target: target)
         NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
@@ -131,6 +133,7 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
         NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPDraftSDPA.qualifyPaged(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
