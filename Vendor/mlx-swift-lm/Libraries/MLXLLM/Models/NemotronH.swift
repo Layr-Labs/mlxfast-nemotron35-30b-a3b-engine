@@ -5710,6 +5710,13 @@ class NemotronHAttention: Module, NemotronHMixer {
                    nemotronBitwiseOrNaN(outputs.2, wv(x)))
                 : outputs
         }
+        // Request prefill: the dense dictionary run gather (`NemotronPrefillDenseDict`, checked bitwise against
+        // these stock projections at load) for each of Q, K and V when admitted.
+        if !captureMTP, let q = NemotronPrefillDenseDict.apply(x, wq, kind: "q_proj"),
+           let k = NemotronPrefillDenseDict.apply(x, wk, kind: "k_proj"),
+           let v = NemotronPrefillDenseDict.apply(x, wv, kind: "v_proj") {
+            return (q, k, v)
+        }
         return (
             captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
@@ -5801,7 +5808,8 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo)
+            : (NemotronPrefillDenseDict.apply(merged, wo, kind: "o_proj") ?? nemotronR1Linear(merged, wo))
     }
 
     // Protocol conformance
@@ -8565,7 +8573,8 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) dense projections
 enum NemotronPrefillDenseDict {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_DENSE_DICT"] != "0"
-    /// The admitted kinds: "in_proj", "out_proj" (Mamba mixers), "up_proj" (shared experts, with ReLU2).
+    /// The admitted kinds: "in_proj", "out_proj" (Mamba mixers), "up_proj" (shared experts, with ReLU2), and the
+    /// attention layers' "q_proj", "k_proj", "v_proj", "o_proj".
     nonisolated(unsafe) static var kinds: Set<String> = []
 
     private static let header: String? = {
@@ -8604,13 +8613,36 @@ enum NemotronPrefillDenseDict {
             header: header)
     }
 
+    /// The same body with 128-row tiles and 4 x 2 SIMD groups (256 threads): each SIMD group keeps its 32 x 32
+    /// output block, and each threadgroup's dequantized weight block feeds twice the rows.
+    private static let wideKernel = header.map { header in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_dense_dict_w42",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                nemotron_gather_qmm_runs_dict_impl<T, GS, BITS, BM, BN, BK, 4, 2, ALIGN_N, ALIGN_K, RELU2>(
+                    x, w, scales, biases, tiles, y, N, K, Ws,
+                    threadgroup_position_in_grid,
+                    simdgroup_index_in_threadgroup,
+                    thread_index_in_simdgroup);
+            """,
+            header: header)
+    }
+    /// NEMOTRON_PREFILL_DENSE_WIDE=0 keeps the 64-row tiles. Otherwise `tuneWide` (load time) adopts the 128-row
+    /// launch per kind when it is bitwise equal to the 64-row launch and at least 3% faster on the 488-row seed.
+    static let wideRequested = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_DENSE_WIDE"] != "0"
+    nonisolated(unsafe) static var wideKinds: Set<String> = []
+
     static func apply(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool = false) -> MLXArray? {
         guard NemotronHPrefillX5.active, !kinds.isEmpty, kinds.contains(kind) else { return nil }
-        return launch(x, linear, relu2: relu2)
+        return launch(x, linear, relu2: relu2, wide: wideKinds.contains(kind))
     }
 
-    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
-        guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
+    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool, wide: Bool = false) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, let kernel = wide ? wideKernel : kernel,
+              let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
               !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
@@ -8620,22 +8652,24 @@ enum NemotronPrefillDenseDict {
         else { return nil }
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64] else { return nil }
-        // Row tiles of 64 over the request's tokens, at least three descriptors
+        // Row tiles of 64 (128 when wide) over the request's tokens, at least three descriptors
         // (as `NemotronPrefillSharedUpGather`); a zero-row descriptor is skipped.
-        let used = (rows + 63) / 64
+        let bm = wide ? 128 : 64
+        let threads = wide ? 256 : 128
+        let used = (rows + bm - 1) / bm
         let count = max(used, 3)
         var desc = [Int32]()
         desc.reserveCapacity(count * 3)
         for t in 0 ..< count {
-            desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
+            desc += t < used ? [Int32(t * bm), Int32(min(bm, rows - t * bm)), 0] : [0, 0, 0]
         }
         let tiles = MLXArray(desc).reshaped(count, 3)
         let y = kernel(
             [x.reshaped(rows, 1, k), q.weight.expandedDimensions(axis: 0), d.index.expandedDimensions(axis: 0),
              d.table, tiles, nOut, k],
-            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", 64), ("BN", 64), ("BK", 64),
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", bm), ("BN", 64), ("BK", 64),
                        ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", true), ("RELU2", relu2)],
-            grid: (((nOut + 63) / 64) * 128, count, 1), threadGroup: (128, 1, 1),
+            grid: (((nOut + 63) / 64) * threads, count, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
         return y.reshaped(1, rows, nOut)
     }
@@ -8647,6 +8681,10 @@ enum NemotronPrefillDenseDict {
             case "in_proj": return (module as? NemotronHMamba2Mixer)?.inProj
             case "out_proj": return (module as? NemotronHMamba2Mixer)?.outProj
             case "up_proj": return (module as? NemotronHMoE)?.sharedExperts?.upProj
+            case "q_proj": return (module as? NemotronHAttention)?.wq
+            case "k_proj": return (module as? NemotronHAttention)?.wk
+            case "v_proj": return (module as? NemotronHAttention)?.wv
+            case "o_proj": return (module as? NemotronHAttention)?.wo
             default: return nil
             }
         }
@@ -8661,7 +8699,7 @@ enum NemotronPrefillDenseDict {
         guard kernel != nil else { return report("off (kernel source)") }
         var admitted: Set<String> = []
         var notes: [String] = []
-        for (kindIndex, kind) in ["in_proj", "out_proj", "up_proj"].enumerated() {
+        for (kindIndex, kind) in ["in_proj", "out_proj", "up_proj", "q_proj", "k_proj", "v_proj", "o_proj"].enumerated() {
             let withRelu2 = kind == "up_proj"
             let all = linears(target, kind: kind)
             guard let first = all.first,
@@ -8689,6 +8727,81 @@ enum NemotronPrefillDenseDict {
             notes.append("\(kind) \(matches ? "on" : "off") (\(checked) cases\(matches ? " bitwise equal, every layer in the first" : ""))")
         }
         kinds = admitted
+        report(notes.joined(separator: "; "))
+        tuneWide(target)
+    }
+
+    /// Load time, after `qualify`: per admitted kind, the 128-row launch against the 64-row launch bit for bit
+    /// (every layer at 488 rows, the first layer at 300, 97 and 17 rows), then both timed round robin over every
+    /// layer of the kind on a 488-row input (median); the wide launch is adopted only if at most 0.97 of the
+    /// 64-row median. One stderr line.
+    static func tuneWide(_ target: Module) {
+        wideKinds = []
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron prefill dense wide: \(message)\n".utf8))
+        }
+        guard wideRequested else { return report("off (setting)") }
+        guard wideKernel != nil, !kinds.isEmpty else { return report("off (no admitted kind)") }
+        var notes: [String] = []
+        for (kindIndex, kind) in ["in_proj", "out_proj", "up_proj", "q_proj", "k_proj", "v_proj", "o_proj"].enumerated()
+            where kinds.contains(kind) {
+            let withRelu2 = kind == "up_proj"
+            let all = linears(target, kind: kind)
+            guard let first = all.first else { continue }
+            let k = first.weight.dim(1) * 8
+            var same = false
+            var medians: [Double] = []
+            do {
+                try withError {
+                    var ok = MLXArray(true)
+                    for (index, rows) in [488, 300, 97, 17].enumerated() {
+                        let x = (MLXRandom.normal([1, rows, k], scale: 2,
+                            key: MLXRandom.key(UInt64(0xdd2c_0000 + 16 * kindIndex + index)))).asType(.bfloat16)
+                        for linear in (index == 0 ? all : [first]) {
+                            guard let a = launch(x, linear, relu2: withRelu2, wide: false),
+                                  let b = launch(x, linear, relu2: withRelu2, wide: true) else {
+                                ok = MLXArray(false); continue
+                            }
+                            ok = ok .&& (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                        }
+                        eval(ok)
+                    }
+                    same = ok.item(Bool.self)
+                    guard same else { return }
+                    let x = (MLXRandom.normal([1, 488, k], scale: 2, key: MLXRandom.key(UInt64(0xdd3c_0000 + kindIndex))))
+                        .asType(.bfloat16)
+                    eval(x)
+                    func sample(_ wide: Bool) -> Double {
+                        let outs = all.compactMap { launch(x, $0, relu2: withRelu2, wide: wide) }
+                        Stream.gpu.synchronize()
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(outs)
+                        Stream.gpu.synchronize()
+                        return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 / Double(max(1, outs.count))
+                    }
+                    for _ in 0 ..< 3 { _ = sample(false); _ = sample(true) }
+                    var samples: [[Double]] = [[], []]
+                    for rep in 0 ..< 15 {
+                        for j in 0 ..< 2 {
+                            let i = (j + rep) % 2
+                            samples[i].append(sample(i == 1))
+                        }
+                    }
+                    medians = samples.map { $0.sorted()[$0.count / 2] }
+                }
+            } catch {
+                notes.append("\(kind) narrow (\(error))")
+                continue
+            }
+            guard same, medians.count == 2 else {
+                notes.append("\(kind) narrow (\(same ? "timing incomplete" : "differs from the 64-row launch"))")
+                continue
+            }
+            let adopt = medians[1] <= 0.97 * medians[0]
+            if adopt { wideKinds.insert(kind) }
+            notes.append("\(kind) \(adopt ? "wide" : "narrow") (128-row \(String(format: "%.4f", medians[1])) ms vs "
+                + "64-row \(String(format: "%.4f", medians[0])) ms per launch, \(all.count) layers, bitwise equal)")
+        }
         report(notes.joined(separator: "; "))
     }
 }
