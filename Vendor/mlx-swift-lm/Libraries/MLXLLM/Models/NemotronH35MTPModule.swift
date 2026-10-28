@@ -318,6 +318,10 @@ enum NemotronMTPFrontNorms {
     /// The hidden half and everything after the reads are the record's text. Plain, prepared and shuffle forms;
     /// used only after `qualifyEmbed` found each bitwise equal to the embedding-rows launch plus the front norms.
     static let embed = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_EMBED"] != "0"
+    /// NEMOTRON_MTP_FRONT_EMBED_PAGED=0 keeps the embedding-rows launch ahead of the one-token draft
+    /// `pagedForward` (the speculation tail and the second draft). Otherwise those tails read the token's
+    /// embedding row inside the front norms, through the same qualified fold as `apply(operands:)`.
+    static let embedPaged = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FRONT_EMBED_PAGED"] != "0"
     nonisolated(unsafe) private static var embedVerified = false
 
     private static func embedSource(_ s: String) -> String {
@@ -554,7 +558,9 @@ enum NemotronMTPFrontNorms {
     /// Whether `apply(bests:rows:...)` serves one row whose token is the pick of `bests`.
     static func servesPick(_ bests: NemotronScreenPicks.Bests, rows o: NemotronHEmbeddingRows.Operands,
                            hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm) -> Bool {
-        pickVerified && o.count == 1 && serves(o, hidden: hidden, enorm: enorm, hnorm: hnorm)
+        // NEMOTRON_MTP_SCREEN_PICK_SHARE: the caller takes the final kernel's pick plus the reading form.
+        guard !NemotronHeadScreen.pickShareEnabled else { return false }
+        return pickVerified && o.count == 1 && serves(o, hidden: hidden, enorm: enorm, hnorm: hnorm)
             && bests.values.ndim == 1 && bests.values.dtype == .float32 && (1...4096).contains(bests.count)
             && bests.ids.shape == bests.values.shape && bests.ids.dtype == .int32
     }
@@ -873,6 +879,19 @@ final class NemotronH35MTPAttentionBlock: Module {
         cache: any CBv2AttendingLayerCache
     ) -> (residual: MLXArray, attention: MLXArray) {
         let front = draftFrontCache(hidden: hidden, embedding: embedding, owner: self)
+        return (front[0], mixer.cbv2Forward(
+            front[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV))
+    }
+
+    /// `pagedForwardParts` with the front norms reading the token's embedding row themselves (the same
+    /// qualified fold as `pagedDraftInputs(hidden:operands:)`); nil where that launch does not serve the
+    /// operands (the caller then feeds the embedding-rows launch, as before).
+    func pagedForwardParts(
+        hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands,
+        cache: any CBv2AttendingLayerCache
+    ) -> (residual: MLXArray, attention: MLXArray)? {
+        guard NemotronMTPFrontNorms.embedPaged else { return nil }
+        guard let front = draftFrontCache(hidden: hidden, operands: operands, owner: self) else { return nil }
         return (front[0], mixer.cbv2Forward(
             front[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV))
     }
@@ -1572,6 +1591,18 @@ final class NemotronH35MTPModule: Module {
     ) -> MLXArray {
         let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
             hidden: hidden, embedding: embedding, cache: cache)
+        return (layers[1] as! NemotronH35MTPExpertBlock)(
+            residual: parts.residual, attention: parts.attention)
+    }
+    /// `pagedForward` on the token's embedding operands (the front norms read the row); nil where they
+    /// do not serve them.
+    func pagedForward(
+        hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands,
+        cache: any CBv2AttendingLayerCache
+    ) -> MLXArray? {
+        guard let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
+            hidden: hidden, operands: operands, cache: cache)
+        else { return nil }
         return (layers[1] as! NemotronH35MTPExpertBlock)(
             residual: parts.residual, attention: parts.attention)
     }

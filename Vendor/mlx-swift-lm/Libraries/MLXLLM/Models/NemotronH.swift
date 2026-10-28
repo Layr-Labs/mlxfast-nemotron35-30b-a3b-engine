@@ -1021,6 +1021,9 @@ extension NemotronHResidualRMSNorm {
     private static func verifyEntryPicks(_ tokens: MLXArray)
         -> (MLXArray, NemotronScreenPicks.Bests, NemotronScreenPicks.Bests)?
     {
+        // NEMOTRON_MTP_SCREEN_PICK_SHARE: the entry reads the final kernel's picks from the window's columns
+        // instead of recomputing them inline (the column/window path below).
+        guard !NemotronHeadScreen.pickShareEnabled else { return nil }
         guard NemotronHVerifyEntry.picksVerified, tokens.dtype == .int32,
               let columns = verifyEntryColumns(tokens),
               let sources = CBv2MTPVerifyWindowColumns.sources(of: tokens), sources.count == 2,
@@ -1753,13 +1756,25 @@ enum NemotronHCompactSSMGated {
     }
     /// NEMOTRON_SSM_TAIL_ONE_BARRIER=0 keeps one barrier per row in the shuffle tail. Otherwise the group's
     static let tailOneBarrier = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_ONE_BARRIER"] != "0"
+    /// NEMOTRON_SSM_TAIL_WEIGHT_AHEAD=0 keeps the one-barrier tail's norm-weight loads inside its row loop, where
+    /// the loads of rows 1 ... L - 1 follow the thread's stores of the previous row. Otherwise each thread loads its
+    /// four weights (the same `weight[f]`, f = grp * 512 + lid * 4 + i for every row) once at the start of the tail.
+    static let tailWeightAhead = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_WEIGHT_AHEAD"] != "0"
     static func rowsTail(_ source: String) -> String? {
         let head = "threadgroup T rounded[512];\n"
         let loop = "for (int row = 0; row < L; ++row) {\n"
         guard tailShuffle, tailOneBarrier, source.components(separatedBy: head).count == 2,
               let start = source.range(of: loop) else { return nil }
         return String(source[..<start.lowerBound]).replacingOccurrences(of: head, with:
-            "            threadgroup float nst_sums[L][4];\n") + """
+            "            threadgroup float nst_sums[L][4];\n") + (tailWeightAhead ? """
+                        T nst_w[4];
+                        if (on) {
+                            for (int i = 0; i < 4; i++) {
+                                nst_w[i] = weight[int64_t(grp) * 512 + int64_t(lid) * 4 + int64_t(i)];
+                            }
+                        }
+
+            """ : "") + """
                         float nst_x[L][4];
                         for (int row = 0; row < L; ++row) {
                             int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;
@@ -1793,7 +1808,7 @@ enum NemotronHCompactSSMGated {
                                     int64_t f = feature + int64_t(i);
                                     T normalized = static_cast<T>(nst_x[row][i] * inv_mean);
                                     T unweighted = identity * normalized;
-                                    T weighted = weight[f] * unweighted;
+                                    T weighted = \(tailWeightAhead ? "nst_w[i]" : "weight[f]") * unweighted;
                                     normed[int64_t(row) * (H * Dh) + f] = weighted;
                                     w[i] = weighted;
                                 }
@@ -8606,10 +8621,10 @@ enum NemotronPrefillDenseDict {
 
     static func apply(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool = false) -> MLXArray? {
         guard NemotronHPrefillX5.active, !kinds.isEmpty, kinds.contains(kind) else { return nil }
-        return launch(x, linear, relu2: relu2)
+        return NemotronSeedDenseRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -8741,10 +8756,10 @@ enum NemotronPrefillSharedDownCopy {
 
     static func apply(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, down)
+        return NemotronSeedDenseRetile.sharedDown(x, down) ?? launch(x, down)
     }
 
-    private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
