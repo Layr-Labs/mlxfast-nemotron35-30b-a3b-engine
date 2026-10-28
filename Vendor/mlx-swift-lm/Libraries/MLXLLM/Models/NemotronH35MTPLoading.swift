@@ -82,6 +82,7 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -95,6 +96,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -408,28 +411,21 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     let cut: Int
     let queue = DispatchQueue(label: "nemotron.decode.memory")
     /// NEMOTRON_MTP_RESIDENCY_END=1 ends every set's request when the lease finishes; by default the
-    /// requests are left standing between requests.
     static let endsRequests = ProcessInfo.processInfo.environment["NEMOTRON_MTP_RESIDENCY_END"] == "1"
 
     /// The target's own parameter buffers, one set per backbone group (embeddings, layers in order, then the
-    /// rest), requested on their own serial queue when a request's lease begins and ended with the lease.
     static let targetEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_TARGET_RESIDENCY"] != "0"
     let targetSets: [any MTLResidencySet]
     let targetQueue = DispatchQueue(label: "nemotron.target.memory")
     /// Load-time decode-only backing outside the head and copy sets (the draft head's routed-FC2 copy and the
-    /// scale-bias pair dictionaries), requested on the target queue after the target's own groups.
     static let extrasEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_EXTRA_RESIDENCY"] != "0"
     let extraSets: [any MTLResidencySet]
     /// Backing first read after the request's first verify (the head's routed experts with
-    /// `NemotronMTPFirstRoundDraft`), requested on the target queue after the extras.
     let lateSets: [any MTLResidencySet]
     /// With target sets, the per-layer copy sets are requested on the target queue right after the extras, each
-    /// marking its layer ready when its request returns, instead of at the first verify graph.
     static let copiesAfterExtras = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COPIES_AFTER_HEAD"] != "0"
     private(set) var copiesEnqueued = false
     /// The buffers of the residency sets are locked in memory (`mlock`) once at load, so a lease's request maps
-    /// pages that stay wired between requests. NEMOTRON_MTP_MLOCK=targets locks only the target's groups;
-    /// NEMOTRON_MTP_MLOCK=0 locks nothing.
     static let lockMode = ProcessInfo.processInfo.environment["NEMOTRON_MTP_MLOCK"] ?? "all"
     /// `mlock` of every distinct buffer of `sets`: (buffers locked, bytes locked).
     static func lockPages(_ sets: [any MTLResidencySet]) -> (Int, Int) {
@@ -450,10 +446,6 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     }
 
     /// The target's parameters grouped in backbone order: embeddings, layers 0..., then the rest.
-    /// With `NemotronPrefillFC2Copy` verified, a MoE layer's routed fc2 bank is replaced in its group by
-    /// that layer's decode copy (codes, pair index, pair table): the request prefill reads the copy, the
-    /// decode reads the copy, and nothing in the request reads the bank.
-    /// NEMOTRON_RESIDENCY_SPLIT_EXPERTS=0 keeps one set per backbone layer.
     static let splitExpertGroups = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_SPLIT_EXPERTS"] != "0"
 
     static func targetGroups(_ model: Module) -> [[MLXArray]] {
@@ -675,14 +667,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         }
     }
     /// One serial order for the lease's first requests: the target's groups (the seed's own weights, in
-    /// backbone order), then the MTP head's set, then the decode-only extras. With no target sets the head
-    /// set keeps its own queue.
-    /// The lease this process built at load, for `earlyBegin` from an engine's initializer.
     nonisolated(unsafe) static weak var current: NemotronDecodeResidency?
     /// NEMOTRON_RESIDENCY_EARLY=0 skips it: the target groups' residency requests are enqueued (in the same
-    /// backbone order, on the same serial queue) when a request's engine is built, before the engine is
-    /// assembled; the lease's `begin` that follows within `earlyWindow` then enqueues only the head set, the
-    /// extras and the copies after them, so the serial order is the base's.
     static let earlyEnabled = ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_EARLY"] != "0"
     private static let earlyWindow: TimeInterval = 5
     private let earlyLock = NSLock()
@@ -752,11 +738,6 @@ final class NemotronDecodeResidency: @unchecked Sendable {
 // Measurement entry 2 of this tree.
 
 /// A request's CPU keep-busy (terrapinelf's `8e4dac9d`, carried unchanged). The host builds the first decode
-/// rounds right after the seed, a phase in which it mostly waits on the GPU; after an idle period the CPU then
-/// builds those rounds at a lowered clock, and the GPU waits for their command buffers. From the MTP lease's
-/// begin (the request's seed) until the fourth decode round begins, or the lease finishes if sooner, two
-/// user-interactive threads stay busy so that the cores that build the first rounds run at speed. Nothing runs
-/// between requests, and no value changes. Off by default; NEMOTRON_MTP_CPU_WARM=1 enables it.
 final class NemotronCPUWarm: @unchecked Sendable {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_CPU_WARM"] == "1"
     /// Decode rounds covered after the seed.

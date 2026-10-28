@@ -7,7 +7,6 @@ import MLX
 
 // Metal entry-point names remain stable so extraction preserves pipeline identity.
 /// Shared exact ordering for the two-stage candidate-only top-2 reduction:
-/// value descending, token id ascending on exact ties, and NaNs last.
 private let cbv2TopTwoHeader = """
     struct darkbloom_qwen35_mtp_top2_state {
         float first_value;
@@ -185,10 +184,6 @@ private let cbv2TopTwoFinalizeKernel = MLXFast.metalKernel(
 )
 
 /// Exact top-2 token ids and logit values for every row of `[1, rows, vocab]`.
-///
-/// Returns lazy device arrays shaped `[rows, 2]`: ids are `int32`, values are
-/// `float32`. No evaluation or host read occurs here. Results are ordered by
-/// value descending, then token id ascending on exact ties, with NaNs last.
 package func cbv2TopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
     precondition(logits.ndim == 3 && logits.dim(0) == 1)
     let rows = logits.dim(1)
@@ -215,22 +210,15 @@ package func cbv2TopTwoRows(_ logits: MLXArray) -> (ids: MLXArray, values: MLXAr
 // MARK: - Top-2 finalize that also writes the MTP acceptance packet
 
 /// CBV2_MTP_TOP2_PACKET=0 keeps the acceptance packet as a separate
-/// concatenate (one copy launch per part) after the top-2 finalize.
 public enum CBv2MTPTopTwoPacket {
     public static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_PACKET"] != "0"
     /// NEMOTRON_KERNEL_SELFTEST=1: compare with the concatenated packet on
-    /// the host when it is built (the process stops on a difference).
     public static let selfTest =
         ProcessInfo.processInfo.environment["NEMOTRON_KERNEL_SELFTEST"] == "1"
 }
 
 /// The finalize body above, unchanged, plus the MTP acceptance packet the
-/// engine otherwise concatenates: `[B * k]` drafts (window columns 1...k,
-/// row-major), the `[B * (1 + k)]` top-1 ids, then the `[B * (1 + k) * 2]`
-/// top-2 values as their int32 bit patterns. `window` is the `[B, 1 + k]`
-/// int32 verify input; logits row r is its position r. Integer stores only:
-/// each element is window[r], or a value this launch already writes.
 private let cbv2TopTwoFinalizePacketSource = """
         uint lane = thread_position_in_threadgroup.x;
         uint row = threadgroup_position_in_grid.x;
@@ -290,16 +278,6 @@ private let cbv2TopTwoFinalizePacketKernel = MLXFast.metalKernel(
 // MARK: - Shuffle-form reductions of the decode round's top-2
 
 /// CBV2_MTP_TOP2_SHUFFLE=0 keeps the threadgroup-tree reductions in the decode
-/// round's top-2 (the partial and the packet finalize). Otherwise each SIMD
-/// group merges its lanes' states through `simd_shuffle_down` (offsets 16, 8,
-/// 4, 2, 1, the lower lane keeping the merge), the partial then merges its
-/// eight SIMD-group states after one barrier, and the finalize (one SIMD group)
-/// needs no threadgroup memory: one barrier instead of nine, none instead of
-/// six. Every merge is the tree's `insert` code. The two best of a set under
-/// the shared order (value descending, id ascending on ties, NaNs last; the
-/// ids, sentinels included, are distinct) do not depend on the merge order, so
-/// the ids and values (moved as raw bits) are the tree's. Used only after
-/// `cbv2TopTwoShuffleQualify` found both bitwise equal to the tree launches.
 public enum CBv2MTPTopTwoShuffle {
     public static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_SHUFFLE"] != "0"
@@ -323,7 +301,6 @@ private let cbv2TopTwoShuffleHeader = cbv2TopTwoHeader + """
 """
 
 /// The partial with the shuffle-form reduction (see `CBv2MTPTopTwoShuffle`);
-/// 256 threads, eight SIMD groups.
 private let cbv2TopTwoPartialShuffleKernel = MLXFast.metalKernel(
     name: "darkbloom_qwen35_mtp_top2_partial_sh",
     inputNames: ["logits"],
@@ -456,12 +433,6 @@ private let cbv2TopTwoFinalizePacketShuffleKernel = MLXFast.metalKernel(
 // MARK: - Packet finalize reading the verify columns
 
 /// CBV2_MTP_PACKET_COLUMNS=0 keeps the packet finalize reading the draft ids from the verify window. Otherwise,
-/// while the engine publishes the window's columns (`CBv2MTPVerifyWindowColumns`, batch 1, width 3), a twin of
-/// each finalize form (tree, shuffle) takes the two draft columns ([1, 1] int32 each) and stores row r's draft
-/// id from column r (`row == 1 ? w1[0] : w2[0]`, the rows `column > 0` admits) where the record stores
-/// `window[row]`, with the window's batch 1 and width 3 as constants. Every other statement is the record's.
-/// With the verify entry reading the columns too, nothing reads the window and its concatenation is never
-/// launched. Used only after `cbv2TopTwoPacketColumnsQualify` found the twins bitwise equal to the window reads.
 public enum CBv2MTPTopTwoPacketColumns {
     public static let enabled = ProcessInfo.processInfo.environment["CBV2_MTP_PACKET_COLUMNS"] != "0"
     nonisolated(unsafe) static var verified = false
@@ -499,7 +470,6 @@ private let cbv2TopTwoFinalizePacketColumnsShuffleKernel = MLXFast.metalKernel(
 )
 
 /// The draft columns (window columns 1 and 2) the packet finalize reads in place of `window`, while `window` is
-/// the published verify window: batch 1, width 3, three [1, 1] int32 columns.
 private func cbv2PacketDraftColumns(_ window: MLXArray) -> [MLXArray]? {
     guard CBv2MTPTopTwoPacketColumns.verified, window.shape == [1, 3], window.dtype == .int32,
           let columns = CBv2MTPVerifyWindowColumns.columns(of: window), columns.count == 3,
@@ -509,7 +479,6 @@ private func cbv2PacketDraftColumns(_ window: MLXArray) -> [MLXArray]? {
 }
 
 /// The packet finalize of either form on the partials, reading the draft ids from `draftColumns` ([1] int32
-/// each, window columns 1 and 2) or from `window`.
 private func cbv2TopTwoPacketFinalize(
     _ partials: [MLXArray], window: MLXArray?, draftColumns: [MLXArray]?, rows: Int, drafts: Int, shuffled: Bool
 ) -> [MLXArray] {
@@ -532,10 +501,6 @@ private func cbv2TopTwoPacketFinalize(
 }
 
 /// `cbv2TopTwoRows` plus the MTP acceptance packet from the same finalize
-/// launch, for logits `[1, B * (1 + k), vocab]` whose rows are the positions
-/// of the int32 verify window `[B, 1 + k]`. `ids` and `values` are those of
-/// `cbv2TopTwoRows` (same partial kernel and merge code). nil when the
-/// shapes do not qualify or `CBV2_MTP_TOP2_PACKET=0`.
 package func cbv2TopTwoRowsPacket(
     _ logits: MLXArray, window: MLXArray, shuffle: Bool? = nil
 ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
@@ -543,7 +508,6 @@ package func cbv2TopTwoRowsPacket(
 }
 
 /// `cbv2TopTwoRowsPacket` with the packet's draft ids read from `draftColumns` (window columns 1 and 2, [1]
-/// int32 each; batch 1, width 3) when given, else from `window`.
 private func cbv2TopTwoRowsPacket(
     _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, shuffle: Bool?
 ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
@@ -569,10 +533,6 @@ private func cbv2TopTwoRowsPacket(
 }
 
 /// Load time, after `cbv2TopTwoShuffleQualify`: the column-reading finalize of each form that can run (tree;
-/// shuffle when it qualified) against the same form reading the concatenated window, bit for bit in the ids, the
-/// values (as bits) and the packet. Seeded logits at width 3 over the full vocabulary and a short one: Gaussian,
-/// exact ties, NaNs, infinities, signed zeros and constant rows; draft columns of seeded ids, the int32 extremes
-/// and negative values. Engages only if every case matches (`CBv2MTPTopTwoPacketColumns`).
 package func cbv2TopTwoPacketColumnsQualify(logitsDType: DType, vocabulary: Int) {
     CBv2MTPTopTwoPacketColumns.verified = false
     func report(_ message: String) {
@@ -636,10 +596,6 @@ package func cbv2TopTwoPacketColumnsQualify(logitsDType: DType, vocabulary: Int)
 }
 
 /// Load time: the shuffle-form partial + packet finalize against the tree
-/// launches, bit for bit in the ids, the values (as bits) and the packet, on
-/// seeded logits: full and short vocabularies, R = 1 ... 4, exact ties (rounded
-/// values), NaNs, infinities, signed zeros and constant rows. Engages only if
-/// every case matches (`CBv2MTPTopTwoShuffle`).
 package func cbv2TopTwoShuffleQualify(logitsDType: DType, vocabulary: Int) {
     CBv2MTPTopTwoShuffle.verified = false
     func report(_ message: String) {
@@ -696,7 +652,6 @@ package func cbv2TopTwoShuffleQualify(logitsDType: DType, vocabulary: Int) {
 }
 
 /// Load-time JIT of the packet finalize (its pipeline depends only on the
-/// int32/float32/int32 input types, not on the window shape).
 package func cbv2TopTwoRowsPacketWarm(logitsDType: DType) {
     let logits = MLXArray.zeros([1, 3, 64], dtype: logitsDType)
     let window = MLXArray([Int32(1), 2, 3]).reshaped([1, 3])
