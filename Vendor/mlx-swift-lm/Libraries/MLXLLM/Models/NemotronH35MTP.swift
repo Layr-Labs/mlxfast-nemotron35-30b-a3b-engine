@@ -4,13 +4,6 @@ import MLXLMCommon
 import MLXNN
 
 /// Drafts score only the first half of the target head's rows; the target
-/// still scores every emitted token over the full vocabulary. Ids below 1000
-/// are control tokens (both EOS ids included), 1000..<1256 the raw bytes, and
-/// every later id is a BPE merge in rank order, so the first half keeps all
-/// control and byte ids and the earliest merges. A row prefix of a row-major
-/// quantized matrix is a strided view (no copy) that runs the same qmv kernel,
-/// so each kept logit equals the full head's. Held outside the module tree so
-/// it registers no parameters.
 private final class NemotronMTPDraftHead {
     let target: NemotronHModel
 
@@ -30,7 +23,6 @@ private final class NemotronMTPDraftHead {
     }
 
     /// Load-time screen plan (input-independent): the selected K-groups and
-    /// the shared head arrays it reads in place. nil = stock argmax.
     private struct Screen {
         let weight: MLXArray, scales: MLXArray, biases: MLXArray
         let groups: MLXArray
@@ -39,35 +31,24 @@ private final class NemotronMTPDraftHead {
         let upperGroups: MLXArray?
         let upperGroupCount: Int
         /// Packed selected scales/biases (`NemotronHeadScreen.packScalesBiases`),
-        /// used once its partial scores matched the gathered ones bitwise.
         var packed: MLXArray? = nil
         /// Full packed records (`NemotronHeadScreen.packRecords`), adopted the
-        /// same way; when set, `packed` is not built.
         var records: MLXArray? = nil
         /// 2-bit screen records (`NemotronHeadScreen.packRecords2`), adopted
-        /// once the plan's rescore and pick checks pass on them; when set,
-        /// neither `records` nor `packed` is built.
         var records2: MLXArray? = nil
         /// Ticket counter of the fused select + final launch
-        /// (`NemotronHeadScreen.makeCounter`), set once its ids matched the
-        /// two-launch path bitwise.
         var counter: MLXArray? = nil
         /// The 2-bit partial pass with the upper rows two per pass, set once
-        /// its scores matched the one-row record kernel's bitwise.
         var paired = false
         /// The fused select with one barrier fewer (`NemotronHeadScreen`'s B1
-        /// select), set once its ids and kept values matched the record's.
         var b1 = false
         /// The B1 select without the ticket (`NemotronHeadScreen.noTicketEnabled`),
-        /// set once its pick, kept rows and chunk bests matched the fused B1 select.
         var noTicket = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
 
     /// Qualified immutable screen backing is outside the registered module
-    /// tree. Include it in the existing decode lease, but never the mutable
-    /// fused-selection ticket counter or any request tensor.
     var decodeResidencyArrays: [MLXArray] {
         guard let screen else { return [] }
         return [screen.groups] + [screen.upperGroups, screen.packed, screen.records, screen.records2]
@@ -75,8 +56,6 @@ private final class NemotronMTPDraftHead {
     }
 
     /// Greedy draft id [1] int32 for hidden [1, 1, K]: the screen when it
-    /// qualified at load and the shapes match, else the stock argmax.
-    /// `upper`: also screen the upper vocabulary half (when the plan has it).
     func greedy(_ hidden: MLXArray, upper: Bool = false) -> MLXArray {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
@@ -98,8 +77,6 @@ private final class NemotronMTPDraftHead {
     }
 
     /// NEMOTRON_MTP_HEAD_SCREEN_CHECK=1 only: synchronous comparison with the
-    /// stock argmax, plus the stock argmax's rank under the partial score
-    /// (global and within 512/1024/2048/4096-row chunks) for offline tuning.
     private func checkAgainstStock(
         _ hidden: MLXArray, _ result: NemotronHeadScreen.Result, _ screen: Screen
     ) {
@@ -135,8 +112,6 @@ private final class NemotronMTPDraftHead {
     }
 
     /// Choose the screen groups from the weights alone and qualify the
-    /// rescore against the stock head bitwise, once, at load. gamma is the
-    /// head input's final RMSNorm weight.
     func prepareScreen(gamma: MLXArray) {
         guard NemotronHeadScreen.enabled else { return }
         func report(_ message: String) {
@@ -660,15 +635,6 @@ private final class NemotronMTPDraftHead {
     }
 
     /// A request's drafts screen the upper vocabulary half while it committed
-    /// an upper-half id within this many committed tokens; separately per draft
-    /// position. Break-even per draft: one draft's upper screen costs ~0.4% of a
-    /// round with packed records (~0.01 tokens' worth at ~2.45 tokens per round;
-    /// both drafts' together measured ~0.8%). An upper-half hit is worth
-    /// ~h (1 + a2) ~ 1.08 accepted tokens for the first draft and ~h a1 ~ 0.48
-    /// for the second (h ~0.6, a1 ~0.8, a2 ~0.8), so the first pays above an
-    /// upper-id rate of ~0.9% (one per ~110 tokens) and the second above ~2.0%
-    /// (one per ~49). NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW_FIRST / _LATER set
-    /// them; NEMOTRON_MTP_HEAD_SCREEN_UPPER_WINDOW sets both; 0 screens always.
     private static func window(_ key: String, _ fallback: Int) -> Int {
         let environment = ProcessInfo.processInfo.environment
         return Int(environment[key] ?? "")
@@ -682,8 +648,6 @@ private final class NemotronMTPDraftHead {
     }
 
     /// Multi-row twin for the post-verify head rows: the same prefix view
-    /// through the multi-row qmv, so each row's argmax matches the one-token
-    /// draft's over the same rows. The full-head chain is kept as fallback.
     func rowLogits(_ rows: MLXArray) -> MLXArray {
         if let prefix { return nemotronMTPLinearRows(rows, prefix) }
         return target.lmHead.map { nemotronMTPHeadRows(rows, $0) } ?? target.logits(rows)
@@ -691,9 +655,6 @@ private final class NemotronMTPDraftHead {
 }
 
 /// Request-local embedded assistant with native paged attention. Each draft
-/// retains the ordinary one-token shape; the target verifies every proposal.
-/// Trusted shifted prompt history primes the assistant before its first
-/// proposal and is preserved by the durable prefix checkpoint codec.
 public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafter, CBv2MTPMemoryPreparing, @unchecked Sendable {
     private var decodeResidency: AnyObject?
     func prepareDecodeResidency() {
@@ -769,7 +730,6 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     public var requestStateTokenAllocationPadding: Int { draftLimit + 1 }
 
     /// Load-time preparation of the draft-only head screen (see
-    /// NemotronHeadScreen); weights-only, before the shape warm-up.
     func prepareDraftHeadScreen() {
         draftHead.prepareScreen(
             gamma: (module.layers[1] as! NemotronH35MTPExpertBlock).finalNorm.weight)
@@ -808,41 +768,30 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var prestagedHidden: MLXArray?
         var prestagedResult: (tokens: MLXArray, hidden: MLXArray)?
         /// The second draft chained on the prestaged first one; handed out
-        /// only for the first draft's own `hidden` output object.
         var prestagedSecond: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
         /// Post-verify rows: fused residuals, queries and the K/V appended to
-        /// the head cache; the device-picked row's attention reads them.
         var speculation: (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray,
                           width: Int)?
         /// The head row's `writeGeneration` right after `speculation`'s rows
-        /// were written; set only there, read only with a `nextFirstDraft`
-        /// that finalize built from that same speculation.
         var speculationWriteGeneration: UInt64?
         /// The single expert/head continuation selected at the existing host boundary.
         var nextFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         /// The next first draft queued behind the verify for the device-picked
-        /// row, and the host walk's accept count that decides whether to adopt it.
         var deviceFirstDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray)?
         var hostAcceptedDrafts: Int?
         /// Committed tokens since the last one in the upper vocabulary half
-        /// (prompt tail included); Int.max when none has been seen.
         var tokensSinceUpper = Int.max
         /// Whether a round's first draft (`firstDraft`) or a later one screens
-        /// the upper vocabulary half.
         func screensUpper(firstDraft: Bool) -> Bool {
             NemotronMTPDraftHead.usesUpper(tokensSinceUpper: tokensSinceUpper, firstDraft: firstDraft)
         }
         /// The cache-free inputs of the second draft on `deviceFirstDraft`
-        /// (`pagedDraftInputs`), queued with it, and the same inputs carried
-        /// with `nextFirstDraft` once finalize adopts that first draft.
         var deviceSecondInputs: (inputs: [MLXArray], from: MLXArray)?
         var nextSecondInputs: (inputs: [MLXArray], from: MLXArray)?
         /// The whole second draft on `deviceFirstDraft` (masked attention over
-        /// the head cache's rows as the device-picked count keeps them), with
-        /// its own K/V row; carried with `nextFirstDraft` once adopted.
         var deviceSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
                                 from: MLXArray)?
         var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
@@ -1179,11 +1128,6 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
 
 extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     /// Called from finalize once the next round's carry is final, while the
-    /// GPU is idle after the acceptance readback. Builds and submits exactly
-    /// the first draft the next round would build (same ops, same inputs:
-    /// trusted replay of accepted rows + one head step). `draftStep` returns
-    /// it only for this carry `hidden` object; any other next transition
-    /// discards it exactly like a rejected round.
     public func prestageFirstDraft(
         token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState
     ) {
@@ -1229,8 +1173,6 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     }
 
     /// Also chains the next round's second draft on the prestaged first one
-    /// while the GPU runs it, instead of at round build. Same ops on the same
-    /// inputs as the second `draftStep`; only the submission moves earlier.
     public func prestageDrafts(
         token: Int, hidden: MLXArray, requestState: any CBv2MTPRequestState, depth: Int
     ) {
@@ -1272,10 +1214,6 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
     }
 
     /// Called right after the round's verify graph is submitted (before the
-    /// acceptance readback): causal attention/KV over all k+1 row pairs.
-    /// Finalize retains the committed prefix and selects one row for the
-    /// ordinary one-token expert/head tail. This preserves attention overlap
-    /// without computing unused expert/head rows. Target work is unaffected.
     public func speculateAfterVerify(
         targetTokens: MLXArray, targetHidden: MLXArray, requestState: any CBv2MTPRequestState
     ) {
@@ -1310,9 +1248,6 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
 
 extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     /// Queue the next round's first draft for the device-picked row right
-    /// behind `speculateAfterVerify`: the same one-token expert/head tail and
-    /// K/V row the host path takes from `speculation` at finalize, gathered
-    /// with the device index instead of a host one.
     public func speculateNextFirstDraft(
         acceptedDrafts: MLXArray, requestState: any CBv2MTPRequestState
     ) {
@@ -1320,8 +1255,6 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     }
 
     /// With the walk's operands one launch walks the packet and yields the
-    /// masks and the picked row (`NemotronMTPDraftRowPick`); `acceptedDrafts`
-    /// then stays unlaunched.
     public func speculateNextFirstDraft(
         acceptedDrafts: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands,
         requestState: any CBv2MTPRequestState
@@ -1449,18 +1382,11 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
     }
 
     /// The submission roots for a draft pick: a ticket-free screen's pick as its chunk bests, so the final kernel
-    /// runs only where the pick itself is read, outside the speculative draft submission (`NemotronScreenPicks`).
     private func pickRoots(_ pick: MLXArray) -> [MLXArray] {
         NemotronScreenPicks.bests(of: pick).map { [$0.values, $0.ids] } ?? [pick]
     }
 
     /// `queueNextFirstDraft` with the device accept walk folded into its consumers, once
-    /// `NemotronMTPDraftSDPA.qualifyWalk` matched (NEMOTRON_MTP_DRAFT_WALK_FOLD): the first draft's attention
-    /// reads the walked row's query and masks from the walk, its join reads the walked fused row, and the second
-    /// draft's attention masks from the walk, so the row pick (`NemotronMTPDraftRowPick`) is not launched for
-    /// them. The same drafts, K/V rows and submissions as the record path otherwise; the seed K/V rows stay lazy
-    /// outputs of the row pick, which launches only if `prestageFirstDraft` cannot re-expose the stored row. False,
-    /// with nothing built, unless the head cache pages serve the first draft in place.
     private func queueWalkedFirstDraft(
         spec: (fused: MLXArray, queries: MLXArray, keys: MLXArray, values: MLXArray, width: Int),
         row: MLXArray, walk: CBv2MTPDeviceAcceptWalk.Operands, paged: PagedState, state s: State
@@ -1544,7 +1470,6 @@ extension NemotronH35MTPAssistant: CBv2MTPDeviceAcceptedPrestaging {
 
 extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
     /// Tracks how recently the request committed an upper-half token, which
-    /// decides whether its drafts screen the upper vocabulary half.
     public func observeCommittedTokens(
         _ tokens: [Int], requestState: any CBv2MTPRequestState
     ) {
@@ -1560,31 +1485,21 @@ extension NemotronH35MTPAssistant: CBv2MTPCommittedTokenObserving {
 }
 
 /// NEMOTRON_MTP_LAZY_SEED_KV=0 submits the device-picked first draft's seed
-/// K/V gathers with its ids and hidden again.
 enum NemotronMTPLazySeedKV {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_LAZY_SEED_KV"] != "0"
 }
 
 /// NEMOTRON_MTP_DEVICE_SECOND_FRONT=0 builds the whole second draft after
-/// the readback again.
-/// NEMOTRON_MTP_DEVICE_SECOND_DRAFT=0 keeps the second draft's attention and
-/// tail after the readback.
 enum NemotronH35MTPDeviceSecondDraft {
     static let enabled = NemotronH35MTPDeviceSecondFront.enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DEVICE_SECOND_DRAFT"] != "0"
 }
 
 /// The two additive masks of `speculateNextFirstDraft` from one launch:
-/// `first[i]` keeps `i <= row + firstSpeculated` over the snapshot's `length`
-/// keys, `second[i]` the same over `length + 1` keys plus the draft's own
-/// row `i == length`. Kept entries are +0 and the others -inf in the history
-/// dtype, the values the integer compare, `which(keep, 0, -inf)` (FP32) and
-/// the cast produce. NEMOTRON_MTP_DRAFT_MASKS=0 builds them with those ops.
 enum NemotronMTPDraftMasks {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_MASKS"] != "0"
     /// NEMOTRON_MTP_DRAFT_SNAPSHOT_REUSE=0 gathers the head cache again for
-    /// the second draft.
     static let reuseSnapshot =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_SNAPSHOT_REUSE"] != "0"
     private static let kernel = MLXFast.metalKernel(
@@ -1620,12 +1535,6 @@ enum NemotronMTPDraftMasks {
 }
 
 /// The device accept walk, both masks of `NemotronMTPDraftMasks` and the
-/// walked row of the post-verify fused residuals, queries, keys and values
-/// from one launch, instead of the walk launch, the masks launch and four
-/// `take` gathers. The walk is the engine's integer loop on the same packet
-/// (`CBv2MTPDeviceAcceptWalk`), the masks are the masks kernel's statements
-/// and every row element is a copy. Engaged only once `qualify` matched the
-/// separate launches bit for bit. NEMOTRON_MTP_DRAFT_ROW_PICK=0 keeps them.
 enum NemotronMTPDraftRowPick {
     static let enabled = NemotronMTPDraftMasks.enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_ROW_PICK"] != "0"
@@ -1669,10 +1578,6 @@ enum NemotronMTPDraftRowPick {
         ensureRowContiguous: false)
 
     /// For the row `walk` selects: (first mask [1, 1, 1, length], second mask
-    /// [1, 1, 1, length + 1] as `NemotronMTPDraftMasks.masks`, fused [1, 1, F],
-    /// queries [1, QH, 1, D], keys and values [1, KH, 1, D] as `take` along
-    /// the row axis). fused [1, W, F], queries [1, QH, W, D] and keys / values
-    /// [1, KH, W, D] are read through their strides; nil outside the shapes.
     static func pick(
         walk: CBv2MTPDeviceAcceptWalk.Operands, fused: MLXArray, queries: MLXArray,
         keys: MLXArray, values: MLXArray, firstSpeculated: Int, length: Int, dtype: DType,
@@ -1705,10 +1610,6 @@ enum NemotronMTPDraftRowPick {
     }
 
     /// Load time: the launch against the masks launch and the four `take`
-    /// gathers of the row it walks to, bit for bit, for every accept count of
-    /// a depth-2 packet in both argument spaces (6 elements: constant, 11:
-    /// device), on seeded rows in the post-verify layouts (Q/K/V transposed
-    /// views). Engages only if all match; also compiles both pipelines.
     static func qualify() {
         verified = false
         guard enabled else { return }
@@ -1785,7 +1686,6 @@ enum NemotronH35MTPDeviceSecondFront {
 
 enum NemotronH35MTPSpeculation {
     /// DARKBLOOM_NEMOTRON35_MTP_SV_COLUMN_ATTENTION=0 attends post-verify rows
-    /// through the prompt-chunk SDPA path instead (KV-length-dependent kernels).
     static let columnAttention = ProcessInfo.processInfo.environment[
         "DARKBLOOM_NEMOTRON35_MTP_SV_COLUMN_ATTENTION"] != "0"
     /// DARKBLOOM_NEMOTRON35_MTP_SV_WARMUP=0 skips the load-time warm-up below.
@@ -1795,8 +1695,6 @@ enum NemotronH35MTPSpeculation {
 
 extension NemotronH35MTPAssistant {
     /// A private warm-up may replace one synthetic width with the same
-    /// post-verify entry over a real target verification graph. This guard
-    /// has the original warm-up policy and width cap, not a timed-phase gate.
     func canWarmPostVerifySpeculation(width: Int) -> Bool {
         NemotronH35MTPSpeculation.warmUp && kvOnlyHistory
             && CBv2MTPFirstDraftPrestage.speculateAfterVerify
@@ -1804,8 +1702,6 @@ extension NemotronH35MTPAssistant {
     }
 
     /// Warm the remaining promoted synthetic widths exactly once each.
-    /// A width already attempted by the private general warm-up is omitted;
-    /// no extra request/cache transaction is added for row offsets.
     func warmPostVerifySpeculation(skippingWidth: Int? = nil) {
 
         guard NemotronH35MTPSpeculation.warmUp, kvOnlyHistory,
