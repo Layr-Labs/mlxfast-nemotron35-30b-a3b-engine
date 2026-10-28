@@ -5091,6 +5091,12 @@ enum NemotronHeadScreen {
     /// (`pickStatements`); every other reader takes the final's id. Used only after the plan's check found it
     /// bitwise equal to the fused B1 select (`NemotronH35MTPDraftHead`).
     static let noTicketEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_NO_TICKET"] != "0"
+    /// NEMOTRON_MTP_SCREEN_PICK_SHARE=0 keeps the inline pick statements in the verify entry and the front-norms
+    /// pick twin. Otherwise those consumers take the final kernel's pick array itself (the verify entry falls back
+    /// to its column/window path on the window the final built; the front norms fall back to the final kernel's
+    /// pick plus the reading form), so the reduction runs once instead of in every SIMD group of both launches.
+    /// Both fallbacks are the record paths those twins qualified against, bitwise, at load.
+    static let pickShareEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_PICK_SHARE"] != "0"
     private static let selectB1Source: String? = b1Swapped(selectSource)
     private static let selectB1Kernel = selectB1Source.map {
         MLXFast.metalKernel(
