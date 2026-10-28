@@ -879,3 +879,1120 @@ enum NemotronSeedRetile {
             + " fc1 \(detail(0)); fc2 \(detail(1)))")
     }
 }
+
+// MARK: - Seed dense retile
+
+/// The seed's dense run gathers (one "expert", `tiles[t]` = (first row, rows <=
+/// BM, 0) over the request's rows) with free tiling, appended to
+/// `nemotronRunGatherHeader` and `nemotronSeedRetileSource`. For every output
+/// fragment pair the same `BaseNAXFrag::mma` (matmul2d(16, 32, 16),
+/// multiply_accumulate) runs over k chunks 0, 16, ..., K - 16 in order, on A
+/// fragments loaded by the incumbents' statements and B fragments read from a
+/// threadgroup block holding the incumbents' BF16 dequantized value at each
+/// (n, k); the typed store is the incumbents'. Free: BM, BN, BK, the SIMD-group
+/// grid WM x WN (SM, SN multiples of 16 and 32, so rows keep their 16-row
+/// fragments from the tile's first row and each mma pairs columns 32c ...
+/// 32c + 31), which thread dequantizes which B value, and DB: two threadgroup
+/// stages with one barrier per K block instead of one stage with two.
+let nemotronSeedDenseSource = #"""
+// B source: the bank's codes with (scale, bias) through the pair dictionary,
+// as QuantizedBlockLoaderDict (the FP32 table holds exact BF16 widenings, so
+// s and b are float(T(table)) bit for bit). Thread t of NT dequantizes KPT
+// consecutive k of one output row (the stock loader's split), reading the
+// codes as 32-bit words (little endian: byte j = bits 8j ... 8j + 7).
+template <typename T>
+struct NemotronSeedDenseDict {
+  const device uint8_t* w;
+  const device uint16_t* sidx;
+  const device float* table;
+  int K;
+
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void fill(threadgroup T* ws, const int t, const int y_col, const int N,
+                       const int kb, const int klim) const thread {
+    constexpr int BK_padded = BK + 16 / sizeof(T);
+    constexpr int KPT = BN * BK / NT;
+    static_assert(KPT % 8 == 0 && KPT <= 64 && 64 % KPT == 0, "dict fill split");
+    const int lr = t / (BK / KPT);
+    const int lk = (t % (BK / KPT)) * KPT;
+    const int n = y_col + lr;
+    threadgroup T* dst = ws + lr * BK_padded + lk;
+    if ((ALIGN_N || n < N) && lk < klim) {
+      const uint pair = uint(sidx[size_t(n) * size_t(K / 64) + size_t((kb + lk) / 64)]);
+      const float s = table[2 * pair];
+      const float b = table[2 * pair + 1];
+      const device uint32_t* src =
+          (const device uint32_t*)(w + size_t(n) * size_t(K / 2) + size_t((kb + lk) / 2));
+      STEEL_PRAGMA_UNROLL
+      for (short q = 0; q < KPT / 8; ++q) {
+        const uint word = src[q];
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < 4; ++j) {
+          T v0, v1;
+          nemotron_seed_deq2(uint8_t((word >> (8 * j)) & 0xffu), s, b, v0, v1);
+          dst[q * 8 + 2 * j] = v0;
+          dst[q * 8 + 2 * j + 1] = v1;
+        }
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < KPT; ++j) {
+        dst[j] = T(0);
+      }
+    }
+  }
+};
+
+// B source: the shared down's tile-major decode copy (codes [N / 128, K, 32]
+// uint16, four outputs per word; BF16 scales and biases [N / 128, K / 64, 128]),
+// as the shared down copy loader: thread t of NT holds four consecutive outputs
+// (one code word lane) and CK consecutive k, puts each k pair back into the
+// bank's byte and widens the group's scale and bias to float.
+template <typename T>
+struct NemotronSeedDenseCopy {
+  const device uint16_t* codes;
+  const device T* sk;
+  const device T* bk;
+  int K;
+
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void fill(threadgroup T* ws, const int t, const int y_col, const int N,
+                       const int kb, const int klim) const thread {
+    constexpr int BK_padded = BK + 16 / sizeof(T);
+    constexpr int CK = BK * (BN / 4) / NT;
+    static_assert(CK % 2 == 0 && CK <= 64 && 64 % CK == 0 && NT % (BN / 4) == 0, "copy fill split");
+    const int cm = t % (BN / 4);
+    const int cc = t / (BN / 4);
+    const int n = y_col + 4 * cm;
+    const int k0 = kb + cc * CK;
+    threadgroup T* dst = ws + (4 * cm) * BK_padded + cc * CK;
+    if ((ALIGN_N || n < N) && cc * CK < klim) {
+      const device uint16_t* c =
+          codes + (size_t(n / 128) * size_t(K) + size_t(k0)) * 32 + size_t((n % 128) / 4);
+      const size_t g = (size_t(n / 128) * size_t(K / 64) + size_t(k0 / 64)) * 128 + size_t(n % 128);
+      STEEL_PRAGMA_UNROLL
+      for (short o = 0; o < 4; o++) {
+        const float s = float(sk[g + o]);
+        const float b = float(bk[g + o]);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < CK; j += 2) {
+          const uint lo = (uint(c[j * 32]) >> (4 * o)) & 0xfu;
+          const uint hi = (uint(c[(j + 1) * 32]) >> (4 * o)) & 0xfu;
+          T v0, v1;
+          nemotron_seed_deq2(uint8_t(lo | (hi << 4)), s, b, v0, v1);
+          dst[o * BK_padded + j] = v0;
+          dst[o * BK_padded + j + 1] = v1;
+        }
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short o = 0; o < 4; o++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < CK; ++j) {
+          dst[o * BK_padded + j] = T(0);
+        }
+      }
+    }
+  }
+};
+
+template <
+    typename T,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool DB,
+    bool ALIGN_N,
+    bool RELU2,
+    class BSrc>
+METAL_FUNC void nemotron_seed_dense_impl(
+    const device T* x,
+    BSrc bsrc,
+    const device int* tiles,
+    device T* y,
+    const int N,
+    const int K,
+    threadgroup T* Ws,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id) {
+  const int tile_rows = tiles[tid.y * 3 + 1];
+  if (tile_rows <= 0) {
+    return;
+  }
+  const int row0 = tiles[tid.y * 3 + 0];
+
+  constexpr bool transpose = true;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int STAGE = BN * BK_padded;
+  constexpr int NT = WM * WN * 32;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
+  static_assert(BK % 64 == 0, "B blocks start on a quantization group");
+
+  const int y_col = tid.x * BN;
+  const short tgp_bm = short(min(BM, tile_rows));
+  const short tgp_bn = ALIGN_N ? BN : short(min(BN, N - y_col));
+  y += size_t(row0) * N + size_t(y_col);
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  const short sgp_sm = min(SM, short(max(0, int(tgp_bm) - tm)));
+  const short sgp_sn = ALIGN_N ? SN : min(SN, short(max(0, (N - (y_col + tn)))));
+  const bool is_unaligned_sm = (sgp_sm != SM);
+  const bool is_unaligned_bn = ALIGN_N ? false : (tgp_bn != BN);
+
+  const short m_lo_lim = 0;
+  const short m_hi_lim = min(int(sgp_sm), max(0, int(tgp_bm) - tm));
+  const bool sg_active = m_hi_lim > m_lo_lim;
+
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+
+  const device T* xn = x + (size_t(row0) + size_t(tm)) * size_t(K);
+  const int t = int(simd_group_id) * 32 + int(simd_lane_id);
+  // K % 64 == 0: every block is whole groups and whole 32-k steps.
+  const int nb = (K + BK - 1) / BK;
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    constexpr bool aligned_m = decltype(kAlignedM)::value;
+    auto fill = [&](threadgroup T* ws, const int b) {
+      bsrc.template fill<BN, BK, NT, ALIGN_N>(ws, t, y_col, N, b * BK, min(BK, K - b * BK));
+    };
+    auto compute = [&](threadgroup T* ws, const int b) {
+      const int kb = b * BK;
+      const int klim = min(BK, K - kb);
+      STEEL_PRAGMA_NO_UNROLL
+      for (int kk1 = 0; kk1 < klim; kk1 += SK) {
+        if (sg_active) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (aligned_m) {
+            Atile.load(xn + kb + kk1, K);
+          } else {
+            Atile.load_safe(xn + kb + kk1, K, short2(SK, sgp_sm));
+          }
+
+          Btile.template load<T, BK_padded, 1>(ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<false>{},
+              Btile,
+              metal::bool_constant<transpose>{});
+
+          (void)compiler_barrier;
+        }
+      }
+    };
+    if constexpr (DB) {
+      // Stage b & 1 holds block b. Block b + 1 is written while block b is
+      // read; the barrier closing iteration b - 1 orders both (its stage was
+      // last read in iteration b - 1, and block b was written there).
+      fill(Ws, 0);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int b = 0; b < nb; b++) {
+        if (b + 1 < nb) {
+          fill(Ws + ((b + 1) & 1) * STAGE, b + 1);
+        }
+        compute(Ws + (b & 1) * STAGE, b);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    } else {
+      for (int b = 0; b < nb; b++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        fill(Ws, b);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        compute(Ws, b);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  });
+
+  if (ALIGN_N || !is_unaligned_bn) {
+    if (m_lo_lim == 0 && m_hi_lim == SM) {
+      Dtile.template store<RELU2>(y + tm * N + tn, N);
+    } else {
+      Dtile.template store_slice<RELU2>(
+          y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+    }
+  } else {
+    Dtile.template store_slice<RELU2>(
+        y + tm * N + tn,
+        N,
+        short2(0, m_lo_lim),
+        short2(sgp_sn, m_hi_lim));
+  }
+}
+"""#
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`) dense GEMMs through a
+/// retiled run gather (`nemotron_seed_dense_impl`) chosen once at load, per kind:
+/// Mamba `in_proj` / `out_proj` and the shared `up_proj` (typed ReLU2) through
+/// their pair dictionaries (incumbent `NemotronPrefillDenseDict.launch`), and the
+/// shared down through its decode copy (incumbent
+/// `NemotronPrefillSharedDownCopy.launch`). Every variant keeps each output's
+/// `BaseNAXFrag::mma` sequence (`nemotronSeedDenseSource`). `tune` (load time,
+/// after the routed retile) compares each variant with the incumbent bit for bit
+/// on seeded inputs (488 rows on every layer of the kind; 488 rows x 40, 300, 97
+/// and 17 rows on the first; ReLU2-like rows where the kind sees them), drops any
+/// mismatch or Metal error, times the survivors and the incumbent round robin on
+/// every layer of the kind per repetition (3 warm-up and 12 timed repetitions,
+/// median), and adopts the fastest only if it is at least 3% faster. Direct-B
+/// variants are left out: forced on every seed role they cost ~40 ms (331295a3).
+/// NEMOTRON_SEED_DENSE_RETILE=0 keeps the incumbents;
+/// NEMOTRON_SEED_DENSE_RETILE_FORCE=<variant> adopts that variant wherever it
+/// qualifies.
+enum NemotronSeedDenseRetile {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE"] != "0"
+    static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_FORCE"]
+
+    struct Variant: Sendable, Equatable {
+        let name: String
+        let bm: Int, bn: Int, bk: Int, wm: Int, wn: Int
+        let db: Bool
+        var threads: Int { wm * wn * 32 }
+        var threadgroupBytes: Int { (db ? 2 : 1) * bn * (bk + 8) * 2 }
+
+        init(_ bm: Int, _ bn: Int, _ bk: Int, wm: Int, wn: Int, db: Bool = false) {
+            (self.bm, self.bn, self.bk, self.wm, self.wn, self.db) = (bm, bn, bk, wm, wn, db)
+            name = "\(bm)x\(bn)x\(bk)w\(wm)\(wn)" + (db ? "db" : "")
+        }
+    }
+
+    /// Name = BM x BN x BK, w WM WN, db for two stages. 64x64x64w22 is the
+    /// incumbents' geometry (control); 64x128x64w24 is MLX's NAX bf16 GEMM layout
+    /// for Max-class GPUs (32 x 32 per SIMD group); the 128-row tiles share each
+    /// dequantized B block between twice the rows. Each fits 32 KB of threadgroup memory.
+    static let variants: [Variant] = [
+        Variant(64, 64, 64, wm: 2, wn: 2),
+        Variant(64, 64, 64, wm: 2, wn: 2, db: true),
+        Variant(64, 64, 128, wm: 2, wn: 2),
+        Variant(64, 128, 64, wm: 2, wn: 4),
+        Variant(128, 64, 64, wm: 4, wn: 2),
+        Variant(128, 64, 64, wm: 4, wn: 2, db: true),
+        Variant(128, 128, 64, wm: 4, wn: 4),
+    ]
+
+    enum Source: String, Sendable { case dict, copy }
+
+    /// Kinds: "in_proj", "out_proj", "up_proj" (pair dictionaries), "shared_down" (decode copy).
+    nonisolated(unsafe) static var choice: [String: Variant] = [:]
+
+    private static func makeKernel(_ source: Source) -> MLXFast.MLXFastKernel {
+        let make = source == .dict
+            ? "NemotronSeedDenseDict<T> b{(const device uint8_t*)w, scales, biases, K};"
+            : "NemotronSeedDenseCopy<T> b{w, scales, biases, K};"
+        func call(_ bm: String) -> String {
+            """
+                    nemotron_seed_dense_impl<T, \(bm), BN, BK, WM, WN, DB, ALIGN_N, RELU2>(
+                        x, b, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+            """
+        }
+        // A tile of at most BM / 2 rows runs the BM / 2 body (for BM 64 the
+        // incumbents' 32-row bound); either way rows keep their 16-row fragments.
+        return MLXFast.metalKernel(
+            name: "nemotron_seed_dense_\(source.rawValue)",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: """
+                threadgroup T Ws[(DB ? 2 : 1) * BN * (BK + 16 / sizeof(T))];
+                \(make)
+                if (tiles[threadgroup_position_in_grid.y * 3 + 1] <= BM / 2) {
+            \(call("BM / 2"))
+                } else {
+            \(call("BM"))
+                }
+            """,
+            header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource + "\n" + nemotronSeedDenseSource)
+    }
+
+    private static let dictKernel = makeKernel(.dict)
+    private static let copyKernel = makeKernel(.copy)
+
+    /// One retiled launch over the request's rows (`x`: [1, rows, K]) in tiles of
+    /// `v.bm` rows (at least three descriptors, as the incumbents); nil wherever
+    /// the incumbent's guards (`NemotronPrefillDenseDict.launch` for .dict,
+    /// `NemotronPrefillSharedDownCopy.launch` for .copy) would not admit it.
+    static func launch(_ v: Variant, source: Source, x: MLXArray, linear: Linear, relu2: Bool) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, v.threadgroupBytes <= 32768, let q = linear as? QuantizedLinear,
+              type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 32 == 0 else { return nil }
+        let kernel: MLXFast.MLXFastKernel
+        let operands: [MLXArray]
+        switch source {
+        case .dict:
+            guard !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+                  q.weight.dtype == .uint32, q.weight.ndim == 2, q.scales.shape == [nOut, k / 64],
+                  let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
+                  d.table.dtype == .float32
+            else { return nil }
+            (kernel, operands) = (dictKernel, [q.weight, d.index, d.table])
+        case .copy:
+            guard !relu2, nOut % 128 == 0, let copy = NemotronSharedDownZSkip.copyArrays(for: linear),
+                  copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+                  copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
+                  copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
+            else { return nil }
+            (kernel, operands) = (copyKernel, [copy.codes, copy.scales, copy.biases])
+        }
+        let used = (rows + v.bm - 1) / v.bm
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * v.bm), Int32(min(v.bm, rows - t * v.bm)), 0] : [0, 0, 0]
+        }
+        let tiles = MLXArray(desc).reshaped(count, 3)
+        let y = kernel(
+            [x.reshaped(rows, 1, k)] + operands + [tiles, nOut, k],
+            template: [("T", x.dtype), ("BM", v.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
+                       ("DB", v.db), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", relu2)],
+            grid: (((nOut + v.bn - 1) / v.bn) * v.threads, count, 1), threadGroup: (v.threads, 1, 1),
+            outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(1, rows, nOut)
+    }
+
+    /// From `NemotronPrefillDenseDict.apply` (request prefill, admitted kinds only).
+    static func dense(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool) -> MLXArray? {
+        guard let v = choice[kind], relu2 == (kind == "up_proj") else { return nil }
+        return launch(v, source: .dict, x: x, linear: linear, relu2: relu2)
+    }
+
+    /// From `NemotronPrefillSharedDownCopy.apply` (request prefill, verified only).
+    static func sharedDown(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+        guard let v = choice["shared_down"] else { return nil }
+        return launch(v, source: .copy, x: x, linear: down, relu2: false)
+    }
+
+    private struct Outcome {
+        let alive: [Variant]
+        let dropped: [String]
+        let medians: [(Variant?, Double)]
+        let choice: Variant?
+    }
+
+    /// Qualifies `variants` against the incumbent (`run(nil, case, layer)`) bit for
+    /// bit (every layer in case 0, the first layer in the others; any mismatch or
+    /// error drops a variant), then times the incumbent and the survivors round
+    /// robin on case 0, every layer per repetition: 3 warm-up and 12 timed
+    /// repetitions, median ms per launch.
+    private static func evaluate(cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?) -> Outcome {
+        var alive = variants.filter { $0.threadgroupBytes <= 32768 }
+        var dropped: [String] = []
+        caseLoop: for c in 0 ..< cases {
+            for layer in 0 ..< (c == 0 ? layers : 1) {
+                let reference = try? withError { () -> MLXArray? in
+                    guard let out = run(nil, c, layer) else { return nil }
+                    eval(out)
+                    return out
+                }
+                guard let reference else {
+                    dropped.append("incumbent unavailable")
+                    alive = []
+                    break caseLoop
+                }
+                alive = alive.filter { v in
+                    do {
+                        let same = try withError { () -> Bool in
+                            guard let out = run(v, c, layer) else { return false }
+                            return (out.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()
+                                .item(Bool.self)
+                        }
+                        if !same { dropped.append("\(v.name) differs@\(c)") }
+                        return same
+                    } catch {
+                        dropped.append("\(v.name) error")
+                        return false
+                    }
+                }
+                if alive.isEmpty { break caseLoop }
+            }
+        }
+        guard !alive.isEmpty else { return Outcome(alive: alive, dropped: dropped, medians: [], choice: nil) }
+        let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
+        var samples = Array(repeating: [Double](), count: candidates.count)
+        do {
+            try withError {
+                for rep in 0 ..< 15 {
+                    for (i, candidate) in candidates.enumerated() {
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        let outs = (0 ..< layers).compactMap { run(candidate, 0, $0) }
+                        eval(outs)
+                        Stream.gpu.synchronize()
+                        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+                        if rep >= 3, outs.count == layers {
+                            samples[i].append(Double(elapsed) / 1e6 / Double(layers))
+                        }
+                    }
+                }
+            }
+        } catch {
+            dropped.append("timing error")
+        }
+        guard samples.allSatisfy({ $0.count == 12 }) else {
+            return Outcome(alive: alive, dropped: dropped, medians: [], choice: nil)
+        }
+        let medians = zip(candidates, samples).map { candidate, s in (candidate, s.sorted()[s.count / 2]) }
+        var pick: Variant? = nil
+        if let forced, let f = alive.first(where: { $0.name == forced }) {
+            pick = f
+        } else if let best = medians.dropFirst().min(by: { $0.1 < $1.1 }), best.1 <= 0.97 * medians[0].1 {
+            pick = best.0
+        }
+        return Outcome(alive: alive, dropped: dropped, medians: medians, choice: pick)
+    }
+
+    static func tune(_ target: Module) {
+        choice = [:]
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron seed dense retile: \(message)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather else { return report("off (setting)") }
+        var head: [String] = []
+        var detail: [String] = []
+        func note(_ kind: String, _ o: Outcome) {
+            func ms(_ v: Variant?) -> String {
+                o.medians.first(where: { $0.0 == v }).map { String(format: "%.3f", $0.1) } ?? "n/a"
+            }
+            head.append("\(kind) \(o.choice?.name ?? "V0") \(ms(o.choice)) ms vs V0 \(ms(nil))")
+            let times = o.medians.dropFirst().map { "\($0.0!.name) \(String(format: "%.3f", $0.1))" }
+            detail.append("\(kind) \(o.alive.count)/\(variants.count) bitwise"
+                + (times.isEmpty ? "" : " [" + times.joined(separator: ", ") + "]")
+                + (o.dropped.isEmpty ? "" : " dropped: " + o.dropped.prefix(6).joined(separator: ", ")))
+        }
+        // Rows: 488, 488 x 40, 300, 97, 17; `zeros(case)`: ReLU2-like rows, mostly exact zeros.
+        let rowCounts = [488, 488, 300, 97, 17]
+        func inputs(_ k: Int, seed: UInt64, zeros: (Int) -> Bool) -> [MLXArray] {
+            (try? withError { () -> [MLXArray] in
+                rowCounts.enumerated().map { index, rows in
+                    var a = MLXRandom.normal([1, rows, k], scale: 2, key: MLXRandom.key(seed + UInt64(index)))
+                    if index == 1 { a = a * 40 }
+                    if zeros(index) {
+                        a = MLX.maximum(a - 1.5, MLXArray(Float(0)))
+                        a = a * a
+                    }
+                    let x = a.asType(.bfloat16)
+                    eval(x)
+                    return x
+                }
+            }) ?? []
+        }
+        for (kindIndex, kind) in ["in_proj", "out_proj", "up_proj"].enumerated() {
+            let all = NemotronPrefillDenseDict.linears(target, kind: kind)
+            guard NemotronPrefillDenseDict.kinds.contains(kind), let first = all.first else {
+                detail.append("\(kind) off (not admitted)")
+                continue
+            }
+            let relu2 = kind == "up_proj"
+            let xs = inputs(first.weight.dim(1) * 8, seed: UInt64(0x5eed_de00 + 16 * kindIndex), zeros: { $0 == 3 })
+            guard xs.count == rowCounts.count else {
+                detail.append("\(kind) off (inputs)")
+                continue
+            }
+            let o = evaluate(cases: xs.count, layers: all.count) { v, c, layer in
+                if let v { return launch(v, source: .dict, x: xs[c], linear: all[layer], relu2: relu2) }
+                return NemotronPrefillDenseDict.launch(xs[c], all[layer], relu2: relu2)
+            }
+            if let pick = o.choice { choice[kind] = pick }
+            note(kind, o)
+        }
+        let downs = target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }
+        if NemotronPrefillSharedDownCopy.verified, let first = downs.first {
+            // The shared up's ReLU2 output, except the scaled case.
+            let xs = inputs(first.weight.dim(1) * 8, seed: 0x5eed_de80, zeros: { $0 != 1 })
+            if xs.count == rowCounts.count {
+                let o = evaluate(cases: xs.count, layers: downs.count) { v, c, layer in
+                    if let v { return launch(v, source: .copy, x: xs[c], linear: downs[layer], relu2: false) }
+                    return NemotronPrefillSharedDownCopy.launch(xs[c], downs[layer])
+                }
+                if let pick = o.choice { choice["shared_down"] = pick }
+                note("shared_down", o)
+            } else {
+                detail.append("shared_down off (inputs)")
+            }
+        } else {
+            detail.append("shared_down off (not verified)")
+        }
+        report(head.joined(separator: ", ") + " (per launch, 488 rows, median of 12 over every layer; "
+            + detail.joined(separator: "; ") + ")")
+    }
+}
+
+// MARK: - Seed scan-window NAX GEMM tune (NEMOTRON_SEED_SSM_TUNE)
+
+/// Seed-only (request prefill, `NemotronHPrefillX5.active`, NAX hosts): load-time geometry choice of the Mamba
+/// scan-window GEMMs, the state product `nemotron_ssm_state_gemm` (`NemotronPrefillStateGemm`) and the scan decay
+/// GEMM `nemotron_ssm_scan_decay_gemm` with its fresh-window form `_fresh_out` (`NemotronPrefillScanDecayGemm`).
+/// Each variant is the incumbent's text through counted replacements (nil when a statement moved) and keeps every
+/// output's `tile_matmad_nax` sequence: the same 16 x 32 x 16 multiply-accumulates on the same operand fragments
+/// into the same accumulator, 32-k chunks in increasing order, the A tile staged by the same expressions, the same
+/// stores and epilogue. A variant moves only
+/// - rows per threadgroup (`m2`: the state product's 64 rows as two threadgroups of 32 rows, four SIMD groups);
+/// - K staging: 64 k staged per barrier pair and consumed as two 32-k chunks in order (`sk64`), or two staging
+///   buffers with one barrier per chunk (`dbuf`);
+/// - staging SIMD groups (`st8`: eight SIMD groups stage the scan's A tile; the incumbent's four run the
+///   multiply-accumulates and the store).
+/// Variants: state product 1 `m2dbuf`, 2 `m2sk64`; scan decay (and its fresh form) 1 `sk64st8`, 2 `st8dbuf`.
+/// `tune` (load time, after the seed retiles) checks every variant bit for bit against the production launch on
+/// `qualify`'s kinds of seeded cases (specials included), three passes each, drops any mismatch or Metal error,
+/// times the incumbent and the survivors round robin (rotating start, median) as chains in which each launch reads
+/// the previous launch's output (the state product takes its decay row from the previous product, the scan its
+/// decay input from the previous decay row), and adopts the fastest only when it is at least 3% faster. The
+/// fresh-window kernel takes the scan's adopted variant once that variant's fresh form passes the same check.
+/// On hosts without NAX the seed path does not run these kernels and the tune reports off.
+/// Off by default: NEMOTRON_SEED_SSM_TUNE=1 turns the tune on; NEMOTRON_SEED_SSM_FORCE=<n> adopts variant n (1-based, per
+/// kernel list) wherever it qualified, 0 keeps the incumbents.
+enum NemotronSeedSSMTune {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_SSM_TUNE"] == "1"
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SEED_SSM_FORCE"] ?? "")
+    /// Soft cap on the tune's own load time: no variant or timing phase starts past it.
+    static let budgetSeconds = 1.5
+
+    enum Staging: Sendable { case sk32, sk64, dbuf }
+
+    struct Variant: Sendable, Equatable {
+        let name: String
+        /// Output rows per threadgroup (the incumbents': 64).
+        let rows: Int
+        let staging: Staging
+        /// SIMD groups staging the scan's A tile (nil: the four computing ones).
+        let stage: Int?
+    }
+
+    static let stateVariants: [Variant] = [
+        Variant(name: "m2dbuf", rows: 32, staging: .dbuf, stage: nil),
+        Variant(name: "m2sk64", rows: 32, staging: .sk64, stage: nil),
+    ]
+    static let scanVariants: [Variant] = [
+        Variant(name: "sk64st8", rows: 64, staging: .sk64, stage: 8),
+        Variant(name: "st8dbuf", rows: 64, staging: .dbuf, stage: 8),
+    ]
+
+    /// Adopted variants (nil: the incumbent), set once at load before any request.
+    nonisolated(unsafe) private(set) static var stateChoice: Variant? = nil
+    nonisolated(unsafe) private(set) static var scanChoice: Variant? = nil
+    nonisolated(unsafe) private(set) static var freshChoice: Variant? = nil
+
+    private static let barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);"
+
+    /// `text` with `old` replaced; nil unless `old` occurs exactly once.
+    private static func once(_ text: String, _ old: String, _ new: String) -> String? {
+        text.components(separatedBy: old).count == 2 ? text.replacingOccurrences(of: old, with: new) : nil
+    }
+
+    /// The K loop opened by `head`: the text before it, its staging statements (between its two barriers), its
+    /// compute statements (after the second) and the text after it; nil when the loop moved.
+    private static func split(_ body: String, head: String) -> (String, String, String, String)? {
+        let lines = body.components(separatedBy: "\n")
+        let heads = lines.indices.filter { lines[$0].trimmingCharacters(in: .whitespaces) == head }
+        guard heads.count == 1 else { return nil }
+        let hi = heads[0]
+        let close = String(lines[hi].prefix(while: { $0 == " " })) + "}"
+        guard let ei = lines[(hi + 1)...].firstIndex(where: { $0 == close }) else { return nil }
+        let inner = Array(lines[(hi + 1) ..< ei])
+        let bars = inner.indices.filter { inner[$0].trimmingCharacters(in: .whitespaces) == barrier }
+        guard bars.count == 2, bars[0] == 0 else { return nil }
+        return (lines[..<hi].joined(separator: "\n"), inner[1 ..< bars[1]].joined(separator: "\n"),
+                inner[(bars[1] + 1)...].joined(separator: "\n"), lines[(ei + 1)...].joined(separator: "\n"))
+    }
+
+    /// The K loop rebuilt over `ext` for `staging` (`rows` staged rows per buffer; `only`: the SIMD groups that
+    /// run the compute statements, every SIMD group reaching every barrier).
+    private static func loop(_ staging: String, _ compute: String, ext: String, _ form: Staging, rows: Int,
+                             only: String?) -> String? {
+        let open = only.map { "if (\($0)) {" } ?? "{"
+        let load = "Atile.template load<float, AS, 1>(As + tm * AS);"
+        switch form {
+        case .sk32:
+            return ["for (int k0 = 0; k0 < \(ext); k0 += SK) {", barrier, staging, barrier, open, compute, "}", "}"]
+                .joined(separator: "\n")
+        case .sk64:
+            guard let c = once(compute, load, "Atile.template load<float, AS, 1>(As + tm * AS + (k0 - kb));")
+            else { return nil }
+            return ["for (int k0 = 0; k0 < \(ext); k0 += 2 * SK) {", barrier, staging, barrier, open,
+                    "const int kb = k0;", "for (int k0 = kb; k0 < kb + 2 * SK && k0 < \(ext); k0 += SK) {", c, "}",
+                    "}", "}"].joined(separator: "\n")
+        case .dbuf:
+            guard let c = once(compute, load,
+                               "Atile.template load<float, AS, 1>(As + ((k0 / SK) & 1) * (\(rows) * AS) + tm * AS);")
+            else { return nil }
+            return ["for (int ks = 0; ks < \(ext) + SK; ks += SK) {", "if (ks > 0) {", barrier, "}",
+                    "if (ks < \(ext)) {", "const int k0 = ks;",
+                    "threadgroup float* Ab = As + ((ks / SK) & 1) * (\(rows) * AS);",
+                    staging.replacingOccurrences(of: "As[", with: "Ab["), "}",
+                    "if (" + (only.map { "ks > 0 && (\($0))" } ?? "ks > 0") + ") {", "const int k0 = ks - SK;", c,
+                    "}", "}"].joined(separator: "\n")
+        }
+    }
+
+    /// The state product's text: `v.rows` of the 64 rows per threadgroup (threadgroup y picks them), all 128
+    /// columns, one 32 x 32 tile per SIMD group (four per 32 rows).
+    static func stateSource(_ v: Variant) -> String? {
+        let ks = v.staging == .sk64 ? 64 : 32, buffers = v.staging == .dbuf ? 2 : 1, threads = 4 * v.rows
+        guard v.rows == 32 || v.rows == 64,
+              case let (p0, s0, compute, q0)? = split(NemotronPrefillStateGemm.body,
+                                                      head: "for (int k0 = 0; k0 < n; k0 += SK) {")
+        else { return nil }
+        var pre: String? = p0
+        if ks == 64 { pre = pre.flatMap { once($0, "constexpr int AS = SK + 1;", "constexpr int AS = 2 * SK + 1;") } }
+        pre = pre.flatMap { once($0, "threadgroup float As[DH * AS];", "threadgroup float As[\(buffers * v.rows) * AS];") }
+        pre = pre.flatMap { once($0, "const short tm = SM * short(sg / 4);",
+                                 "const int r0 = \(v.rows) * int(threadgroup_position_in_grid.y);\n"
+                                     + "    const short tm = SM * short(sg / 4);") }
+        var stg: String? = once(s0, "for (int e = tid; e < DH * SK; e += 256) {",
+                                "for (int e = tid; e < \(v.rows) * \(ks); e += \(threads)) {")
+        stg = stg.flatMap { once($0, "const int i = e % DH;", "const int i = e % \(v.rows);") }
+        stg = stg.flatMap { once($0, "const int t = e / DH;", "const int t = e / \(v.rows);") }
+        stg = stg.flatMap { once($0, "const float a = xr[size_t(tt) * H * DH + i];",
+                                 "const float a = xr[size_t(tt) * H * DH + r0 + i];") }
+        let post = once(q0, "Dtile.store(out + (size_t(bh) * DH + tm) * DS + tn, DS);",
+                        "Dtile.store(out + (size_t(bh) * DH + r0 + tm) * DS + tn, DS);")
+        guard let pre, let stg, let post,
+              let body = loop(stg, compute, ext: "n", v.staging, rows: v.rows, only: nil) else { return nil }
+        return [pre, body, post].joined(separator: "\n")
+    }
+
+    /// The scan decay GEMM's text (`fresh`: the fresh-window form): 64 time rows x 64 columns per threadgroup as
+    /// before, the A tile staged by `v.stage` SIMD groups (the computing four only when nil).
+    static func scanSource(_ v: Variant, fresh: Bool) -> String? {
+        let ks = v.staging == .sk64 ? 64 : 32, buffers = v.staging == .dbuf ? 2 : 1, stagers = v.stage ?? 4
+        guard v.rows == 64, stagers >= 4,
+              case let (p0, s0, compute, q0)? = split(NemotronPrefillScanDecayGemm.source(freshOut: fresh),
+                                                      head: "for (int k0 = 0; k0 < L; k0 += SK) {")
+        else { return nil }
+        var pre: String? = p0
+        if ks == 64 { pre = pre.flatMap { once($0, "constexpr int AS = SK + 1;", "constexpr int AS = 2 * SK + 1;") } }
+        pre = pre.flatMap { once($0, "threadgroup float As[64 * AS];", "threadgroup float As[\(buffers * 64) * AS];") }
+        let stg = once(s0, "for (int c = int(sg); c < SK; c += 4) {", "for (int c = int(sg); c < \(ks); c += \(stagers)) {")
+        let only = stagers > 4 ? "sg < 4" : nil
+        guard let pre, let stg,
+              let body = loop(stg, compute, ext: "L", v.staging, rows: 64, only: only) else { return nil }
+        return [pre, body, only.map { "if (\($0)) {\n" + q0 + "\n}" } ?? q0].joined(separator: "\n")
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel?] = [:]
+
+    private static func kernel(_ kind: String, _ v: Variant) -> MLXFast.MLXFastKernel? {
+        lock.withLock { () -> MLXFast.MLXFastKernel? in
+            let key = kind + "_" + v.name
+            if let made = kernels[key] { return made }
+            var made: MLXFast.MLXFastKernel? = nil
+            switch kind {
+            case "state":
+                made = stateSource(v).map {
+                    MLXFast.metalKernel(
+                        name: "nemotron_seed_ssm_state_" + v.name, inputNames: ["dtx", "last", "B", "n"],
+                        outputNames: ["out"], source: $0, header: nemotronRunGatherHeader)
+                }
+            case "scan":
+                made = scanSource(v, fresh: false).map {
+                    MLXFast.metalKernel(
+                        name: "nemotron_seed_ssm_scan_" + v.name, inputNames: ["dtA", "CB", "dtx", "L"],
+                        outputNames: ["y", "last"], source: $0, header: nemotronRunGatherHeader)
+                }
+            default:
+                made = scanSource(v, fresh: true).map {
+                    MLXFast.metalKernel(
+                        name: "nemotron_seed_ssm_fresh_" + v.name,
+                        inputNames: ["dtA", "CB", "dtx", "L", "ec", "X", "Dw"], outputNames: ["o", "last"],
+                        source: $0, header: nemotronRunGatherHeader, ensureRowContiguous: false)
+                }
+            }
+            kernels[key] = made
+            return made
+        }
+    }
+
+    /// One state-product launch of `v` under `NemotronPrefillStateGemm.launch`'s guards; nil outside them.
+    static func launchState(_ v: Variant, _ dtx: MLXArray, _ last: MLXArray, _ bWindow: MLXArray, n: Int, h: Int,
+                            g: Int, dh: Int, d: Int) -> MLXArray? {
+        guard NemotronHPrefillX5.runGather, dh == 64, d == 128, g > 0, h % g == 0,
+              dtx.dtype == .float32, last.dtype == .float32, bWindow.dtype == .float32,
+              dtx.shape == [1, n, h, dh], last.shape == [1, h, 1, n], bWindow.shape == [1, g, 1, n, d],
+              let kernel = kernel("state", v)
+        else { return nil }
+        return kernel(
+            [dtx, last, bWindow, n],
+            template: [("H", h), ("R", h / g), ("DH", dh), ("DS", d)],
+            grid: (4 * v.rows, 64 / v.rows, h), threadGroup: (4 * v.rows, 1, 1),
+            outputShapes: [[1, h, dh, d]], outputDTypes: [.float32])[0]
+    }
+
+    /// One scan-decay launch of `v` under `NemotronPrefillScanDecayGemm.launch`'s guards; nil outside them.
+    static func launchScan(_ v: Variant, _ dtA: MLXArray, _ CB: MLXArray, _ dtx: MLXArray, n: Int, b: Int, h: Int,
+                           g: Int, dh: Int) -> (y: MLXArray, last: MLXArray)? {
+        guard NemotronHPrefillX5.runGather, b == 1, dh == 64, g > 0, h % g == 0,
+              dtA.dtype == .float32, dtx.dtype == .float32,
+              CB.dtype == .bfloat16 || CB.dtype == .float16 || CB.dtype == .float32,
+              dtA.shape == [b, n, h], dtx.shape == [b, n, h, dh], CB.shape == [b, g, n, n],
+              let kernel = kernel("scan", v)
+        else { return nil }
+        let threads = 32 * (v.stage ?? 4)
+        let out = kernel(
+            [dtA, CB, dtx, n],
+            template: [("CBT", CB.dtype), ("H", h), ("R", h / g), ("DH", dh)],
+            grid: (((n + 63) / 64) * threads, 1, b * h), threadGroup: (threads, 1, 1),
+            outputShapes: [[b, h, n, dh], [b, h, 1, n]], outputDTypes: [.float32, .float32])
+        return (out[0], out[1])
+    }
+
+    /// One fresh-window launch of `v` under `NemotronPrefillScanDecayGemm.launchFresh`'s guards; nil outside them.
+    static func launchFresh(_ v: Variant, _ dtA: MLXArray, _ CB: MLXArray, _ dtx: MLXArray, n: Int, h: Int, g: Int,
+                            dh: Int, ec: MLXArray, x: MLXArray, D: MLXArray, lt: Int)
+        -> (o: MLXArray, last: MLXArray)? {
+        guard NemotronHPrefillX5.runGather, dh == 64, g > 0, h % g == 0,
+              dtA.dtype == .float32, dtx.dtype == .float32,
+              CB.dtype == .bfloat16 || CB.dtype == .float16 || CB.dtype == .float32,
+              dtA.shape == [1, n, h], dtx.shape == [1, n, h, dh], CB.shape == [1, g, n, n],
+              dtA.strides.last == 1, dtx.strides.last == 1, CB.strides.last == 1,
+              dtA.strides[1] == h, dtx.strides[1] == h * dh, dtx.strides[2] == dh, CB.strides[2] == n,
+              CB.strides[1] == n * n,
+              ec.dtype == .float32, ec.shape == [1, n, h], ec.strides[1] == h, ec.strides[2] == 1,
+              x.dtype == .bfloat16 || x.dtype == .float16, x.ndim == 4, x.dim(0) == 1, x.dim(1) >= n,
+              x.dim(2) == h, x.dim(3) == dh, D.dtype == x.dtype, D.shape == [h], lt >= n,
+              let kernel = kernel("fresh", v)
+        else { return nil }
+        let threads = 32 * (v.stage ?? 4)
+        let out = kernel(
+            [dtA, CB, dtx, n, ec, x, D],
+            template: [("CBT", CB.dtype), ("H", h), ("R", h / g), ("DH", dh), ("OT", x.dtype), ("LT", lt)],
+            grid: (((n + 63) / 64) * threads, 1, h), threadGroup: (threads, 1, 1),
+            outputShapes: [[1, lt, h, dh], [1, h, 1, n]], outputDTypes: [x.dtype, .float32])
+        return (out[0], out[1])
+    }
+
+    /// Production hooks (`apply` of the two enums): the adopted variant's launch, nil for the incumbent's.
+    static func state(_ dtx: MLXArray, _ last: MLXArray, _ bWindow: MLXArray, n: Int, h: Int, g: Int, dh: Int,
+                      d: Int) -> MLXArray? {
+        stateChoice.flatMap { launchState($0, dtx, last, bWindow, n: n, h: h, g: g, dh: dh, d: d) }
+    }
+    static func scan(_ dtA: MLXArray, _ CB: MLXArray, _ dtx: MLXArray, n: Int, b: Int, h: Int, g: Int, dh: Int)
+        -> (y: MLXArray, last: MLXArray)? {
+        scanChoice.flatMap { launchScan($0, dtA, CB, dtx, n: n, b: b, h: h, g: g, dh: dh) }
+    }
+    static func fresh(_ dtA: MLXArray, _ CB: MLXArray, _ dtx: MLXArray, n: Int, h: Int, g: Int, dh: Int,
+                      ec: MLXArray, x: MLXArray, D: MLXArray, lt: Int) -> (o: MLXArray, last: MLXArray)? {
+        freshChoice.flatMap { launchFresh($0, dtA, CB, dtx, n: n, h: h, g: g, dh: dh, ec: ec, x: x, D: D, lt: lt) }
+    }
+
+    /// Check, time and pick over `variants`: `run(v, i)` is check case i's outputs (nil `v`: the production
+    /// launch); `link(v, previous)` one timing-chain link after `previous` (nil for the first), returning what the
+    /// next link reads. Returns the pick and a report fragment.
+    private static func choose(_ variants: [Variant], cases: Int, chain: Int, elapsed: () -> Double,
+                               run: (Variant?, Int) -> [MLXArray]?, link: (Variant?, MLXArray?) -> MLXArray?)
+        -> (Variant?, String) {
+        var references: [[MLXArray]] = []
+        do {
+            references = try withError { () -> [[MLXArray]] in
+                let outs = (0 ..< cases).compactMap { run(nil, $0) }
+                guard outs.count == cases else { return [] }
+                eval(outs.flatMap { $0 })
+                return outs
+            }
+        } catch {
+            return (nil, "off (incumbent: \(error))")
+        }
+        guard references.count == cases else { return (nil, "off (incumbent unavailable)") }
+        var alive: [Variant] = []
+        var dropped: [String] = []
+        for v in variants {
+            guard elapsed() < budgetSeconds else {
+                dropped.append("\(v.name) budget")
+                continue
+            }
+            do {
+                // Three passes over every case: a staging race would have to repeat to pass.
+                let same = try withError { () -> Bool in
+                    var ok = MLXArray(true)
+                    for _ in 0 ..< 3 {
+                        for i in 0 ..< cases {
+                            guard let out = run(v, i), out.count == references[i].count else { return false }
+                            for (a, b) in zip(out, references[i]) {
+                                ok = ok .&& (a.view(dtype: a.dtype == .float32 ? .uint32 : .uint16)
+                                    .== b.view(dtype: b.dtype == .float32 ? .uint32 : .uint16)).all()
+                            }
+                        }
+                        eval(ok)
+                    }
+                    return ok.item(Bool.self)
+                }
+                if same { alive.append(v) } else { dropped.append("\(v.name) differs") }
+            } catch {
+                dropped.append("\(v.name) error")
+            }
+        }
+        let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
+        var medians: [Double] = []
+        var reps = 0
+        if !alive.isEmpty, elapsed() >= budgetSeconds {
+            dropped.append("timing skipped (load budget)")
+            alive = []
+        }
+        if !alive.isEmpty {
+            var samples = Array(repeating: [Double](), count: candidates.count)
+            do {
+                try withError {
+                    func build(_ i: Int) -> MLXArray? {
+                        var previous: MLXArray? = nil
+                        for _ in 0 ..< chain {
+                            guard let out = link(candidates[i], previous) else { return nil }
+                            previous = out
+                        }
+                        return previous
+                    }
+                    func round(_ order: [Int]) -> [Double?] {
+                        let chains = order.map { build($0) }
+                        return chains.map { last -> Double? in
+                            guard let last else { return nil }
+                            let start = DispatchTime.now().uptimeNanoseconds
+                            eval(last)
+                            Stream.gpu.synchronize()
+                            return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 / Double(chain)
+                        }
+                    }
+                    var wall = 0.0
+                    for _ in 0 ..< 2 {
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        _ = round(Array(candidates.indices))
+                        wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+                    }
+                    reps = max(9, min(31, Int(120 / max(wall, 0.01))))
+                    for rep in 0 ..< reps {
+                        let order = candidates.indices.map { ($0 + rep) % candidates.count }
+                        for (i, ms) in zip(order, round(order)) {
+                            if let ms { samples[i].append(ms) }
+                        }
+                    }
+                }
+            } catch {
+                dropped.append("timing error")
+                alive = []
+            }
+            if !alive.isEmpty, samples.allSatisfy({ $0.count == reps }) {
+                medians = samples.map { $0.sorted()[$0.count / 2] }
+            } else {
+                if !alive.isEmpty { dropped.append("timing incomplete") }
+                alive = []
+            }
+        }
+        var picked: Variant? = nil
+        var why = "kept"
+        if !medians.isEmpty, !alive.isEmpty {
+            if let f = forced {
+                if f >= 1, f <= variants.count, alive.contains(variants[f - 1]) {
+                    picked = variants[f - 1]
+                    why = "forced"
+                } else {
+                    why = f == 0 ? "forced V0" : "forced \(f) not qualified, kept"
+                }
+            } else if let best = medians.indices.dropFirst().min(by: { medians[$0] < medians[$1] }),
+                      medians[best] <= 0.97 * medians[0] {
+                picked = candidates[best]
+                why = "adopted"
+            }
+        }
+        func ms(_ v: Variant?) -> String {
+            guard let i = candidates.firstIndex(of: v), i < medians.count else { return "n/a" }
+            return String(format: "%.4f", medians[i])
+        }
+        let times = alive.map { "\($0.name) \(ms($0))" }
+        return (picked, "\(why) \(picked?.name ?? "V0") \(ms(picked)) ms vs V0 \(ms(nil)) ms per launch (median of"
+            + " \(reps), \(chain) chained launches/sample; \(alive.count)/\(variants.count) bitwise over \(cases) cases"
+            + " x 3" + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
+            + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(6).joined(separator: ", ")) + ")")
+    }
+
+    /// Load time, after the seed retiles; NAX hosts only (`NemotronHPrefillX5.runGather`).
+    static func tune(_ target: Module) {
+        stateChoice = nil
+        scanChoice = nil
+        freshChoice = nil
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data(
+                "nemotron seed ssm tune: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
+        }
+        guard enabled, NemotronHPrefillX5.runGather else { return report("off (setting)") }
+        let layers = max(1, target.modules().filter { $0 is NemotronHMamba2Mixer }.count)
+        let (h, g, dh, d) = (64, 8, 64, 128)
+        let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
+                                 Float(bitPattern: 0x8001_0000), 3e38])
+        var parts: [String] = []
+
+        // State product: `NemotronPrefillStateGemm.qualify`'s case kinds; the chain alternates the seed's two
+        // window lengths, each link's decay row read from the previous product.
+        if NemotronPrefillStateGemm.verified {
+            typealias StateCase = (dtx: MLXArray, last: MLXArray, b: MLXArray, n: Int)
+            var cases: [StateCase] = []
+            do {
+                cases = try withError { () -> [StateCase] in
+                    var made: [StateCase] = []
+                    for (seed, (n, l, start)) in [(256, 488, 0), (232, 488, 256), (256, 512, 256), (100, 356, 256),
+                                                  (64, 64, 0)].enumerated() {
+                        let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x57b7 + seed)), into: 3)
+                        var dtxFull = MLXRandom.normal([1, l, h, dh], key: key[0]) * Float(1 + seed)
+                        if seed == 1 {
+                            dtxFull = concatenated([specials, dtxFull.reshaped(-1)[8...]]).reshaped(1, l, h, dh)
+                        }
+                        var last = MLX.exp(-MLX.abs(MLXRandom.normal([1, h, 1, n], key: key[1])))
+                        if seed == 2 {
+                            last = concatenated([MLXArray([Float(0), .infinity, .nan, 1e-30]),
+                                                 last.reshaped(-1)[4...]]).reshaped(1, h, 1, n)
+                        }
+                        let flat = MLXRandom.normal([l * g * d], key: key[2]) * Float(2 + seed)
+                        let b = nemotronPrefillBF32Window(flat, start: start, end: start + n, groups: g, state: d)
+                        let dtx = dtxFull[0..., start ..< (start + n), 0..., 0...]
+                        eval(dtx, last, b)
+                        made.append((dtx, last, b, n))
+                    }
+                    return made
+                }
+            } catch {
+                cases = []
+            }
+            if cases.count == 5 {
+                func launch(_ v: Variant?, _ c: StateCase, _ last: MLXArray) -> MLXArray? {
+                    v.map { launchState($0, c.dtx, last, c.b, n: c.n, h: h, g: g, dh: dh, d: d) }
+                        ?? NemotronPrefillStateGemm.launch(dtx: c.dtx, last: last, bWindow: c.b, n: c.n, h: h, g: g,
+                                                           dh: dh, d: d)
+                }
+                var step = 0
+                let (pick, message) = choose(
+                    stateVariants, cases: cases.count, chain: 2 * layers, elapsed: elapsed,
+                    run: { v, i in launch(v, cases[i], cases[i].last).map { [$0] } },
+                    link: { v, previous in
+                        if previous == nil { step = 0 }
+                        let c = cases[step % 2]
+                        step += 1
+                        return launch(v, c, previous.map { $0.reshaped(-1)[0 ..< (h * c.n)].reshaped(1, h, 1, c.n) }
+                            ?? c.last)
+                    })
+                stateChoice = pick
+                parts.append("state " + message)
+            } else {
+                parts.append("state off (inputs)")
+            }
+        } else {
+            parts.append("state off (not verified)")
+        }
+
+        // Scan decay GEMM: `NemotronPrefillScanDecayGemm.qualify`'s case kinds; the chain runs the seed's second
+        // window length, each link's decay input read from the previous decay row.
+        if NemotronPrefillScanDecayGemm.verified, elapsed() < budgetSeconds {
+            typealias ScanCase = (dtA: MLXArray, cb: MLXArray, dtx: MLXArray, n: Int)
+            var cases: [ScanCase] = []
+            do {
+                cases = try withError { () -> [ScanCase] in
+                    var made: [ScanCase] = []
+                    for (seed, (n, l, start)) in [(256, 488, 0), (232, 488, 256), (256, 512, 256), (100, 356, 256),
+                                                  (17, 17, 0)].enumerated() {
+                        let key = MLXRandom.split(key: MLXRandom.key(UInt64(0x5cb9 + seed)), into: 4)
+                        let dtAFull = -MLX.abs(MLXRandom.normal([1, l, h], key: key[0])) * Float(0.05 * Double(1 + seed))
+                        var dtxFull = MLXRandom.normal([1, l, h, dh], key: key[1]) * Float(1 + seed)
+                        if seed == 1 {
+                            dtxFull = concatenated([dtxFull.reshaped(-1)[..<(start * h * dh + 3 * dh)], specials,
+                                                    dtxFull.reshaped(-1)[(start * h * dh + 3 * dh + 8)...]])
+                                .reshaped(1, l, h, dh)
+                        }
+                        var cb = MLXRandom.normal([1, g, n, n], key: key[2]) * Float(2 + seed)
+                        if seed == 2 { cb = concatenated([specials, cb.reshaped(-1)[8...]]).reshaped(1, g, n, n) }
+                        cb = cb.asType(.bfloat16)
+                        let dtA = dtAFull[0..., start ..< (start + n), 0...]
+                        let dtx = dtxFull[0..., start ..< (start + n), 0..., 0...]
+                        eval(dtA, cb, dtx)
+                        made.append((dtA, cb, dtx, n))
+                    }
+                    return made
+                }
+            } catch {
+                cases = []
+            }
+            if cases.count == 5 {
+                func launch(_ v: Variant?, _ c: ScanCase, _ dtA: MLXArray) -> (y: MLXArray, last: MLXArray)? {
+                    v.map { launchScan($0, dtA, c.cb, c.dtx, n: c.n, b: 1, h: h, g: g, dh: dh) }
+                        ?? NemotronPrefillScanDecayGemm.launch(dtA: dtA, CB: c.cb, dtx: c.dtx, n: c.n, b: 1, h: h,
+                                                               g: g, dh: dh)
+                }
+                let c1 = cases[1]
+                let (pick, message) = choose(
+                    scanVariants, cases: cases.count, chain: layers, elapsed: elapsed,
+                    run: { v, i in launch(v, cases[i], cases[i].dtA).map { [$0.y, $0.last] } },
+                    link: { v, previous in
+                        launch(v, c1, previous.map { $0.reshaped(1, c1.n, h) } ?? c1.dtA)?.last
+                    })
+                scanChoice = pick
+                parts.append("scan " + message)
+                // The fresh window takes the scan's pick once its own form matches on
+                // `qualifyFresh`'s case kinds (three passes).
+                if let pick, NemotronPrefillScanDecayGemm.freshVerified {
+                    var same = false
+                    do {
+                        same = try withError { () -> Bool in
+                            var ok = MLXArray(true)
+                            for (seed, (n, l)) in [(256, 488), (256, 300), (100, 100), (17, 17)].enumerated() {
+                                let key = MLXRandom.split(key: MLXRandom.key(UInt64(0xf5f0 + seed)), into: 6)
+                                let dtAFull = -MLX.abs(MLXRandom.normal([1, l, h], key: key[0]))
+                                    * Float(0.05 * Double(1 + seed))
+                                var dtxFull = MLXRandom.normal([1, l, h, dh], key: key[1]) * Float(1 + seed)
+                                if seed == 1 {
+                                    dtxFull = concatenated([specials, dtxFull.reshaped(-1)[8...]]).reshaped(1, l, h, dh)
+                                }
+                                let cb = (MLXRandom.normal([1, g, n, n], key: key[2]) * Float(2 + seed))
+                                    .asType(.bfloat16)
+                                let ecFull = MLX.exp(-MLX.abs(MLXRandom.normal([1, l, h], key: key[3])))
+                                let wide = MLXRandom.normal([1, l, h * dh + 64], key: key[4]).asType(.bfloat16)
+                                let x = wide[0..., 0..., 0 ..< (h * dh)].reshaped(1, l, h, dh)
+                                let D = MLXRandom.normal([h], key: key[5]).asType(.bfloat16)
+                                let dtA = dtAFull[0..., 0 ..< n, 0...]
+                                let dtx = dtxFull[0..., 0 ..< n, 0..., 0...]
+                                let ec = ecFull[0..., 0 ..< n, 0...]
+                                let lt = n == l ? l : n
+                                guard let a = NemotronPrefillScanDecayGemm.launchFresh(
+                                    dtA: dtA, CB: cb, dtx: dtx, n: n, h: h, g: g, dh: dh, ec: ec, x: x, D: D, lt: lt)
+                                else { return false }
+                                for _ in 0 ..< 3 {
+                                    guard let b = launchFresh(pick, dtA, cb, dtx, n: n, h: h, g: g, dh: dh, ec: ec,
+                                                              x: x, D: D, lt: lt) else { return false }
+                                    ok = ok .&& (a.o[0..., 0 ..< n, 0..., 0...].view(dtype: .uint16)
+                                        .== b.o[0..., 0 ..< n, 0..., 0...].view(dtype: .uint16)).all()
+                                        .&& (a.last.view(dtype: .uint32) .== b.last.view(dtype: .uint32)).all()
+                                    eval(ok)
+                                }
+                            }
+                            return ok.item(Bool.self)
+                        }
+                    } catch {
+                        same = false
+                    }
+                    freshChoice = same ? pick : nil
+                    parts.append("fresh " + (same ? "on \(pick.name) (4 cases x 3 bitwise)" : "kept (\(pick.name) differs)"))
+                }
+            } else {
+                parts.append("scan off (inputs)")
+            }
+        } else {
+            parts.append(NemotronPrefillScanDecayGemm.verified ? "scan skipped (load budget)" : "scan off (not verified)")
+        }
+        report(parts.joined(separator: "; "))
+    }
+}
