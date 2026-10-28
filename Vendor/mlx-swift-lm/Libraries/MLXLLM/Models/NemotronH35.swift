@@ -509,6 +509,69 @@ METAL_FUNC void nemotron_seed_gather_impl(
 }
 """#
 
+// MARK: - Seed shared-B double buffer (official-only qualification)
+
+/// A distinct same-geometry algorithm. The original retile literal and all eight
+/// kernels remain available. Transform only on the official worker; a missing
+/// anchor disables the new candidate. No source expansion is run locally.
+private let nemotronSeedPipeBSource: String? = {
+    var source = nemotronSeedRetileSource
+    func swap(_ old: String, _ new: String) -> Bool {
+        guard source.components(separatedBy: old).count == 2 else { return false }
+        source = source.replacingOccurrences(of: old, with: new)
+        return true
+    }
+    guard swap("METAL_FUNC void nemotron_seed_gather_impl(",
+               "METAL_FUNC void nemotron_seed_pipe_b_impl(") else { return nil }
+    guard swap("      threadgroup T* wdst = Ws + lr * BK_padded + lk;\n", "") else { return nil }
+    guard swap("      auto fill = [&](const int kb, const int klim) {",
+               """
+                     auto fill = [&](const int kb, const int klim, threadgroup T* plane) {
+                       threadgroup T* wdst = plane + lr * BK_padded + lk;
+               """) else { return nil }
+    guard swap(#"""
+      auto block = [&](const int kb, const int klim) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        fill(kb, klim);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+"""#, #"""
+      auto consume = [&](const int kb, const int klim, threadgroup T* plane) {
+"""#) else { return nil }
+    guard swap("Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);",
+               "Btile.template load<T, BK_padded, 1>(plane + tn * BK_padded + kk1);") else { return nil }
+    guard swap(#"""
+      const int K_it = K / BK;
+      for (int kb_i = 0; kb_i < K_it; kb_i++) {
+        block(kb_i * BK, BK);
+      }
+      // K % 64 == 0, so the tail is whole groups and whole 32-k steps.
+      const int k_rem = K - K_it * BK;
+      if (k_rem > 0) {
+        block(K_it * BK, k_rem);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+"""#, #"""
+      static_assert(BN == 64 && BK == 64 && WM == 2 && WN == 2 && !DIRECT_B,
+                    "shared-B pipeline geometry");
+      constexpr int plane_words = BN * BK_padded;
+      const int K_it = K / BK;  // Host guard: positive K, K % 64 == 0.
+      fill(0, BK, Ws);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      STEEL_PRAGMA_NO_UNROLL
+      for (int kb_i = 0; kb_i < K_it; ++kb_i) {
+        threadgroup T* current = Ws + (kb_i & 1) * plane_words;
+        threadgroup T* next = Ws + ((kb_i + 1) & 1) * plane_words;
+        if (kb_i + 1 < K_it) {
+          fill((kb_i + 1) * BK, BK, next);
+        }
+        consume(kb_i * BK, BK, current);
+        // Publish next and retire every current-plane reader before reuse.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+"""#) else { return nil }
+    return source
+}()
+
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) routed MoE fc1 and
 /// fc2 through a retiled run gather (`nemotron_seed_gather_impl`) chosen once at
 /// load. Every variant keeps each output's `BaseNAXFrag::mma` sequence over k
@@ -532,6 +595,7 @@ enum NemotronSeedRetile {
         let name: String
         let bn: Int, bk: Int, wm: Int, wn: Int
         let direct: Bool
+        var pipeline: Bool = false
         var threads: Int { wm * wn * 32 }
     }
 
@@ -546,7 +610,9 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
-    ]
+    ] + (ProcessInfo.processInfo.environment["NEMOTRON_SEED_BPIPE"] == "0" ? [] : [
+        Variant(name: "ws64x64w22pipe", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pipeline: true),
+    ])
 
     enum Source: String, Sendable { case bank, dict, copy }
 
@@ -603,6 +669,30 @@ enum NemotronSeedRetile {
     private static let plainBank = makeKernel(routed: false, source: .bank)
     private static let plainCopy = makeKernel(routed: false, source: .copy)
 
+    /// Separate kernel objects and headers; fail closed without changing old kernels.
+    private static func makePipelineKernel(routed: Bool, source: Source) -> MLXFast.MLXFastKernel? {
+        guard let header = nemotronSeedPipeBSource else { return nil }
+        var code = body(routed: routed, source: source)
+        let allocation = "threadgroup T Ws[DIRECT_B ? 1 : BN * (BK + 16 / sizeof(T))];"
+        guard code.components(separatedBy: allocation).count == 2,
+              code.components(separatedBy: "nemotron_seed_gather_impl<").count == 3
+        else { return nil }
+        code = code.replacingOccurrences(of: allocation,
+            with: "threadgroup T Ws[2 * BN * (BK + 16 / sizeof(T))];")
+        code = code.replacingOccurrences(of: "nemotron_seed_gather_impl<", with: "nemotron_seed_pipe_b_impl<")
+        return MLXFast.metalKernel(
+            name: "nemotron_seed_pipe_b_\(routed ? "routed_" : "")\(source.rawValue)",
+            inputNames: ["x", "w", "scales", "biases", "tiles"] + (routed ? ["routed_rows"] : []) + ["N", "K"],
+            outputNames: ["y"],
+            source: code,
+            header: nemotronRunGatherHeader + "\n" + header)
+    }
+
+    private static let pipelineRoutedBank = makePipelineKernel(routed: true, source: .bank)
+    private static let pipelineRoutedDict = makePipelineKernel(routed: true, source: .dict)
+    private static let pipelinePlainBank = makePipelineKernel(routed: false, source: .bank)
+    private static let pipelinePlainCopy = makePipelineKernel(routed: false, source: .copy)
+
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
                        rows: MLXArray?, tiles: NemotronHRunTiles) -> MLXArray? {
@@ -621,7 +711,7 @@ enum NemotronSeedRetile {
         } else {
             guard x.dim(0) == n else { return nil }
         }
-        let kernel: MLXFast.MLXFastKernel
+        var kernel: MLXFast.MLXFastKernel
         let operands: [MLXArray]
         switch role.source {
         case .bank, .dict:
@@ -644,6 +734,17 @@ enum NemotronSeedRetile {
                   copy.biases.dtype == .float32
             else { return nil }
             (kernel, operands) = (plainCopy, [copy.codes, copy.scales, copy.biases])
+        }
+        if v.pipeline {
+            guard !v.direct, v.bn == 64, v.bk == 64, v.wm == 2, v.wn == 2, k > 0 else { return nil }
+            let selected: MLXFast.MLXFastKernel?
+            switch role.source {
+            case .bank: selected = role.routed ? pipelineRoutedBank : pipelinePlainBank
+            case .dict: selected = role.routed ? pipelineRoutedDict : nil
+            case .copy: selected = role.routed ? nil : pipelinePlainCopy
+            }
+            guard let selected else { return nil }
+            kernel = selected
         }
         var inputs: [any ScalarOrArray] = [x] + operands + [tiles.tiles]
         if role.routed, let rows { inputs.append(rows) }
