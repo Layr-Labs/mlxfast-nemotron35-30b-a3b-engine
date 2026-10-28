@@ -7,17 +7,6 @@ import MLXLMCommon
 import MLXNN
 
 /// NEMOTRON_MTP_SSM_PENDING_FOLD: a strict-prefix commit replays every Mamba
-/// layer's SSM state over the accepted steps, and the grouped replay reads and
-/// writes each layer's FP32 state. The replayed state is an array the commit
-/// only builds; this table maps it to its operands (an evaluated anchor state
-/// and the accepted steps' conv/dt tape). When the next compact verify of that
-/// layer receives it as its initial state, the fused SSM launch runs those
-/// steps from the anchor before its window (`NemotronHCompactSSMGated
-/// .pendingKernel`, the replay kernel's per-step statements) and the replay
-/// array is never evaluated. Every other reader of the committed state still
-/// evaluates the replay. Strict prefixes in a row extend the pending steps up
-/// to `strictSteps`. Admitted at load only after the folded launch matched replay
-/// + launch bitwise for every step count (`qualify`).
 final class NemotronMTPPendingSSM {
     struct Pending {
         let anchor: MLXArray, conv: MLXArray, dt: MLXArray
@@ -37,7 +26,6 @@ final class NemotronMTPPendingSSM {
     static let anchorRequested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_SKIP"] != "0"
     /// A window launch with at least this many pending steps stores the state after them
-    /// (NEMOTRON_MTP_SSM_ANCHOR_AT, 1 ... maxSteps - 2).
     static let anchorAt = min(max(Int(
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_AT"] ?? "") ?? 6, 1), maxSteps - 2)
     nonisolated(unsafe) static var qualified = false
@@ -67,7 +55,6 @@ final class NemotronMTPPendingSSM {
     }
 
     /// The pending replay `state` stands for, if it is one (removed: a second
-    /// reader evaluates the replay).
     static func take(_ state: MLXArray) -> Pending? {
         guard enabled else { return nil }
         return lock.withLock {
@@ -78,8 +65,6 @@ final class NemotronMTPPendingSSM {
     }
 
     /// Load time: compile the folded launch for every step count and admit it
-    /// only if its normed rows, prepared activation and final state equal the
-    /// replay followed by the plain fused launch, bitwise, on seeded operands.
     static func qualify(_ mixer: NemotronHMamba2Mixer) {
         guard requested else { return }
         func report(_ message: String) {
@@ -141,18 +126,6 @@ final class NemotronMTPPendingSSM {
 }
 
 /// NEMOTRON_MTP_SSM_ANCHOR_SKIP: the compact verify window's fused launch
-/// (NemotronHCompactSSMGated) without its store of the state after the
-/// window, which a strict prefix never reads. Every acceptance, full or
-/// strict, commits the replay of its accepted steps from an anchor state
-/// and registers it with NemotronMTPPendingSSM, so the next window's launch
-/// folds those steps (compile-time `P`, the pending prelude). A launch whose
-/// pending count is at least `NemotronMTPPendingSSM.anchorAt` stores the
-/// state after its pending steps (`anchor` form; always a committed state),
-/// which anchors the next tape; below that it stores no state (`none` form)
-/// and the tape grows by the accepted steps (at most `anchorAt + 2`). The
-/// state stays FP32 in registers through the fold, so a stored-then-reloaded
-/// state and a folded one are the same bits; `qualify` checks every form and
-/// whole acceptance sequences against the window-store launches before admitting it.
 enum NemotronMTPSSMAnchor {
     enum Store { case none, anchor }
 
@@ -170,12 +143,6 @@ enum NemotronMTPSSMAnchor {
         """
 
     /// NEMOTRON_MTP_SSM_LOADS_FIRST=0 keeps the stores where the record text has them. Otherwise no device load
-    /// of the window loop follows a device store of the same thread: each step's output (the same
-    /// `static_cast<T>(acc + x_ * D[h_idx])`) is kept in `nss_y[t]` and lane 0 stores the window's outputs after
-    /// the loop, and the anchor form copies the state after the pending steps to `nss_a` and stores it after the
-    /// loop (the same `static_cast<U>` of the same values, to the same addresses). The window loop is fully
-    /// unrolled so `nss_y` is indexed statically. `qualify` checks these launches against the window-store
-    /// launches, which keep the record text.
     static let loadsFirst = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_LOADS_FIRST"] != "0"
     static let windowOut = "    acc = simd_sum(acc);\n"
         + "    if (thread_index_in_simdgroup == 0) {\n"
@@ -263,8 +230,6 @@ enum NemotronMTPSSMAnchor {
     nonisolated(unsafe) static var lastPending = 0
 
     /// Warm-up: the acceptance length for the round after one whose windows folded `pending` steps and
-    /// committed `keep`, so that the anchor-skip windows reach every pending count 0 ... anchorAt + 2
-    /// (the first step of a shortest path to a count not yet in `seen`); nil once every count was reached.
     static func warmKeep(pending: Int, keep: Int, seen: inout Set<Int>) -> Int? {
         let at = NemotronMTPPendingSSM.anchorAt
         func after(_ count: Int, _ keep: Int) -> Int { (count >= at ? 0 : count) + keep }
@@ -293,13 +258,6 @@ enum NemotronMTPSSMAnchor {
     }
 
     /// Load time, after the pending fold qualified 1 ... `passed` steps. With operands seeded as in
-    /// NemotronMTPPendingSSM.qualify and `mixer`'s parameters, for every pending count 0 ... anchorAt + 2:
-    /// the `none` and `anchor` launches against the record launch (normed rows, prepared activation),
-    /// the anchor store against the replay of the pending steps, and the record launch's window state
-    /// against the replays the anchor skip commits instead; then whole acceptance sequences (full and
-    /// strict, every pending count) run under both policies: every window's normed rows and prepared
-    /// activation, and the committed state replayed from either representation, bitwise equal.
-    /// Admitted only if every case matches; otherwise the window keeps its store.
     static func qualify(_ mixer: NemotronHMamba2Mixer, passed: Int) {
         NemotronMTPPendingSSM.anchorQualified = false
         func report(_ message: String) {
@@ -452,8 +410,6 @@ enum NemotronMTPSSMAnchor {
 
 extension NemotronHRMSNormGated {
     /// NEMOTRON_MTP_SSM_ANCHOR_SKIP: `compactSSMPreparedRows` (same guards, operands, tail form and
-    /// pending fold) without the store of the state after the window; `.anchor` stores the state after
-    /// the pending steps instead. Returns (normalized, prepared, that state for `.anchor`) or nil.
     func compactSSMAnchorRows(
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
@@ -500,8 +456,6 @@ extension NemotronHRMSNormGated {
 }
 
 /// Cache the complete numerical Mamba verify window, with explicit current
-/// conv/SSM inputs and explicit replay-tape outputs. No evaluation object,
-/// transaction, prefix-replay closure or request identity enters this graph.
 final class NemotronH35MTPCompactGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
@@ -511,8 +465,6 @@ final class NemotronH35MTPCompactGraphCache {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_COMPILED_MAMBA_WINDOW"] != "0"
     private let lock = NSLock()
     /// [plain, consuming a prepared in_proj activation] x [unjoined, joined]
-    /// x pending steps (0 ... NemotronMTPPendingSSM.maxSteps) x [window store,
-    /// no store, anchor store] (NemotronMTPSSMAnchor): separate graphs.
     private var entries: [Int: Entry] = [:]
     private var joinTimed = false
     private var joinChecked = false
@@ -745,9 +697,6 @@ extension NemotronHMamba2Mixer {
     }
 
     /// Compact verify: the window kernel writes only the final SSM state and
-    /// the window's y; a strict accepted prefix replays the same kernel for
-    /// `keep` steps from the same input state at commit (bitwise equal to the
-    /// captured per-position state). Conv states are views of `padded`.
     func mtpCompactForward(
         _ hiddenStates: MLXArray, modelLayerIndex: Int,
         evaluation: CBv2RecurrentStateEvaluation, convState: MLXArray, initialSSM: MLXArray,
@@ -834,9 +783,6 @@ extension NemotronHMamba2Mixer {
     }
 
     /// NEMOTRON_MTP_SSM_ANCHOR_SKIP commit: an accepted prefix of `keep` window steps (full or strict) is
-    /// the compact replay, from `anchor`, of the `carried` pending steps the window's launch did not store
-    /// followed by the accepted ones, registered so the next window's launch folds it. A full acceptance
-    /// is built on first read like a strict prefix (`defersFullAcceptance`).
     private func stageAnchorReplay(
         _ evaluation: CBv2RecurrentStateEvaluation, modelLayerIndex: Int, length: Int,
         window: (padded: MLXArray, convolution: MLXArray, dt: MLXArray), anchor: MLXArray,
@@ -883,9 +829,6 @@ extension NemotronHMamba2Mixer {
     }
 
     /// Original numerical graph, with request state supplied as dynamic arrays.
-    /// Return its replay tape explicitly; staging/commit stay outside compile.
-    /// `inputPrepared`: in_proj's K=2688 activation, prepared by the preceding
-    /// join from these exact BF16 rows (otherwise prepared here).
     func mtpCompactArrays(
         _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
         prepared inputPrepared: MLXArray? = nil,
@@ -1009,7 +952,6 @@ extension NemotronHMamba2Mixer {
     }
 
     /// The window's start state: `anchor` itself, or `anchor` advanced over
-    /// the pending tape by the compact replay (outside the fused launch).
     func replayedPending(
         _ pending: (conv: MLXArray, dt: MLXArray, steps: Int)?, _ anchor: MLXArray
     ) -> MLXArray {
@@ -1110,9 +1052,6 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
 
 extension NemotronH35Model {
     /// Compile, at load time, every SSM verify-kernel instantiation an MTP
-    /// round can use (window widths 2...8; compact replay prefixes 1...7), so
-    /// a JIT compile never lands inside a timed decode window. Dummy inputs
-    /// use the real parameter dtypes, hence the exact runtime instantiations.
     func warmMTPSSMKernels(activationDType: DType) {
         guard let mixer = modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first
         else { return }
