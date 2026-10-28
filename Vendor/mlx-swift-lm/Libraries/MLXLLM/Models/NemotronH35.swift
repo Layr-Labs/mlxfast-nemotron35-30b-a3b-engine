@@ -521,7 +521,7 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// case), drops any mismatch or Metal error, times the survivors and the
 /// incumbent round robin on the 488-token gathers of the first four MoE layers
 /// (5 warm-up and 25 timed repetitions, median), and adopts the fastest only if
-/// it is at least 3% faster than the incumbent. NEMOTRON_SEED_RETILE=0 keeps
+/// it is at least 0.5% faster than the incumbent. NEMOTRON_SEED_RETILE=0 keeps
 /// the incumbents; NEMOTRON_SEED_RETILE_FORCE=<variant> adopts that variant
 /// for both roles when it qualifies.
 enum NemotronSeedRetile {
@@ -546,6 +546,9 @@ enum NemotronSeedRetile {
         Variant(name: "d64w12", bn: 64, bk: 64, wm: 1, wn: 2, direct: true),
         Variant(name: "d128w14", bn: 128, bk: 64, wm: 1, wn: 4, direct: true),
         Variant(name: "d128w24", bn: 128, bk: 64, wm: 2, wn: 4, direct: true),
+        Variant(name: "ws64x64w42", bn: 64, bk: 64, wm: 4, wn: 2, direct: false),
+        Variant(name: "d64w42", bn: 64, bk: 64, wm: 4, wn: 2, direct: true),
+        Variant(name: "ws128x64w42", bn: 128, bk: 64, wm: 4, wn: 2, direct: false),
     ]
 
     enum Source: String, Sendable { case bank, dict, copy }
@@ -581,8 +584,12 @@ enum NemotronSeedRetile {
         return """
                 threadgroup T Ws[DIRECT_B ? 1 : BN * (BK + 16 / sizeof(T))];
                 \(make)
+                if constexpr (32 / WM >= 16) {
                 if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
             \(call("32"))
+                } else {
+            \(call("BM"))
+                }
                 } else {
             \(call("BM"))
                 }
@@ -857,7 +864,7 @@ enum NemotronSeedRetile {
             let base = medians[r][0].1
             if let forced, let f = alive[r].first(where: { $0.name == forced }) {
                 choice[r] = f
-            } else if let best = medians[r].dropFirst().min(by: { $0.1 < $1.1 }), best.1 <= 0.97 * base {
+            } else if let best = medians[r].dropFirst().min(by: { $0.1 < $1.1 }), best.1 <= 0.995 * base {
                 choice[r] = best.0
             }
         }
