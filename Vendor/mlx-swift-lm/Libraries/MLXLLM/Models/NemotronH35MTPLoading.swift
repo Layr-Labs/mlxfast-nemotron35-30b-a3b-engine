@@ -82,6 +82,7 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -95,6 +96,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -796,3 +799,4 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry of the carried 3f932e3c tree.
 
 // Measurement entry 1 of this tree.
+// measurement 3 of submission 73df5103

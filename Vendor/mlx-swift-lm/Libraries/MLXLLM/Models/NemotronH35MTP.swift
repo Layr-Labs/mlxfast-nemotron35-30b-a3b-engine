@@ -632,6 +632,100 @@ private final class NemotronMTPDraftHead {
         } else {
             noTicketNote = "off (setting)"
         }
+        // NEMOTRON_MTP_HEAD_SCREEN_TUNE=0 keeps the partial pass at 8 rows per SIMD group and 2 SIMD groups
+        // per threadgroup. Otherwise each (RPS, NSG) candidate is compared with the incumbent bit for bit (scores,
+        // pick, kept ids and values, and the chunk bests when the no-ticket pick is on) on synthetic inputs for
+        // each half the plan screens, then timed round robin (whole screen launches, median) and adopted only if
+        // at most 0.97 of the incumbent.
+        var tuneNote = "off (setting)"
+        if ProcessInfo.processInfo.environment["NEMOTRON_MTP_HEAD_SCREEN_TUNE"] == "1" {
+            let halves = plan.upperGroups == nil ? [false] : [false, true]
+            func screened(_ x: MLXArray, _ half: Bool, _ rps: Int, _ nsg: Int) -> NemotronHeadScreen.Result {
+                NemotronHeadScreen.run(
+                    x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                    groups: plan.groups, groupCount: groupCount, chunk: chunk,
+                    keep: keep, upperGroups: half ? plan.upperGroups : nil,
+                    upperGroupCount: half ? plan.upperGroupCount : 0,
+                    packed: plan.packed, records: plan.records, records2: plan.records2,
+                    counter: plan.counter, paired: plan.paired, rowsPerSimdgroup: rps, simdgroups: nsg,
+                    b1: plan.b1, noTicket: plan.noTicket)
+            }
+            func outputs(_ r: NemotronHeadScreen.Result) -> [MLXArray] {
+                [r.id, r.scores, r.candidateIds, r.candidateValues] + (r.bestValues.map { [$0] } ?? [])
+                    + (r.bestIds.map { [$0] } ?? [])
+            }
+            func bits(_ a: MLXArray) -> MLXArray { a.dtype == .float32 ? a.view(dtype: .uint32) : a }
+            var state: UInt64 = 0x6A09_E667_F3BC_C908
+            var inputs: [MLXArray] = []
+            for round in 0 ..< 4 {
+                let t = (0..<k).map { _ -> Float in
+                    state = state &* 6364136223846793005 &+ 1442695040888963407
+                    return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                }
+                inputs.append((MLXArray(t) * g * Float(1 + round % 2)).asType(.bfloat16).reshaped(1, 1, k))
+            }
+            var candidates: [(Int, Int)] = []
+            for rps in [4, 8, 16] {
+                for nsg in [1, 2, 4, 8] where !(rps == 8 && nsg == 2)
+                    && NemotronHeadScreen.rows % (rps * nsg) == 0 && NemotronHeadScreen.headRows % (rps * nsg) == 0 {
+                    candidates.append((rps, nsg))
+                }
+            }
+            do {
+                try withError {
+                    var reference: [[MLXArray]] = []
+                    for x in inputs { for half in halves { reference.append(outputs(screened(x, half, 8, 2))) } }
+                    eval(reference.flatMap { $0 })
+                    var alive: [(Int, Int)] = []
+                    for (rps, nsg) in candidates {
+                        var ok = MLXArray(true)
+                        var i = 0
+                        for x in inputs {
+                            for half in halves {
+                                let out = outputs(screened(x, half, rps, nsg))
+                                if out.count != reference[i].count { ok = MLXArray(false) }
+                                for (a, b) in zip(out, reference[i]) { ok = ok .&& (bits(a) .== bits(b)).all() }
+                                i += 1
+                            }
+                        }
+                        if ok.item(Bool.self) { alive.append((rps, nsg)) }
+                    }
+                    let timed: [(Int, Int)] = [(8, 2)] + alive
+                    func sample(_ j: Int) -> Double {
+                        var outs: [MLXArray] = []
+                        for x in inputs { for half in halves { outs.append(screened(x, half, timed[j].0, timed[j].1).id) } }
+                        Stream.gpu.synchronize()
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(outs)
+                        Stream.gpu.synchronize()
+                        return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 / Double(outs.count)
+                    }
+                    for j in timed.indices { _ = sample(j); _ = sample(j) }
+                    var samples = Array(repeating: [Double](), count: timed.count)
+                    for rep in 0 ..< 15 {
+                        for jj in timed.indices {
+                            let j = (jj + rep) % timed.count
+                            samples[j].append(sample(j))
+                        }
+                    }
+                    let medians = samples.map { $0.sorted()[$0.count / 2] }
+                    let best = medians.indices.dropFirst().min(by: { medians[$0] < medians[$1] })
+                    if let best, medians[best] <= 0.97 * medians[0] {
+                        NemotronHeadScreen.tunedRPS = timed[best].0
+                        NemotronHeadScreen.tunedNSG = timed[best].1
+                    }
+                    tuneNote = "rps \(NemotronHeadScreen.tunedRPS) nsg \(NemotronHeadScreen.tunedNSG) "
+                        + "(incumbent 8 x 2 \(String(format: "%.4f", medians[0])) ms, best candidate "
+                        + "\(best.map { "\(timed[$0].0) x \(timed[$0].1) \(String(format: "%.4f", medians[$0])) ms" } ?? "none"); "
+                        + "\(alive.count)/\(candidates.count) bitwise equal)"
+                }
+            } catch {
+                NemotronHeadScreen.tunedRPS = 8
+                NemotronHeadScreen.tunedNSG = 2
+                tuneNote = "kept 8 x 2 (\(error))"
+            }
+        }
+        FileHandle.standardError.write(Data("nemotron mtp head screen tune: \(tuneNote)\n".utf8))
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
