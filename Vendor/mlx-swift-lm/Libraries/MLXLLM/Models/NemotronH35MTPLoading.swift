@@ -94,16 +94,30 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
+        NemotronMTPJoinRouter.qualify(target)
+        if let (norm, gate) = nemotronDraftTailNormGate(assistant.module) {
+            NemotronMTPJoinRouter.qualifyDraft(norm: norm, gate: gate)
+        }
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
+        cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
             (assistant.module.layers[0] as! NemotronH35MTPAttentionBlock).mixer.wo)
         NemotronMTPFrontNorms.qualifyShuffle(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPFrontNorms.qualifyEmbed(
+            assistant.module.layers[0] as! NemotronH35MTPAttentionBlock, target: target)
+        NemotronMTPFrontNorms.qualifyPick(
+            assistant.module.layers[0] as! NemotronH35MTPAttentionBlock, target: target)
+        NemotronMTPFrontNorms.qualifyPickHoist(
+            assistant.module.layers[0] as! NemotronH35MTPAttentionBlock, target: target)
+        NemotronMTPDraftFrontNorm.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPFrontRowsQKV.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPFrontRowsKVDirect.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronPrefillConvDt.qualify(target)
@@ -131,6 +145,11 @@ extension NemotronH35MTPAssistant {
         NemotronPrefillStateGemm.qualify()
         NemotronPrefillSeedI32.qualify(target)
         NemotronMTPDraftSDPA.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPDraftSDPA.qualifyPaged(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronMTPDraftSDPA.qualifyWalk(
+            assistant.module.layers[0] as! NemotronH35MTPAttentionBlock,
+            norm: (assistant.module.layers[1] as! NemotronH35MTPExpertBlock).norm)
+        NemotronMTPDraftSDPA.qualifyFence(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
@@ -271,6 +290,11 @@ extension NemotronH35MTPAssistant {
         // branch), then every shallower width.
         var rounds = [(depth, min(2, depth + 1)), (depth, depth + 1), (depth, 1)]
         for k in (1..<depth).reversed() { rounds += [(k, k + 1), (k, 1)] }
+        if depth == 2, NemotronMTPPendingSSM.warmsSteps, NemotronMTPPendingSSM.enabled {
+            rounds += [(depth, depth + 1)]
+                + Array(repeating: (depth, 1), count: NemotronMTPPendingSSM.limit + 1)
+                + [(depth, depth + 1)]
+        }
         for (k, confirmed) in rounds {
             var tokens = seed, hidden = carry
             var drafts: [MLXArray] = []
@@ -759,7 +783,3 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry of the carried 3f932e3c tree.
 
 // Measurement entry 2 of this tree.
-// e-man07: measurement 2 of c46.
-// e-man07: measurement 3 of c46.
-// e-man07: measurement 4 of c46.
-// e-man07: measurement 4 of c46.

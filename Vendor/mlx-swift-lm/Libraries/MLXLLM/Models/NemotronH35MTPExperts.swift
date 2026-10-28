@@ -23,7 +23,7 @@ final class NemotronH35MTPGraphCache {
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private let lock = NSLock()
-    private var entries: [Entry?] = Array(repeating: nil, count: 16)
+    private var entries: [Entry?] = Array(repeating: nil, count: 32)
     private var generations = 0
     private var calls = 0
     private var joinedChecks = 0
@@ -38,7 +38,8 @@ final class NemotronH35MTPGraphCache {
 
     /// parts: [routed, shared] before their Add (owner must have shared experts).
     func outputs(_ x: MLXArray, prepared: MLXArray?, parts: Bool,
-                 owner: NemotronHMoE, residual: MLXArray? = nil, nextNorm: RMSNorm? = nil) -> [MLXArray] {
+                 owner: NemotronHMoE, residual: MLXArray? = nil, nextNorm: RMSNorm? = nil,
+                 routed: (MLXArray, MLXArray)? = nil) -> [MLXArray] {
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
         // child identity cheaply, and collect array handles only on a miss.
@@ -54,6 +55,8 @@ final class NemotronH35MTPGraphCache {
         let usesPrepared = prepared != nil
         let slot = (usesPrepared ? 1 : 0) + (parts ? 2 : 0)
             + (NemotronZSkip.needsOriginal(owner.switchMLP.fc2) ? 4 : 0) + (joins ? 8 : 0)
+            + (routed != nil ? 16 : 0)
+        let usesRouted = routed != nil
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
@@ -61,8 +64,15 @@ final class NemotronH35MTPGraphCache {
             let state = (parameters ?? owner.innerState()) + (joins ? [nextNorm!.weight] : [])
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { [weak owner] arrays in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
+                // NEMOTRON_MTP_JOIN_ROUTER: the routing the join-router launch formed, as this graph's inputs.
+                if usesRouted {
+                    let r0 = (usesPrepared ? 2 : 1) + (joins ? 1 : 0)
+                    precondition(arrays.count >= r0 + 2, "routed MoE graph inputs")
+                    NemotronInjectedRouting.inside = (arrays[r0], arrays[r0 + 1])
+                }
                 let outputs = owner.mtpForwardRowsUncompiledOutputs(arrays[0],
                     prepared: usesPrepared ? arrays[1] : nil, parts: parts)
+                NemotronInjectedRouting.inside = nil
                 guard joins, let nextNorm else { return outputs }
                 let lhs = arrays[usesPrepared ? 2 : 1]
                 guard outputs.count == 2, let joined = NemotronHResidualRMSNorm.applyPreparedRows(
@@ -81,6 +91,7 @@ final class NemotronH35MTPGraphCache {
         // evaluation owns a separate global/per-function lock ordering.
         var arguments = prepared.map { [x, $0] } ?? [x]
         if let residual, joins { arguments.append(residual) }
+        if let routed { arguments += [routed.0, routed.1] }
         return withExtendedLifetime(retired) { current.function(arguments) }
     }
 
@@ -185,7 +196,8 @@ extension NemotronHMoE {
     private static let joinTiming: String? = nil
 
     func mtpForwardRowsJoined(_ x: MLXArray, prepared: MLXArray?, residual: MLXArray,
-                              nextNorm: RMSNorm, layerIndex: Int = -1) -> (MLXArray, MLXArray, MLXArray)? {
+                              nextNorm: RMSNorm, layerIndex: Int = -1,
+                              routed: (MLXArray, MLXArray)? = nil) -> (MLXArray, MLXArray, MLXArray)? {
         guard NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
               sharedExperts != nil, NemotronHResidualRMSNorm.plumbingAvailable,
               x.shape == [1, 3, 2688], x.dtype == .bfloat16,
@@ -194,7 +206,7 @@ extension NemotronHMoE {
               nextNorm.weight.shape == [2688], nextNorm.weight.dtype == .bfloat16
         else { return nil }
         let outputs = mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true,
-            owner: self, residual: residual, nextNorm: nextNorm)
+            owner: self, residual: residual, nextNorm: nextNorm, routed: routed)
         precondition(outputs.count == 3)
         if Self.joinCheck {
             let parts = mtpForwardRowsParts(x, prepared: prepared)!
@@ -247,7 +259,11 @@ extension NemotronHMoE {
         // selected expert and can dispatch all assignments in one operation.
         let indices: MLXArray
         let scores: MLXArray
-        if NemotronMTPExecution.batchedRouter, let colaunch, let packed,
+        if let inside = NemotronInjectedRouting.inside {
+            // NEMOTRON_MTP_JOIN_ROUTER: the join-router launch already formed this block's routing.
+            indices = inside.indices
+            scores = inside.weights
+        } else if NemotronMTPExecution.batchedRouter, let colaunch, let packed,
            NemotronSharedUpPacking.unpackedApplies(colaunch.x, up: colaunch.mlp.upProj, down: colaunch.mlp.downProj),
            let fused = NemotronRouterSharedUpColaunch.run(x, gate: gate, up: colaunch.mlp.upProj, prepared: packed) {
             // The router and the shared up in one launch; the shared up rows
@@ -4535,4 +4551,9 @@ extension NemotronU2 {
         self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }
         draft = admit(.draft) { draftCheck(head) }
     }
+}
+
+/// NEMOTRON_MTP_JOIN_ROUTER: the routing a MoE block's compiled graph takes as inputs while it is traced.
+enum NemotronInjectedRouting {
+    nonisolated(unsafe) static var inside: (indices: MLXArray, weights: MLXArray)? = nil
 }
