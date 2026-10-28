@@ -1276,13 +1276,13 @@ enum NemotronMoELeader {
     /// pair-only prepared R3 FC1; on, one leader also serves an expert's third
     /// row with one shared coefficient decode.
     static let tripleGateUp =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_TRIPLE_FC1_ONLY"] != "0"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_TRIPLE_FC1_ONLY"] == "1"
     /// Tail block of the R3 triple FC1 / balanced FC2 in its constant 8-value
     /// form (nmlTail8Source); =0 keeps the runtime-`remaining` tail.
     static let fc1Tail8 =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_TAIL8"] != "0"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_TAIL8"] == "1"
     static let fc2Tail8 =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_TAIL8"] != "0"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC2_TAIL8"] == "1"
     /// The plan-free triple FC1 with its main K loops unrolled by two
     /// (nmlFC1UnrollSource); =0 keeps the record loops. Selected only after
     /// `qualifyFC1Unroll` found the unrolled kernel bit for bit equal to the
@@ -1293,7 +1293,7 @@ enum NemotronMoELeader {
     /// The same constant tail for the R != 3 (draft tail) leader and weighted
     /// kernels, through production-only kernel copies.
     static let leaderTail8 =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEADER_TAIL8"] != "0"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_LEADER_TAIL8"] == "1"
 
     /// The ordinary prepared R3/top-six FC1 arithmetic plus the original
     /// integer FC2 plan, emitted by just the first leader/output tile.
@@ -2867,7 +2867,7 @@ enum NemotronZSkip {
     /// NEMOTRON_MTP_ZSKIP_FAST=0. `prepare` falls back to the tiled kernel (and
     /// re-checks every layer) if the fast twin misses a bit check.
     nonisolated(unsafe) fileprivate static var fast =
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_FAST"] != "0"
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_FAST"] == "1"
     /// The tile-major copy and its slot kernel unless NEMOTRON_MTP_ZSKIP_TILED=0.
     /// `prepare` falls back to the K-major copy and the staged kernel (and
     /// re-checks every layer) if the tiled kernel misses a bit check.
