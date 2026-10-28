@@ -96,6 +96,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronMambaInProjConvDt.qualifyLoadsFirst(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
