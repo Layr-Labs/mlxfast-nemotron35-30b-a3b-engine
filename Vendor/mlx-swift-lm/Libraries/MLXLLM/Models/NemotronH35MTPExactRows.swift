@@ -773,6 +773,138 @@ private let nemotronMambaInProjConvDtEpilogue = """
   }
 """
 
+/// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS: the in_proj launch whose epilogue takes
+/// its row's BF16 outputs from registers instead of reading them back from its
+/// own stores. `simd_sum` leaves each output's sum in every lane, so in the
+/// store loop each lane also keeps the stored value of the outputs of the row
+/// it serves in the epilogue (`nmc_y[r]`, statically indexed: the loops over
+/// the SIMD group's rows and the window positions are unrolled, and the lane's
+/// row is a compare). The epilogue picks position t's value with a select
+/// chain over the window's positions (no dynamic register indexing), so it
+/// reads no device output back and the device fence ahead of it goes. Every
+/// stored and computed value is the record kernel's.
+private let nemotronInProjStoreLoop = """
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
+      }
+    }
+  }
+"""
+private let nemotronInProjStoreLoopRegs = """
+  const int nmc_row = int(simd_lid) / R;
+  T nmc_y[R];
+  #pragma clang loop unroll(full)
+  for (int r = 0; r < R; r++) {
+    nmc_y[r] = static_cast<T>(0);
+  }
+  #pragma clang loop unroll(full)
+  for (int row = 0; row < results_per_simdgroup; row++) {
+    #pragma clang loop unroll(full)
+    for (int r = 0; r < R; r++) {
+      U v = simd_sum(result[r][row]);
+      if (simd_lid == 0) {
+        T h = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(h) ? h : (h > zero ? h : zero);
+          h = m * m;
+        }
+        yp[r * out_vec_size + row] = h;
+      }
+      if (nmc_row == row) {
+        T hc = static_cast<T>(v);
+        if (RELU2) {
+          T zero = static_cast<T>(0);
+          T m = metal::isnan(hc) ? hc : (hc > zero ? hc : zero);
+          hc = m * m;
+        }
+        nmc_y[r] = hc;
+      }
+    }
+  }
+"""
+private let nemotronMambaInProjConvDtRegsEpilogue = """
+
+  // Lane-parallel: lane l < RPS * R owns (row l / R, position l % R). Its
+  // row's BF16 outputs are in nmc_y, kept by the store loop above.
+  {
+    const int l = int(simd_lid);
+    if (l < results_per_simdgroup * R) {
+      const int row = l / R;
+      const int t = l % R;
+      const int o = out_row + row;
+      T yt = nmc_y[0];
+      #pragma clang loop unroll(full)
+      for (int s = 1; s < R; ++s) {
+        yt = t == s ? nmc_y[s] : yt;
+      }
+      if (o >= CS && o < CS + CC) {
+        const int64_t channel = int64_t(o - CS);
+        if (t < 3) {
+          padded[int64_t(t) * CC + channel] =
+              oldState[int64_t(t) * oldState_strides[1] + channel * oldState_strides[2]];
+        }
+        padded[(int64_t(t) + 3) * CC + channel] = yt;
+        float acc = 0;
+        for (int i = 0; i < 4; ++i) {
+          int64_t crow = int64_t(t) + int64_t(i);
+          T value = nmc_y[0];
+          if (crow < 3) {
+            value = oldState[crow * oldState_strides[1] + channel * oldState_strides[2]];
+          } else {
+            #pragma clang loop unroll(full)
+            for (int s = 1; s < R; ++s) {
+              value = crow - 3 == int64_t(s) ? nmc_y[s] : value;
+            }
+          }
+          acc += static_cast<float>(value)
+              * cw[channel * cw_strides[0] + int64_t(i) * cw_strides[1]];
+        }
+        T convolved = static_cast<T>(acc);
+        T xc = convolved + cb[channel * cb_strides[0]];
+        auto yc = 1 / (1 + metal::exp(metal::abs(xc)));
+        T sigmoid = xc < 0 ? yc : 1 - yc;
+        conv[int64_t(t) * CC + channel] = xc * sigmoid;
+      } else if (o >= DS && o < DS + NH) {
+        const int head = o - DS;
+        float v = static_cast<float>(yt)
+            + static_cast<float>(dtBias[int64_t(head) * dtBias_strides[0]]);
+        float sp;
+        if (metal::isnan(v)) {
+          sp = metal::numeric_limits<float>::quiet_NaN();
+        } else {
+          constexpr float inf = metal::numeric_limits<float>::infinity();
+          float maxval = metal::max(v, 0.0f);
+          float minval = metal::min(v, 0.0f);
+          sp = (minval == -inf || maxval == inf)
+              ? maxval : (maxval + log1p(metal::exp(minval - maxval)));
+        }
+        float lo = dtLo;
+        float hi = dtHi;
+        float m = metal::isnan(sp) ? sp : (sp > lo ? sp : lo);
+        dt[t * NH + head] = metal::isnan(m) ? m : (m < hi ? m : hi);
+      }
+    }
+  }
+"""
+/// The record in_proj source (prepared body + epilogue) with the register store
+/// loop and epilogue, or nil when the body's store loop text is not found.
+private func nemotronInProjRegsSource() -> String? {
+    guard nemotronHeadPreparedQMVSource.components(separatedBy: nemotronInProjStoreLoop).count == 2
+    else { return nil }
+    return nemotronHeadPreparedQMVSource.replacingOccurrences(
+        of: nemotronInProjStoreLoop, with: nemotronInProjStoreLoopRegs) + nemotronMambaInProjConvDtRegsEpilogue
+}
+
 enum NemotronMambaInProjConvDt {
     /// NEMOTRON_MTP_INPROJ_CONV=0 keeps the separate conv/timestep launch.
     static let enabled =
@@ -824,6 +956,35 @@ enum NemotronMambaInProjConvDt {
     }
     static var u2Available: Bool { kernelU2 != nil && (dictKernel == nil || dictKernelU2 != nil) }
 
+    /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS=0 keeps the epilogue that reads the
+    /// stored outputs back behind a device fence (see `nemotronInProjRegsSource`).
+    static let regsRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_INPROJ_EPILOGUE_REGS"] != "0"
+    nonisolated(unsafe) private(set) static var regsVerified = false
+    private static func regsKernel(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        source.map {
+            MLXFast.metalKernel(
+                name: name,
+                inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                             "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+                outputNames: ["y", "conv", "padded", "dt"],
+                source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: false)
+        }
+    }
+    private static let kernelRegs = regsKernel("nemotron_mamba_in_proj_conv_dt_rg", nemotronInProjRegsSource())
+    private static let dictKernelRegs = regsKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_rg", nemotronSBDictSource(nemotronInProjRegsSource() ?? ""))
+    private static let kernelU2Regs = regsKernel(
+        "nemotron_mamba_in_proj_conv_dt_u2_rg",
+        nemotronU2Source(nemotronInProjRegsSource(), loop: NemotronU2.qmvLoop, count: 1))
+    private static let dictKernelU2Regs = regsKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_u2_rg",
+        nemotronU2Source(nemotronSBDictSource(nemotronInProjRegsSource() ?? ""), loop: NemotronU2.qmvLoop, count: 1))
+    /// The register-epilogue twin of each record launch, all four built.
+    private static var regsAvailable: Bool {
+        kernelRegs != nil && dictKernelRegs != nil && kernelU2Regs != nil && dictKernelU2Regs != nil
+    }
+
     /// x: [3, 2688] BF16 rows (or their prepared activation), the Mamba
     /// in_proj [z | xBC | dt]. Returns the projection [3, N] plus the window's
     /// convolution [1, 3, convDim], padded history [1, 6, convDim] and FP32
@@ -832,7 +993,7 @@ enum NemotronMambaInProjConvDt {
         _ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
-        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil
+        convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -853,7 +1014,14 @@ enum NemotronMambaInProjConvDt {
         let args = NemotronMultiRowQMV.scalarPair(k, n)
         let dict = sbDict && NemotronSBDict.enabled && dictKernel != nil ? NemotronSBDict.dict(q) : nil
         let unrolled = (u2 ?? NemotronU2.inProj) ? (dict != nil ? dictKernelU2 : kernelU2) : nil
-        let outputs = (unrolled ?? (dict != nil ? dictKernel! : kernel))(
+        var chosen = unrolled ?? (dict != nil ? dictKernel! : kernel)
+        if regs ?? regsVerified {
+            // The register-epilogue twin of the same launch (same unroll, same dictionary form).
+            let twin = unrolled != nil ? (dict != nil ? dictKernelU2Regs : kernelU2Regs)
+                : (dict != nil ? dictKernelRegs : kernelRegs)
+            if let twin { chosen = twin }
+        }
+        let outputs = chosen(
             [q.weight, dict?.index ?? q.scales, dict?.table ?? biases, packed, args.0, args.1,
              oldState, convWeight, convBias, dtBias,
              MLXArray(timeStepLimit.0), MLXArray(timeStepLimit.1)],
@@ -900,6 +1068,60 @@ enum NemotronMambaInProjConvDt {
             }
         }
         return cases > 0 ? (same, cases) : nil
+    }
+
+    /// Load time, after `NemotronU2.qualify`: the register-epilogue launch
+    /// against the launch it replaces (the same unroll and dictionary form as
+    /// the verify takes) on every Mamba layer's real in_proj, conv and timestep
+    /// parameters, from the rows and from their prepared activation, two seeded
+    /// row sets and conv states each, all four outputs bit for bit. Engages only
+    /// if every case matches.
+    static func qualifyRegs(_ model: Module) {
+        regsVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp in_proj epilogue regs: \(message)\n".utf8))
+        }
+        guard regsRequested else { return report("off (setting)") }
+        guard enabled, regsAvailable else { return report("off (source not found)") }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let mixer = module as? NemotronHMamba2Mixer, let q = mixer.inProj as? QuantizedLinear,
+                          let convBias = mixer.conv1d.bias else { continue }
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x52c1 + 2 * cases + seed)), into: 2)
+                        let x = (MLXRandom.normal([3, 2688], key: keys[0]) * Float(seed == 0 ? 0.5 : 4))
+                            .asType(.bfloat16)
+                        let state = (MLXRandom.normal([1, 3, mixer.convDim], key: keys[1]) * 0.5)
+                            .asType(.bfloat16)
+                        let prepared = seed == 1 ? NemotronHeadPreparedActivation.pack(x) : nil
+                        func run(_ on: Bool) -> [MLXArray]? {
+                            apply(x, q, prepared: prepared, oldState: state, convWeight: mixer.conv1d.weight,
+                                  convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                  convStart: mixer.intermediateSize, convDim: mixer.convDim,
+                                  heads: mixer.numHeads, regs: on)
+                                .map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                        }
+                        guard let a = run(false), let b = run(true) else { same = MLXArray(false); return }
+                        for (u, v) in zip(a, b) {
+                            same = logicalAnd(same, u.dtype == .float32
+                                ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                        }
+                    }
+                    cases += 1
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        regsVerified = cases > 0 && same.item(Bool.self)
+        report(regsVerified
+            ? "on (\(cases) layers x 2 row sets: projection, conv, padded history and timestep bitwise equal)"
+            : "off (differs from the record epilogue)")
     }
 }
 
@@ -4480,3 +4702,4 @@ enum NemotronHeadScreen {
         return Result(id: id, scores: scores, candidateIds: picked[0], candidateValues: picked[1])
     }
 }
+// revision 3
