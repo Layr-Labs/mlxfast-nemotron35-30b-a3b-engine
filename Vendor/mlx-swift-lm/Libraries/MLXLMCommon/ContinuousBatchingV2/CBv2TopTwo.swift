@@ -703,3 +703,200 @@ package func cbv2TopTwoRowsPacketWarm(logitsDType: DType) {
     guard let warmed = cbv2TopTwoRowsPacket(logits, window: window) else { return }
     eval(warmed.ids, warmed.values, warmed.packet)
 }
+// Explicit forward-owned native-word summaries; compact selection and the original acceptance packet.
+// Header must be the unchanged cbv2TopTwoShuffleHeader; caller supplies T=.bfloat16, B=actual RPS*NSG.
+private let cbv2PackedHeadFinalizeSource = """
+    const uint lane = thread_position_in_threadgroup.x;
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint sl = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x;
+    const uint groups = uint(partial_shape[1]);
+    darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
+    for (uint i = lane; i < groups * 2; i += 256) {
+      const uint word = partial[row * groups * 2 + i];
+      const uint id = (i / 2) * uint(B) + (word & 0xffffu);
+      darkbloom_qwen35_mtp_top2_insert(local, float(as_type<T>(ushort(word >> 16))), id);
+    }
+    for (ushort delta = 16; delta > 0; delta >>= 1) {
+      const auto other = darkbloom_qwen35_mtp_top2_shuffle_down(local, delta);
+      if (sl < delta) {
+        if (other.count > 0) darkbloom_qwen35_mtp_top2_insert(local, other.first_value, other.first_id);
+        if (other.count > 1) darkbloom_qwen35_mtp_top2_insert(local, other.second_value, other.second_id);
+      }
+    }
+    threadgroup darkbloom_qwen35_mtp_top2_state scratch[8];
+    if (sl == 0) scratch[sg] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+      local = sl < 8 ? scratch[sl] : darkbloom_qwen35_mtp_top2_empty();
+      for (ushort delta = 4; delta > 0; delta >>= 1) {
+        const auto other = darkbloom_qwen35_mtp_top2_shuffle_down(local, delta);
+        if (sl < delta) {
+          if (other.count > 0) darkbloom_qwen35_mtp_top2_insert(local, other.first_value, other.first_id);
+          if (other.count > 1) darkbloom_qwen35_mtp_top2_insert(local, other.second_value, other.second_id);
+        }
+      }
+      if (sl == 0) {
+        const uint at = row * 2;
+        top_ids[at] = int(local.first_id);
+        top_ids[at + 1] = int(local.second_id);
+        top_values[at] = local.first_value;
+        top_values[at + 1] = local.second_value;
+        const uint batch = uint(window_shape[0]);
+        const uint width = uint(window_shape[1]);
+        const uint drafts = batch * (width - 1);
+        const uint rows = batch * width;
+        packet[drafts + row] = int(local.first_id);
+        packet[drafts + rows + at] = as_type<int>(local.first_value);
+        packet[drafts + rows + at + 1] = as_type<int>(local.second_value);
+        const uint column = row % width;
+        if (column > 0) packet[(row / width) * (width - 1) + (column - 1)] = window[row];
+      }
+    }
+"""
+
+// Native-BF16 head tile summaries. These are forward-owned tensors, not a global logits-to-summary cache.
+package let cbv2PackedHeadTopTwoHeader = cbv2TopTwoShuffleHeader
+
+private enum CBv2PackedHeadTopTwo {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_HEAD_PACKED_TOP2"] != "0"
+    nonisolated(unsafe) static var verifiedWidths: Set<Int> = []
+}
+
+private let cbv2PackedHeadReferenceKernel = MLXFast.metalKernel(
+    name: "nemotron_head_packed_top2_reference", inputNames: ["logits"], outputNames: ["partial"],
+    source: """
+      const uint lane = thread_index_in_simdgroup;
+      const uint group = threadgroup_position_in_grid.x;
+      const uint row = threadgroup_position_in_grid.y;
+      const uint vocabulary = uint(logits_shape[2]);
+      darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_empty();
+      if (lane < uint(B)) {
+        darkbloom_qwen35_mtp_top2_insert(local, float(logits[row * vocabulary + group * B + lane]), lane);
+      }
+      for (ushort delta = 16; delta > 0; delta >>= 1) {
+        const auto other = darkbloom_qwen35_mtp_top2_shuffle_down(local, delta);
+        if (lane < delta) {
+          if (other.count > 0) darkbloom_qwen35_mtp_top2_insert(local, other.first_value, other.first_id);
+          if (other.count > 1) darkbloom_qwen35_mtp_top2_insert(local, other.second_value, other.second_id);
+        }
+      }
+      if (lane == 0) {
+        const uint groups = vocabulary / B;
+        const uint at = (row * groups + group) * 2;
+        const uint base = row * vocabulary + group * B;
+        partial[at] = (uint(as_type<ushort>(logits[base + local.first_id])) << 16) | local.first_id;
+        partial[at + 1] = (uint(as_type<ushort>(logits[base + local.second_id])) << 16) | local.second_id;
+      }
+    """, header: cbv2TopTwoShuffleHeader)
+
+private let cbv2PackedHeadFinalizeKernel = MLXFast.metalKernel(
+    name: "nemotron_head_packed_top2_finalize", inputNames: ["partial", "window"],
+    outputNames: ["top_ids", "top_values", "packet"], source: cbv2PackedHeadFinalizeSource,
+    header: cbv2TopTwoShuffleHeader)
+private let cbv2PackedHeadFinalizeColumnsKernel = MLXFast.metalKernel(
+    name: "nemotron_head_packed_top2_finalize_columns", inputNames: ["partial", "w1", "w2"],
+    outputNames: ["top_ids", "top_values", "packet"],
+    source: cbv2PacketColumnsSource(cbv2PackedHeadFinalizeSource), header: cbv2TopTwoShuffleHeader)
+
+package func cbv2PackedHeadTopTwoAvailable(tileWidth: Int) -> Bool {
+    CBv2PackedHeadTopTwo.enabled && CBv2PackedHeadTopTwo.verifiedWidths.contains(tileWidth)
+}
+
+/// Worker-only oracle for the exact packed summaries of already-materialized BF16 head logits.
+package func cbv2PackedHeadReference(_ logits: MLXArray, tileWidth: Int) -> MLXArray? {
+    guard logits.shape == [1, 3, 131072], logits.dtype == .bfloat16,
+          tileWidth == 16 || tileWidth == 32 else { return nil }
+    return cbv2PackedHeadReferenceKernel([logits], template: [("B", tileWidth)],
+        grid: (32 * (131072 / tileWidth), 3, 1), threadGroup: (32, 1, 1),
+        outputShapes: [[3, 131072 / tileWidth, 2]], outputDTypes: [.uint32])[0]
+}
+
+private func cbv2PackedHeadPacket(
+    _ partial: MLXArray, tileWidth: Int, window: MLXArray, columns: [MLXArray]?
+) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+    guard CBv2MTPTopTwoPacket.enabled, tileWidth == 16 || tileWidth == 32,
+          partial.shape == [3, 131072 / tileWidth, 2], partial.dtype == .uint32,
+          window.shape == [1, 3], window.dtype == .int32 else { return nil }
+    let inputs: [MLXArray]
+    let kernel: MLXFast.MLXFastKernel
+    if let columns {
+        guard columns.count == 2, columns.allSatisfy({ $0.shape == [1] && $0.dtype == .int32 }) else { return nil }
+        inputs = [partial] + columns
+        kernel = cbv2PackedHeadFinalizeColumnsKernel
+    } else {
+        inputs = [partial, window]
+        kernel = cbv2PackedHeadFinalizeKernel
+    }
+    let out = kernel(inputs, template: [("T", DType.bfloat16), ("B", tileWidth)],
+        grid: (3 * 256, 1, 1), threadGroup: (256, 1, 1),
+        outputShapes: [[3, 2], [3, 2], [11]], outputDTypes: [.int32, .float32, .int32])
+    return (out[0], out[1], out[2])
+}
+
+package func cbv2PackedHeadTopTwoPacket(
+    _ partial: MLXArray, tileWidth: Int, window: MLXArray
+) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+    guard cbv2PackedHeadTopTwoAvailable(tileWidth: tileWidth) else { return nil }
+    return cbv2PackedHeadPacket(partial, tileWidth: tileWidth, window: window,
+                               columns: cbv2PacketDraftColumns(window))
+}
+
+/// Official-worker-only exact reduction/packing/packet checks, independent of the fused QMV body.
+package func cbv2PackedHeadTopTwoQualify() {
+    CBv2PackedHeadTopTwo.verifiedWidths = []
+    func report(_ text: String) {
+        FileHandle.standardError.write(Data("nemotron packed head top2 merge: \(text)\n".utf8))
+    }
+    guard CBv2PackedHeadTopTwo.enabled, CBv2MTPTopTwoPacket.enabled,
+          Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu else { return report("off (setting)") }
+    var staged: Set<Int> = []
+    do {
+        try withError {
+            for b in [16, 32] {
+                var matches = true
+                for kind in 0 ..< 13 {
+                    let key = MLXRandom.key(UInt64(0x71e0_0000 + kind))
+                    var logits = MLXRandom.normal([1, 3, 131072], key: key) * 3
+                    let pos = MLXArray(Int32(0) ..< Int32(131072)).reshaped(1, 1, 131072)
+                    switch kind {
+                    case 1: logits = round(logits)
+                    case 2: logits = MLXArray.zeros([1, 3, 131072])
+                    case 3: logits = MLXArray.full([1, 3, 131072], values: MLXArray(-Float(0)))
+                    case 4: logits = MLXArray.full([1, 3, 131072], values: MLXArray(Float.nan))
+                    case 5: logits = MLXArray.full([1, 3, 131072], values: MLXArray(Float.infinity))
+                    case 6: logits = MLXArray.full([1, 3, 131072], values: MLXArray(-Float.infinity))
+                    case 7: logits = which(abs(logits) .> MLXArray(Float(4)), MLXArray(Float.nan), logits)
+                    case 8:
+                        logits = which(logits .> MLXArray(Float(5)), MLXArray(Float.infinity),
+                            which(logits .< MLXArray(Float(-5)), MLXArray(-Float.infinity), logits))
+                    case 9: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(-Float(0)), round(logits))
+                    case 10: logits = logits * Float(1e-35)
+                    case 11: logits = which((pos .== Int32(15)) .|| (pos .== Int32(16)), MLXArray(Float(64)), logits)
+                    case 12: logits = which((pos .== Int32(0)) .|| (pos .== Int32(131071)), MLXArray(Float(64)), logits)
+                    default: break
+                    }
+                    let typed = logits.asType(.bfloat16)
+                    let window = MLXArray([Int32(kind), Int32(131071 - kind), Int32(17 + kind)]).reshaped(1, 3)
+                    let columns = [window[0, 1].reshaped(1), window[0, 2].reshaped(1)]
+                    guard let packed = cbv2PackedHeadReference(typed, tileWidth: b),
+                          let reference = cbv2TopTwoRowsPacket(typed, window: window),
+                          let plain = cbv2PackedHeadPacket(packed, tileWidth: b, window: window, columns: nil),
+                          let direct = cbv2PackedHeadPacket(packed, tileWidth: b, window: window, columns: columns)
+                    else { matches = false; break }
+                    for out in [plain, direct] {
+                        let same = (out.ids .== reference.ids).all()
+                            .&& (out.values.view(dtype: .uint32) .== reference.values.view(dtype: .uint32)).all()
+                            .&& (out.packet .== reference.packet).all()
+                        if !same.item(Bool.self) { matches = false; break }
+                    }
+                    if !matches { break }
+                }
+                if matches { staged.insert(b) }
+            }
+        }
+        // Deferred backend errors are checked before making a width available to production.
+        CBv2PackedHeadTopTwo.verifiedWidths = staged
+    } catch { return report("off (\(error))") }
+    report("qualified widths \(staged.sorted()); 13 cases x window/columns, exact ids/native-word values/packet")
+}

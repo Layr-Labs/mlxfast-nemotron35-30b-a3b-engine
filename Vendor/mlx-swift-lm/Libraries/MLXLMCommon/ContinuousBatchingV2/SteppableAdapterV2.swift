@@ -466,6 +466,19 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
             positionIds: positionIds)
     }
+
+    public func forwardWithHiddenCapturedPolicy(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> CBv2MTPCapturedPolicyOutput {
+        if let forwardable = model as? any CBv2RecurrentCapturePolicyMTPForwardable {
+            return forwardable.cbv2ForwardWithHiddenCapturedPolicy(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState, positionIds: positionIds)
+        }
+        let out = forwardWithHiddenCaptured(tokens: tokens, caches: caches,
+                                           recurrentState: recurrentState, positionIds: positionIds)
+        return CBv2MTPCapturedPolicyOutput(logits: out.logits, lastHidden: out.lastHidden)
+    }
 }
 
 

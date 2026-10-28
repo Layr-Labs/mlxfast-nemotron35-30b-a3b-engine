@@ -124,6 +124,29 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
     ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
+
+/// Capture-forward-owned policy evidence. Full logits stay available to diagnostics/prefix/shortlist readers.
+/// This value has no global registration and owns only the current forward's lazy tensors.
+public struct CBv2MTPCapturedPolicyOutput {
+    public let logits: MLXArray
+    public let lastHidden: MLXArray
+    public let topTwo: (ids: MLXArray, values: MLXArray, packet: MLXArray)?
+    public init(logits: MLXArray, lastHidden: MLXArray,
+                topTwo: (ids: MLXArray, values: MLXArray, packet: MLXArray)? = nil) {
+        self.logits = logits
+        self.lastHidden = lastHidden
+        self.topTwo = topTwo
+    }
+}
+
+/// Additive capture seam; called instead of (never in addition to) the ordinary captured forward.
+public protocol CBv2RecurrentCapturePolicyMTPForwardable: CBv2RecurrentCaptureMTPForwardable {
+    func cbv2ForwardWithHiddenCapturedPolicy(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> CBv2MTPCapturedPolicyOutput
+}
+
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
@@ -185,6 +208,11 @@ public protocol CBv2RecurrentMTPSteppableModel:
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+    /// Same single captured forward, with optional forward-owned exact policy tensors.
+    func forwardWithHiddenCapturedPolicy(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> CBv2MTPCapturedPolicyOutput
 }
 
 extension CBv2RecurrentMTPSteppableModel {
@@ -207,6 +235,19 @@ extension CBv2RecurrentMTPSteppableModel {
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         preconditionFailure(
             "CBv2 capture-verify forward called on a model without captured-window support")
+    }
+}
+
+extension CBv2RecurrentMTPSteppableModel {
+
+    /// Default performs exactly one ordinary captured forward; policy extraction remains with the caller.
+    public func forwardWithHiddenCapturedPolicy(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> CBv2MTPCapturedPolicyOutput {
+        let out = forwardWithHiddenCaptured(tokens: tokens, caches: caches,
+                                           recurrentState: recurrentState, positionIds: positionIds)
+        return CBv2MTPCapturedPolicyOutput(logits: out.logits, lastHidden: out.lastHidden)
     }
 }
 
