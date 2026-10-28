@@ -8456,11 +8456,7 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
 }
 """#
 
-    private static let kernel = MLXFast.metalKernel(
-        name: "nemotron_gather_qmm_runs_fc2_copy",
-        inputNames: ["x", "wk", "sidx", "table", "tiles", "N", "K"],
-        outputNames: ["y"],
-        source: """
+    private static let body = """
             threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
             if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
                 nemotron_gather_qmm_runs_copy_impl<T, GS, BITS, 32, BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
@@ -8475,8 +8471,37 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
                     simdgroup_index_in_threadgroup,
                     thread_index_in_simdgroup);
             }
-        """,
+        """
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_gather_qmm_runs_fc2_copy",
+        inputNames: ["x", "wk", "sidx", "table", "tiles", "N", "K"],
+        outputNames: ["y"],
+        source: body,
         header: header)
+    /// The target's expert-group codes wk0 ... (`NemotronZSkip.copyPieces`, EP experts each): the tile's expert
+    /// picks its group as the verify slot kernels do, and the loader's codes start at the local expert
+    /// (index - wk_first); the pair index keeps index. Nil when a statement no longer matches.
+    private static let piecesKernel: MLXFast.MLXFastKernel? = {
+        let impl = ("nemotron_gather_qmm_runs_copy_impl", "nemotron_gather_qmm_runs_copy_pieces_impl")
+        var h = header, b = body
+        for (old, new) in [impl, ("    const device uint16_t* wk,\n", "    const device uint16_t* wk,\n    const uint wk_first,\n"),
+                           ("= wk\n      + ((size_t(index) *", "= wk\n      + ((size_t(index - wk_first) *")] {
+            guard h.components(separatedBy: old).count == 2 else { return nil }
+            h = h.replacingOccurrences(of: old, with: new)
+        }
+        for (old, new) in [impl, ("x, wk, sidx,", "x, wk, wk_first, sidx,")] {
+            guard b.components(separatedBy: old).count == 3 else { return nil }
+            b = b.replacingOccurrences(of: old, with: new)
+        }
+        return MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_fc2_copy_p\(NemotronZSkip.copyPieces)",
+            inputNames: ["x"] + NemotronZSkip.pieceInputs("wk") + ["sidx", "table", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: "const uint nmz_piece = uint(tiles[threadgroup_position_in_grid.y * 3 + 2]) / EP;\n"
+                + "const device uint16_t* wk = \(NemotronZSkip.pieceSelect("wk", "nmz_piece"));\n"
+                + "const uint wk_first = nmz_piece * EP;\n" + b,
+            header: h)
+    }()
 
     static func apply(_ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
@@ -8493,15 +8518,19 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
         guard n == tiles.rows, n >= 16, n / experts >= 4,
               tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
               ops.weight.dim(2) * 8 == k, k % 64 == 0, nOut % 128 == 0,
-              copy.codes.shape == [experts, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+              case let p = copy.codes.count, p == 1 || p == NemotronZSkip.copyPieces, experts % p == 0,
+              copy.codes.allSatisfy({ $0.shape == [experts / p, nOut / 128, k, 32] && $0.dtype == .uint16 }),
               copy.scales.shape == [experts, nOut / 128, k / 64, 128], copy.scales.dtype == .uint16,
-              copy.biases.dtype == .float32
+              copy.biases.dtype == .float32, let kernel = p > 1 ? piecesKernel : Self.kernel
         else { return nil }
         let bn = Self.columns
+        var inputs: [any ScalarOrArray] = [x] + copy.arrays + [tiles.tiles]
+        inputs += [nOut, k]
+        let ep: [(String, any KernelTemplateArg)] = p > 1 ? [("EP", experts / p)] : []
         return kernel(
-            [x, copy.codes, copy.scales, copy.biases, tiles.tiles, nOut, k],
+            inputs,
             template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", bn), ("BK", 64),
-                       ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", false)],
+                       ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", false)] + ep,
             grid: (((nOut + bn - 1) / bn) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }
@@ -8606,10 +8635,10 @@ enum NemotronPrefillDenseDict {
 
     static func apply(_ x: MLXArray, _ linear: Linear, kind: String, relu2: Bool = false) -> MLXArray? {
         guard NemotronHPrefillX5.active, !kinds.isEmpty, kinds.contains(kind) else { return nil }
-        return launch(x, linear, relu2: relu2)
+        return NemotronSeedDenseRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
@@ -8741,10 +8770,10 @@ enum NemotronPrefillSharedDownCopy {
 
     static func apply(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, down)
+        return NemotronSeedDenseRetile.sharedDown(x, down) ?? launch(x, down)
     }
 
-    private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,

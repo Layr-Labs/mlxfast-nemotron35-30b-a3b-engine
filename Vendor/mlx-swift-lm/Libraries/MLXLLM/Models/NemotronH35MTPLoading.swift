@@ -82,10 +82,12 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
+        NemotronBankBinding.warmGroups(NemotronZSkip.codeGroups)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
@@ -95,6 +97,8 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronQMVTune.tune(target)
+        NemotronQMVTune.tuneDraft(assistant.module)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -149,6 +153,8 @@ extension NemotronH35MTPAssistant {
         cbv2PagedHostWriteFenceReport()
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
+        NemotronSeedRetileExt.tune(target)
+        NemotronSeedDenseRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -464,7 +470,7 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
                       let moe = module as? NemotronHMoE,
                       let copy = NemotronZSkip.copy(for: moe.switchMLP.fc2), copy.dict else { continue }
-                copies[n] = [copy.codes, copy.scales, copy.biases]
+                copies[n] = copy.arrays
             }
         }
         // With `NemotronPrefillDirectFC1.dictVerified`, the request prefill's fc1 reads the bank's pair
