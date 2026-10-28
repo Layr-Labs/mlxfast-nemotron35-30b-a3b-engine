@@ -2368,6 +2368,57 @@ private func nemotronZSkipDictSource(_ source: String) -> String? {
     return s
 }
 
+/// NEMOTRON_MTP_ZSKIP_INDEX_AHEAD=0 keeps the routed dictionary slot kernels' chunk loop as is. Otherwise
+/// each lane loads the next nonzero chunk's pair-dictionary index word while it works on the current chunk
+/// (one register pair carried across iterations), so a chunk's table loads no longer wait for its own
+/// index load. The same words are loaded (only for chunks with a nonzero mask) and every product, sum and
+/// store is unchanged.
+enum NemotronZSkipIndexAhead {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ZSKIP_INDEX_AHEAD"] != "0"
+}
+
+/// The routed dictionary slot source with the index read-ahead above; the input unchanged when the switch
+/// is off or an anchor is missing.
+private func nemotronZSkipIndexAheadSource(_ source: String) -> String {
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("nemotron zskip index ahead: \(message)\n".utf8))
+    }
+    guard NemotronZSkipIndexAhead.enabled else { return source }
+    let head = """
+            const int count = l < tail ? 8 : 7;
+            for (int j = 0; j < count; j++) {
+              const int c = j < 7 ? l + 32 * j : 224 + l;
+              const uint m = cmask[c];
+
+        """
+    let loads = ["      const uint2 ir = *((const device uint2*)(sq + gi * OT));\n",
+                 "        const uint2 ir = *((const device uint2*)(sq + gi * OT));\n"]
+    let found = loads.map { source.components(separatedBy: $0).count - 1 }
+    guard source.components(separatedBy: head).count == 2, found.reduce(0, +) >= 3 else {
+        report("off (source differs)")
+        return source
+    }
+    var s = source.replacingOccurrences(of: head, with: """
+            const int count = l < tail ? 8 : 7;
+            uint2 nmz_next = cmask[l] != 0 ? *((const device uint2*)(sq + (l / 8) * OT)) : uint2(0);
+            for (int j = 0; j < count; j++) {
+              const int c = j < 7 ? l + 32 * j : 224 + l;
+              const uint m = cmask[c];
+              const uint2 nmz_cur = nmz_next;
+              if (j + 1 < count) {
+                const int cn = j + 1 < 7 ? l + 32 * (j + 1) : 224 + l;
+                nmz_next = cmask[cn] != 0 ? *((const device uint2*)(sq + (cn / 8) * OT)) : uint2(0);
+              }
+
+        """)
+    for load in loads {
+        s = s.replacingOccurrences(of: load, with: load.replacingOccurrences(
+            of: "*((const device uint2*)(sq + gi * OT));", with: "nmz_cur;"))
+    }
+    report("on (\(found.reduce(0, +)) index loads read the carried word)")
+    return s
+}
+
 // MARK: Wide zero-skip tiles (NEMOTRON_ZSKIP_WIDE)
 //
 // The shared-down zero-skip copy only (the routed FC2 copies keep the tile-major layout: the request prefill
@@ -2824,9 +2875,12 @@ enum NemotronZSkip {
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
     }
-    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernel = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .map(nemotronZSkipIndexAheadSource).map {
         MLXFast.metalKernel(
-            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd", inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
+            name: NemotronZSkipIndexAhead.enabled ? "nemotron_zskip_fc2_slots_tiled_fast_sbd_ia"
+                : "nemotron_zskip_fc2_slots_tiled_fast_sbd",
+            inputNames: ["wk", "sk", "bk", "x", "inds", "scores"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
             ensureRowContiguous: true)
@@ -2844,9 +2898,11 @@ enum NemotronZSkip {
         outputNames: ["prod"], source: nemotronZSkipTiledFastSource,
         header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
         ensureRowContiguous: true)
-    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource).map {
+    private static let tiledFastDictSlotKernelDep = nemotronZSkipDictSource(nemotronZSkipTiledFastSource)
+        .map(nemotronZSkipIndexAheadSource).map {
         MLXFast.metalKernel(
-            name: "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
+            name: NemotronZSkipIndexAhead.enabled ? "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_ia"
+                : "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep",
             inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
             outputNames: ["prod"], source: $0,
             header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
