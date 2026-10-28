@@ -278,12 +278,25 @@ extension EngineLoopV2 {
                     // A fixed depth plans the next round with exactly this
                     // many drafts whenever enough tokens remain for it.
                     let fixed = mtp.config.fixedDraftTokens ?? 0
-                    let depth = CBv2MTPFirstDraftPrestage.chained
+                    let offeredDepth = CBv2MTPFirstDraftPrestage.chained
                         && rec.request.maxTokens - rec.generatedTokenCount >= fixed ? fixed : 1
+                    // Confirmed output slots cannot increase. Use the same
+                    // bound as the next plan; depth zero must skip the call
+                    // because prestageDrafts always builds its first draft,
+                    // even when its offered depth is zero (adaptive mode).
+                    let depth = CBv2MTPFirstDraftPrestage.tailBudget
+                        ? Self.mtpDepthWithinOutputBudget(
+                            offeredDepth: max(1, offeredDepth),
+                            remainingTokens: [rec.request.maxTokens - rec.generatedTokenCount])
+                        : offeredDepth
+                    // Preserve the original hold/flush ownership even when
+                    // no future draft can consume this carry.
                     CBv2MTPSubmitMerge.begin()
-                    prestager.prestageDrafts(
-                        token: kept[confirmed - 1], hidden: hidden, requestState: state,
-                        depth: depth)
+                    if depth > 0 || !CBv2MTPFirstDraftPrestage.tailBudget {
+                        prestager.prestageDrafts(
+                            token: kept[confirmed - 1], hidden: hidden, requestState: state,
+                            depth: depth)
+                    }
                 }
             }
             if let evaluations = verify.recurrentEvaluations[id] {
@@ -542,6 +555,10 @@ public enum CBv2MTPFirstDraftPrestage {
     /// NEMOTRON_MTP_PRESTAGE_SECOND=0 prestages only the first draft.
     public static let chained = enabled
         && ProcessInfo.processInfo.environment["NEMOTRON_MTP_PRESTAGE_SECOND"] != "0"
+    /// Bound optional future heads by the immutable confirmed output budget.
+    /// CBV2_MTP_PRESTAGE_TAIL_BUDGET=0 restores the original prestaging calls.
+    public static let tailBudget =
+        ProcessInfo.processInfo.environment["CBV2_MTP_PRESTAGE_TAIL_BUDGET"] != "0"
     /// CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT=0 restores host-selected tail submission.
     public static let deviceAccepted = speculateAfterVerify
         && ProcessInfo.processInfo.environment["CBV2_MTP_DEVICE_ACCEPTED_FIRST_DRAFT"] != "0"
@@ -601,7 +618,24 @@ extension EngineLoopV2 {
                 targetTokens: targets[index ..< (index + 1)],
                 targetHidden: verify.lastHidden[index ..< (index + 1)],
                 requestState: state)
+            // A continuing verify emits at least one confirmed target token.
+            // With at most two slots before this verify, its successor can
+            // offer no draft. Keep the trusted K/V work above, but omit the
+            // unused full first/second head chain. Read confirmed tokens,
+            // never optimistic computed or pending sample counts.
+            let futureHeadCanBeConsumed: Bool
+            if CBv2MTPFirstDraftPrestage.tailBudget {
+                if let rec = scheduler.record(for: row.id) {
+                    futureHeadCanBeConsumed =
+                        rec.request.maxTokens - rec.generatedTokenCount > 2
+                } else {
+                    futureHeadCanBeConsumed = false
+                }
+            } else {
+                futureHeadCanBeConsumed = true
+            }
             if CBv2MTPFirstDraftPrestage.deviceAccepted, verify.k > 0,
+                futureHeadCanBeConsumed,
                 let deviceAccepted = speculator as? any CBv2MTPDeviceAcceptedPrestaging
             {
                 let acceptedDrafts = Self.mtpDeviceAcceptedDrafts(verify, row: index)
