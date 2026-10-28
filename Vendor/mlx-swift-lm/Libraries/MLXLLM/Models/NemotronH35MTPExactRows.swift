@@ -1130,10 +1130,21 @@ enum NemotronHeadPreparedActivation {
         name: "nemotron_head_prepare_activation", inputNames: ["x"],
         outputNames: ["prepared"], source: nemotronHeadPrepareSource,
         header: nemotronMultiRowQMVHeader)
-    static let project = MLXFast.metalKernel(
+    static let projectRecord = MLXFast.metalKernel(
         name: "nemotron_head_prepared_qmv", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
         outputNames: ["y"], source: nemotronHeadPreparedQMVSource,
         header: nemotronMultiRowQMVHeader)
+    /// The crown launch with the vector store (`nemotronQMVVectorStoreSource`), used once
+    /// `NemotronTargetQKV.qualifyVectorStore` matched it to the lane-0 launch.
+    static let projectVS: MLXFast.MLXFastKernel? = nemotronQMVVectorStoreSource(nemotronHeadPreparedQMVSource).map {
+        MLXFast.metalKernel(
+            name: "nemotron_head_prepared_qmv_vs", inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
+            outputNames: ["y"], source: $0, header: nemotronMultiRowQMVHeader)
+    }
+    nonisolated(unsafe) static var projectVSVerified = false
+    static var project: MLXFast.MLXFastKernel {
+        projectVSVerified ? (projectVS ?? projectRecord) : projectRecord
+    }
     private static func rowSource() -> String {
         let address = "x + row * K + chunk * PV"
         precondition(nemotronHeadPrepareSource.components(separatedBy: address).count == 2)
@@ -3972,11 +3983,23 @@ enum NemotronTargetQKV {
     // prefix: the three verify rows are packed once per launch instead of
     // once per output tile. Each Q/K/V row keeps the body's lane split, block
     // order, qdot, affine update, simd_sum and BF16 store.
-    private static let preparedKernel = MLXFast.metalKernel(
+    private static let preparedKernelRecord = MLXFast.metalKernel(
         name: "nemotron_target_qkv_prepared_affine4_gs64",
         inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
         outputNames: ["qy", "ky", "vy"], source: tilePrefix + nemotronHeadPreparedQMVSource + "\n}",
         header: nemotronMultiRowQMVHeader)
+    /// The prepared launch (the MTP head's post-verify rows) with the vector store, used once
+    /// `qualifyVectorStore` matched it to the lane-0 launch.
+    private static let preparedKernelVS: MLXFast.MLXFastKernel? =
+        nemotronQMVVectorStoreSource(tilePrefix + nemotronHeadPreparedQMVSource + "\n}").map {
+            MLXFast.metalKernel(
+                name: "nemotron_target_qkv_prepared_affine4_gs64_vs",
+                inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K"],
+                outputNames: ["qy", "ky", "vy"], source: $0, header: nemotronMultiRowQMVHeader)
+        }
+    private static var preparedKernel: MLXFast.MLXFastKernel {
+        vstoreVerified ? (preparedKernelVS ?? preparedKernelRecord) : preparedKernelRecord
+    }
     // CBV2_KV_IN_PLACE_APPEND: the prepared launch above, whose K and V tiles
     // also store each BF16 result into the layer's contiguous cache
     // [1, 2, cap, 128] at token kvpos[0] + r (kvpos = [offset, capacity]).
@@ -4011,19 +4034,31 @@ enum NemotronTargetQKV {
       }
 
     """
-    private static let preparedWritingKVKernel: MLXFast.MLXFastKernel = {
+    private static let preparedWritingKVSource: String = {
         precondition(nemotronHeadPreparedQMVSource.components(separatedBy: storeLine).count == 2,
                      "NemotronTargetQKV: prepared body store not unique")
-        return MLXFast.metalKernel(
-            name: "nemotron_target_qkv_prepared_kv_affine4_gs64",
+        return kvPreload + tilePrefix
+            + nemotronHeadPreparedQMVSource.replacingOccurrences(of: storeLine, with: storeAndCache) + "\n}"
+    }()
+    private static func makeWritingKV(_ name: String, _ source: String) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name,
             inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K",
                          "kcache", "vcache", "kvpos"],
-            outputNames: ["qy", "ky", "vy"],
-            source: kvPreload + tilePrefix
-                + nemotronHeadPreparedQMVSource.replacingOccurrences(of: storeLine, with: storeAndCache)
-                + "\n}",
+            outputNames: ["qy", "ky", "vy"], source: source,
             header: nemotronMultiRowQMVHeader, mutableInputs: ["kcache", "vcache"])
-    }()
+    }
+    private static let preparedWritingKVKernelRecord =
+        makeWritingKV("nemotron_target_qkv_prepared_kv_affine4_gs64", preparedWritingKVSource)
+    /// The cache-writing launch with the vector store (`nemotronQMVVectorStoreSource`), used once
+    /// `qualifyVectorStore` matched it to the lane-0 launch.
+    private static let preparedWritingKVKernelVS: MLXFast.MLXFastKernel? =
+        nemotronQMVVectorStoreSource(preparedWritingKVSource).map {
+            makeWritingKV("nemotron_target_qkv_prepared_kv_affine4_gs64_vs", $0)
+        }
+    private static var preparedWritingKVKernel: MLXFast.MLXFastKernel {
+        vstoreVerified ? (preparedWritingKVKernelVS ?? preparedWritingKVKernelRecord) : preparedWritingKVKernelRecord
+    }
     // NEMOTRON_MTP_FRONT_KV_DIRECT: the same prepared launch for the MTP head's
     // post-verify rows, whose K and V tiles also store each BF16 result into the
     // head cache's paged segment `storage` [2, pages, 2, 16, 128]: row r's token
@@ -4335,6 +4370,143 @@ enum NemotronTargetQKV {
         }
         outputs += warmWritingKV()
         return outputs
+    }
+    /// NEMOTRON_MORE_VSTORE: the prepared and cache-writing launches take their vector-store twins.
+    nonisolated(unsafe) static var vstoreVerified = false
+
+    /// Load time, before any verify or draft graph is traced: the vector-store twins of the prepared launch (the
+    /// MTP head's post-verify rows) and of the cache-writing launch (the verify's attention layers) against their
+    /// lane-0 launches, bit for bit (q, k, v, and every element of both caches), on the real Q/K/V weights of the
+    /// every real target attention layer and every MTP head attention layer's, with seeded rows: Gaussian rows at two scales,
+    /// an all-zero row, -0 entries, a one-hot row, tiny (1e-30) and large (±3e4) values; the cache rows land at
+    /// two offsets of a cache holding Gaussian values. The lane-0 launches stay on any miss. One stderr line.
+    static func qualifyVectorStore(target: Module, head: Module) {
+        vstoreVerified = false
+        NemotronHeadPreparedActivation.projectVSVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron more vstore: \(message)\n".utf8))
+        }
+        guard nemotronMoreVectorStore else { return report("off (setting)") }
+        guard Device.defaultDevice().deviceType == .gpu, preparedEnabled, resultsPerSimdgroup(rows: 3) == 2
+        else { return report("off (prepared Q/K/V launch not used)") }
+        guard let preparedVS = preparedKernelVS, let writingVS = preparedWritingKVKernelVS
+        else { return report("off (a prepared Q/K/V body no longer matches)") }
+        let targets = target.modules().compactMap { $0 as? NemotronHAttention }
+        let heads = head.modules().compactMap { $0 as? NemotronHAttention }
+        let layers = targets + heads
+        let weightSets = layers.compactMap { a -> [MLXArray]? in
+            guard let q = buffers(a.wq, rows: 4096), let k = buffers(a.wk, rows: 256),
+                  let v = buffers(a.wv, rows: 256) else { return nil }
+            return q + k + v
+        }
+        guard !targets.isEmpty, !heads.isEmpty, weightSets.count == layers.count
+        else { return report("off (missing real Q/K/V weights)") }
+        let keys = MLXRandom.split(key: MLXRandom.key(0x7652_5153), into: 6)
+        let bf16 = { (v: Float) in MLXArray(v).asType(.bfloat16) }
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(1, 3, 1)
+        let column = MLXArray((0 ..< 2688).map(Int32.init)).reshaped(1, 1, 2688)
+        let gaussian = MLXRandom.normal([1, 3, 2688], key: keys[0]).asType(.bfloat16)
+        let small = (MLXRandom.normal([1, 3, 2688], key: keys[1]) * 0.01).asType(.bfloat16)
+        let u = MLXRandom.uniform(Float(0) ..< 1, [1, 3, 2688], key: keys[2])
+        // Row 0 sparse with -0 for some zeros, row 1 all zero, row 2 one-hot.
+        let sparse = which(row .== MLXArray(Int32(0)),
+                           which(u .< MLXArray(Float(0.3)), small, which(u .< MLXArray(Float(0.6)), bf16(-0.0), bf16(0))),
+                           which(row .== MLXArray(Int32(1)), bf16(0),
+                                 which(column .== MLXArray(Int32(1337)), bf16(1.5), bf16(0))))
+        // Row 0 tiny, row 1 large, row 2 Gaussian with -0 and zero entries.
+        let edges = which(row .== MLXArray(Int32(0)), (gaussian.asType(.float32) * 1e-30).asType(.bfloat16),
+                          which(row .== MLXArray(Int32(1)), (small.asType(.float32) * 3e6).asType(.bfloat16),
+                                which(u .< MLXArray(Float(0.1)), bf16(-0.0),
+                                      which(u .< MLXArray(Float(0.2)), bf16(0), gaussian))))
+        let rows = [gaussian, small, sparse, edges]
+        let template: [(String, any KernelTemplateArg)] =
+            [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", 2)]
+        let outputShapes = [[1, 3, 4096], [1, 3, 256], [1, 3, 256]]
+        let outputDTypes: [DType] = [.bfloat16, .bfloat16, .bfloat16]
+        let k = NemotronMultiRowQMV.scalarPair(2688, 4096).0
+        func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+        }
+        var cases = 0
+        var verdict = ""
+        do {
+            let matched = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                var okProject = MLXArray(true)
+                var okWriting = MLXArray(true)
+                for (l, weights) in weightSets.enumerated() {
+                    for (i, x) in rows.enumerated() {
+                        let packed = NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+                        let a = preparedKernelRecord(weights + [packed, k], template: template,
+                            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+                            outputShapes: outputShapes, outputDTypes: outputDTypes)
+                        let b = preparedVS(weights + [packed, k], template: template,
+                            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+                            outputShapes: outputShapes, outputDTypes: outputDTypes)
+                        for j in 0 ..< 3 { ok = ok .&& same(a[j], b[j]) }
+                        cases += 1
+                        // The crown prepared QMV (`NemotronHeadPreparedActivation.project`) on this layer's
+                        // Q (N = 4096) and K (N = 256) weights, with and without ReLU².
+                        if let projectVS = NemotronHeadPreparedActivation.projectVS {
+                            for (index, n) in [(0, 4096), (3, 256)] {
+                                let args = NemotronMultiRowQMV.scalarPair(2688, n)
+                                for relu2 in [false, true] {
+                                    let inputs = Array(weights[index ..< index + 3]) + [packed, args.0, args.1]
+                                    let projectTemplate: [(String, any KernelTemplateArg)] = [
+                                        ("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", relu2), ("RPS", 2)]
+                                    let e = NemotronHeadPreparedActivation.projectRecord(inputs, template: projectTemplate,
+                                        grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                                        outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
+                                    let f = projectVS(inputs, template: projectTemplate,
+                                        grid: (32, n / 2, 1), threadGroup: (32, 2, 1),
+                                        outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
+                                    okProject = okProject .&& same(e, f)
+                                    cases += 1
+                                }
+                            }
+                        }
+                        guard l < targets.count else { continue }
+                        // The cache-writing launch on the target layers, rows at two offsets.
+                        let offset = i % 2 == 0 ? 0 : 13
+                        // Two caches with Gaussian contents, and a copy of each for the twin.
+                        let initial = (0 ..< 2).map {
+                            MLXRandom.normal([1, 2, 16, 128], key: MLXRandom.key(UInt64(0x7653_0000 + 2 * i + $0)))
+                                .asType(.bfloat16)
+                        }
+                        let caches = initial + initial.map { $0 * bf16(1) }
+                        eval(caches)
+                        let position = MLXArray([Int32(offset), Int32(16)])
+                        let c = preparedWritingKVKernelRecord(
+                            weights + [packed, k, caches[0], caches[1], position], template: template,
+                            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+                            outputShapes: outputShapes, outputDTypes: outputDTypes)
+                        let d = writingVS(
+                            weights + [packed, k, caches[2], caches[3], position], template: template,
+                            grid: (32, 4608 / 2, 1), threadGroup: (32, 2, 1),
+                            outputShapes: outputShapes, outputDTypes: outputDTypes)
+                        eval(c + d)
+                        for j in 0 ..< 3 { okWriting = okWriting .&& same(c[j], d[j]) .&& same(a[j], c[j]) }
+                        let stored = depends(inputs: caches, dependencies: c + d)
+                        okWriting = okWriting .&& same(stored[0], stored[2]) .&& same(stored[1], stored[3])
+                        cases += 1
+                    }
+                }
+                eval(ok, okProject, okWriting)
+                verdict = "prepared Q/K/V \(ok.item(Bool.self)), crown prepared QMV \(okProject.item(Bool.self)), "
+                    + "cache-writing Q/K/V \(okWriting.item(Bool.self))"
+                return (ok .&& okProject .&& okWriting).item(Bool.self)
+            }
+            vstoreVerified = matched
+            NemotronHeadPreparedActivation.projectVSVerified = matched && NemotronHeadPreparedActivation.projectVS != nil
+        } catch {
+            return report("off (\(error))")
+        }
+        report(vstoreVerified
+            ? "on (\(cases) cases bitwise equal to the lane-0 store: prepared Q/K/V on every real target "
+                + "attention layers and the MTP head, cache-writing Q/K/V with both caches on the target layers, "
+                + "crown prepared QMV \(NemotronHeadPreparedActivation.projectVSVerified ? "on" : "off") "
+                + "(Q and K weights, ReLU² off and on); zero, -0, one-hot, tiny and large rows included)"
+            : "off (differs from the lane-0 store: \(verdict))")
     }
 }
 

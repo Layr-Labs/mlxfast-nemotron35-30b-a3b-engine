@@ -710,6 +710,62 @@ func nemotronSBDVectorStoreSource(_ source: String) -> String {
     return s
 }
 
+/// NEMOTRON_MORE_VSTORE=0 keeps the lane-0 closing stores of the BF16 (non-dictionary) prepared QMV launches
+/// that `nemotronQMVVectorStoreSource` rewrites (the verify's fused Q/K/V with its KV-cache stores, the MTP
+/// head's post-verify Q/K/V rows and the crown prepared QMV its front projections take). Each twin is used
+/// only after `NemotronTargetQKV.qualifyVectorStore` matched it to its lane-0 launch bit for bit.
+let nemotronMoreVectorStore = ProcessInfo.processInfo.environment["NEMOTRON_MORE_VSTORE"] != "0"
+
+/// The prepared / multi-row QMV closing store loop over (row, r) with whatever statements a launch stores
+/// after the record `T h = static_cast<T>(v);` (the plain `yp` store, or that store plus a fused launch's
+/// KV-cache stores) as a vector store, the form `nemotronSBDVectorStoreSource` gives the dictionary kernels:
+/// each SIMD group runs the same `simd_sum` of the same lane partials in the same order, lane
+/// r * RPS + row keeps the sum it stores (a select), and lanes 0 ... R * RPS - 1 then run the loop body's
+/// statements at once for their (r, row), where lane 0 ran them for each output in turn. Every output gets the
+/// same sum, rounding, ReLU² and addresses; only the storing lane changes. Used only when R * RPS <= 32 (else
+/// the lane-0 loop runs). nil when no loop matches.
+func nemotronQMVVectorStoreSource(_ source: String) -> String? {
+    let pattern = "(?m)^( *)for \\(int row = 0; row < results_per_simdgroup; row\\+\\+\\) \\{\\n"
+        + "\\1  for \\(int r = 0; r < R; r\\+\\+\\) \\{\\n"
+        + "\\1    U v = simd_sum\\(result\\[r\\]\\[row\\]\\);\\n"
+        + "\\1    if \\(simd_lid == 0\\) \\{\\n"
+        + "(\\1      T h = static_cast<T>\\(v\\);\\n(?:\\1      [^\\n]*\\n)*?)"
+        + "\\1    \\}\\n"
+        + "\\1  \\}\\n"
+        + "\\1\\}(?:\\n|$)"
+    guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+    let matches = regex.matches(in: source, range: NSRange(source.startIndex..., in: source))
+    guard !matches.isEmpty else { return nil }
+    var s = source
+    // Last match first, so the earlier ranges stay valid.
+    for match in matches.reversed() {
+        guard let whole = Range(match.range, in: s), let indent = Range(match.range(at: 1), in: s),
+              let bodyRange = Range(match.range(at: 2), in: s) else { return nil }
+        let i = String(s[indent])
+        let loop = s[whole].hasSuffix("\n") ? String(s[whole]) : String(s[whole]) + "\n"
+        let body = String(s[bodyRange])
+        let vector = "\(i)if (R * results_per_simdgroup <= 32) {\n"
+            + "\(i)  U nmq_kept = 0;\n"
+            + "\(i)  for (int row = 0; row < results_per_simdgroup; row++) {\n"
+            + "\(i)    for (int r = 0; r < R; r++) {\n"
+            + "\(i)      U v = simd_sum(result[r][row]);\n"
+            + "\(i)      nmq_kept = simd_lid == uint(r * results_per_simdgroup + row) ? v : nmq_kept;\n"
+            + "\(i)    }\n"
+            + "\(i)  }\n"
+            + "\(i)  if (simd_lid < uint(R * results_per_simdgroup)) {\n"
+            + "\(i)    const int r = int(simd_lid) / results_per_simdgroup;\n"
+            + "\(i)    const int row = int(simd_lid) % results_per_simdgroup;\n"
+            + "\(i)    const U v = nmq_kept;\n"
+            + body
+            + "\(i)  }\n"
+            + "\(i)} else {\n"
+            + loop
+            + "\(i)}\n"
+        s.replaceSubrange(whole, with: vector)
+    }
+    return s
+}
+
 private let nemotronMoELeaderSource = """
   constexpr int results_per_simdgroup = RPS;
   constexpr int values_per_thread = 8;
@@ -1467,7 +1523,8 @@ enum NemotronMoELeader {
     /// record kernel stands in whenever its unrolled twin is missing.
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil,
+        wordPair: Bool? = nil, tail8Override: Bool? = nil
     ) -> MLXArray? {
         let kernels = NemotronMoELeaderPreparedKernels.shared
         guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
@@ -1475,7 +1532,7 @@ enum NemotronMoELeader {
               inds.shape == [18], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
         else { return nil }
-        let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
+        let tail8 = tail8Override ?? (fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil)
         guard tail8 || kernels.tripleGateUpAndPlan != nil else { return nil }
         let useDict = dict != nil
             && (tail8 ? kernels.tripleGateUpAndPlanTail8Dict : kernels.tripleGateUpAndPlanDict) != nil
@@ -1484,11 +1541,19 @@ enum NemotronMoELeader {
             : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
         else { return nil }
         let unrolled = unroll ?? (fc1Unroll && fc1UnrollQualified)
-        let kernel = (unrolled
+        let original = (unrolled
             ? (useDict
                 ? (tail8 ? kernels.tripleGateUpTail8DictUnrolled : kernels.tripleGateUpDictUnrolled)
                 : (tail8 ? kernels.tripleGateUpTail8Unrolled : kernels.tripleGateUpUnrolled))
             : nil) ?? record
+        let kernel: MLXFast.MLXFastKernel
+        if wordPair ?? NemotronFC1WordPairReuse.verified {
+            guard let twin = NemotronFC1WordPairReuse.kernel(tail8: tail8, dict: useDict, unroll: unrolled)
+            else { return nil }
+            kernel = twin
+        } else {
+            kernel = original
+        }
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
@@ -4907,5 +4972,259 @@ extension NemotronU2 {
         inProj = admit(.inProj) { NemotronMambaInProjConvDt.u2Check(target) }
         self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }
         draft = admit(.draft) { draftCheck(head) }
+    }
+}
+
+
+// One immutable packed-word producer serves the two ordered four-term consumers.
+// Original kernels stay available for independent official-remote admission.
+enum NemotronFC1WordPairReuse {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_WORD_PAIR"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    private static let halfHelpers = """
+template <typename U, int values_per_thread>
+inline U nml_qdot_half(
+    const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum) {
+  static_assert(values_per_thread % 8 == 0, "paired word ownership");
+  U accum = 0;
+  const device uint* ws2 = (const device uint*)w;
+  for (int word = 0; word < values_per_thread / 8; word++) {
+    const uint w2 = ws2[word];
+    const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+    const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+    for (int half_word = 0; half_word < 2; half_word++) {
+      const int i = 2 * word + half_word;
+      const U a = U(h0[half_word]);
+      const U b1 = U(h1[half_word]);
+      const U c = U(half(ushort((w2 >> (16 * half_word)) & 0x0f00u)));
+      const U d = U(half(ushort((w2 >> (16 * half_word)) & 0xf000u)));
+      accum += (x_thread[4 * i] * a + x_thread[4 * i + 1] * b1
+          + x_thread[4 * i + 2] * c + x_thread[4 * i + 3] * d);
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename U, int values_per_thread>
+inline U nml_qdot_safe_half(
+    const device uint8_t* w, const thread U* x_thread, U scale, U bias, U sum, int N) {
+  static_assert(values_per_thread % 8 == 0, "paired word ownership");
+  U accum = 0;
+  const device uint* ws2 = (const device uint*)w;
+  for (int word = 0; word < values_per_thread / 8; word++) {
+    if (2 * word < N / 4) {
+      const uint w2 = ws2[word];
+      const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+      const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+      for (int half_word = 0; half_word < 2; half_word++) {
+        const int i = 2 * word + half_word;
+        if (i < N / 4) {
+          const U a = U(h0[half_word]);
+          const U b1 = U(h1[half_word]);
+          const U c = U(half(ushort((w2 >> (16 * half_word)) & 0x0f00u)));
+          const U d = U(half(ushort((w2 >> (16 * half_word)) & 0xf000u)));
+          accum += (x_thread[4 * i] * a + x_thread[4 * i + 1] * b1
+              + x_thread[4 * i + 2] * c + x_thread[4 * i + 3] * d);
+        }
+      }
+    }
+  }
+  return scale * accum + sum * bias;
+}
+
+template <typename U, int values_per_thread>
+inline void nml_qdot_pair_half(
+    const device uint8_t* w, const thread U* x0, const thread U* x1,
+    U scale, U bias, U sum0, U sum1, int N, thread U& value0, thread U& value1) {
+  static_assert(values_per_thread % 8 == 0, "paired word ownership");
+  U accum0 = 0;
+  U accum1 = 0;
+  const device uint* ws2 = (const device uint*)w;
+  for (int word = 0; word < values_per_thread / 8; word++) {
+    if (2 * word < N / 4) {
+      const uint w2 = ws2[word];
+      const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+      const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+      for (int half_word = 0; half_word < 2; half_word++) {
+        const int i = 2 * word + half_word;
+        if (i < N / 4) {
+          const U a = U(h0[half_word]);
+          const U b1 = U(h1[half_word]);
+          const U c = U(half(ushort((w2 >> (16 * half_word)) & 0x0f00u)));
+          const U d = U(half(ushort((w2 >> (16 * half_word)) & 0xf000u)));
+          accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b1 + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+          accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b1 + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+        }
+      }
+    }
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+}
+
+"""
+
+    private static let tripleHeader = """
+template <typename U, int values_per_thread, bool HALF = false>
+inline void nml_qdot_triple(
+    const device uint8_t* w, const thread U* x0, const thread U* x1, const thread U* x2,
+    U scale, U bias, U sum0, U sum1, U sum2, int N,
+    thread U& value0, thread U& value1, thread U& value2) {
+  static_assert(values_per_thread % 8 == 0, "paired word ownership");
+  U accum0 = 0;
+  U accum1 = 0;
+  U accum2 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  if (HALF) {
+    const device uint* ws2 = (const device uint*)w;
+    for (int word = 0; word < values_per_thread / 8; word++) {
+      if (2 * word < N / 4) {
+        const uint w2 = ws2[word];
+        const half2 h0 = as_type<half2>((w2 & 0x000f000fu) | 0x64006400u) - half2(1024.0h);
+        const half2 h1 = as_type<half2>((w2 & 0x00f000f0u) | 0x64006400u) - half2(1024.0h);
+        for (int half_word = 0; half_word < 2; half_word++) {
+          const int i = 2 * word + half_word;
+          if (i < N / 4) {
+            const U a = U(h0[half_word]);
+            const U b1 = U(h1[half_word]);
+            const U c = U(half(ushort((w2 >> (16 * half_word)) & 0x0f00u)));
+            const U d = U(half(ushort((w2 >> (16 * half_word)) & 0xf000u)));
+            accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b1 + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+            accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b1 + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+            accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b1 + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+          }
+        }
+      }
+    }
+  } else {
+    for (int i = 0; i < (N / 4); i++) {
+      const uint16_t q = ws[i];
+      const U a = q & 0x000f;
+      const U b = q & 0x00f0;
+      const U c = q & 0x0f00;
+      const U d = q & 0xf000;
+      accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+      accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+      accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+    }
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+  value2 = scale * accum2 + sum2 * bias;
+}
+"""
+
+    private static func header() -> String? {
+        let base = nemotronMoELeaderHeader
+        let first = "template <typename U, int values_per_thread>\ninline U nml_qdot_half("
+        let following = "template <typename U, int values_per_thread, bool HALF = false>\ninline U nml_qdot("
+        guard base.components(separatedBy: first).count == 2,
+              base.components(separatedBy: following).count == 2,
+              let a = base.range(of: first), let b = base.range(of: following), a.lowerBound < b.lowerBound
+        else { return nil }
+        let leader = String(base[..<a.lowerBound]) + halfHelpers + String(base[b.lowerBound...])
+        return leader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader + tripleHeader
+    }
+
+    static func kernel(tail8: Bool, dict: Bool, unroll: Bool) -> MLXFast.MLXFastKernel? {
+        let key = "t\(tail8 ? 1 : 0)d\(dict ? 1 : 0)u\(unroll ? 1 : 0)"
+        return lock.withLock {
+            if let kernel = kernels[key] { return kernel }
+            guard let header = header() else { return nil }
+            var source = nemotronMoETripleGateUpSource.replacingOccurrences(
+                of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+            if unroll {
+                guard let s = nmlFC1UnrollSource(source) else { return nil }
+                source = s
+            }
+            if tail8 {
+                guard let s = nmlTail8Source(source) else { return nil }
+                source = s
+            }
+            guard var prepared = nmlPreparedSource(source, pointers: [
+                ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+                 "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+                ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+                 "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+                ("const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;",
+                 "const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ]) else { return nil }
+            if dict {
+                guard let s = nemotronSBDictSource(prepared) else { return nil }
+                prepared = s
+            }
+            let kernel = MLXFast.metalKernel(name: "nemotron_fc1_wordpair_" + key,
+                inputNames: ["w", "scales", "biases", "prepared", "inds"], outputNames: ["y"],
+                source: prepared, header: header)
+            kernels[key] = kernel
+            return kernel
+        }
+    }
+
+    static func qualify(_ target: Module) {
+        verified = false
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron fc1 word pair: \(text)\n".utf8))
+        }
+        guard enabled, NemotronMoELeader.enabled else { return report("off (setting)") }
+        var routes = (0 ..< 8).map { base in (0 ..< 18).map { UInt32((18 * base + $0) % 128) } }
+        routes.append(Array(repeating: Array(UInt32(0) ..< UInt32(6)), count: 3).flatMap { $0 })
+        routes.append(Array(UInt32(0) ..< UInt32(6)) + Array(UInt32(0) ..< UInt32(6))
+            + Array(UInt32(6) ..< UInt32(12)))
+        routes.append([3,17,42,77,100,121,17,5,64,90,3,11,3,8,50,66,101,127])
+        routes.append(Array(UInt32(0) ..< UInt32(18)))
+        routes.append(Array(UInt32(0) ..< UInt32(6)) + Array(UInt32(0) ..< UInt32(6))
+            + Array(UInt32(6) ..< UInt32(12)))
+        let edge: [UInt16] = [0x0000,0x8000,0x0080,0x8080,0x7f80,0xff80,0x7fc1,0xffc2]
+        let exceptional = MLXArray((0 ..< 3 * 2688).map { edge[$0 % edge.count] })
+            .reshaped(3, 2688).view(dtype: .bfloat16)
+        let finiteEdge: [UInt16] = [0x0000,0x8000,0x0080,0x8080,0x3f80,0xbf80,0x4000,0xc000]
+        let finite = MLXArray((0 ..< 3 * 2688).map { finiteEdge[$0 % finiteEdge.count] })
+            .reshaped(3, 2688).view(dtype: .bfloat16)
+        var layers = 0, comparisons = 0
+        do {
+            let passed = try withError { () -> Bool in
+                for module in target.modules() {
+                    guard let moe = module as? NemotronHMoE,
+                          let bank = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                          bank.weight.shape == [128, 1856, 336] else { continue }
+                    let dictionary = NemotronSBDict.dict(moe.switchMLP.fc1)
+                    for (ri, route) in routes.enumerated() {
+                        let x = ri == 8 || ri >= 11 ? exceptional : (ri == 0 ? finite
+                            : MLXRandom.normal([3, 2688], scale: ri == 1 ? 8 : 0.5,
+                                key: MLXRandom.key(UInt64(0xA321 + ri))).asType(.bfloat16))
+                        let inds = MLXArray(route)
+                        var forms: [NemotronSBDict.Dict?] = [nil]
+                        if let dictionary { forms.append(dictionary) }
+                        for dict in forms {
+                            for tail8 in [false, true] {
+                                for unroll in [false, true] {
+                                    for relu2 in [false, true] {
+                                        guard let expected = NemotronMoELeader.applyTripleWithoutPlan(
+                                            x, inds, bank: bank, relu2: relu2, prepared: nil, dict: dict,
+                                            unroll: unroll, wordPair: false, tail8Override: tail8),
+                                              let got = NemotronMoELeader.applyTripleWithoutPlan(
+                                            x, inds, bank: bank, relu2: relu2, prepared: nil, dict: dict,
+                                            unroll: unroll, wordPair: true, tail8Override: tail8),
+                                              (expected.view(dtype: .uint16) .== got.view(dtype: .uint16)).all().item(Bool.self)
+                                        else { return false }
+                                        comparisons += 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    layers += 1
+                }
+                return true
+            }
+            guard passed else { return report("off (mismatch or missing reference/twin)") }
+        } catch { return report("off (\(error))") }
+        guard layers > 0 else { return report("off (no layers)") }
+        verified = true
+        report("on (\(layers) real banks, all128experts, \(comparisons) bitwise comparisons)")
     }
 }
