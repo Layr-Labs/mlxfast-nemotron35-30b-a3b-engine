@@ -1753,13 +1753,25 @@ enum NemotronHCompactSSMGated {
     }
     /// NEMOTRON_SSM_TAIL_ONE_BARRIER=0 keeps one barrier per row in the shuffle tail. Otherwise the group's
     static let tailOneBarrier = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_ONE_BARRIER"] != "0"
+    /// NEMOTRON_SSM_TAIL_WEIGHT_AHEAD=0 keeps the one-barrier tail's norm-weight loads inside its row loop, where
+    /// the loads of rows 1 ... L - 1 follow the thread's stores of the previous row. Otherwise each thread loads its
+    /// four weights (the same `weight[f]`, f = grp * 512 + lid * 4 + i for every row) once at the start of the tail.
+    static let tailWeightAhead = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TAIL_WEIGHT_AHEAD"] != "0"
     static func rowsTail(_ source: String) -> String? {
         let head = "threadgroup T rounded[512];\n"
         let loop = "for (int row = 0; row < L; ++row) {\n"
         guard tailShuffle, tailOneBarrier, source.components(separatedBy: head).count == 2,
               let start = source.range(of: loop) else { return nil }
         return String(source[..<start.lowerBound]).replacingOccurrences(of: head, with:
-            "            threadgroup float nst_sums[L][4];\n") + """
+            "            threadgroup float nst_sums[L][4];\n") + (tailWeightAhead ? """
+                        T nst_w[4];
+                        if (on) {
+                            for (int i = 0; i < 4; i++) {
+                                nst_w[i] = weight[int64_t(grp) * 512 + int64_t(lid) * 4 + int64_t(i)];
+                            }
+                        }
+
+            """ : "") + """
                         float nst_x[L][4];
                         for (int row = 0; row < L; ++row) {
                             int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;
@@ -1793,7 +1805,7 @@ enum NemotronHCompactSSMGated {
                                     int64_t f = feature + int64_t(i);
                                     T normalized = static_cast<T>(nst_x[row][i] * inv_mean);
                                     T unweighted = identity * normalized;
-                                    T weighted = weight[f] * unweighted;
+                                    T weighted = \(tailWeightAhead ? "nst_w[i]" : "weight[f]") * unweighted;
                                     normed[int64_t(row) * (H * Dh) + f] = weighted;
                                     w[i] = weighted;
                                 }
@@ -5711,7 +5723,8 @@ class NemotronHAttention: Module, NemotronHMixer {
                 : outputs
         }
         return (
-            captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
+            captureMTP ? nemotronMTPLinearRows(x, wq)
+                : (NemotronPrefillDenseDict.apply(x, wq, kind: "q_proj") ?? wq(x)),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
     }
@@ -5801,7 +5814,8 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo)
+            : (NemotronPrefillDenseDict.apply(merged, wo, kind: "o_proj") ?? nemotronR1Linear(merged, wo))
     }
 
     // Protocol conformance
@@ -8609,17 +8623,18 @@ enum NemotronPrefillDenseDict {
         return launch(x, linear, relu2: relu2)
     }
 
-    private static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
-              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 32, x.dtype == .bfloat16,
               !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
               q.weight.dtype == .uint32, q.weight.ndim == 2,
               let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
               d.table.dtype == .float32
         else { return nil }
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
-        guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64] else { return nil }
+        guard ((nOut + 31) / 32) * ((rows + 31) / 32) > 256,
+              q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64] else { return nil }
         // Row tiles of 64 over the request's tokens, at least three descriptors
         // (as `NemotronPrefillSharedUpGather`); a zero-row descriptor is skipped.
         let used = (rows + 63) / 64
@@ -8647,6 +8662,8 @@ enum NemotronPrefillDenseDict {
             case "in_proj": return (module as? NemotronHMamba2Mixer)?.inProj
             case "out_proj": return (module as? NemotronHMamba2Mixer)?.outProj
             case "up_proj": return (module as? NemotronHMoE)?.sharedExperts?.upProj
+            case "q_proj": return (module as? NemotronHAttention)?.wq
+            case "o_proj": return (module as? NemotronHAttention)?.wo
             default: return nil
             }
         }
@@ -8661,7 +8678,7 @@ enum NemotronPrefillDenseDict {
         guard kernel != nil else { return report("off (kernel source)") }
         var admitted: Set<String> = []
         var notes: [String] = []
-        for (kindIndex, kind) in ["in_proj", "out_proj", "up_proj"].enumerated() {
+        for (kindIndex, kind) in ["in_proj", "out_proj", "up_proj", "q_proj", "o_proj"].enumerated() {
             let withRelu2 = kind == "up_proj"
             let all = linears(target, kind: kind)
             guard let first = all.first,
@@ -8669,7 +8686,7 @@ enum NemotronPrefillDenseDict {
             else { notes.append("\(kind) off (no dictionary)"); continue }
             var checked = 0
             let matches = (try? withError { () -> Bool in
-                for (index, rows) in [488, 488, 300, 97, 17].enumerated() {
+                for (index, rows) in [488, 488, 300, 129, 97].enumerated() {
                     let k = first.weight.dim(1) * 8
                     var a = MLXRandom.normal([1, rows, k], scale: 2,
                                              key: MLXRandom.key(UInt64(0xdd1c_0000 + 16 * kindIndex + index)))
@@ -8747,11 +8764,12 @@ enum NemotronPrefillSharedDownCopy {
     private static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
-              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 32, x.dtype == .bfloat16,
               let copy = NemotronSharedDownZSkip.copyArrays(for: down)
         else { return nil }
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
-        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
+        guard ((nOut + 31) / 32) * ((rows + 31) / 32) > 256,
+              q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
               copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
               copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
               copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
@@ -8787,7 +8805,7 @@ enum NemotronPrefillSharedDownCopy {
         var checked = 0
         do {
             let matches = try withError { () -> Bool in
-                for (index, rows) in [488, 488, 300, 97, 17].enumerated() {
+                for (index, rows) in [488, 488, 300, 129, 97].enumerated() {
                     let k = first.weight.dim(1) * 8
                     var a = MLXRandom.normal([1, rows, k], scale: 2, key: MLXRandom.key(UInt64(0x5d0c_0000 + index)))
                     if index != 1 {
@@ -9279,12 +9297,13 @@ enum NemotronPrefillSharedUpGather {
     private static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let q = up as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
               q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases = q.biases,
-              x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
+              x.ndim == 3, x.dim(0) == 1, x.dim(1) > 32, x.dtype == .bfloat16,
               MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
               q.weight.dtype == .uint32, q.weight.ndim == 2, q.scales.dtype == x.dtype, biases.dtype == x.dtype
         else { return nil }
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
-        guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64],
+        guard ((nOut + 31) / 32) * ((rows + 31) / 32) > 256,
+              q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64],
               biases.shape == q.scales.shape
         else { return nil }
         // At least three descriptors (>= 8 elements, so `tiles` stays a device
@@ -9319,7 +9338,7 @@ enum NemotronPrefillSharedUpGather {
         var checked = 0
         do {
             let matches = try withError { () -> Bool in
-                for (index, rows) in [488, 300, 97, 64, 9 + 8].enumerated() {
+                for (index, rows) in [488, 300, 129, 97].enumerated() {
                     let x = MLXRandom.normal([1, rows, moe.switchMLP.inputDims], scale: 2,
                                              key: MLXRandom.key(UInt64(0x5a6e_0000 + index))).asType(.bfloat16)
                     guard let fused = launch(x, mlp.upProj) else { return false }

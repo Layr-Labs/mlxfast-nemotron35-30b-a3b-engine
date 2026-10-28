@@ -76,6 +76,7 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
         NemotronMTPDraftRowPick.qualify()
+        NemotronTargetQKV.qualifyVectorStore(target: target, head: assistant.module)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
@@ -95,10 +96,14 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        assistant.tuneDraftKernels()
+        NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
+        cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
@@ -146,9 +151,8 @@ extension NemotronH35MTPAssistant {
             assistant.module.layers[0] as! NemotronH35MTPAttentionBlock,
             norm: (assistant.module.layers[1] as! NemotronH35MTPExpertBlock).norm)
         NemotronMTPDraftSDPA.qualifyFence(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronDraftTune.tuneSDPA(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         cbv2PagedHostWriteFenceReport()
-        // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
-        NemotronSeedRetile.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -496,8 +500,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 sharedCopies[n] = [c.codes, c.scales, c.biases]
             }
         }
-        // With a `NemotronPrefillDenseDict` kind admitted, the request prefill reads that kind's pair dictionaries
-        // (as the verify does) instead of its BF16 scales and biases.
+        // With a `NemotronPrefillDenseDict` kind admitted, the request prefill reads that kind's pair
+        // dictionaries (as the verify does) instead of its BF16 scales and biases.
         var denseDicts: [Int: [MLXArray]] = [:]
         var denseMetadata = Set<ObjectIdentifier>()
         for (name, module) in model.namedModules() {
@@ -508,8 +512,11 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 dense = [("in_proj", mamba.inProj), ("out_proj", mamba.outProj)]
             } else if let moe = module as? NemotronHMoE, let up = moe.sharedExperts?.upProj {
                 dense = [("up_proj", up)]
+            } else if let attn = module as? NemotronHAttention {
+                dense = [("q_proj", attn.wq), ("o_proj", attn.wo)]
             }
-            for (kind, linear) in dense where NemotronPrefillDenseDict.kinds.contains(kind) {
+            for (kind, linear) in dense
+            where NemotronPrefillDenseDict.kinds.contains(kind) {
                 guard let q = linear as? QuantizedLinear, let d = NemotronSBDict.dict(q), let b = q.biases else { continue }
                 denseDicts[n, default: []] += [d.index, d.table]
                 denseMetadata.formUnion([ObjectIdentifier(q.scales), ObjectIdentifier(b)])
@@ -794,5 +801,7 @@ final class NemotronCPUWarm: @unchecked Sendable {
 }
 
 // Measurement entry of the carried 3f932e3c tree.
+
+// Measurement entry 1 of this tree.
 
 // Measurement entry 1 of this tree.

@@ -65,6 +65,13 @@ private final class NemotronMTPDraftHead {
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
 
+    /// The plan's paired 2-bit partial pass for `NemotronDraftTune` (nil: not in use).
+    var screenTunePlan: NemotronDraftTune.ScreenPlan? {
+        guard let screen, let records2 = screen.records2, screen.paired else { return nil }
+        return .init(records2: records2, groups: screen.groups, groupCount: screen.groupCount,
+                     upperGroups: screen.upperGroups, upperGroupCount: screen.upperGroupCount)
+    }
+
     /// Qualified immutable screen backing is outside the registered module
     /// tree. Include it in the existing decode lease, but never the mutable
     /// fused-selection ticket counter or any request tensor.
@@ -81,13 +88,16 @@ private final class NemotronMTPDraftHead {
         guard let screen, hidden.shape == [1, 1, NemotronHeadScreen.width],
               hidden.dtype == .bfloat16, StreamOrDevice.default == .gpu
         else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
+        // `NemotronDraftTune` (screen): the paired 2-bit partial pass at the geometry adopted at load.
+        let tuned = screen.records2 != nil && screen.paired ? NemotronDraftTune.adopted[.screen] : nil
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
             keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
             upperGroupCount: upper ? screen.upperGroupCount : 0, packed: screen.packed,
             records: screen.records, records2: screen.records2,
-            counter: screen.counter, paired: screen.paired, b1: screen.b1, noTicket: screen.noTicket)
+            counter: screen.counter, paired: screen.paired, rowsPerSimdgroup: tuned?.rps ?? 8,
+            simdgroups: tuned?.nsg ?? 2, b1: screen.b1, noTicket: screen.noTicket, tunedPartial: tuned != nil)
         if screen.noTicket, let values = result.bestValues, let ids = result.bestIds {
             NemotronScreenPicks.register(result.id, .init(values: values, ids: ids))
         }
@@ -632,6 +642,41 @@ private final class NemotronMTPDraftHead {
         } else {
             noTicketNote = "off (setting)"
         }
+        // 32-bit select twin (NEMOTRON_MTP_SCREEN_SELECT_O32=0 keeps the B1 select's offsets): checked against the
+        // B1 select on the plan's head, chunk and keep (`NemotronHeadScreen.qualifySelectOffset32`).
+        let selectOffset32Note = plan.noTicket
+            ? NemotronHeadScreen.qualifySelectOffset32(
+                weight: plan.weight, scales: plan.scales, biases: plan.biases, chunk: chunk, keep: keep,
+                rowCounts: plan.upperGroups == nil ? [rows] : [rows, NemotronHeadScreen.headRows], gamma: g,
+                screen: { x, half, on in
+                    NemotronHeadScreen.run(
+                        x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                        groups: plan.groups, groupCount: groupCount, chunk: chunk,
+                        keep: keep, upperGroups: half ? plan.upperGroups : nil,
+                        upperGroupCount: half ? plan.upperGroupCount : 0,
+                        packed: plan.packed, records: plan.records, records2: plan.records2,
+                        counter: plan.counter, paired: plan.paired, b1: true, noTicket: true, selectOffset32: on)
+                })
+            : "off (no ticket-free select)"
+        // 32-bit twin of the paired partial on full-head screens (NEMOTRON_MTP_SCREEN_PARTIAL_O32=0 keeps the record
+        // addresses): checked against the paired partial on the plan's records (`qualifyPartialOffset32`).
+        let partialOffset32Note: String
+        if plan.paired, let records2 = plan.records2, let upperGroups = plan.upperGroups {
+            partialOffset32Note = NemotronHeadScreen.qualifyPartialOffset32(
+                records2: records2, groups: plan.groups, groupCount: groupCount, upperGroups: upperGroups,
+                upperGroupCount: plan.upperGroupCount, gamma: g,
+                screen: { x, on in
+                    NemotronHeadScreen.run(
+                        x, weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                        groups: plan.groups, groupCount: groupCount, chunk: chunk, keep: keep,
+                        upperGroups: plan.upperGroups, upperGroupCount: plan.upperGroupCount,
+                        packed: plan.packed, records: plan.records, records2: plan.records2,
+                        counter: plan.counter, paired: plan.paired, b1: plan.b1, noTicket: plan.noTicket,
+                        partialOffset32: on)
+                })
+        } else {
+            partialOffset32Note = "off (no paired full-head 2-bit screen)"
+        }
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -657,6 +702,8 @@ private final class NemotronMTPDraftHead {
         if let noTicketNote {
             FileHandle.standardError.write(Data("nemotron mtp head screen no ticket: \(noTicketNote)\n".utf8))
         }
+        FileHandle.standardError.write(Data("nemotron mtp head screen select o32: \(selectOffset32Note)\n".utf8))
+        FileHandle.standardError.write(Data("nemotron mtp head screen partial o32: \(partialOffset32Note)\n".utf8))
     }
 
     /// A request's drafts screen the upper vocabulary half while it committed
@@ -773,6 +820,12 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     func prepareDraftHeadScreen() {
         draftHead.prepareScreen(
             gamma: (module.layers[1] as! NemotronH35MTPExpertBlock).finalNorm.weight)
+    }
+
+    /// Load-time geometry tune of the draft chain's kernels (`NemotronDraftTune`), after the screen plan, the draft
+    /// dictionaries and `NemotronU2`, before any draft graph is traced.
+    func tuneDraftKernels() {
+        NemotronDraftTune.tune(module, screen: draftHead.screenTunePlan)
     }
 
     init(target: NemotronH35Model, maximumDraftTokens: Int? = nil,
@@ -1056,13 +1109,20 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // matters for quantized projections whose selected graph may depend
         // on row count. It also bounds temporary fused/K/V tensors.
         if primePromptHistory && !s.started && !s.pendingTokens.isEmpty {
-            let ids = concatenated(s.pendingTokens, axis: 1)
-            let rows = concatenated(s.pendingHidden, axis: 1)
+            let ids = s.pendingTokens.count == 1 ? s.pendingTokens[0] : concatenated(s.pendingTokens, axis: 1)
+            let rows = s.pendingHidden.count == 1 ? s.pendingHidden[0] : concatenated(s.pendingHidden, axis: 1)
             for start in stride(from: 0, to: ids.dim(1), by: 512) {
                 let end = min(start + 512, ids.dim(1))
-                let primed = module.appendTrustedKV(
-                    hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+                let sliceIds = (start == 0 && end == ids.dim(1)) ? ids : ids[0..., start..<end]
+                let sliceRows = (start == 0 && end == rows.dim(1)) ? rows : rows[0..., start..<end, 0...]
+                let primed: [MLXArray]
+                if let operands = target.mtpEmbeddingOperands(sliceIds) {
+                    primed = module.appendTrustedKV(
+                        hidden: sliceRows, operands: operands, cache: s.cache)
+                } else {
+                    primed = module.appendTrustedKV(
+                        hidden: sliceRows, embedding: target.mtpEmbedding(sliceIds), cache: s.cache)
+                }
                 asyncEval(primed)
                 s.roots = primed
             }
@@ -1634,7 +1694,8 @@ enum NemotronMTPDraftRowPick {
         name: "nemotron_mtp_draft_row_pick",
         inputNames: ["packet", "params", "fused", "queries", "keys", "values"],
         outputNames: ["first", "second", "fused_row", "query_row", "key_row", "value_row"],
-        source: """
+        source: source, ensureRowContiguous: false)
+    private static let source = """
             const int i = int(thread_position_in_grid.x);
             const int count = params[0];
             const int drafts = params[1];
@@ -1665,8 +1726,56 @@ enum NemotronMTPDraftRowPick {
                 value_row[i] = values[(i / HD) * values_strides[1] + a * values_strides[2]
                     + (i % HD) * values_strides[3]];
             }
-            """,
-        ensureRowContiguous: false)
+            """
+
+    /// NEMOTRON_MTP_ROW_PICK_LOADS_FIRST=0 keeps the record's load / store order. Otherwise each thread reads
+    /// its elements of the walked row (fused, query, key and value; the record's addresses, or element 0 where
+    /// the record reads none) right after the walk, before its mask stores, and stores them after the masks
+    /// (`loadsFirstSource`): no device load follows a device store of the same thread. Every load, value and
+    /// address is the record's. Used once `qualify` found it bitwise equal to the record launch.
+    static let loadsFirstRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROW_PICK_LOADS_FIRST"] != "0"
+    nonisolated(unsafe) static var loadsFirstVerified = false
+    private static let loadsFirstSource: String? = {
+        let anchor = "const int last = a + params[3];\n"
+        let copies = "if (i < FW) {\n    fused_row[i] = fused[a * fused_strides[1] + i * fused_strides[2]];\n}\n"
+        guard source.components(separatedBy: anchor).count == 2,
+              let start = source.range(of: copies), source[start.lowerBound...].hasSuffix("    + (i % HD) * values_strides[3]];\n}")
+        else { return nil }
+        let loads = """
+            const bool nrp_f = i < FW;
+            const bool nrp_q = i < QH * HD;
+            const bool nrp_k = i < KH * HD;
+            const auto nrp_fv = fused[nrp_f ? a * fused_strides[1] + i * fused_strides[2] : 0];
+            const auto nrp_qv = queries[nrp_q ? (i / HD) * queries_strides[1] + a * queries_strides[2]
+                + (i % HD) * queries_strides[3] : 0];
+            const auto nrp_kv = keys[nrp_k ? (i / HD) * keys_strides[1] + a * keys_strides[2]
+                + (i % HD) * keys_strides[3] : 0];
+            const auto nrp_vv = values[nrp_k ? (i / HD) * values_strides[1] + a * values_strides[2]
+                + (i % HD) * values_strides[3] : 0];
+
+            """
+        let stores = """
+            if (nrp_f) {
+                fused_row[i] = nrp_fv;
+            }
+            if (nrp_q) {
+                query_row[i] = nrp_qv;
+            }
+            if (nrp_k) {
+                key_row[i] = nrp_kv;
+                value_row[i] = nrp_vv;
+            }
+            """
+        return String(source[..<start.lowerBound]).replacingOccurrences(of: anchor, with: loads + anchor) + stores
+    }()
+    private static let loadsFirstKernel = loadsFirstSource.map {
+        MLXFast.metalKernel(
+            name: "nemotron_mtp_draft_row_pick_lf",
+            inputNames: ["packet", "params", "fused", "queries", "keys", "values"],
+            outputNames: ["first", "second", "fused_row", "query_row", "key_row", "value_row"],
+            source: $0, ensureRowContiguous: false)
+    }
 
     /// For the row `walk` selects: (first mask [1, 1, 1, length], second mask
     /// [1, 1, 1, length + 1] as `NemotronMTPDraftMasks.masks`, fused [1, 1, F],
@@ -1676,7 +1785,7 @@ enum NemotronMTPDraftRowPick {
     static func pick(
         walk: CBv2MTPDeviceAcceptWalk.Operands, fused: MLXArray, queries: MLXArray,
         keys: MLXArray, values: MLXArray, firstSpeculated: Int, length: Int, dtype: DType,
-        force: Bool = false
+        force: Bool = false, loadsFirst: Bool? = nil
     ) -> (first: MLXArray, second: MLXArray, fused: MLXArray, queries: MLXArray,
           keys: MLXArray, values: MLXArray)?
     {
@@ -1692,7 +1801,9 @@ enum NemotronMTPDraftRowPick {
         let params = MLXArray([Int32(walk.count), Int32(walk.drafts), Int32(walk.targets),
                                Int32(firstSpeculated), Int32(length)])
         let widest = max(length + 1, fused.dim(2), queries.dim(1) * headDim, keys.dim(1) * headDim)
-        let out = kernel(
+        // The loads-first twin once verified (`loadsFirst` names the form for the load-time check).
+        let chosen = (loadsFirst ?? (loadsFirstRequested && loadsFirstVerified)) ? loadsFirstKernel ?? kernel : kernel
+        let out = chosen(
             [walk.packet, params, fused, queries, keys, values],
             template: [("T", dtype), ("FW", fused.dim(2)), ("QH", queries.dim(1)),
                        ("KH", keys.dim(1)), ("HD", headDim)],
@@ -1770,6 +1881,74 @@ enum NemotronMTPDraftRowPick {
             verified = false
         }
         report(verified ? "on (bitwise equal, accept counts 0...2)" : "off (differs or failed)")
+        qualifyLoadsFirst()
+    }
+
+    /// Load time, after `qualify`: the loads-first launch against the record launch, all six outputs bit for bit,
+    /// for every accept count of a depth-2 packet in both argument spaces, mask lengths below and above the row
+    /// widths (so threads past every row read element 0), on seeded rows in the post-verify layouts with zeros,
+    /// -0, infinities and NaN among their values. Engages only if every case matches. One stderr line.
+    private static func qualifyLoadsFirst() {
+        loadsFirstVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp draft row pick loads first: \(message)\n".utf8))
+        }
+        guard loadsFirstRequested else { return report("off (setting)") }
+        guard verified, loadsFirstKernel != nil else { return report("off (record launch off or source moved)") }
+        func bits(_ a: MLXArray) -> MLXArray {
+            a.view(dtype: a.itemSize == 2 ? .uint16 : (a.itemSize == 4 ? .uint32 : .uint8))
+        }
+        let specials = MLXArray([Float(0), -0.0, .infinity, -.infinity, .nan, 1e-30, -3.5, 65504])
+        func seeded(_ shape: [Int], _ seed: UInt64) -> MLXArray {
+            let count = shape.reduce(1, *)
+            let values = MLXRandom.normal([count], key: MLXRandom.key(seed))
+            return concatenated([specials, values[8...]]).reshaped(shape).asType(.bfloat16)
+        }
+        let width = 3
+        let fused = seeded([1, width, 2688], 0x6c66_0001)
+        let queries = seeded([1, width, 4096], 0x6c66_0002).reshaped(1, width, 32, 128).transposed(0, 2, 1, 3)
+        let keys = seeded([1, width, 256], 0x6c66_0003).reshaped(1, width, 2, 128).transposed(0, 2, 1, 3)
+        let values = seeded([1, width, 256], 0x6c66_0004).reshaped(1, width, 2, 128).transposed(0, 2, 1, 3)
+        var cases = 0
+        do {
+            let matched = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                for length in [600, 5000] {
+                    for size in [6, 11] {
+                        for accepted in 0 ... 2 {
+                            var host = [Int32](repeating: 7, count: size)
+                            host[0] = 11; host[1] = 12
+                            host[2] = accepted >= 1 ? 11 : 21
+                            host[3] = accepted >= 2 ? 12 : 22
+                            host[4] = 13
+                            let walk = CBv2MTPDeviceAcceptWalk.Operands(
+                                packet: MLXArray(host), count: 2, drafts: 0, targets: 2)
+                            func picked(_ loadsFirst: Bool) -> [MLXArray]? {
+                                pick(walk: walk, fused: fused, queries: queries, keys: keys, values: values,
+                                     firstSpeculated: length - width, length: length, dtype: .bfloat16,
+                                     force: true, loadsFirst: loadsFirst)
+                                    .map { [$0.first, $0.second, $0.fused, $0.queries, $0.keys, $0.values] }
+                            }
+                            guard let a = picked(false), let b = picked(true) else { return false }
+                            for (x, y) in zip(a, b) {
+                                guard x.shape == y.shape, x.dtype == y.dtype else { return false }
+                                ok = MLX.logicalAnd(ok, all(bits(x) .== bits(y)))
+                            }
+                            eval([ok] + a + b)
+                            cases += 1
+                        }
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+            loadsFirstVerified = matched
+        } catch {
+            return report("off (\(error))")
+        }
+        report(loadsFirstVerified
+            ? "on (\(cases) cases bitwise equal to the record launch: masks and walked rows, accept counts 0...2, "
+                + "zeros, -0, infinities and NaN included)"
+            : "off (differs from the record launch)")
     }
 }
 
