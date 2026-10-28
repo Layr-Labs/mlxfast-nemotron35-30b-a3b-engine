@@ -580,6 +580,9 @@ extension EngineLoopV2 {
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
         var assistantEvalTargets: [MLXArray] = []
+        // Batch 1: the drafter's own token arrays, one per draft column, for a
+        // target that reads them in place of the columns (`CBv2MTPVerifyWindowColumns`).
+        var draftSources: [MLXArray] = []
         if let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter {
             var currentTokens = (0 ..< batch).map {
                 seedColumn[$0 ..< $0 + 1, 0...]
@@ -602,6 +605,7 @@ extension EngineLoopV2 {
                         shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
                         requestState: requestState)
                     let next = result.tokens.reshaped([1])
+                    if batch == 1 { draftSources.append(result.tokens) }
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)
                     stepEvalTargets.append(next)
@@ -658,7 +662,8 @@ extension EngineLoopV2 {
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
         let target = try mtpBuildTargetVerification(
-            columns: targetColumns, rows: verifyRows, driver: mtp)
+            columns: targetColumns, rows: verifyRows, driver: mtp,
+            draftSources: draftSources.count == k ? draftSources : [])
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
