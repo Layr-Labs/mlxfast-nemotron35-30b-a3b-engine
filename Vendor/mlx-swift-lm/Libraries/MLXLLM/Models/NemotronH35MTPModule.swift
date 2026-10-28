@@ -748,17 +748,35 @@ final class NemotronH35MTPExpertBlock: Module {
     }
 
     /// `ordered`: the `NemotronDraftColaunch` graph (nil: when qualified; false: the t71 graph).
-    func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?, ordered: Bool? = nil) -> MLXArray {
+    func exactOneTokenTail(_ x: MLXArray, normalized: MLXArray?, ordered: Bool? = nil,
+                           fc1Shared: Bool? = nil, routerUp: Bool? = nil) -> MLXArray {
         let h = normalized ?? norm(x)
         let gate = mixer.gate
-        let fused = NemotronMTPDraftTail.oneLaunchRouter && gate.topK == 6 && gate.nGroup == 1
+        let paired = (routerUp ?? NemotronDraftRouterUp.active) && (ordered ?? NemotronDraftColaunch.active)
+            ? mixer.sharedExperts.flatMap { NemotronDraftRouterUp.run(h, gate: gate, shared: $0) } : nil
+        let fused = paired.map { ($0.indices, $0.weights) } ?? (NemotronMTPDraftTail.oneLaunchRouter && gate.topK == 6 && gate.nGroup == 1
             && gate.topkGroup == 1 && gate.normTopkProb && gate.routedScalingFactor == 2.5
-            ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil
+            ? NemotronMTPRouterRowsSelect.run(h, gate.weight, bias: gate.eSCB, draft: true) : nil)
         let (indices, scores) = fused ?? gate(h)
+        // The native FC1 and shared-down are independent producers in one
+        // primitive; the original FC2, product order and shared-first join stay.
+        if fc1Shared ?? NemotronDraftFC1SharedDown.active,
+           ordered ?? NemotronDraftColaunch.active,
+           scores.dtype == .float32, scores.shape == indices.shape,
+           let sharedExperts = mixer.sharedExperts,
+           let sx = paired?.up ?? sharedExperts.draftUpActivation(h),
+           let pair = NemotronDraftFC1SharedDown.run(
+               h, indices, sx, mlp: mixer.switchMLP, down: sharedExperts.downProj),
+           let routed = NemotronZSkip.draftProducts(pair.0, indices.reshaped(6), scores.reshaped(6),
+                                                  owner: mixer.switchMLP.fc2, dep: sx),
+           let joined = NemotronHResidualRMSNorm.applySum(
+               x, routed, shared: pair.1, norm: finalNorm, sharedFirst: true) {
+            return joined.1
+        }
         // `NemotronDraftColaunch`: the same kernels and arithmetic; only the eval tape's encode order changes.
         if ordered ?? NemotronDraftColaunch.active, let sharedExperts = mixer.sharedExperts,
            NemotronZSkip.draftDepAvailable(mixer.switchMLP.fc2),
-           let sx = sharedExperts.draftUpActivation(h) {
+           let sx = paired?.up ?? sharedExperts.draftUpActivation(h) {
             var fc1: MLXArray? = nil
             if let routed = NemotronMoELeader.switchRowsAndWeightedReduce(
                    h, indices, scores, mixer.switchMLP, products: true,

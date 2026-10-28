@@ -1163,6 +1163,20 @@ private final class NemotronMoELeaderWeightedKernel: Sendable {
 let nemotronKernelSelfTestBuild = false
 
 enum NemotronMoELeader {
+    /// Select exactly the production R1 FC1 body: admitted tail8, dictionary
+    /// and U2 in the same fallback order as `apply`, never a target R3 body.
+    static func draftFC1CoLaunchSource(dict: Bool) -> (String, String)? {
+        guard enabled, fuseRelu2, !selfTest, leaderResultsPerSimdgroup(rows: 1) == 4 else { return nil }
+        var source = nemotronMoELeaderSource
+        if leaderTail8, let tail = nmlTail8Source(source) { source = tail }
+        if dict {
+            guard draftDictFC1Available, let twin = nemotronSBDictSource(source) else { return nil }
+            source = NemotronU2.draft
+                ? (nemotronU2Source(twin, loop: NemotronU2.leaderLoop, count: 2) ?? twin) : twin
+        }
+        return (source, nemotronMoELeaderHeader + nemotronMoELeaderStore)
+    }
+
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_MOE_LEADER"] != "0"
     static let fuseRelu2 =
@@ -3556,6 +3570,211 @@ enum NemotronSharedDownZSkip {
 // separate kernels (which keep their own record checks) and leaves the separate launches on any miss.
 // The shared rows (twice the K of a slot row) come first. NEMOTRON_MTP_COLAUNCH=0 keeps the separate launches;
 // NEMOTRON_MTP_COLAUNCH_SD_FIRST=0 puts the shared rows last.
+/// Two independent native draft producers share a 64-thread launch. All
+/// shared-down CTAs precede the routed FC1 CTAs in the logical grid; neither
+/// body reads the other's output. FC2 still runs after the complete primitive.
+/// This removes one dispatch, but can extend FC2's ready time if shared-down
+/// outlasts FC1. No cross-CTA progress or physical occupancy is assumed.
+enum NemotronDraftFC1SharedDown {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FC1_SHARED_DOWN"] != "0"
+    nonisolated(unsafe) private(set) static var active = false
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var kernels: [Int: MLXFast.MLXFastKernel] = [:]
+
+    private static func kernel(fc1Dict: Bool, sdDict: Bool) -> MLXFast.MLXFastKernel? {
+        let key = (fc1Dict ? 1 : 0) | (sdDict ? 2 : 0)
+            | (NemotronMoELeader.leaderTail8 ? 4 : 0) | (NemotronU2.draft ? 8 : 0)
+        return lock.withLock {
+            if let old = kernels[key] { return old }
+            guard let fc1 = NemotronMoELeader.draftFC1CoLaunchSource(dict: fc1Dict),
+                  let sd = NemotronMultiRowQMV.draftSharedDownCoLaunchSource(dict: sdDict)
+            else { return nil }
+            let coordinate = "  const uint3 tid = threadgroup_position_in_grid;\n"
+            guard fc1.0.components(separatedBy: coordinate).count == 2,
+                  sd.0.components(separatedBy: coordinate).count == 2,
+                  !fc1.0.contains("threadgroup_barrier"), !sd.0.contains("threadgroup_barrier")
+            else { return nil }
+            let routed = fc1.0.replacingOccurrences(of: coordinate, with:
+                "  const uint job = ndf_job - 336;\n  const uint3 tid = uint3(0, job % 232, job / 232);\n")
+            let shared = sd.0.replacingOccurrences(of: coordinate, with:
+                "  const uint3 tid = uint3(0, ndf_job, 0);\n")
+            let source = """
+              const uint ndf_job = threadgroup_position_in_grid.y;
+              if (ndf_job < 336) {
+                constexpr int R = 1;
+                constexpr int RPS = 4;
+                constexpr bool FAST = false;
+                constexpr bool RELU2 = false;
+                constexpr int HF = 2;
+                const auto K = sdK;
+                const auto N = sdN;
+                const auto w = sw;
+                const auto scales = ss;
+                const auto biases = sb;
+                const auto x = sx;
+                const auto y = shared_y;
+              \(shared)
+              } else {
+                constexpr int R = 1;
+                constexpr int RPS = 4;
+                constexpr int TOPK = 6;
+                constexpr int K = 2688;
+                constexpr int N = 1856;
+                constexpr bool XSLOT = false;
+                constexpr bool RELU2 = true;
+                const auto w = fw;
+                const auto scales = fs;
+                const auto biases = fb;
+                const auto x = h;
+                const auto y = activation;
+              \(routed)
+              }
+              """
+            let built = MLXFast.metalKernel(
+                name: "nemotron_draft_fc1_shared_down_\(key)",
+                inputNames: ["fw", "fs", "fb", "h", "inds", "sw", "ss", "sb", "sx", "sdK", "sdN"],
+                outputNames: ["activation", "shared_y"], source: source,
+                header: fc1.1 + sd.1, ensureRowContiguous: true)
+            kernels[key] = built
+            return built
+        }
+    }
+
+    /// Only the native single-row draft, ordinary FC1/ReLU2 and QMV shared
+    /// down. No request output, owner state or KV data is cached.
+    static func run(_ h: MLXArray, _ indices: MLXArray, _ sx: MLXArray,
+                    mlp: NemotronHSwitchMLP, down: Linear, sbDict: Bool = true)
+        -> (MLXArray, MLXArray)? {
+        guard requested, !NemotronMoELeader.selfTest, NemotronMoELeader.fuseRelu2,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.r1Route,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              h.shape == [1, 1, 2688], h.dtype == .bfloat16,
+              indices.shape == [1, 1, 6], indices.dtype == .uint32,
+              sx.shape == [1, 3712], sx.dtype == .bfloat16,
+              type(of: mlp) == NemotronHSwitchMLP.self,
+              type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+              type(of: mlp.fc2) == QuantizedSwitchLinear.self,
+              let up = NemotronMoELeader.bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+              up.weight.shape == [128, 1856, 336], up.scales.shape == [128, 1856, 42],
+              up.biases.shape == up.scales.shape,
+              let fc2 = NemotronMoELeader.bank(mlp.fc2, k: 1856, dtype: .bfloat16),
+              fc2.weight.shape == [128, 2688, 232], fc2.scales.shape == [128, 2688, 29],
+              fc2.biases.shape == fc2.scales.shape,
+              NemotronZSkip.draftDepAvailable(mlp.fc2),
+              type(of: down) == QuantizedLinear.self, let q = down as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.dtype == .uint32, q.weight.shape == [2688, 464],
+              q.scales.dtype == .bfloat16, q.scales.shape == [2688, 58],
+              let biases = q.biases, biases.dtype == .bfloat16, biases.shape == q.scales.shape
+        else { return nil }
+        let fd = sbDict ? NemotronSBDict.draftDict(mlp.fc1) : nil
+        let sd = sbDict ? NemotronSBDict.draftDict(q) : nil
+        guard let f = kernel(fc1Dict: fd != nil, sdDict: sd != nil) else { return nil }
+        let (k, n) = NemotronMultiRowQMV.scalarPair(3712, 2688)
+        let outputs = f(
+            [NemotronBankBinding.bind(up.weight), NemotronBankBinding.bind(fd?.index ?? up.scales),
+             fd?.table ?? NemotronBankBinding.bind(up.biases), h.reshaped(1, 2688), indices.reshaped(6),
+             q.weight, sd?.index ?? q.scales, sd?.table ?? biases, sx, k, n],
+            template: [("T", DType.bfloat16)],
+            grid: (32, 2 * (336 + 6 * 232), 1), threadGroup: (32, 2, 1),
+            outputShapes: [[6, 1856], [1, 2688]], outputDTypes: [.bfloat16, .bfloat16])
+        return (outputs[0], outputs[1].reshaped(1, 1, 2688))
+    }
+
+    /// Official load only, after dictionaries/U2/old draft order are settled,
+    /// before graph tracing. Compare every producer word and every FC2 product
+    /// as well as both normalized-input and ordinary complete tails.
+    static func qualify(_ head: Module) {
+        active = false
+        guard requested, NemotronDraftColaunch.active, !NemotronMoELeader.selfTest,
+              Device.defaultDevice().deviceType == .gpu else { return }
+        var same = MLXArray(true)
+        var cases = 0
+        for block in head.modules().compactMap({ $0 as? NemotronH35MTPExpertBlock }) {
+            guard let shared = block.mixer.sharedExperts,
+                  let q = shared.downProj as? QuantizedLinear,
+                  let up = NemotronMoELeader.bank(block.mixer.switchMLP.fc1, k: 2688, dtype: .bfloat16)
+            else { return }
+            for i in 0 ..< 6 {
+                let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xfc510 + i)), into: 4)
+                let base = MLXRandom.normal([1, 1, 2688], key: keys[0])
+                let x: MLXArray
+                switch i {
+                case 0: x = MLXArray.zeros([1, 1, 2688], dtype: .bfloat16)
+                case 1: x = (base * Float(0.00001)).asType(.bfloat16)
+                case 2: x = (base * Float(4)).asType(.bfloat16)
+                case 3: x = which(base .> MLXArray(Float(0.9)), base, MLXArray(Float(-0.0))).asType(.bfloat16)
+                default: x = base.asType(.bfloat16)
+                }
+                let h = block.norm(x)
+                guard let realUp = shared.draftUpActivation(h) else { return }
+                let sx: MLXArray
+                let v = MLXRandom.normal([1, 3712], key: keys[2])
+                switch i {
+                case 0: sx = MLXArray.zeros([1, 3712], dtype: .bfloat16)
+                case 1: sx = (v * v * Float(0.00000001)).asType(.bfloat16)
+                case 3: sx = which(v .> MLXArray(Float(0.9)), v * v,
+                                   MLXArray(Float(-0.0))).asType(.bfloat16)
+                case 4:
+                    var one = [Float](repeating: 0, count: 3712)
+                    one[3711] = 1
+                    sx = MLXArray(one).reshaped(1, 3712).asType(.bfloat16)
+                default: sx = realUp
+                }
+                let routes: [UInt32] = i == 5 ? [7, 7, 127, 0, 7, 127] : [0, 5, 33, 64, 100, 127]
+                let inds = MLXArray(routes).reshaped(1, 1, 6)
+                let scores = MLXRandom.uniform(Float(0.01) ..< 0.5, [6], key: keys[1])
+                for dictionary in [false, true] {
+                    guard let fused = run(h, inds, sx, mlp: block.mixer.switchMLP,
+                                          down: shared.downProj, sbDict: dictionary),
+                          let s0 = NemotronMultiRowQMV.apply(sx, q, sbDict: dictionary)
+                    else { return }
+                    let a0 = NemotronMoELeader.apply(h.reshaped(1, 2688), inds.reshaped(6),
+                        rows: 1, topK: 6, bank: up, perSlot: false, relu2: true,
+                        tail8: NemotronMoELeader.leaderTail8,
+                        dict: dictionary ? NemotronSBDict.draftDict(block.mixer.switchMLP.fc1) : nil)
+                    guard let p0 = NemotronZSkip.draftProducts(a0, inds.reshaped(6), scores,
+                                                              owner: block.mixer.switchMLP.fc2, dep: sx),
+                          let p1 = NemotronZSkip.draftProducts(fused.0, inds.reshaped(6), scores,
+                                                              owner: block.mixer.switchMLP.fc2, dep: sx),
+                          let j0 = NemotronHResidualRMSNorm.applySum(x, p0,
+                              shared: s0.reshaped(1, 1, 2688), norm: block.finalNorm, sharedFirst: true),
+                          let j1 = NemotronHResidualRMSNorm.applySum(x, p1,
+                              shared: fused.1, norm: block.finalNorm, sharedFirst: true)
+                    else { return }
+                    for (a, b) in [(a0, fused.0), (s0.reshaped(1, 1, 2688), fused.1),
+                                   (j0.0, j1.0), (j0.1, j1.1)] {
+                        same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                    }
+                    same = logicalAnd(same, (p0.view(dtype: .uint32) .== p1.view(dtype: .uint32)).all())
+                    cases += 1
+                }
+                let normalizedInputs: [MLXArray?] = [nil, h]
+                for normalized in normalizedInputs {
+                    let a = block.exactOneTokenTail(x, normalized: normalized, ordered: true, fc1Shared: false)
+                    let b = block.exactOneTokenTail(x, normalized: normalized, ordered: true, fc1Shared: true)
+                    same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                    cases += 1
+                }
+            }
+        }
+        guard cases > 0 else { return }
+        do {
+            var ok = false
+            try withError { ok = same.item(Bool.self) }
+            guard ok else {
+                FileHandle.standardError.write(Data("nemotron draft FC1/shared-down off: a bit differs\n".utf8))
+                return
+            }
+        } catch {
+            FileHandle.standardError.write(Data("nemotron draft FC1/shared-down off: \(error)\n".utf8))
+            return
+        }
+        active = true
+        FileHandle.standardError.write(Data("nemotron draft FC1/shared-down on: \(cases) cases bit-identical\n".utf8))
+    }
+}
+
 enum NemotronFC2SharedColaunch {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_COLAUNCH"] != "0"
         && !NemotronMoELeader.selfTest

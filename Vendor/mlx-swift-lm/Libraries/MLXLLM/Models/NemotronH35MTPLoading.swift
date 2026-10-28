@@ -97,6 +97,8 @@ extension NemotronH35MTPAssistant {
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronDraftFC1SharedDown.qualify(assistant.module)
+        NemotronDraftRouterUp.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
