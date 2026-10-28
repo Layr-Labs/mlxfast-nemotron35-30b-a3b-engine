@@ -7,8 +7,10 @@ extension NemotronHMLP {
     func mtpForwardRows(_ x: MLXArray, prepared: MLXArray? = nil) -> MLXArray {
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
         if let rows = NemotronSharedUpPacking.apply(x, up: upProj, down: downProj, prepared: prepared) {
+            NemotronR4.note("moe.shared.up", true, rows: x.dim(1))
             return rows
         }
+        NemotronR4.note("moe.shared.up", false, rows: x.dim(1))
         let activated = nemotronMTPLinearRelu2Rows(x, upProj, prepared: prepared)
         return nemotronMTPLinearRows(activated, downProj)
     }
@@ -188,11 +190,15 @@ extension NemotronHMoE {
                               nextNorm: RMSNorm, layerIndex: Int = -1) -> (MLXArray, MLXArray, MLXArray)? {
         guard NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
               sharedExperts != nil, NemotronHResidualRMSNorm.plumbingAvailable,
-              x.shape == [1, 3, 2688], x.dtype == .bfloat16,
+              x.ndim == 3, x.dim(0) == 1, NemotronR4.rows(x.dim(1)), x.dim(2) == 2688, x.dtype == .bfloat16,
               residual.shape == x.shape, residual.dtype == .bfloat16,
               type(of: nextNorm) == RMSNorm.self,
               nextNorm.weight.shape == [2688], nextNorm.weight.dtype == .bfloat16
-        else { return nil }
+        else {
+            NemotronR4.note("moe.joined", false, rows: x.dim(1))
+            return nil
+        }
+        NemotronR4.note("moe.joined", true, rows: x.dim(1))
         let outputs = mtpCompiledRowsCache.outputs(x, prepared: prepared, parts: true,
             owner: self, residual: residual, nextNorm: nextNorm)
         precondition(outputs.count == 3)
@@ -200,8 +206,8 @@ extension NemotronHMoE {
             let parts = mtpForwardRowsParts(x, prepared: prepared)!
             let expected = NemotronHResidualRMSNorm.applyPreparedRows(
                 residual, parts.0, shared: parts.1, norm: nextNorm)!
-            let got = outputs[2].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
-            let want = expected.2.reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+            let got = outputs[2].reshaped([x.dim(1), 11, 9, 32]).view(dtype: .uint32)
+            let want = expected.2.reshaped([x.dim(1), 11, 9, 32]).view(dtype: .uint32)
             let preparedEqual = MLX.logicalAnd(
                 (got[0..., 0..<10, 0..., 0...] .== want[0..., 0..<10, 0..., 0...]).all(),
                 (got[0..., 10, 0..., 0..<16] .== want[0..., 10, 0..., 0..<16]).all())
@@ -232,10 +238,11 @@ extension NemotronHMoE {
         let packed: MLXArray?
         if NemotronHResidualRMSNorm.preparedMoEEnabled, NemotronMoELeader.enabled,
            Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
-           NemotronMoELeader.preparedGateUp, x.shape == [1, 3, 2688], x.dtype == .bfloat16 {
+           NemotronMoELeader.preparedGateUp, x.ndim == 3, x.dim(0) == 1, NemotronR4.prepared(x.dim(1)),
+           x.dim(2) == 2688, x.dtype == .bfloat16 {
             // Share one dynamic operand buffer with both routed and shared up.
-            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: 2688)
-                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(3, 2688), pv: 8)
+            packed = NemotronHeadPreparedActivation.compatible(prepared, rows: x.dim(1), k: 2688)
+                ?? NemotronHeadPreparedActivation.prepareContiguousRows(x.reshaped(x.dim(1), 2688), pv: 8)
         } else {
             packed = nil
         }
@@ -528,7 +535,7 @@ private func nmlTail8Source(_ source: String) -> String? {
     guard source.components(separatedBy: typedef).count == 2 else { return nil }
     var s = source.replacingOccurrences(of: typedef, with:
         "  static_assert(K % values_per_thread == 0, \"tail lanes hold 8 values\");\n" + typedef)
-    for x in ["x0, x_thread", "x0, x0_thread", "x1, x1_thread", "x2, x2_thread"] {
+    for x in ["x0, x_thread", "x0, x0_thread", "x1, x1_thread", "x2, x2_thread", "x3, x3_thread"] {
         s = s.replacingOccurrences(
             of: "nml_load_vector_safe<T, U, values_per_thread>(\(x), remaining)",
             with: "nml_load_vector<T, U, values_per_thread>(\(x))")
@@ -537,6 +544,7 @@ private func nmlTail8Source(_ source: String) -> String? {
         ("sum, remaining)", "sum, values_per_thread)"),
         ("sum1, remaining, ", "sum1, values_per_thread, "),
         ("sum2,\n            remaining, ", "sum2,\n            values_per_thread, "),
+        ("sum3,\n            remaining, ", "sum3,\n            values_per_thread, "),
     ] {
         s = s.replacingOccurrences(of: from, with: to)
     }
@@ -613,7 +621,7 @@ let nemotronSBDVectorStore = ProcessInfo.processInfo.environment["NEMOTRON_SBD_V
 /// statements, where lane 0 rounded and stored each output in turn. Every output gets the same sum, rounding and
 /// address; only the storing lane changes. Forms: the prepared / multi-row QMV loop over (row, r) (lane
 /// r * RPS + row), the in_proj register-epilogue loop (lane row * R + t stores the value it already keeps for its
-/// epilogue), and the routed FC1 leader / triple loops over one, two or three rows (lane j * RPS + r stores row j's
+/// epilogue), and the routed FC1 leader / triple / quad loops over one to four rows (lane j * RPS + r stores row j's
 /// output r). Each form is used only when its lanes fit in one SIMD group (else the lane-0 loop runs); a loop that
 /// does not match keeps its lane-0 stores.
 func nemotronSBDVectorStoreSource(_ source: String) -> String {
@@ -682,8 +690,8 @@ func nemotronSBDVectorStoreSource(_ source: String) -> String {
         s = s.replacingOccurrences(of: regsStore, with: "      if (nmc_row == row) {\n")
             .replacingOccurrences(of: regsPick, with: regsPick + "      yp[t * out_vec_size + row] = yt;\n")
     }
-    // Routed FC1 leader / triple: one, two and three rows.
-    for rows in 1 ... 3 {
+    // Routed FC1 leader / triple / quad: one, two, three and four rows.
+    for rows in 1 ... 4 {
         let names = rows == 1 ? ["result"] : (0 ..< rows).map { "result\($0)" }
         let sums = names.map { "      \($0)[r] = simd_sum(\($0)[r]);\n" }.joined()
         let stores = names.enumerated()
@@ -1465,14 +1473,17 @@ enum NemotronMoELeader {
 
     /// unroll: the unrolled main loops (nil: `fc1Unroll` once qualified); the
     /// record kernel stands in whenever its unrolled twin is missing.
+    /// quad: at four rows, the quad leader form of the same launch (`nmlQuadSource`; nil: `NemotronR4.quadFC1`).
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
-        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil
+        prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil,
+        tuned: NemotronFC1Tune.Variant? = nil, quad: Bool? = nil
     ) -> MLXArray? {
         let kernels = NemotronMoELeaderPreparedKernels.shared
+        let rows = x.ndim == 2 ? x.dim(0) : 0
         guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
-              x.shape == [3, 2688], x.dtype == .bfloat16,
-              inds.shape == [18], inds.dtype == .uint32,
+              rows == 3 || (rows == 4 && NemotronR4.fc1), x.shape == [rows, 2688], x.dtype == .bfloat16,
+              inds.shape == [6 * rows], inds.dtype == .uint32,
               bank.weight.shape == [128, 1856, 336], bank.k == 2688, bank.n == 1856
         else { return nil }
         let tail8 = fc1Tail8 && kernels.tripleGateUpAndPlanTail8 != nil
@@ -1484,27 +1495,45 @@ enum NemotronMoELeader {
             : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
         else { return nil }
         let unrolled = unroll ?? (fc1Unroll && fc1UnrollQualified)
-        let kernel = (unrolled
+        let twin = unrolled
             ? (useDict
                 ? (tail8 ? kernels.tripleGateUpTail8DictUnrolled : kernels.tripleGateUpDictUnrolled)
                 : (tail8 ? kernels.tripleGateUpTail8Unrolled : kernels.tripleGateUpUnrolled))
-            : nil) ?? record
-        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
+            : nil
+        let kernel = twin ?? record
+        let quadRows = rows == 4 && (quad ?? NemotronR4.quadFC1)
+        if rows == 4, quad == nil { NemotronR4.noteQuadRoute(inds) }
+        let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: rows, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
         let nsg = (bank.n / rps) % fc1SimdGroups == 0 ? fc1SimdGroups : 2
-        let activation = kernel(
+        var retuned: MLXArray? = nil
+        if unroll == nil, let v = tuned ?? NemotronFC1Tune.choice {
+            retuned = NemotronFC1Tune.launch(v, packed: packed, inds: inds, bank: bank,
+                dict: useDict ? dict : nil, relu2: relu2, tail8: tail8, explicit: tuned != nil, quad: quadRows)
+            if retuned == nil, tuned != nil { return nil }
+        }
+        if retuned == nil, quadRows {
+            // The incumbent's geometry and loop form (record or unrolled twin), quad leader rule.
+            retuned = NemotronFC1Tune.launch(
+                NemotronFC1Tune.Variant(name: "q0", rps: rps, nsg: nsg, slotX: false, w32: false,
+                                        unroll: twin != nil ? 2 : 1),
+                packed: packed, inds: inds, bank: bank, dict: useDict ? dict : nil, relu2: relu2, tail8: tail8,
+                explicit: true, quad: true)
+            if retuned == nil { return nil }
+        }
+        let activation = retuned ?? kernel(
             useDict
                 ? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(dict!.index), dict!.table, packed, inds]
                 : [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
                    NemotronBankBinding.bind(bank.biases), packed, inds],
-            template: [("T", x.dtype), ("R", 3), ("TOPK", 6),
+            template: [("T", x.dtype), ("R", rows), ("TOPK", 6),
                        ("K", bank.k), ("N", bank.n), ("XSLOT", false),
                        ("RELU2", relu2), ("RPS", rps)],
-            grid: (32, bank.n / rps, 18), threadGroup: (32, nsg, 1),
-            outputShapes: [[18, bank.n]], outputDTypes: [x.dtype])[0]
+            grid: (32, bank.n / rps, 6 * rows), threadGroup: (32, nsg, 1),
+            outputShapes: [[6 * rows, bank.n]], outputDTypes: [x.dtype])[0]
         guard selfTest else { return activation }
-        let expected = apply(x, inds, rows: 3, topK: 6, bank: bank,
+        let expected = apply(x, inds, rows: rows, topK: 6, bank: bank,
             perSlot: false, relu2: relu2, prepared: packed)
         let ok = (activation.view(dtype: .uint16) .== expected.view(dtype: .uint16)).all()
         return which(ok, activation, MLXArray(Float.nan).asType(x.dtype))
@@ -1619,10 +1648,11 @@ enum NemotronMoELeader {
         // One row (the draft tail): the draft head bank's admitted pair dictionary, if any.
         let draftDict = rows == 1 ? NemotronSBDict.draftDict(mlp.fc1) : nil
         if fuseRelu2 {
-            let dict = rows == 3 && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
-            if rows == 3, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
+            let dict = (rows == 3 || rows == 4) && NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
+            if rows == 3 || rows == 4, !NemotronZSkip.needsOriginal(mlp.fc2), NemotronZSkip.covers(mlp.fc2),
                let activation = applyTripleWithoutPlan(
                    xr, flat, bank: up, relu2: true, prepared: prepared, dict: dict) {
+                NemotronR4.note("moe.fc1", true, rows: rows)
                 act = activation
                 balancePlan = nil
             } else if rows == 3, let fused = applyWithBalancePlan(
@@ -1630,6 +1660,7 @@ enum NemotronMoELeader {
                 act = fused.activation
                 balancePlan = fused.plan
             } else {
+                NemotronR4.note("moe.fc1", false, rows: rows)
                 act = apply(xr, flat, rows: rows, topK: 6, bank: up, perSlot: false,
                     relu2: true, prepared: prepared, tail8: leaderTail8, dict: draftDict)
                 balancePlan = nil
@@ -1647,15 +1678,17 @@ enum NemotronMoELeader {
         // `products`: the unreduced slot products for the captured verify's
         // (R = 3) or the draft tail's (R = 1) join kernel, which sums them
         // itself (same expressions and order).
-        if products, rows == 3, let colaunch,
+        if products, rows == 3 || rows == 4, let colaunch,
            let pair = NemotronFC2SharedColaunch.run(act, flat, weights, fc2: mlp.fc2, shared: colaunch) {
+            NemotronR4.note("moe.fc2.products+shared", true, rows: rows)
             return pair
         }
-        if products, let prod = rows == 3
+        if products, let prod = rows == 3 || rows == 4
             ? NemotronZSkip.weightedProducts(act, flat, weights, owner: mlp.fc2)
             : (rows == 1 ? NemotronZSkip.draftProducts(
                 after.map { depends(input: act, dependencies: [$0]) } ?? act, flat, weights, owner: mlp.fc2,
                 dep: draftDep) : nil) {
+            NemotronR4.note("moe.fc2.products", true, rows: rows)
             guard selfTest else { return prod }
             let original = switchRows(x, indices, mlp) ?? mlp(x, indices)
             let expected = (original * scores[.ellipsis, .newAxis])
@@ -1664,6 +1697,7 @@ enum NemotronMoELeader {
                 .== expected.view(dtype: .uint16)).all()
             return which(ok, prod, MLXArray(Float.nan))
         }
+        NemotronR4.note("moe.fc2.products", false, rows: rows)
         var y = NemotronZSkip.weighted(act, flat, weights, rows: rows, owner: mlp.fc2)
             ?? applyWeighted(act, flat, weights, rows: rows, bank: down, plan: NemotronZSkip.needsOriginal(mlp.fc2) ? nil : balancePlan,
                 tail8: leaderTail8)
@@ -3173,20 +3207,23 @@ enum NemotronZSkip {
     /// slot-major), or nil when `owner` has no verified copy.
     static func weightedProducts(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray,
                                  owner: SwitchLinear) -> MLXArray? {
+        let rows = x.ndim == 2 ? x.dim(0) / 6 : 0
         guard !needsOriginal(owner), joinReduce, NemotronHResidualRMSNorm.productsJoinVerified,
-              x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+              rows == 3 || (rows == 4 && NemotronR4.fc2 && NemotronR4.active),
+              x.shape == [6 * rows, 1856], x.dtype == .bfloat16,
+              inds.shape == [6 * rows], scores.shape == [6 * rows], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return products(x, inds, scores, copy: copy, rows: 3)
+        return products(x, inds, scores, copy: copy, rows: rows)
     }
 
     /// The R = 3 weighted fc2 of `owner`, or nil when it has no verified copy.
     static func weighted(_ x: MLXArray, _ inds: MLXArray, _ scores: MLXArray, rows: Int,
                          owner: SwitchLinear) -> MLXArray? {
-        guard !needsOriginal(owner), rows == 3, x.shape == [18, 1856], x.dtype == .bfloat16,
-              inds.shape == [18], scores.shape == [18], scores.dtype == .float32,
+        guard !needsOriginal(owner), rows == 3 || (rows == 4 && NemotronR4.fc2),
+              x.shape == [6 * rows, 1856], x.dtype == .bfloat16,
+              inds.shape == [6 * rows], scores.shape == [6 * rows], scores.dtype == .float32,
               let copy = lock.withLock({ copies[ObjectIdentifier(owner)] }) else { return nil }
-        return run(x, inds, scores, copy: copy)
+        return run(x, inds, scores, copy: copy, rows: rows)
     }
 
     // MARK: Draft head (one row per draft step)
@@ -3717,17 +3754,22 @@ enum NemotronSharedDownZSkip {
                                  _ kernel: MLXFast.MLXFastKernel) -> MLXArray {
         let sgs = NemotronZSkip.sgs
         let tiles = copy.wide ? n / 256 + 1 : n / 128
+        let rows = x.dim(0)
         return kernel(
             [copy.decodeCodes, copy.scales, copy.biases, x, inds],
             template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", sgs)],
-            grid: (32 * sgs * tiles, 3, 1), threadGroup: (32 * sgs, 1, 1),
-            outputShapes: [[1, 3, n]], outputDTypes: [.bfloat16])[0]
+            grid: (32 * sgs * tiles, rows, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[1, rows, n]], outputDTypes: [.bfloat16])[0]
     }
+    /// The four rows' expert indices (zeros, evaluated at load by `NemotronR4.qualifyMoE`).
+    nonisolated(unsafe) fileprivate static var inds4: MLXArray? = nil
 
     static func run(_ x: MLXArray, owner: Linear) -> MLXArray? {
-        guard enabled, kernel != nil, x.shape == [3, k], x.dtype == .bfloat16 else { return nil }
+        guard enabled, kernel != nil, x.ndim == 2, x.dim(0) == 3 || (x.dim(0) == 4 && NemotronR4.sharedDown),
+              x.dim(1) == k, x.dtype == .bfloat16 else { return nil }
+        let four = x.dim(0) == 4
         let found = lock.withLock { () -> (Copy, MLXArray)? in
-            guard let copy = copies[ObjectIdentifier(owner)], let inds else { return nil }
+            guard let copy = copies[ObjectIdentifier(owner)], let inds = four ? inds4 : inds else { return nil }
             return (copy, inds)
         }
         guard let found, let kernel = kernel(for: found.0) else { return nil }
@@ -4506,6 +4548,146 @@ inline void nml_qdot_triple(
 }
 """
 
+// The quad leader's decode (`nmlQuadSource`, R = 4 only, so never HALF): each packed word and its four
+// masked coefficients feed four accumulators, each with nml_qdot_pair's per-row terms, order and close.
+private let nemotronMoEQuadDecodeHeader = """
+template <typename U, int values_per_thread>
+inline void nml_qdot_quad(
+    const device uint8_t* w, const thread U* x0, const thread U* x1, const thread U* x2,
+    const thread U* x3, U scale, U bias, U sum0, U sum1, U sum2, U sum3, int N,
+    thread U& value0, thread U& value1, thread U& value2, thread U& value3) {
+  U accum0 = 0;
+  U accum1 = 0;
+  U accum2 = 0;
+  U accum3 = 0;
+  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (N / 4); i++) {
+    const uint16_t q = ws[i];
+    const U a = q & 0x000f;
+    const U b = q & 0x00f0;
+    const U c = q & 0x0f00;
+    const U d = q & 0xf000;
+    accum0 += (x0[4 * i] * a + x0[4 * i + 1] * b + x0[4 * i + 2] * c + x0[4 * i + 3] * d);
+    accum1 += (x1[4 * i] * a + x1[4 * i + 1] * b + x1[4 * i + 2] * c + x1[4 * i + 3] * d);
+    accum2 += (x2[4 * i] * a + x2[4 * i + 1] * b + x2[4 * i + 2] * c + x2[4 * i + 3] * d);
+    accum3 += (x3[4 * i] * a + x3[4 * i + 1] * b + x3[4 * i + 2] * c + x3[4 * i + 3] * d);
+  }
+  value0 = scale * accum0 + sum0 * bias;
+  value1 = scale * accum1 + sum1 * bias;
+  value2 = scale * accum2 + sum2 * bias;
+  value3 = scale * accum3 + sum3 * bias;
+}
+"""
+
+/// The four-row (R = 4) quad form of the triple FC1 text (NEMOTRON_MOE_QUAD_FC1): the first slot of each
+/// expert among the four rows leads and serves every later row that routed to it (partner, third, fourth in
+/// row order), so the expert's codes and metadata are read once for up to four rows. The triple's pair rule
+/// at R = 4 lets a leader serve only one more row (an expert of three or four rows is read twice). Each row
+/// keeps its own accumulator, prepared load, lane split, block order, qdot terms (the R = 4 non-HALF decode
+/// of nml_qdot / nml_qdot_pair), affine close, closing simd_sum and ReLU2 store; only which threadgroup
+/// computes a row moves. The singleton, triple and pair branches are the record's text. Applied before the
+/// unroll, tail-8, prepared and dictionary transforms (`NemotronFC1Tune.source`); nil when the text moved.
+private func nmlQuadSource(_ source: String) -> String? {
+    var s = source
+    for (from, to) in [
+        ("  if ((R == 3 ? before : (before & 1)) != 0) {\n",
+         "  static_assert(R == 4, \"quad leader: four rows\");\n  if (before != 0) {\n"),
+        ("  int third = -1;\n", "  int third = -1;\n  int fourth = -1;\n"),
+        ("        if (R == 3) { third = partner; }\n", "        fourth = third;\n        third = partner;\n"),
+        ("  } else if (third >= 0) {\n", nmlQuadBranch + "  } else if (third >= 0) {\n"),
+    ] {
+        guard s.components(separatedBy: from).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: from, with: to)
+    }
+    return s
+}
+
+private let nmlQuadBranch = """
+  } else if (fourth >= 0) {
+    const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +
+        simd_lid * values_per_thread;
+    const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +
+        simd_lid * values_per_thread;
+    const device T* x3 = x + (XSLOT ? fourth : fourth / TOPK) * K +
+        simd_lid * values_per_thread;
+    device T* y1 = y + partner * N + out_row;
+    device T* y2 = y + third * N + out_row;
+    device T* y3 = y + fourth * N + out_row;
+    thread U x0_thread[values_per_thread];
+    thread U x1_thread[values_per_thread];
+    thread U x2_thread[values_per_thread];
+    thread U x3_thread[values_per_thread];
+    thread U result0[results_per_simdgroup] = {0};
+    thread U result1[results_per_simdgroup] = {0};
+    thread U result2[results_per_simdgroup] = {0};
+    thread U result3[results_per_simdgroup] = {0};
+    int k = 0;
+    for (; k < K - block_size; k += block_size) {
+      U sum0 = nml_load_vector<T, U, values_per_thread>(x0, x0_thread);
+      U sum1 = nml_load_vector<T, U, values_per_thread>(x1, x1_thread);
+      U sum2 = nml_load_vector<T, U, values_per_thread>(x2, x2_thread);
+      U sum3 = nml_load_vector<T, U, values_per_thread>(x3, x3_thread);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1, value2, value3;
+        nml_qdot_quad<U, values_per_thread>(
+            wl, x0_thread, x1_thread, x2_thread, x3_thread, s, b, sum0, sum1, sum2, sum3,
+            values_per_thread, value0, value1, value2, value3);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+        result3[r] += value3;
+      }
+      ws += block_size / 2;
+      sc += block_size / 64;
+      bs += block_size / 64;
+      x0 += block_size;
+      x1 += block_size;
+      x2 += block_size;
+      x3 += block_size;
+    }
+    const int remaining = clamp(
+        static_cast<int>(K - k - simd_lid * values_per_thread), 0, values_per_thread);
+    if (remaining > 0) {
+      U sum0 = nml_load_vector_safe<T, U, values_per_thread>(x0, x0_thread, remaining);
+      U sum1 = nml_load_vector_safe<T, U, values_per_thread>(x1, x1_thread, remaining);
+      U sum2 = nml_load_vector_safe<T, U, values_per_thread>(x2, x2_thread, remaining);
+      U sum3 = nml_load_vector_safe<T, U, values_per_thread>(x3, x3_thread, remaining);
+      for (int r = 0; r < results_per_simdgroup; r++) {
+        auto wl = (const device uint8_t*)(ws + r * in_vec_size_w);
+        const device T* sl = sc + r * in_vec_size_g;
+        const device T* bl = bs + r * in_vec_size_g;
+        U s = sl[0];
+        U b = bl[0];
+        U value0, value1, value2, value3;
+        nml_qdot_quad<U, values_per_thread>(
+            wl, x0_thread, x1_thread, x2_thread, x3_thread, s, b, sum0, sum1, sum2, sum3,
+            remaining, value0, value1, value2, value3);
+        result0[r] += value0;
+        result1[r] += value1;
+        result2[r] += value2;
+        result3[r] += value3;
+      }
+    }
+    for (int r = 0; r < results_per_simdgroup; r++) {
+      result0[r] = simd_sum(result0[r]);
+      result1[r] = simd_sum(result1[r]);
+      result2[r] = simd_sum(result2[r]);
+      result3[r] = simd_sum(result3[r]);
+      if (simd_lid == 0) {
+        y0[r] = nml_store<T, RELU2>(result0[r]);
+        y1[r] = nml_store<T, RELU2>(result1[r]);
+        y2[r] = nml_store<T, RELU2>(result2[r]);
+        y3[r] = nml_store<T, RELU2>(result3[r]);
+      }
+    }
+
+"""
+
 // MARK: - Exact (scale, bias) pair dictionary for the R = 3 verify QMVs
 //
 // The pinned checkpoint's affine4/gs64 groups carry a BF16 scale and a BF16
@@ -4907,5 +5089,655 @@ extension NemotronU2 {
         inProj = admit(.inProj) { NemotronMambaInProjConvDt.u2Check(target) }
         self.head = admit(.head) { NemotronHeadPreparedActivation.u2CheckHead(target) }
         draft = admit(.draft) { draftCheck(head) }
+    }
+}
+
+// MARK: - Load-time geometry tune of the verify's triple FC1 (NEMOTRON_FC1_TUNE)
+//
+// The plan-free triple FC1 (`applyTripleWithoutPlan`: R = 3, top six, K 2688,
+// N 1856, prepared FP32 activations, tail-8, pair dictionary, unroll by two)
+// launches one 32-lane SIMD group per threadgroup with two outputs each, the
+// slot on grid z and the 928 output tiles on grid y. That geometry was tuned
+// on M4-class hosts. `NemotronFC1Tune` rebuilds the same body under other
+// launch geometries and keeps every output's arithmetic: one output is one
+// SIMD group's accumulator, lane l holds values [8l, 8l + 8) of each 256-value
+// block, blocks run in K order with the same qdot term order and affine close
+// (`scale * accum + sum * bias`) per block, then one closing simd_sum over the
+// 32 lanes and the same typed ReLU2 store. A variant moves only
+// - RPS: how many consecutive outputs one SIMD group owns (each keeps its own
+//   accumulator and order);
+// - NSG: how many SIMD groups share a threadgroup (output tiles per group);
+// - slot axis: slot on grid x (all 18 slots of an output tile dispatched
+//   together) instead of z (all tiles of a slot together);
+// - W32: the HALF decode takes its n2/n3 halfwords from the 32-bit word it
+//   already loads (the same bits, so the same half and FP32 operands);
+// - unroll: `#pragma clang loop unroll_count` on the three main K loops.
+// None of these touches the lane split, the K order, a term, a rounding point
+// or the cross-lane reduction tree. `tune` (load time, untimed) still checks
+// every variant bit for bit against the launch production makes today on
+// seeded inputs and routes over the real routed FC1 banks (every case on every
+// MoE layer), drops any mismatch or Metal error (an unavailable incumbent or a
+// timing error keeps the incumbent), times the incumbent and the survivors round robin (rotating
+// order, median), and adopts the fastest only when it is at least 3% faster.
+// The pair-dictionary form and the plain form are adopted separately: the
+// plain form only when some bank without a dictionary took part in the check.
+// NEMOTRON_FC1_TUNE=0 keeps the incumbent; NEMOTRON_FC1_FORCE=<n> adopts
+// variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
+enum NemotronFC1Tune {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE"] != "0"
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "")
+
+    struct Variant: Sendable, Equatable {
+        let name: String
+        /// Outputs per SIMD group.
+        let rps: Int
+        /// SIMD groups per threadgroup.
+        let nsg: Int
+        /// Slot on grid x (slots fastest) instead of z.
+        let slotX: Bool
+        /// HALF decode reads each lane's weight word once as 32 bits.
+        let w32: Bool
+        /// unroll_count of the three main K loops; 0: the incumbent's (2 once
+        /// `qualifyFC1Unroll` admitted it, else none).
+        let unroll: Int
+    }
+
+    /// The incumbent is r2n1 (two outputs, one SIMD group, slot on z).
+    static let variants: [Variant] = [
+        Variant(name: "r2n2", rps: 2, nsg: 2, slotX: false, w32: false, unroll: 0),
+        Variant(name: "r2n4", rps: 2, nsg: 4, slotX: false, w32: false, unroll: 0),
+        Variant(name: "r1n4", rps: 1, nsg: 4, slotX: false, w32: false, unroll: 0),
+        Variant(name: "r4n1", rps: 4, nsg: 1, slotX: false, w32: false, unroll: 0),
+        Variant(name: "r4n2", rps: 4, nsg: 2, slotX: false, w32: false, unroll: 0),
+        Variant(name: "r2n1x", rps: 2, nsg: 1, slotX: true, w32: false, unroll: 0),
+        Variant(name: "r2n4x", rps: 2, nsg: 4, slotX: true, w32: false, unroll: 0),
+        Variant(name: "r2n1w", rps: 2, nsg: 1, slotX: false, w32: true, unroll: 0),
+    ]
+
+    /// The adopted geometry (nil: the incumbent). Set once at load, before any
+    /// verify graph is traced; `plainQualified` admits it for banks without a
+    /// pair dictionary too.
+    nonisolated(unsafe) private(set) static var choice: Variant? = nil
+    nonisolated(unsafe) private(set) static var plainQualified = false
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel?] = [:]
+
+    private static func unrollCount(_ v: Variant) -> Int {
+        v.unroll > 0 ? v.unroll
+            : (NemotronMoELeader.fc1Unroll && NemotronMoELeader.fc1UnrollQualified ? 2 : 1)
+    }
+
+    /// The incumbent's source pipeline (`NemotronMoELeaderPreparedKernels`:
+    /// unroll, then tail-8, prepared pointers and pair dictionary) with the
+    /// variant's slot axis; nil when the record text moved. `quad`: from the
+    /// four-row quad form (`nmlQuadSource`, a fourth main K loop and row).
+    static func source(_ v: Variant, tail8: Bool, dict: Bool, quad: Bool = false) -> String? {
+        var s = nemotronMoETripleGateUpSource
+        if quad {
+            guard let q = nmlQuadSource(s) else { return nil }
+            s = q.replacingOccurrences(of: "x3 += block_size;", with: "x3 += PSTRIDE;")
+        }
+        s = s.replacingOccurrences(of: "x2 += block_size;", with: "x2 += PSTRIDE;")
+        if v.slotX {
+            let from = "  const int slot = tid.z;\n"
+            guard s.components(separatedBy: from).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: from, with: "  const int slot = tid.x;\n")
+        }
+        let count = unrollCount(v)
+        if count > 1 {
+            let loop = "    for (; k < K - block_size; k += block_size) {\n"
+            guard s.components(separatedBy: loop).count == (quad ? 5 : 4) else { return nil }
+            s = s.replacingOccurrences(of: loop, with: "    #pragma clang loop unroll_count(\(count))\n" + loop)
+        }
+        if tail8 {
+            guard let t = nmlTail8Source(s) else { return nil }
+            s = t
+        }
+        guard var p = nmlPreparedSource(s, pointers: [
+            ("const device T* x0 = x + (XSLOT ? slot : row) * K + simd_lid * values_per_thread;",
+             "const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x1 = x + (XSLOT ? partner : partner / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+            ("const device T* x2 = x + (XSLOT ? third : third / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ] + (quad ? [
+            ("const device T* x3 = x + (XSLOT ? fourth : fourth / TOPK) * K +\n        simd_lid * values_per_thread;",
+             "const device float* x3 = prepared + (fourth / TOPK) * (PTILES * PSTRIDE) + simd_lid;"),
+        ] : [])) else { return nil }
+        if dict {
+            guard let d = nemotronSBDictSource(p) else { return nil }
+            p = d
+        }
+        return p
+    }
+
+    /// The incumbent's header; with W32 the HALF helpers' n2/n3 halfword loads
+    /// `ws[i]` (i = 0, 1 of a lane's 32-bit word) read as `w2 >> 16 * (i % 2)`
+    /// from the word each helper already holds (little endian: the same bits).
+    static func header(w32: Bool) -> String? {
+        let base = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
+            + nemotronMoETripleDecodeHeader
+        guard w32 else { return base }
+        var s = base
+        for mask in ["0x0f00", "0xf000"] {
+            let from = "U(half(ushort(ws[i] & \(mask))))"
+            guard s.components(separatedBy: from).count == 5 else { return nil }
+            s = s.replacingOccurrences(of: from, with: "U(half(ushort((w2 >> (16 * (i % 2))) & \(mask))))")
+        }
+        guard !s.contains("ushort(ws[i]") else { return nil }
+        return s
+    }
+
+    static func kernel(_ v: Variant, tail8: Bool, dict: Bool, quad: Bool = false) -> MLXFast.MLXFastKernel? {
+        let key = "\(v.name)_u\(unrollCount(v))_\(tail8 ? "t8" : "tr")_\(dict ? "sbd" : "bf")\(quad ? "_q" : "")"
+        return lock.withLock { () -> MLXFast.MLXFastKernel? in
+            if let made = kernels[key] { return made }
+            var made: MLXFast.MLXFastKernel? = nil
+            if let body = source(v, tail8: tail8, dict: dict, quad: quad), let header = header(w32: v.w32) {
+                made = MLXFast.metalKernel(
+                    name: "nemotron_fc1_tune_" + key,
+                    inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                    outputNames: ["y"], source: body, header: header + (quad ? nemotronMoEQuadDecodeHeader : ""))
+            }
+            kernels[key] = made
+            return made
+        }
+    }
+
+    /// One variant launch with the incumbent's operands and template; nil when
+    /// the geometry does not tile N, the kernel is missing, or (`explicit`
+    /// false, production) the variant is not admitted for this form.
+    static func launch(_ v: Variant, packed: MLXArray, inds: MLXArray, bank: NemotronMoELeader.Bank,
+                       dict: NemotronSBDict.Dict?, relu2: Bool, tail8: Bool, explicit: Bool,
+                       quad: Bool = false) -> MLXArray? {
+        let n = bank.n
+        guard explicit || dict != nil || plainQualified,
+              n % v.rps == 0, (n / v.rps) % v.nsg == 0, !quad || inds.size == 24,
+              let kernel = kernel(v, tail8: tail8, dict: dict != nil, quad: quad)
+        else { return nil }
+        let operands: [MLXArray] = dict.map {
+            [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind($0.index), $0.table, packed, inds]
+        } ?? [NemotronBankBinding.bind(bank.weight), NemotronBankBinding.bind(bank.scales),
+              NemotronBankBinding.bind(bank.biases), packed, inds]
+        let slots = inds.size
+        return kernel(
+            operands,
+            template: [("T", DType.bfloat16), ("R", slots / 6), ("TOPK", 6),
+                       ("K", bank.k), ("N", n), ("XSLOT", false),
+                       ("RELU2", relu2), ("RPS", v.rps)],
+            grid: v.slotX ? (32 * slots, n / v.rps, 1) : (32, n / v.rps, slots),
+            threadGroup: (32, v.nsg, 1),
+            outputShapes: [[slots, n]], outputDTypes: [.bfloat16])[0]
+    }
+
+    /// Deterministic route generator (SplitMix64): three rows of six distinct
+    /// experts; rows 1 and 2 reuse `overlap` experts of the rows above.
+    private struct Routes {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+        mutating func pick(_ n: Int) -> Int { Int(next() % UInt64(n)) }
+        mutating func route(experts: Int, overlap: Int) -> [UInt32] {
+            var rows: [[Int]] = []
+            for r in 0 ..< 3 {
+                var row: [Int] = []
+                let seen = Array(Set(rows.flatMap { $0 })).sorted()
+                if r > 0 {
+                    var pool = seen
+                    while row.count < min(overlap, pool.count) {
+                        row.append(pool.remove(at: pick(pool.count)))
+                    }
+                }
+                while row.count < 6 {
+                    let e = pick(experts)
+                    if !row.contains(e) && !seen.contains(e) { row.append(e) }
+                }
+                for i in stride(from: row.count - 1, to: 0, by: -1) { row.swapAt(i, pick(i + 1)) }
+                rows.append(row)
+            }
+            return rows.flatMap { $0 }.map { UInt32($0) }
+        }
+    }
+
+    private struct Case {
+        let packed: MLXArray
+        let inds: MLXArray
+        let x: MLXArray
+    }
+
+    /// Load time, after `qualifyFC1Unroll` and the pair dictionaries and before
+    /// any verify graph is traced or warmed.
+    static func tune(_ model: Module) {
+        choice = nil
+        plainQualified = false
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func report(_ message: String) {
+            let s = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+            FileHandle.standardError.write(Data(
+                "nemotron fc1 tune: \(message) (\(String(format: "%.2f", s)) s)\n".utf8))
+        }
+        guard enabled else { return report("off (setting)") }
+        guard NemotronMoELeader.enabled, NemotronMoELeader.fuseRelu2 else {
+            return report("off (triple FC1 not in use)")
+        }
+        var layers: [(bank: NemotronMoELeader.Bank, dict: NemotronSBDict.Dict?)] = []
+        for module in model.modules() {
+            guard let moe = module as? NemotronHMoE,
+                  type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                  let up = NemotronMoELeader.bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                  up.weight.shape == [128, 1856, 336] else { continue }
+            layers.append((up, NemotronSBDict.enabled ? NemotronSBDict.dict(moe.switchMLP.fc1) : nil))
+        }
+        guard !layers.isEmpty else { return report("off (no routed FC1 bank)") }
+
+        // Seeded activations and routes: two fixed routes with a three-row and
+        // a two-row expert, decode-like random routes (about 15 experts), all
+        // 18 distinct, one six-expert triple set; plain, wide, ReLU2-sparse and
+        // large inputs.
+        var gen = Routes(state: 0xFC1_7E5E)
+        let routes: [[UInt32]] = [
+            [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127],
+            [96, 30, 1, 65, 127, 33, 65, 2, 96, 40, 12, 7, 33, 96, 9, 19, 64, 65],
+            gen.route(experts: 128, overlap: 2),
+            gen.route(experts: 128, overlap: 0),
+            [9, 44, 71, 2, 120, 33, 33, 120, 2, 9, 71, 44, 44, 9, 33, 71, 120, 2],
+            gen.route(experts: 128, overlap: 1),
+            gen.route(experts: 128, overlap: 3),
+        ]
+        var cases: [Case] = []
+        do {
+            cases = try withError { () -> [Case] in
+                routes.enumerated().map { i, route -> Case in
+                    let key = MLXRandom.key(UInt64(0xFC1_0000 + i))
+                    var x = MLXRandom.normal([3, 2688], key: key) * ([0.5, 2, 1, 8, 1, 0.5, 1] as [Float])[i]
+                    if i == 2 {
+                        x = MLX.maximum(x - 1, MLXArray(Float(0)))
+                        x = x * x
+                    }
+                    let xb = x.asType(.bfloat16)
+                    let c = Case(packed: NemotronHeadPreparedActivation.prepareContiguousRows(xb, pv: 8),
+                                 inds: MLXArray(route), x: xb)
+                    eval([c.packed, c.inds, c.x])
+                    return c
+                }
+            }
+        } catch {
+            return report("off (inputs: \(error))")
+        }
+        func incumbent(_ l: Int, _ c: Case) -> MLXArray? {
+            NemotronMoELeader.applyTripleWithoutPlan(c.x, c.inds, bank: layers[l].bank, relu2: true,
+                prepared: c.packed, dict: layers[l].dict)
+        }
+        func variant(_ v: Variant, _ l: Int, _ c: Case) -> MLXArray? {
+            NemotronMoELeader.applyTripleWithoutPlan(c.x, c.inds, bank: layers[l].bank, relu2: true,
+                prepared: c.packed, dict: layers[l].dict, tuned: v)
+        }
+
+        // Qualify: bit for bit against the incumbent; any mismatch, missing
+        // kernel or error drops a variant.
+        var alive = variants
+        var dropped: [String] = []
+        var plainChecked = false
+        var checks = 0
+        qualify: for (ci, c) in cases.enumerated() {
+            for l in layers.indices {
+                let reference: MLXArray?
+                do {
+                    reference = try withError { () -> MLXArray? in
+                        guard let out = incumbent(l, c) else { return nil }
+                        eval(out)
+                        return out
+                    }
+                } catch {
+                    reference = nil
+                }
+                guard let reference else {
+                    return report("off (incumbent unavailable at layer \(l))")
+                }
+                if layers[l].dict == nil { plainChecked = true }
+                alive = alive.filter { v in
+                    do {
+                        let same = try withError { () -> Bool in
+                            guard let out = variant(v, l, c) else { return false }
+                            return (out.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()
+                                .item(Bool.self)
+                        }
+                        if !same { dropped.append("\(v.name) differs@\(ci)/\(l)") }
+                        return same
+                    } catch {
+                        dropped.append("\(v.name) error")
+                        return false
+                    }
+                }
+                checks += 1
+                if alive.isEmpty { break qualify }
+            }
+        }
+        let dictLayers = layers.filter { $0.dict != nil }.count
+
+        // Time the incumbent and the survivors round robin (rotating start):
+        // every MoE layer's FC1 on two decode-like routes per sample, the graph
+        // built before the clock starts; median ms per launch.
+        let timed = [cases[2], cases[5]]
+        let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
+        var medians: [Double] = []
+        var reps = 0
+        if alive.count > 0 {
+            var samples = Array(repeating: [Double](), count: candidates.count)
+            let launches = layers.count * timed.count
+            do {
+                try withError {
+                    func sample(_ i: Int) -> Double? {
+                        var outs: [MLXArray] = []
+                        for l in layers.indices {
+                            for c in timed {
+                                guard let out = candidates[i].map({ variant($0, l, c) }) ?? incumbent(l, c)
+                                else { return nil }
+                                outs.append(out)
+                            }
+                        }
+                        let start = DispatchTime.now().uptimeNanoseconds
+                        eval(outs)
+                        Stream.gpu.synchronize()
+                        return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6 / Double(launches)
+                    }
+                    // Warm-up (3 rounds) sizes the timed rounds to ~0.8 s.
+                    var round = 0.0
+                    for _ in 0 ..< 3 {
+                        round = 0
+                        for i in candidates.indices { round += (sample(i) ?? 0) * Double(launches) }
+                    }
+                    reps = max(11, min(41, Int(800 / max(round, 0.01))))
+                    for rep in 0 ..< reps {
+                        for j in candidates.indices {
+                            let i = (j + rep) % candidates.count
+                            if let ms = sample(i) { samples[i].append(ms) }
+                        }
+                    }
+                }
+            } catch {
+                dropped.append("timing error")
+                alive = []
+            }
+            if samples.allSatisfy({ $0.count == reps }) {
+                medians = samples.map { $0.sorted()[$0.count / 2] }
+            } else {
+                dropped.append("timing incomplete")
+                alive = []
+            }
+        }
+
+        var picked: Variant? = nil
+        var why = "kept"
+        if !medians.isEmpty, !alive.isEmpty {
+            let base = medians[0]
+            if let f = forced {
+                if f >= 1, f <= variants.count, let i = alive.firstIndex(of: variants[f - 1]) {
+                    picked = alive[i]
+                    why = "forced"
+                } else {
+                    why = f == 0 ? "forced V0" : "forced \(f) not qualified, kept"
+                }
+            } else if let best = medians.indices.dropFirst().min(by: { medians[$0] < medians[$1] }),
+                      medians[best] <= 0.97 * base {
+                picked = candidates[best]
+                why = "adopted"
+            }
+        }
+        plainQualified = picked != nil && plainChecked
+        choice = picked
+
+        func ms(_ v: Variant?) -> String {
+            guard let i = candidates.firstIndex(of: v), i < medians.count else { return "n/a" }
+            return String(format: "%.4f", medians[i])
+        }
+        let times = candidates.dropFirst().map { "\($0!.name) \(ms($0))" }
+        report("\(why) \(picked?.name ?? "V0") \(ms(picked)) ms vs V0 \(ms(nil)) ms per launch"
+            + " (median of \(reps), \(layers.count) layers x 2 routes; \(alive.count)/\(variants.count) bitwise"
+            + " over \(checks) layer cases, dict \(dictLayers)/\(layers.count), plain \(plainQualified ? "on" : "off")"
+            + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
+            + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(8).joined(separator: ", ")) + ")")
+    }
+}
+
+// MARK: - Four-row captured verify (MTP depth 3): routed FC1, zero-skip FC2, zero-skip shared down
+
+extension NemotronR4 {
+    /// The plan-free triple FC1 (`NemotronMoELeader.applyTripleWithoutPlan`) at four rows: the triple
+    /// kernel's pair rule (a slot leads when an even number of earlier rows routed to its expert; it serves
+    /// the next such row; `quadFC1`: every such row), set at load by `qualifyMoE`.
+    nonisolated(unsafe) static var fc1 = false
+    /// The zero-skip routed FC2 slot launch at 24 slots (`NemotronZSkip.weightedProducts` / `weighted`).
+    nonisolated(unsafe) static var fc2 = false
+    /// The zero-skip shared down at four rows (`NemotronSharedDownZSkip.run`).
+    nonisolated(unsafe) static var sharedDown = false
+
+    /// Load time, after the R = 3 MoE checks and tunes: on every MoE layer, (1) the triple FC1 at four rows
+    /// (the verify's selection: dictionary, unroll, tuned geometry; from the rows and from their prepared
+    /// activation) against the stock gather FC1 + ReLU2 and the R = 4 leader FC1 the generic route runs, on
+    /// routes where one expert serves rows {0, 1, 2, 3}, {0, 1, 3}, {0, 2, 3}, {0, 2}, {1, 2}, {1, 2, 3}, {1, 3},
+    /// {2, 3} and on all-distinct routes; (2) the zero-skip FC2 at 24 slots: the top-six reduce of its slot
+    /// products against the R = 4 weighted leader FC2, and its slots against the 18-slot launch's; (3) the
+    /// zero-skip shared down at four rows against the three-row launch on rows 0 ..< 3 and 1 ..< 4 and the
+    /// dense four-row projection. Each part is admitted on its own, only if every case is bitwise equal.
+    static let moeRoutes: [[UInt32]] = [
+        [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127, 3, 17, 9, 64, 8, 30],
+        [96, 30, 1, 65, 127, 33, 65, 2, 96, 40, 12, 7, 33, 96, 9, 19, 64, 65, 1, 2, 33, 65, 96, 127],
+        [10, 20, 30, 40, 50, 60, 11, 21, 31, 41, 51, 61, 10, 21, 32, 42, 52, 62, 13, 21, 33, 43, 53, 63],
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+    ]
+    static func qualifyMoE(_ model: Module) {
+        fc1 = false
+        fc2 = false
+        sharedDown = false
+        guard active, NemotronMoELeader.enabled else { return report("moe", "off (four-row joins off)") }
+        let routes = moeRoutes
+        var ok1 = MLXArray(true), ok2 = MLXArray(true), ok3 = MLXArray(true)
+        var layers1 = 0, layers2 = 0, layers3 = 0
+        let zeros4 = MLXArray.zeros([4], dtype: .uint32)
+        eval(zeros4)
+        NemotronSharedDownZSkip.lock.withLock { NemotronSharedDownZSkip.inds4 = zeros4 }
+        fc1 = true
+        fc2 = true
+        sharedDown = true
+        do {
+            try withError {
+                for (li, moe) in model.modules().compactMap({ $0 as? NemotronHMoE }).enumerated() {
+                    let mlp = moe.switchMLP
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7e00 + li)), into: 6)
+                    if type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+                       let up = NemotronMoELeader.bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+                       up.weight.shape == [128, 1856, 336] {
+                        let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
+                        for (ri, route) in routes.enumerated() {
+                            let x = (MLXRandom.normal([4, 2688], key: keys[ri % 2]) * Float(ri % 2 == 0 ? 0.5 : 3))
+                                .asType(.bfloat16)
+                            let inds = MLXArray(route)
+                            guard let a = NemotronMoELeader.applyTripleWithoutPlan(
+                                x, inds, bank: up, relu2: true,
+                                prepared: ri % 2 == 1 ? NemotronHeadPreparedActivation.pack(x) : nil, dict: dict)
+                            else { ok1 = MLXArray(false); continue }
+                            let lead = NemotronMoELeader.apply(x, inds, rows: 4, topK: 6, bank: up, perSlot: false,
+                                relu2: true, tail8: NemotronMoELeader.leaderTail8)
+                            let h0 = mlp.fc1(MLX.expandedDimensions(x.reshaped(1, 4, 2688), axes: [-2, -3]),
+                                             inds.reshaped(1, 4, 6), sortedIndices: false)
+                            let a0 = maximum(h0, MLXArray(0))
+                            ok1 = ok1 .&& same(a, lead) .&& same(a, (a0 * a0).reshaped(24, 1856))
+                        }
+                        layers1 += 1
+                    }
+                    if let copy = NemotronZSkip.copy(for: mlp.fc2), !NemotronZSkip.needsOriginal(mlp.fc2),
+                       let down = NemotronMoELeader.bank(mlp.fc2, k: 1856, dtype: .bfloat16) {
+                        let h = abs(MLXRandom.normal([24, 1856], key: keys[2])) + 1e-3
+                        let keep = MLXRandom.uniform(Float(0) ..< 1, [24, 1856], key: keys[3]) .< MLXArray(Float(0.1))
+                        let act = (which(keep, h, MLXArray(Float(0))) * 2).asType(.bfloat16)
+                        let scores = MLXRandom.uniform(Float(0) ..< 1, [24], key: keys[4])
+                        for route in routes {
+                            let inds = MLXArray(route)
+                            let prod = NemotronZSkip.products(act, inds, scores, copy: copy, rows: 4)
+                            let reference = NemotronMoELeader.applyWeighted(
+                                act, inds, scores, rows: 4, bank: down, tail8: NemotronMoELeader.leaderTail8)
+                            let low = NemotronZSkip.products(
+                                act[0 ..< 18], inds[0 ..< 18], scores[0 ..< 18], copy: copy, rows: 3)
+                            let high = NemotronZSkip.products(
+                                act[6 ..< 24], inds[6 ..< 24], scores[6 ..< 24], copy: copy, rows: 3)
+                            ok2 = ok2 .&& same(NemotronZSkip.reduceProducts(prod, rows: 4), reference)
+                                .&& same(prod[0 ..< (18 * 2688)], low) .&& same(prod[(6 * 2688)...], high)
+                        }
+                        layers2 += 1
+                    }
+                    if let down = moe.sharedExperts?.downProj, NemotronSharedDownZSkip.covers(down) {
+                        let k = NemotronSharedDownZSkip.k
+                        let h = abs(MLXRandom.normal([4, k], key: keys[5])) + 1e-3
+                        let keep = MLXRandom.uniform(Float(0) ..< 1, [4, k], key: keys[3]) .< MLXArray(Float(0.16))
+                        let x = which(keep, h, MLXArray(Float(0))).asType(.bfloat16)
+                        guard let a = NemotronSharedDownZSkip.run(x, owner: down),
+                              let b = NemotronSharedDownZSkip.run(x[0 ..< 3], owner: down),
+                              let c = NemotronSharedDownZSkip.run(x[1 ..< 4], owner: down)
+                        else { ok3 = MLXArray(false); continue }
+                        ok3 = ok3 .&& rowsMatch(a, b, c, axis: 1)
+                            .&& same(a, nemotronMTPLinearRows(x.reshaped(1, 4, k), down))
+                        layers3 += 1
+                    }
+                    eval(ok1, ok2, ok3)
+                }
+            }
+        } catch {
+            fc1 = false
+            fc2 = false
+            sharedDown = false
+            return report("moe", "off (\(error))")
+        }
+        fc1 = layers1 > 0 && ok1.item(Bool.self)
+        fc2 = layers2 > 0 && ok2.item(Bool.self)
+        sharedDown = layers3 > 0 && ok3.item(Bool.self)
+        report("moe", "fc1 \(fc1 ? "on" : "off") (\(layers1) layers), zero-skip fc2 \(fc2 ? "on" : "off") "
+               + "(\(layers2) layers), zero-skip shared down \(sharedDown ? "on" : "off") (\(layers3) layers)")
+    }
+}
+
+// MARK: - Four-row routed FC1 quad leader (NEMOTRON_MOE_QUAD_FC1)
+
+extension NemotronR4 {
+    /// NEMOTRON_MOE_QUAD_FC1=0 keeps the pair rule at four rows.
+    static let quadEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MOE_QUAD_FC1"] != "0"
+    /// The four-row FC1 in its quad leader form (`nmlQuadSource`: one leader per expert serves all of its
+    /// rows), set at load by `qualifyQuadFC1`.
+    nonisolated(unsafe) static var quadFC1 = false
+
+    /// Load time, right after `qualifyMoE` admitted the four-row FC1 and before any four-row verify graph is
+    /// traced: on every MoE layer, the quad form against the launch the verify runs today (pair rule; the same
+    /// dictionary, unroll, tuned geometry and tail), bit for bit, on `moeRoutes` and seeded routes where experts
+    /// serve two, three and four rows (every row set, the leader at any slot) or none is shared, from the rows
+    /// and from their prepared activation, both ReLU2 forms. Any difference, error or missing kernel keeps the
+    /// pair rule.
+    static func qualifyQuadFC1(_ model: Module) {
+        quadFC1 = false
+        guard quadEnabled else { return report("moe quad fc1", "off (setting)") }
+        guard fc1 else { return report("moe quad fc1", "off (four-row FC1 off)") }
+        var state: UInt64 = 0x9AD_F1C1
+        func next() -> Int {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return Int(truncatingIfNeeded: (z ^ (z >> 31)) >> 1)
+        }
+        // Each row set shares one fresh expert, every other slot takes a fresh one; each row is shuffled.
+        func route(_ shared: [[Int]]) -> [UInt32] {
+            var rows = [[Int]](repeating: [], count: 4)
+            var used = Set<Int>()
+            func fresh() -> Int {
+                while true { let e = next() % 128; if used.insert(e).inserted { return e } }
+            }
+            for set in shared { let e = fresh(); for r in set { rows[r].append(e) } }
+            for r in 0 ..< 4 {
+                while rows[r].count < 6 { rows[r].append(fresh()) }
+                for i in stride(from: 5, to: 0, by: -1) { rows[r].swapAt(i, next() % (i + 1)) }
+            }
+            return rows.flatMap { $0 }.map { UInt32($0) }
+        }
+        let all = [0, 1, 2, 3]
+        let patterns: [[[Int]]] = [
+            [], [all], [[0, 1, 2], [1, 2, 3], [0, 1, 3], [0, 2, 3]],
+            [all, [0, 1, 2], [1, 2, 3], [0, 2], [1, 3], [0, 1, 3], [0, 2, 3]],
+            Array(repeating: all, count: 6),
+            Array(repeating: [0, 1, 2], count: 3) + Array(repeating: [1, 2, 3], count: 3),
+            [all, all, [0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3], [0, 1], [2, 3]],
+            [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]],
+        ]
+        let routes = moeRoutes + patterns.map { route($0) }
+        var ok = MLXArray(true)
+        var layers = 0, cases = 0
+        do {
+            try withError {
+                for (li, moe) in model.modules().compactMap({ $0 as? NemotronHMoE }).enumerated() {
+                    let mlp = moe.switchMLP
+                    guard type(of: mlp.fc1) == QuantizedSwitchLinear.self,
+                          let up = NemotronMoELeader.bank(mlp.fc1, k: 2688, dtype: .bfloat16),
+                          up.weight.shape == [128, 1856, 336] else { continue }
+                    let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(mlp.fc1) : nil
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x9a00 + li)), into: 3)
+                    for (ri, route) in routes.enumerated() {
+                        var x = MLXRandom.normal([4, 2688], key: keys[ri % 3]) * ([0.5, 3, 1, 8] as [Float])[ri % 4]
+                        if ri % 3 == 2 {
+                            x = maximum(x - 1, MLXArray(Float(0)))
+                            x = x * x
+                        }
+                        let xb = x.asType(.bfloat16)
+                        let inds = MLXArray(route)
+                        let prepared = ri % 2 == 1 ? NemotronHeadPreparedActivation.pack(xb) : nil
+                        for relu2 in [true, false] {
+                            guard let a = NemotronMoELeader.applyTripleWithoutPlan(
+                                      xb, inds, bank: up, relu2: relu2, prepared: prepared, dict: dict, quad: false),
+                                  let b = NemotronMoELeader.applyTripleWithoutPlan(
+                                      xb, inds, bank: up, relu2: relu2, prepared: prepared, dict: dict, quad: true)
+                            else { ok = MLXArray(false); continue }
+                            ok = ok .&& same(a, b)
+                            cases += 1
+                        }
+                    }
+                    layers += 1
+                    eval(ok)
+                }
+            }
+        } catch {
+            return report("moe quad fc1", "off (\(error))")
+        }
+        quadFC1 = layers > 0 && ok.item(Bool.self)
+        report("moe quad fc1", "\(quadFC1 ? "on" : "off") (\(layers) layers x \(routes.count) routes, \(cases) cases"
+               + " \(quadFC1 ? "bitwise equal to" : "differ from") the pair-rule launch)")
+    }
+
+    /// NEMOTRON_DIAG_QUAD=1 with MLX_DISABLE_COMPILE=1 (the routes are concrete at the call): the experts of each
+    /// four-row routed FC1 after load by how many rows routed to them, and at exit the expert reads of the pair
+    /// rule and of the quad rule. Diagnostic only (compile off).
+    static let quadDiag = ProcessInfo.processInfo.environment["NEMOTRON_DIAG_QUAD"] == "1"
+        && ProcessInfo.processInfo.environment["MLX_DISABLE_COMPILE"] != nil
+    private static let quadLock = NSLock()
+    nonisolated(unsafe) private static var quadCounts = [Int](repeating: 0, count: 5)
+    static func noteQuadRoute(_ inds: MLXArray) {
+        guard quadDiag, loaded, inds.size == 24 else { return }
+        var rows: [UInt32: Int] = [:]
+        for e in inds.asArray(UInt32.self) { rows[e, default: 0] += 1 }
+        let first = quadLock.withLock { () -> Bool in
+            quadCounts[0] += 1
+            for m in rows.values { quadCounts[min(m, 4)] += 1 }
+            return quadCounts[0] == 1
+        }
+        if first { atexit { NemotronR4.reportQuad() } }
+    }
+    static func reportQuad() {
+        let c = quadLock.withLock { quadCounts }
+        let pair = c[1] + c[2] + 2 * (c[3] + c[4]), quad = c[1] + c[2] + c[3] + c[4]
+        report("moe quad diag", "\(c[0]) four-row FC1 calls; experts in 1/2/3/4 rows \(c[1])/\(c[2])/\(c[3])/\(c[4]); "
+               + "expert reads pair rule \(pair), quad \(quad) (\(String(format: "%.2f", Double(pair - quad) / Double(max(c[0], 1)))) "
+               + "fewer per call, \(String(format: "%.1f", 100 * Double(pair - quad) / Double(max(pair, 1))))%)")
     }
 }

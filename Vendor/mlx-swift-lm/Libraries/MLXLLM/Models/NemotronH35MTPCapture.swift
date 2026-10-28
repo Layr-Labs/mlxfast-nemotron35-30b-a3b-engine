@@ -6,6 +6,461 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// The captured verify's fused launches at a window of four rows (MTP depth 3) as well as three:
+/// NEMOTRON_MTP_R4_FUSED=0 keeps every four-row window on the generic captured route. Each launch serves
+/// four rows with the per-row statements it runs for three (row-indexed by its grid), so every row's
+/// arithmetic is the three-row launch's; the launches whose geometry or twin choice depends on R are
+/// admitted at four rows only after their load-time bit checks.
+enum NemotronR4 {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_R4_FUSED"] != "0"
+    /// Set at load once the four-row joins matched the three-row ones (`checkJoins`).
+    nonisolated(unsafe) static var active = false
+    /// A captured verify width the fused launches serve: 3, or 4 when enabled.
+    static func rows(_ r: Int) -> Bool { r == 3 || (r == 4 && active) }
+    /// Four-row prepared QMVs (the R = 3 launch's decode form, load form, geometry, dictionary and unroll
+    /// selection, `NemotronHeadPreparedActivation`), set at load by `qualifyQMV`.
+    nonisolated(unsafe) static var qmv = false
+    /// R = 3, or R = 4 once `qualifyQMV` admitted the four-row prepared launches.
+    static func prepared(_ r: Int) -> Bool { r == 3 || (r == 4 && qmv) }
+    /// The Mamba in_proj launch with the conv/timestep epilogue (`NemotronMambaInProjConvDt`) at four rows.
+    nonisolated(unsafe) static var inProj = false
+    static func inProjRows(_ r: Int) -> Bool { r == 3 || (r == 4 && inProj) }
+    /// The fused compact SSM + gated norm launch (`NemotronHCompactSSMGated`, pending fold and anchor-skip
+    /// forms) at a window of four.
+    nonisolated(unsafe) static var ssm = false
+    static func ssmRows(_ r: Int) -> Bool { r == 3 || (r == 4 && ssm) }
+
+    static func bits(_ a: MLXArray) -> MLXArray {
+        [DType.float32, .uint32, .int32].contains(a.dtype) ? a.view(dtype: .uint32) : a.view(dtype: .uint16)
+    }
+    static func same(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+        a.shape == b.shape && a.dtype == b.dtype ? (bits(a) .== bits(b)).all() : MLXArray(false)
+    }
+    /// The written words of a K = 2688 (PV 8) prepared activation [R, 11, 288]: chunks 0 ..< 336.
+    static func written(_ p: MLXArray) -> MLXArray {
+        let w = p.reshaped(p.dim(0), 11, 9, 32)
+        return concatenated([w[0..., 0 ..< 10].reshaped(p.dim(0), -1),
+                             w[0..., 10, 0..., 0 ..< 16].reshaped(p.dim(0), -1)], axis: 1)
+    }
+    /// Row r of `four` (rows on `axis`) against row r of `low` (rows 0 ..< 3) for r < 3 and row 2 of `high`
+    /// (rows 1 ..< 4) for r = 3: each four-row output row equals the three-row launch's.
+    static func rowsMatch(_ four: MLXArray, _ low: MLXArray, _ high: MLXArray, axis: Int = 0) -> MLXArray {
+        guard four.dtype == low.dtype, four.dtype == high.dtype, (0 ... 1).contains(axis),
+              four.ndim > axis, four.dim(axis) == 4, low.shape == high.shape, low.dim(axis) == 3
+        else { return MLXArray(false) }
+        let f = bits(four), l = bits(low), h = bits(high)
+        func take(_ a: MLXArray, _ r: Range<Int>) -> MLXArray { axis == 0 ? a[r] : a[0..., r] }
+        guard take(f, 0 ..< 3).shape == l.shape else { return MLXArray(false) }
+        return logicalAnd((take(f, 0 ..< 3) .== l).all(), (take(f, 3 ..< 4) .== take(h, 2 ..< 3)).all())
+    }
+
+    static func report(_ unit: String, _ message: String) {
+        FileHandle.standardError.write(Data("nemotron r4 \(unit): \(message)\n".utf8))
+    }
+
+    /// Load time, after the R = 3 tunes (`NemotronQMVTune`, `NemotronU2`): every four-row check, in order.
+    static func qualify(_ model: Module, head: Module) {
+        qualifyQMV(model, head: head)
+        qualifyAttention(model)
+        qualifyMoE(model)
+        qualifyQuadFC1(model)
+        qualifyInProj(model)
+        if let mixer = model.modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first {
+            qualifySSM(mixer)
+        }
+    }
+
+    /// The fused target Q/K/V at four rows (prepared launch; `NemotronTargetQKV.apply`), with and without
+    /// the in-place K/V write.
+    nonisolated(unsafe) static var qkv = false
+    static func qkvRows(_ r: Int) -> Bool { r == 3 || (r == 4 && qkv && qmv) }
+
+    /// Every attention layer's fused Q/K/V at four rows against the three-row launch on rows 0 ..< 3 and 1 ..< 4
+    /// (q, k, v), and its in-place K/V write on scratch caches: the returned q, k, v against the plain launch and
+    /// the four stored cache rows of each head against k and v, bit for bit, two seeded row sets per layer. Any
+    /// miss keeps four-row windows on the Q/K/V of the multi-row QMV.
+    static func qualifyAttention(_ model: Module) {
+        qkv = false
+        guard qmv, NemotronTargetQKV.preparedEnabled else { return report("qkv", "off (four-row prepared QMV off)") }
+        qkv = true
+        var ok = MLXArray(true)
+        var layers = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let a = module as? NemotronHAttention, a.numHeads == 32, a.numKeyValueHeads == 2,
+                          a.headDim == 128 else { continue }
+                    for seed in 0 ..< 2 {
+                        let x = (MLXRandom.normal([1, 4, 2688], key: MLXRandom.key(UInt64(0x7f00 + 2 * layers + seed)))
+                            * Float(seed == 0 ? 0.5 : 4)).asType(.bfloat16)
+                        func f(_ r: Range<Int>) -> (MLXArray, MLXArray, MLXArray)? {
+                            NemotronTargetQKV.apply(x[0..., r], query: a.wq, key: a.wk, value: a.wv, captureMTP: true)
+                        }
+                        let (capacity, offset) = (64, 21 + 13 * seed)
+                        let kc = MLXArray.zeros([1, 2, capacity, 128], dtype: .bfloat16)
+                        let vc = MLXArray.zeros([1, 2, capacity, 128], dtype: .bfloat16)
+                        eval(kc, vc)
+                        guard let full = f(0 ..< 4), let low = f(0 ..< 3), let high = f(1 ..< 4),
+                              let w = NemotronTargetQKV.applyWritingKV(
+                                  x, query: a.wq, key: a.wk, value: a.wv,
+                                  prepared: seed == 1 ? NemotronHeadPreparedActivation.pack(x.reshaped(4, 2688)) : nil,
+                                  kCache: kc, vCache: vc, offset: offset, capacity: capacity)
+                        else { ok = MLXArray(false); return }
+                        ok = ok .&& rowsMatch(full.0, low.0, high.0, axis: 1) .&& rowsMatch(full.1, low.1, high.1, axis: 1)
+                            .&& rowsMatch(full.2, low.2, high.2, axis: 1)
+                            .&& same(w.0, full.0) .&& same(w.1, full.1) .&& same(w.2, full.2)
+                        for (cache, rows) in [(kc, w.1), (vc, w.2)] {
+                            let stored = depends(input: cache[0..., 0..., offset ..< (offset + 4), 0...],
+                                                 dependencies: [w.0])
+                            ok = ok .&& same(stored, rows.reshaped(1, 4, 2, 128).transposed(0, 2, 1, 3))
+                        }
+                        eval(ok)
+                    }
+                    if layers == 0, let wo = a.wo as? QuantizedLinear {
+                        // o_proj through the prepared verify SDPA rows (`takePrepared`) against the re-prepared rows.
+                        let q = MLXRandom.normal([1, 4, 4096], key: MLXRandom.key(0x7f80)).asType(.bfloat16)
+                        let kv = MLXRandom.normal([2, 1, 2, 200, 128], key: MLXRandom.key(0x7f81)).asType(.bfloat16)
+                        let queries = q.reshaped(1, 4, 32, 128).transposed(0, 2, 1, 3)
+                        if let rows = NemotronMTPVerifySDPA.rows(queries, kv[0][.ellipsis, ..<161, 0...],
+                                                                 kv[1][.ellipsis, ..<161, 0...], a.scale) {
+                            let merged = concatenated(rows, axis: 2).transposed(0, 2, 1, 3).reshaped(1, 4, -1)
+                            ok = ok .&& same(NemotronMTPAttentionDirect.project(rows, wo),
+                                             nemotronMTPLinearRows(merged, wo))
+                            eval(ok)
+                        }
+                    }
+                    layers += 1
+                }
+            }
+        } catch {
+            qkv = false
+            return report("qkv", "off (\(error))")
+        }
+        qkv = layers > 0 && ok.item(Bool.self)
+        report("qkv", qkv ? "on (\(layers) layers x 2 row sets: q, k, v and the written cache rows bitwise equal)"
+               : "off (differs)")
+    }
+
+    /// Every Mamba layer's in_proj launch with the conv/timestep epilogue at four rows (the verify's
+    /// selection: dictionary, unroll, geometry, register epilogue), from the rows and from their prepared
+    /// activation, two seeded row sets and conv histories: the projection against the three-row launch on rows
+    /// 0 ..< 3 and 1 ..< 4, and the conv, padded history and timestep against the separate conv/timestep
+    /// launch on that projection, bit for bit. Any miss keeps four-row windows on in_proj + the separate launch.
+    static func qualifyInProj(_ model: Module) {
+        inProj = false
+        guard active, NemotronMambaInProjConvDt.enabled else { return report("inproj", "off (setting)") }
+        inProj = true
+        var ok = MLXArray(true)
+        var layers = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let mixer = module as? NemotronHMamba2Mixer, let q = mixer.inProj as? QuantizedLinear,
+                          let convBias = mixer.conv1d.bias else { continue }
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7c00 + 2 * layers + seed)), into: 2)
+                        let x = (MLXRandom.normal([4, 2688], key: keys[0]) * Float(seed == 0 ? 0.5 : 4))
+                            .asType(.bfloat16)
+                        let state = (MLXRandom.normal([1, 3, mixer.convDim], key: keys[1]) * 0.5).asType(.bfloat16)
+                        func run(_ r: Range<Int>) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray,
+                                                      dt: MLXArray)? {
+                            NemotronMambaInProjConvDt.apply(
+                                x[r], q, prepared: seed == 1 ? NemotronHeadPreparedActivation.pack(x[r]) : nil,
+                                oldState: state, convWeight: mixer.conv1d.weight, convBias: convBias,
+                                dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                convStart: mixer.intermediateSize, convDim: mixer.convDim, heads: mixer.numHeads)
+                        }
+                        guard let a = run(0 ..< 4), let b = run(0 ..< 3), let c = run(1 ..< 4) else {
+                            ok = MLXArray(false); return
+                        }
+                        ok = ok .&& rowsMatch(a.projected, b.projected, c.projected)
+                        let parts = split(a.projected.reshaped(1, 4, -1),
+                            indices: [mixer.intermediateSize, mixer.intermediateSize + mixer.convDim], axis: -1)
+                        let rawDt = parts[2].reshaped(1, 4, mixer.numHeads)
+                        let reference = mixer.packedConvDt(state, parts[1], rawDt) ?? {
+                            let (convolution, padded) = mixer.packedConv(state, parts[1])
+                            return (convolution, padded,
+                                    nemotronPrefillComputeDt(rawDt, mixer.dtBias, mixer.timeStepLimit))
+                        }()
+                        ok = ok .&& same(a.convolution, reference.0) .&& same(a.padded, reference.1)
+                            .&& same(a.dt, reference.2)
+                    }
+                    layers += 1
+                    eval(ok)
+                }
+            }
+        } catch {
+            inProj = false
+            return report("inproj", "off (\(error))")
+        }
+        inProj = layers > 0 && ok.item(Bool.self)
+        report("inproj", inProj ? "on (\(layers) layers x 2 row sets bitwise equal)" : "off (differs)")
+    }
+
+    /// The fused compact SSM + gated norm launch at a window of four with `mixer`'s parameters, for every
+    /// pending count 0 ... anchorAt + 3 (the most a four-row window folds; through maxSteps without the
+    /// anchor skip), two seeds: the normalized rows, prepared activation and final state against the separate
+    /// launches (the pending replay, the compact SSM over the window, the gated norm with its prepared output);
+    /// with the anchor skip qualified, also the no-store and anchor-store forms (normalized rows, prepared
+    /// activation, the stored state against the pending replay), at windows of three and four. Admitted only
+    /// if every case matches; then the pending fold's registration limit covers anchorAt + 3.
+    static func qualifySSM(_ mixer: NemotronHMamba2Mixer) {
+        ssm = false
+        guard active, NemotronHCompactSSMGated.enabled, NemotronHCompactSSMGated.counter != nil
+        else { return report("ssm", "off (fused launch off)") }
+        let (heads, dim, groups, stateDim) = (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        let anchor = NemotronMTPPendingSSM.anchorSkip
+        let top = anchor ? NemotronMTPPendingSSM.anchorAt + 3
+            : (NemotronMTPPendingSSM.enabled ? NemotronMTPPendingSSM.limit : 0)
+        let width = mixer.intermediateSize + mixer.convDim + heads
+        ssm = true
+        var ok = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for steps in 0 ... top {
+                    for seed in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7d00 + 16 * steps + seed)), into: 6)
+                        let scale = Float(1 + 3 * seed)
+                        let state = MLXRandom.normal([1, heads, dim, stateDim], key: keys[2]) * 0.1
+                        let tape: (conv: MLXArray, dt: MLXArray, steps: Int)? = steps == 0 ? nil : (
+                            (MLXRandom.normal([1, steps, mixer.convDim], key: keys[4]) * scale).asType(.bfloat16),
+                            MLXRandom.uniform(Float(0.001) ..< 0.2, [1, steps, heads], key: keys[5]), steps)
+                        let begin = tape.map {
+                            nemotronMTPSSMCompact(convolution: $0.conv, ALog: mixer.aLog, D: mixer.D, dt: $0.dt,
+                                state: state, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                                steps: $0.steps, writeOutput: false).finalState
+                        } ?? state
+                        for l in [3, 4] {
+                            let conv = (MLXRandom.normal([1, l, mixer.convDim], key: keys[0]) * scale).asType(.bfloat16)
+                            let dt = MLXRandom.uniform(Float(0.001) ..< 0.2, [1, l, heads], key: keys[1])
+                            let projected = (MLXRandom.normal([1, l, width], key: keys[3]) * scale).asType(.bfloat16)
+                            guard let record = mixer.norm.compactSSMPreparedRows(
+                                convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                                projected: projected, heads: heads, headDim: dim, groups: groups,
+                                stateDim: stateDim, pending: tape) else { ok = MLXArray(false); return }
+                            eval(record.0, record.1, record.2)
+                            if l == 4 {
+                                let window = nemotronMTPSSMCompact(
+                                    convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: begin,
+                                    heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
+                                    steps: 4, writeOutput: true)
+                                let y = window.output.reshaped(1, 4, heads * dim)
+                                let gate = projected[0..., 0..., 0 ..< mixer.intermediateSize]
+                                // Without four-row prepared QMVs nothing reads the prepared rows.
+                                if let pair = mixer.norm.preparedRows(y, gate: gate) {
+                                    ok = ok .&& same(record.0, pair.0) .&& same(record.1, pair.1)
+                                } else {
+                                    ok = ok .&& same(record.0, mixer.norm(y, gate: gate))
+                                }
+                                ok = ok .&& same(record.2, window.finalState)
+                            }
+                            if anchor, steps <= NemotronMTPPendingSSM.anchorAt + 3 {
+                                guard let none = mixer.norm.compactSSMAnchorRows(
+                                    convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                                    projected: projected, heads: heads, headDim: dim, groups: groups,
+                                    stateDim: stateDim, pending: tape, store: .none)
+                                else { ok = MLXArray(false); return }
+                                eval(none.0, none.1)
+                                ok = ok .&& same(record.0, none.0) .&& same(record.1, none.1)
+                                if tape != nil {
+                                    guard let stored = mixer.norm.compactSSMAnchorRows(
+                                        convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                                        projected: projected, heads: heads, headDim: dim, groups: groups,
+                                        stateDim: stateDim, pending: tape, store: .anchor), let after = stored.2
+                                    else { ok = MLXArray(false); return }
+                                    eval(stored.0, stored.1, after)
+                                    ok = ok .&& same(record.0, stored.0) .&& same(record.1, stored.1)
+                                        .&& same(after, begin)
+                                }
+                            }
+                            cases += 1
+                        }
+                        eval(ok)
+                    }
+                }
+            }
+        } catch {
+            ssm = false
+            return report("ssm", "off (\(error))")
+        }
+        ssm = ok.item(Bool.self)
+        if ssm, anchor { NemotronMTPPendingSSM.limit4 = top }
+        report("ssm", ssm ? "on (\(cases) cases, 0 ... \(top) pending steps: windows of four bitwise equal to the "
+               + "separate launches, anchor forms to the record)" : "off (differs)")
+    }
+
+    /// The four-row prepared QMV of every distinct target projection (K, N >= 2688, with and without a pair
+    /// dictionary) through the selection the verify takes, both ReLU2 forms (the head: plain), against the
+    /// three-row launch on rows 0 ..< 3 and 1 ..< 4, bit for bit; for K = 4096 also the prepared projection of
+    /// a packed activation and of the row-pointer prepare. Any miss or MLX error keeps four rows off the
+    /// prepared route.
+    static func qualifyQMV(_ model: Module, head: Module) {
+        qmv = false
+        guard active, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled
+        else { return report("qmv", "off (four-row joins or the multi-row QMV off)") }
+        var seen = Set<[Int]>()
+        var linears: [QuantizedLinear] = []
+        // The target's projections, then the MTP head's (its post-verify rows take the same route).
+        for (owner, module) in model.modules().map({ (0, $0) }) + head.modules().map({ (1, $0) }) {
+            guard let q = module as? QuantizedLinear, type(of: q) == QuantizedLinear.self,
+                  q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let b = q.biases,
+                  q.weight.ndim == 2, q.weight.dtype == .uint32, q.scales.dtype == .bfloat16, b.dtype == .bfloat16
+            else { continue }
+            let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+            let dict = NemotronSBDict.enabled && NemotronSBDict.dict(q) != nil
+            guard n >= 2688, n % 8 == 0, k % 64 == 0, k > 128, seen.insert([owner, k, n, dict ? 1 : 0]).inserted
+            else { continue }
+            linears.append(q)
+        }
+        qmv = true
+        var ok = MLXArray(true)
+        do {
+            try withError {
+                for (i, q) in linears.enumerated() {
+                    let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+                    let x = (MLXRandom.normal([4, k], key: MLXRandom.key(UInt64(0x7b00 + i))) * Float(i % 2 == 0 ? 0.5 : 3))
+                        .asType(.bfloat16)
+                    for relu2 in n == 131072 ? [false] : [false, true] {
+                        let rps = NemotronMultiRowQMV.headRPS(n: n)
+                        func f(_ r: Range<Int>) -> MLXArray {
+                            NemotronHeadPreparedActivation.apply(x[r], q, relu2: relu2, rps: rps)
+                        }
+                        ok = ok .&& rowsMatch(f(0 ..< 4), f(0 ..< 3), f(1 ..< 4))
+                    }
+                    if k == 4096 {
+                        func p(_ r: Range<Int>) -> MLXArray {
+                            NemotronHeadPreparedActivation.projectPrepared(NemotronHeadPreparedActivation.pack(x[r]), q)
+                        }
+                        ok = ok .&& rowsMatch(p(0 ..< 4), p(0 ..< 3), p(1 ..< 4))
+                        let rows = (0 ..< 4).map { x[$0 ..< ($0 + 1)].reshaped(1, 32, 1, 128) }
+                        func a(_ r: Range<Int>) -> MLXArray {
+                            NemotronHeadPreparedActivation.applyRows(Array(rows[r]), q)
+                        }
+                        ok = ok .&& rowsMatch(a(0 ..< 4), a(0 ..< 3), a(1 ..< 4))
+                    }
+                    eval(ok)
+                }
+                // The gated norm's prepared output (the unfused SSM route's out_proj activation).
+                if let mixer = model.modules().lazy.compactMap({ $0 as? NemotronHMamba2Mixer }).first {
+                    let keys = MLXRandom.split(key: MLXRandom.key(0x7b80), into: 2)
+                    let y = (MLXRandom.normal([1, 4, 4096], key: keys[0]) * 2).asType(.bfloat16)
+                    let gate = (MLXRandom.normal([1, 4, 4096], key: keys[1]) * 2).asType(.bfloat16)
+                    func g(_ r: Range<Int>) -> (MLXArray, MLXArray)? {
+                        mixer.norm.preparedRows(y[0..., r], gate: gate[0..., r])
+                    }
+                    if let a = g(0 ..< 4), let b = g(0 ..< 3), let c = g(1 ..< 4) {
+                        ok = ok .&& rowsMatch(a.0, b.0, c.0, axis: 1) .&& rowsMatch(a.1, b.1, c.1)
+                    }
+                    eval(ok)
+                }
+            }
+        } catch {
+            qmv = false
+            return report("qmv", "off (\(error))")
+        }
+        qmv = !linears.isEmpty && ok.item(Bool.self)
+        report("qmv", qmv ? "on (\(linears.count) projections: four-row rows bitwise equal to the three-row launches)"
+               : "off (a four-row prepared launch differs from the three-row launch)")
+    }
+
+    /// Load time: the four-row joins (plain, shared add, the zero-skip slot products) and the entry norm
+    /// against the three-row launches on rows 0 ..< 3 and 1 ..< 4 (residual, normalized rows, every written
+    /// prepared word), seeded rows on a real norm. Any miss or MLX error keeps four-row windows generic.
+    static func checkJoins(_ model: Module) {
+        guard enabled else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron r4 joins: \(message)\n".utf8))
+        }
+        guard NemotronHResidualRMSNorm.plumbingAvailable,
+              let norm = model.modules().compactMap({ $0 as? RMSNorm }).first(where: {
+                  type(of: $0) == RMSNorm.self && $0.weight.shape == [2688] && $0.weight.dtype == .bfloat16
+              }) else { active = false; return report("off (no plumbing)") }
+        active = true
+        var ok = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for seed in 0 ..< 3 {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x7a41 + seed)), into: 4)
+                    let lhs = (MLXRandom.normal([1, 4, 2688], key: keys[0]) * Float(1 + 3 * seed)).asType(.bfloat16)
+                    let rhs = MLXRandom.normal([1, 4, 2688], key: keys[1]).asType(.bfloat16)
+                    let shared = MLXRandom.normal([1, 4, 2688], scale: 0.1, key: keys[2]).asType(.bfloat16)
+                    var products = MLXRandom.normal([24 * 2688], scale: 0.05, key: keys[3])
+                    if seed == 1 {
+                        products = which(abs(products) .< MLXArray(Float(0.03)), MLXArray(Float(0)), products)
+                    }
+                    func rows(_ a: MLXArray, _ r: Range<Int>) -> MLXArray { a[0..., r, 0...] }
+                    func compare(_ f: (Range<Int>) -> (MLXArray, MLXArray, MLXArray)?) {
+                        guard let a = f(0 ..< 4), let b = f(0 ..< 3), let c = f(1 ..< 4) else {
+                            ok = MLXArray(false); return
+                        }
+                        ok = ok .&& rowsMatch(a.0, b.0, c.0, axis: 1) .&& rowsMatch(a.1, b.1, c.1, axis: 1)
+                            .&& rowsMatch(written(a.2), written(b.2), written(c.2))
+                        cases += 1
+                    }
+                    compare { NemotronHResidualRMSNorm.applyPreparedRows(rows(lhs, $0), rows(rhs, $0), norm: norm) }
+                    compare {
+                        NemotronHResidualRMSNorm.applyPreparedRows(
+                            rows(lhs, $0), rows(rhs, $0), shared: rows(shared, $0), norm: norm)
+                    }
+                    compare { r in
+                        NemotronHResidualRMSNorm.applyPreparedRows(
+                            rows(lhs, r), products[(6 * r.lowerBound * 2688) ..< (6 * r.upperBound * 2688)],
+                            shared: rows(shared, r), norm: norm)
+                    }
+                    compare { r in
+                        NemotronHResidualRMSNorm.normPreparedRows(rows(lhs, r), norm: norm).map { (rows(lhs, r), $0.0, $0.1) }
+                    }
+                }
+                eval(ok)
+            }
+        } catch {
+            active = false
+            return report("off (\(error))")
+        }
+        active = ok.item(Bool.self)
+        report(active ? "on (\(cases) cases: four-row rows bitwise equal to the three-row launches)"
+               : "off (a four-row join differs from the three-row launch)")
+    }
+
+    /// NEMOTRON_DIAG_R4=1: stderr counts of the routes the four-row verify took (graph build; a compiled
+    /// graph counts once per trace), after the first four-row verify and at exit.
+    static let diag = ProcessInfo.processInfo.environment["NEMOTRON_DIAG_R4"] == "1"
+    /// NEMOTRON_MTP_WARMUP_R4=0: the load-time warm-up runs no four-row verify rounds. Otherwise, once the
+    /// four-row joins qualified, it adds depth-3 rounds (steered over every anchor-skip pending count) after the
+    /// depth-2 ones, so the four-row compiled graphs and pipelines exist before any timed window.
+    static let warmRequested = ProcessInfo.processInfo.environment["NEMOTRON_MTP_WARMUP_R4"] != "0"
+    /// Counting starts after the load (its checks and warm-ups also build four-row launches).
+    nonisolated(unsafe) static var loaded = false
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var counts: [String: (fused: Int, generic: Int)] = [:]
+    nonisolated(unsafe) private static var verifies = 0
+    static func note(_ key: String, _ fused: Bool, rows: Int = 4) {
+        guard diag, loaded, rows == 4 else { return }
+        lock.withLock {
+            var c = counts[key] ?? (0, 0)
+            if fused { c.fused += 1 } else { c.generic += 1 }
+            counts[key] = c
+        }
+    }
+    static func verified(rows: Int) {
+        guard diag, loaded, rows == 4 else { return }
+        let first = lock.withLock { () -> Bool in verifies += 1; return verifies == 1 }
+        guard first else { return }
+        report("after the first R=4 verify")
+        atexit { NemotronR4.report("at exit") }
+    }
+    static func report(_ when: String) {
+        let text = lock.withLock {
+            "\(verifies) R=4 verifies; " + counts.keys.sorted().map {
+                "\($0) fused \(counts[$0]!.fused) generic \(counts[$0]!.generic)"
+            }.joined(separator: "; ")
+        }
+        FileHandle.standardError.write(Data("nemotron r4 diag (\(when)): \(text)\n".utf8))
+    }
+}
+
 /// NEMOTRON_MTP_SSM_PENDING_FOLD: a strict-prefix commit replays every Mamba
 /// layer's SSM state over the accepted steps, and the grouped replay reads and
 /// writes each layer's FP32 state. The replayed state is an array the commit
@@ -37,12 +492,14 @@ final class NemotronMTPPendingSSM {
     static let anchorRequested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_SKIP"] != "0"
     /// A window launch with at least this many pending steps stores the state after them
-    /// (NEMOTRON_MTP_SSM_ANCHOR_AT, 1 ... maxSteps - 2).
+    /// (NEMOTRON_MTP_SSM_ANCHOR_AT, 1 ... maxSteps - 3: a four-row window folds up to anchorAt + 3).
     static let anchorAt = min(max(Int(
-        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_AT"] ?? "") ?? 6, 1), maxSteps - 2)
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_AT"] ?? "") ?? 6, 1), maxSteps - 3)
     nonisolated(unsafe) static var qualified = false
     nonisolated(unsafe) static var anchorQualified = false
     nonisolated(unsafe) static var limit = 0
+    /// The registration limit four-row windows need (anchorAt + 3 with the anchor skip; `NemotronR4.qualifySSM`).
+    nonisolated(unsafe) static var limit4 = 0
     static var enabled: Bool { requested && qualified }
     static var anchorSkip: Bool { enabled && anchorRequested && anchorQualified }
 
@@ -59,7 +516,7 @@ final class NemotronMTPPendingSSM {
 
     /// `state` is the replay of `pending.steps` steps of `pending` from its anchor.
     static func register(_ state: MLXArray, _ pending: Pending) {
-        guard enabled, (1 ... limit).contains(pending.steps) else { return }
+        guard enabled, (1 ... max(limit, limit4)).contains(pending.steps) else { return }
         lock.withLock {
             entries = entries.filter { $0.value.state != nil }
             entries[ObjectIdentifier(state)] = Entry(state, pending)
@@ -265,17 +722,18 @@ enum NemotronMTPSSMAnchor {
     /// Warm-up: the acceptance length for the round after one whose windows folded `pending` steps and
     /// committed `keep`, so that the anchor-skip windows reach every pending count 0 ... anchorAt + 2
     /// (the first step of a shortest path to a count not yet in `seen`); nil once every count was reached.
-    static func warmKeep(pending: Int, keep: Int, seen: inout Set<Int>) -> Int? {
+    /// `width`: the window (3, or 4 for the four-row windows, which reach 0 ... anchorAt + 3).
+    static func warmKeep(pending: Int, keep: Int, seen: inout Set<Int>, width: Int = 3) -> Int? {
         let at = NemotronMTPPendingSSM.anchorAt
         func after(_ count: Int, _ keep: Int) -> Int { (count >= at ? 0 : count) + keep }
         seen.insert(pending)
         let next = after(pending, keep)
         let missing = !seen.contains(next)
         seen.insert(next)
-        guard missing || seen.count < at + 3 else { return nil }
+        guard missing || seen.count < at + width else { return nil }
         var first: [Int: Int] = [:]
         var queue: [Int] = []
-        for keep in 1 ... 3 where first[after(next, keep)] == nil {
+        for keep in 1 ... width where first[after(next, keep)] == nil {
             first[after(next, keep)] = keep
             queue.append(after(next, keep))
         }
@@ -284,7 +742,7 @@ enum NemotronMTPSSMAnchor {
             let count = queue[index]
             index += 1
             if !seen.contains(count) { return first[count] }
-            for keep in 1 ... 3 where first[after(count, keep)] == nil {
+            for keep in 1 ... width where first[after(count, keep)] == nil {
                 first[after(count, keep)] = first[count]
                 queue.append(after(count, keep))
             }
@@ -471,10 +929,11 @@ extension NemotronHRMSNormGated {
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               type(of: self) == NemotronHRMSNormGated.self,
               groupSize == 512, heads == 64, headDim == 64, groups == 8, stateDim == 128,
-              convolution.shape == [1, 3, 6144], convolution.dtype == .bfloat16,
-              dt.dtype == .float32, dt.shape == [1, 3, 64],
+              convolution.ndim == 3, case let l = convolution.dim(1), NemotronR4.ssmRows(l),
+              convolution.shape == [1, l, 6144], convolution.dtype == .bfloat16,
+              dt.dtype == .float32, dt.shape == [1, l, 64],
               state.dtype == .float32, state.shape == [1, 64, 64, 128],
-              projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
+              projected.shape == [1, l, 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16,
               let counter = NemotronHCompactSSMGated.counter,
               let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store)
@@ -483,7 +942,7 @@ extension NemotronHRMSNormGated {
             convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity, eps, counter]
         var template: [(String, any KernelTemplateArg)] = [
             ("T", DType.bfloat16), ("U", DType.float32),
-            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", 3),
+            ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", l),
             ("CD", 6144), ("BO", 4096), ("CO", 5120), ("PS", 10304)]
         if let pending {
             inputs += [pending.conv, pending.dt]
@@ -493,7 +952,7 @@ extension NemotronHRMSNormGated {
         let outputs = kernel(
             inputs, template: template,
             grid: (32, 64, 64), threadGroup: (32, 8, 1),
-            outputShapes: [[1, 3, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, 3, 4096], [3, 8, 17 * 32]],
+            outputShapes: [[1, l, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, l, 4096], [l, 8, 17 * 32]],
             outputDTypes: [.bfloat16] + (stores ? [.float32] : []) + [.bfloat16, .float32])
         return stores ? (outputs[2], outputs[3], outputs[1]) : (outputs[1], outputs[2], nil)
     }
@@ -523,8 +982,8 @@ final class NemotronH35MTPCompactGraphCache {
     func supportsJoined(_ hidden: MLXArray, owner: NemotronHMamba2Mixer) -> Bool {
         Self.enabled && NemotronMTPExecution.batchedM1 && NemotronMTPExecution.batchedNorm
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
-            && hidden.shape == [1, 3, 2688] && hidden.dtype == .bfloat16
-            && Self.nativeIdentity(owner) != nil
+            && hidden.ndim == 3 && hidden.dim(0) == 1 && NemotronR4.rows(hidden.dim(1)) && hidden.dim(2) == 2688
+            && hidden.dtype == .bfloat16 && Self.nativeIdentity(owner) != nil
     }
 
     func callAsFunction(
@@ -638,8 +1097,8 @@ final class NemotronH35MTPCompactGraphCache {
                 precondition((result[index].view(dtype: dtype) .== expected[index].view(dtype: dtype))
                     .all().item(Bool.self), "Mamba compiled join output/tape bit mismatch")
             }
-            let got = result[6].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
-            let want = expected[6].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+            let got = result[6].reshaped([hidden.dim(1), 11, 9, 32]).view(dtype: .uint32)
+            let want = expected[6].reshaped([hidden.dim(1), 11, 9, 32]).view(dtype: .uint32)
             precondition(MLX.logicalAnd(
                 (got[0..., 0..<10, 0..., 0...] .== want[0..., 0..<10, 0..., 0...]).all(),
                 (got[0..., 10, 0..., 0..<16] .== want[0..., 10, 0..., 0..<16]).all()).item(Bool.self),
@@ -706,7 +1165,11 @@ extension NemotronHMamba2Mixer {
               NemotronHResidualRMSNorm.plumbingAvailable,
               residual.shape == hidden.shape, residual.dtype == .bfloat16,
               type(of: nextNorm) == RMSNorm.self,
-              nextNorm.weight.shape == [2688], nextNorm.weight.dtype == .bfloat16 else { return nil }
+              nextNorm.weight.shape == [2688], nextNorm.weight.dtype == .bfloat16 else {
+            NemotronR4.note("mamba.joined", false, rows: hidden.dim(1))
+            return nil
+        }
+        NemotronR4.note("mamba.joined", true, rows: hidden.dim(1))
         let evaluation = recurrentState[0]
         let initial = evaluation.inputState(modelLayerIndex: modelLayerIndex)
         let conv = initial?.conv ?? MLXArray.zeros([1, 3, 6144], dtype: hidden.dtype)
@@ -756,11 +1219,11 @@ extension NemotronHMamba2Mixer {
         let length = hiddenStates.dim(1)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: a committed strict-prefix replay
         // arrives as its anchor and tape; the window's fused launch runs it.
-        let pending = length == 3 ? NemotronMTPPendingSSM.take(initialSSM) : nil
+        let pending = NemotronR4.ssmRows(length) ? NemotronMTPPendingSSM.take(initialSSM) : nil
         let start = pending?.anchor ?? initialSSM
         // NEMOTRON_MTP_SSM_ANCHOR_SKIP: no state store after the window; the state after the pending
         // steps is stored once they reach anchorAt (see NemotronMTPSSMAnchor).
-        let anchorSkip = length == 3 && NemotronMTPPendingSSM.anchorSkip
+        let anchorSkip = NemotronR4.ssmRows(length) && NemotronMTPPendingSSM.anchorSkip
         let writes = anchorSkip && (pending?.steps ?? 0) >= NemotronMTPPendingSSM.anchorAt
         let arrays = mtpCompactGraphCache(
             hiddenStates, convState: convState, initialSSM: start, prepared: prepared,
@@ -920,6 +1383,7 @@ extension NemotronHMamba2Mixer {
                 return (convolution, padded, nemotronPrefillComputeDt(rawDt, dtBias, timeStepLimit))
             }()
         }
+        NemotronR4.note("mamba.inproj", fusedWindow != nil, rows: length)
         var (convolution, padded, dt) = fusedWindow ?? separateWindow()
         if fusedWindow != nil, NemotronMambaInProjConvDt.check {
             let reference = separateWindow()
@@ -951,13 +1415,14 @@ extension NemotronHMamba2Mixer {
         // and out_proj's prepared activation in one launch (see
         // NemotronHCompactSSMGated); the same normed rows, prepared activation
         // and final state as the two launches below.
-        if length == 3, NemotronMTPExecution.batchedNorm,
+        if NemotronR4.ssmRows(length), NemotronMTPExecution.batchedNorm,
            let q = outProj as? QuantizedLinear, q.mode == .affine,
            q.bits == 4, q.groupSize == 64, q.bias == nil,
            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
            q.scales.shape == [2688, 64], q.scales.dtype == .bfloat16,
            q.biases?.shape == [2688, 64], q.biases?.dtype == .bfloat16,
            var fused = fusedRows() {
+            NemotronR4.note("mamba.ssm", true, rows: length)
             if NemotronMoELeader.selfTest {
                 // Reference: the two launches (compact SSM, then the gated
                 // norm with the prepared output) on the same operands.
@@ -977,6 +1442,7 @@ extension NemotronHMamba2Mixer {
             return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
                     padded, convolution, dt, fused.2]
         }
+        NemotronR4.note("mamba.ssm", false, rows: length)
         let begin = replayedPending(pending, initialSSM)
         let result = nemotronMTPSSMCompact(
             convolution: convolution, ALog: logA, D: skip, dt: dt,
@@ -1099,8 +1565,11 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
             tokens, caches: caches, recurrentState: recurrentState) {
             let output = lmHead.map { nemotronMTPHeadRows(fused.hidden, $0, prepared: fused.prepared) }
                 ?? nemotronMTPMapRows(fused.hidden) { logits($0) }
+            NemotronR4.note("verify.window", true, rows: tokens.dim(1))
+            NemotronR4.verified(rows: tokens.dim(1))
             return (output, fused.hidden)
         }
+        NemotronR4.note("verify.window", false, rows: tokens.dim(1))
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState, captureMTP: true)
         let output = lmHead.map { nemotronMTPHeadRows(hidden, $0) }
             ?? nemotronMTPMapRows(hidden) { logits($0) }
