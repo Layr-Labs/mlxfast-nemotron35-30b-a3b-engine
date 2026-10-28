@@ -6,6 +6,119 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Copy both accepted pending tapes in one launch. These arrays are dynamic
+/// graph inputs; this helper retains only qualified geometry, never request data.
+enum NemotronMTPPendingTapeAppend {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_MTP_PENDING_TAPE_APPEND"] != "0"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var attempted: Set<String> = []
+    nonisolated(unsafe) private static var qualified: Set<String> = []
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_mtp_pending_conv_dt_append_bits",
+        inputNames: ["old_conv", "old_dt", "conv", "dt"],
+        outputNames: ["tape_conv", "tape_dt"],
+        source: """
+          const uint i = thread_position_in_grid.x;
+          // Explicit integer transfers preserve NaN payloads and signed zero.
+          const device ushort* pc = reinterpret_cast<const device ushort*>(old_conv);
+          const device ushort* nc = reinterpret_cast<const device ushort*>(conv);
+          device ushort* oc = reinterpret_cast<device ushort*>(tape_conv);
+          const device uint* pd = reinterpret_cast<const device uint*>(old_dt);
+          const device uint* nd = reinterpret_cast<const device uint*>(dt);
+          device uint* od = reinterpret_cast<device uint*>(tape_dt);
+          if (i < uint((P + A) * C)) {
+            oc[i] = i < uint(P * C) ? pc[i] : nc[i - uint(P * C)];
+          }
+          if (i < uint((P + A) * H)) {
+            od[i] = i < uint(P * H) ? pd[i] : nd[i - uint(P * H)];
+          }
+          """,
+        ensureRowContiguous: true)
+
+    static func apply(
+        _ oldConv: MLXArray, _ oldDt: MLXArray, convolution: MLXArray, dt: MLXArray,
+        steps: Int, keep: Int, force: Bool = false
+    ) -> (conv: MLXArray, dt: MLXArray)? {
+        guard requested, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu,
+              (1 ... NemotronMTPPendingSSM.maxSteps).contains(steps), (1 ... 2).contains(keep),
+              convolution.ndim == 3, dt.ndim == 3,
+              convolution.dim(0) == 1, convolution.dim(1) == 3,
+              dt.dim(0) == 1, dt.dim(1) == 3,
+              convolution.dtype == .bfloat16, oldConv.dtype == .bfloat16,
+              dt.dtype == .float32, oldDt.dtype == .float32
+        else { return nil }
+        let c = convolution.dim(2), h = dt.dim(2)
+        guard c > 0, h > 0, h <= c,
+              oldConv.shape == [1, steps, c], oldDt.shape == [1, steps, h],
+              force || lock.withLock({ qualified.contains("\(c):\(h)") })
+        else { return nil }
+        let total = steps + keep
+        let outputs = kernel([oldConv, oldDt, convolution, dt],
+            template: [("P", steps), ("A", keep), ("C", c), ("H", h)],
+            grid: (total * c, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[1, total, c], [1, total, h]],
+            outputDTypes: [.bfloat16, .float32])
+        return (outputs[0], outputs[1])
+    }
+
+    /// Official-remote load admission only. Exercise every pending/accepted
+    /// length, both ordinary and strided operands, and arbitrary raw bit patterns.
+    static func qualify(_ mixer: NemotronHMamba2Mixer) {
+        guard requested, NemotronMTPPendingSSM.enabled, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu else { return }
+        let c = mixer.convDim, h = mixer.numHeads, key = "\(c):\(h)"
+        guard c > 0, h > 0, h <= c,
+              lock.withLock({ attempted.insert(key).inserted }) else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron pending tape append: \(message)\n".utf8))
+        }
+        func bits(_ rows: Int, _ width: Int, wide: Bool, seed: UInt32, strided: Bool) -> MLXArray {
+            let storageWidth = width + (strided ? 2 : 0)
+            let count = rows * storageWidth
+            let storage: MLXArray
+            if wide {
+                let words = (0 ..< count).map { UInt32(truncatingIfNeeded: $0) &* 2654435761 &+ seed }
+                storage = MLXArray(words, [1, rows, storageWidth]).view(dtype: .float32)
+            } else {
+                let words = (0 ..< count).map { UInt16(truncatingIfNeeded: UInt32(truncatingIfNeeded: $0) &* 40503 &+ seed) }
+                storage = MLXArray(words, [1, rows, storageWidth]).view(dtype: .bfloat16)
+            }
+            return strided ? storage[0..., 0..., 1 ..< (width + 1)] : storage
+        }
+        var cases = 0
+        do {
+            let matched = try withError { () -> Bool in
+                for steps in 1 ... NemotronMTPPendingSSM.maxSteps {
+                    for keep in 1 ... 2 {
+                        for strided in [false, true] {
+                            for seed in [UInt32(0), UInt32(0x8000_0000), UInt32(0x7fc0_8000)] {
+                                let pc = bits(steps, c, wide: false, seed: seed, strided: strided)
+                                let pd = bits(steps, h, wide: true, seed: seed, strided: strided)
+                                let nc = bits(3, c, wide: false, seed: seed &+ 31, strided: strided)
+                                let nd = bits(3, h, wide: true, seed: seed &+ 79, strided: strided)
+                                guard let actual = apply(pc, pd, convolution: nc, dt: nd,
+                                                         steps: steps, keep: keep, force: true) else { return false }
+                                let expectedConv = concatenated([pc, nc[0..., ..<keep, 0...]], axis: 1)
+                                let expectedDt = concatenated([pd, nd[0..., ..<keep, 0...]], axis: 1)
+                                let same = (actual.conv.view(dtype: .uint16) .== expectedConv.view(dtype: .uint16)).all()
+                                    .&& (actual.dt.view(dtype: .uint32) .== expectedDt.view(dtype: .uint32)).all()
+                                guard same.item(Bool.self) else { return false }
+                                cases += 1
+                            }
+                        }
+                    }
+                }
+                return true
+            }
+            if matched { lock.withLock { _ = qualified.insert(key) } }
+            report(matched ? "on (\(key), \(cases) bitwise cases)" : "off (\(key), mismatch after \(cases) cases)")
+        } catch {
+            report("off (\(key), \(error))")
+        }
+    }
+}
+
 /// NEMOTRON_MTP_SSM_PENDING_FOLD: a strict-prefix commit replays every Mamba
 /// layer's SSM state over the accepted steps, and the grouped replay reads and
 /// writes each layer's FP32 state. The replayed state is an array the commit
@@ -406,8 +519,13 @@ extension NemotronHMamba2Mixer {
                         // The window started `pending.steps` steps past the
                         // anchor: replay those and the accepted ones from it.
                         let steps = pending.steps + keep
-                        let tapeConv = concatenated([pending.conv, convolution[0..., ..<keep, 0...]], axis: 1)
-                        let tapeDt = concatenated([pending.dt, dt[0..., ..<keep, 0...]], axis: 1)
+                        let appended = NemotronMTPPendingTapeAppend.apply(
+                            pending.conv, pending.dt, convolution: convolution, dt: dt,
+                            steps: pending.steps, keep: keep)
+                        let tapeConv = appended?.conv
+                            ?? concatenated([pending.conv, convolution[0..., ..<keep, 0...]], axis: 1)
+                        let tapeDt = appended?.dt
+                            ?? concatenated([pending.dt, dt[0..., ..<keep, 0...]], axis: 1)
                         ssm = nemotronMTPSSMCompact(
                             convolution: tapeConv, ALog: logA, D: skip, dt: tapeDt,
                             state: pending.anchor, heads: heads, headDim: dim, groups: groups,
@@ -672,6 +790,7 @@ extension NemotronH35Model {
         NemotronHCompactSSMGated.qualifyRowsTail(mixer)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: compiles and checks every folded launch.
         NemotronMTPPendingSSM.qualify(mixer)
+        NemotronMTPPendingTapeAppend.qualify(mixer)
         for width in 2...8 {
             let padded = MLXArray.zeros([1, history + width, mixer.convDim], dtype: activationDType)
             let convolution = silu(mixer.conv1d(padded))
