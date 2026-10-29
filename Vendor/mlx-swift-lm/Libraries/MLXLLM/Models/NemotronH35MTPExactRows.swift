@@ -400,6 +400,157 @@ func nemotronPreparedVariantSource(_ base: String, load: Int, nsg: Bool) -> Stri
     return s
 }
 
+/// A prepared QMV body (crown or HF decode, any load form, NSG, unroll, pair-dictionary or BF16 form, the in_proj
+/// epilogues included) with fewer values live across its main K loop (NEMOTRON_QMV_LEAN): each lane reads its code
+/// words and its pair-index (or scale and bias) words through the arrays' base pointers plus 32-bit element offsets,
+/// `nlw` (the record's `ws` less `w`: `out_row * K / 2 + simd_lid * packs_per_thread * 4`) and `nls` (the record's
+/// `sc` less `scales`: `out_row * K / 64 + simd_lid / scale_step_per_thread`), each stepped by the record's block
+/// step, where the record steps 64-bit pointers `ws`, `sc` and `bs` (`bs` reads the same words as `sc`, from
+/// `scales` in the dictionary form or `biases`). Every element a lane reads lies below N x K / 2 bytes (2^28 for
+/// the 131,072-row head), so every load reads the record's address; every statement, decode, product, order,
+/// affine close, closing simd_sum and store is the record's. nil unless every replaced statement occurs as expected.
+func nemotronQMVLeanSource(_ source: String?) -> String? {
+    guard var s = source else { return nil }
+    func swap(_ old: String, _ new: String, _ count: Int = 1) -> Bool {
+        guard s.components(separatedBy: old).count == count + 1 else { return false }
+        s = s.replacingOccurrences(of: old, with: new)
+        return true
+    }
+    let offset = "  uint nls = uint(out_row * in_vec_size_g + simd_lid / scale_step_per_thread);\n"
+    let streams = { (type: String, second: String) in
+        "  const device \(type)* sc = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+            + "  const device \(type)* bs = \(second) + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+    }
+    guard swap("  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;\n",
+               "  uint nlw = uint(out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack);\n"),
+          swap(streams("uint16_t", "scales"),
+               "  const device uint16_t* sc = scales;\n  const device uint16_t* bs = scales;\n" + offset)
+              || swap(streams("T", "biases"),
+                      "  const device T* sc = scales;\n  const device T* bs = biases;\n" + offset),
+          swap("    ws += block_size * bytes_per_pack / pack_factor;\n",
+               "    nlw += block_size * bytes_per_pack / pack_factor;\n"),
+          swap("    sc += block_size / group_size;\n", "    nls += block_size / group_size;\n"),
+          swap("    bs += block_size / group_size;\n", "")
+    else { return nil }
+    var uses = 0
+    for (old, new) in [
+        ("(ws + row * in_vec_size_w)", "(ws + (nlw + uint(row * in_vec_size_w)))"),
+        ("(ws + row * in_vec_size_w, ", "(ws + (nlw + uint(row * in_vec_size_w)), "),
+        ("(ws + block_size * bytes_per_pack / pack_factor + row * in_vec_size_w, ",
+         "(ws + (nlw + uint(block_size * bytes_per_pack / pack_factor + row * in_vec_size_w)), "),
+        ("sc + row * in_vec_size_g;", "sc + (nls + uint(row * in_vec_size_g));"),
+        ("bs + row * in_vec_size_g;", "bs + (nls + uint(row * in_vec_size_g));"),
+        ("sc[row * in_vec_size_g]", "sc[nls + uint(row * in_vec_size_g)]"),
+        ("bs[row * in_vec_size_g]", "bs[nls + uint(row * in_vec_size_g)]"),
+        ("sc[block_size / group_size + row * in_vec_size_g]",
+         "sc[nls + uint(block_size / group_size + row * in_vec_size_g)]"),
+        ("bs[block_size / group_size + row * in_vec_size_g]",
+         "bs[nls + uint(block_size / group_size + row * in_vec_size_g)]"),
+    ] {
+        uses += s.components(separatedBy: old).count - 1
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    guard uses > 0, ![" ws +=", " sc +=", " bs +=", "(ws + row", "(ws + block", "sc + row", "bs + row", "sc[row",
+                      "bs[row", "sc[block", "bs[block"].contains(where: { s.contains($0) })
+    else { return nil }
+    return s
+}
+
+/// The lean prepared QMV bodies (`nemotronQMVLeanSource`) for the R = 3 pair-dictionary launches: every prepared
+/// launch through `NemotronHeadPreparedActivation.dictLaunch` (out_proj, o_proj, the shared up, the target head) and
+/// the Mamba in_proj's dictionary launches (record or 32-bit epilogue, record or unrolled loop), and the rows
+/// `NemotronQMVTune` builds from them. NEMOTRON_QMV_LEAN=0 keeps the record bodies.
+enum NemotronQMVLean {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_QMV_LEAN"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+    static var active: Bool { requested && verified }
+
+    /// Load time, after `NemotronMambaInProjConvDt.qualifyRegs` and before `NemotronQMVTune.tune`: every lean twin
+    /// against the launch it replaces, bit for bit, on the real weights of every 4-bit projection with a pair
+    /// dictionary (every Mamba in_proj with its conv, conv bias, timestep bias and limits, all four outputs; every
+    /// other projection through the prepared dictionary launch, ReLU2 off and on): rows at two scales and rows
+    /// carrying infinities, NaNs, -0, tiny and large values. Any miss, missing twin or error keeps the record
+    /// bodies. One stderr line.
+    static func qualify(_ model: Module) {
+        verified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron qmv lean: \(message)\n".utf8))
+        }
+        guard requested else { return report("off (setting)") }
+        guard NemotronSBDict.enabled else { return report("off (no pair dictionaries)") }
+        func rows(_ k: Int, _ seed: Int) -> [MLXArray] {
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x9e30 + seed)), into: 3)
+            let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+            let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+            var special = MLXRandom.normal([3, k], key: keys[2]) * 2
+            for (r, c, v) in [(0, 3, Float.infinity), (1, k / 3, -.infinity), (2, k / 2, .nan), (0, k - 1, -0.0),
+                              (1, 70, 1e-38), (2, k - 9, 3e38), (0, k / 4, -3e38), (1, k - 64, -1e-38)] {
+                special = which((row .== MLXArray(Int32(r))) .&& (column .== MLXArray(Int32(c))), MLXArray(v), special)
+            }
+            return [MLXRandom.normal([3, k], key: keys[0]) * 0.5, MLXRandom.normal([3, k], key: keys[1]) * 8, special]
+                .map { $0.asType(.bfloat16) }
+        }
+        func equal(_ a: MLXArray, _ b: MLXArray) -> MLXArray {
+            a.dtype == .float32 ? (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                : (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+        }
+        var same = MLXArray(true)
+        var inProj = 0, prepared = 0, cases = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    if let mixer = module as? NemotronHMamba2Mixer, let q = mixer.inProj as? QuantizedLinear,
+                       let convBias = mixer.conv1d.bias, NemotronSBDict.dict(q) != nil {
+                        for (i, x) in rows(2688, inProj).enumerated() {
+                            let state = (MLXRandom.normal([1, 3, mixer.convDim], key: MLXRandom.key(UInt64(0x9e50 + i)))
+                                * 0.5).asType(.bfloat16)
+                            func run(_ on: Bool) -> [MLXArray]? {
+                                NemotronMambaInProjConvDt.apply(
+                                    x, q, prepared: nil, oldState: state, convWeight: mixer.conv1d.weight,
+                                    convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                    convStart: mixer.intermediateSize, convDim: mixer.convDim, heads: mixer.numHeads,
+                                    lean: on)
+                                    .map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                            }
+                            guard let a = run(false), let b = run(true) else { same = MLXArray(false); continue }
+                            for (u, v) in zip(a, b) { same = logicalAnd(same, equal(u, v)) }
+                            cases += 1
+                        }
+                        inProj += 1
+                    } else if let q = module as? QuantizedLinear, type(of: q) == QuantizedLinear.self, q.bias == nil,
+                              q.mode == .affine, q.bits == 4, q.groupSize == 64, NemotronSBDict.dict(q) != nil {
+                        let k = q.weight.dim(1) * 8, n = q.weight.dim(0)
+                        guard NemotronHeadPreparedActivation.dictLaunchAvailable(k: k, n: n) else { continue }
+                        guard NemotronHeadPreparedActivation.dictLaunchAvailable(k: k, n: n, lean: true) else {
+                            same = MLXArray(false); continue
+                        }
+                        let rps = n == 131072 ? NemotronMultiRowQMV.headRPS(n: n) : 2
+                        for x in rows(k, 16 + prepared) {
+                            for relu2 in [false, true] {
+                                let a = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2, rps: rps, lean: false)
+                                let b = NemotronHeadPreparedActivation.apply(x, q, relu2: relu2, rps: rps, lean: true)
+                                same = logicalAnd(same, equal(a, b))
+                                cases += 1
+                            }
+                        }
+                        prepared += 1
+                    }
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        guard inProj + prepared > 0, same.item(Bool.self) else {
+            return report(inProj + prepared > 0 ? "off (differs from the record bodies)" : "off (no launch ran)")
+        }
+        verified = true
+        report("on (\(cases) cases bitwise equal to the record bodies: \(inProj) Mamba in_proj launches and "
+            + "\(prepared) prepared dictionary projections on their real weights; rows with infinities, NaNs, -0, tiny "
+            + "and large values; ReLU2 off and on)")
+    }
+}
+
 private let nemotronMultiRowQMVCrownSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;
@@ -1114,6 +1265,31 @@ enum NemotronMambaInProjConvDt {
     private static var epilogue32Available: Bool {
         kernel32 != nil && dictKernel32 != nil && kernelU2_32 != nil && dictKernelU2_32 != nil
     }
+    /// The four dictionary launches above (record and 32-bit epilogue, record and unrolled loop) with the projection
+    /// body through `nemotronQMVLeanSource` (NEMOTRON_QMV_LEAN), each launched as the launch it replaces.
+    private static func leanKernel(_ name: String, _ source: String?, contiguous: Bool) -> MLXFast.MLXFastKernel? {
+        nemotronQMVLeanSource(source).map {
+            MLXFast.metalKernel(
+                name: name,
+                inputNames: ["w", "scales", "biases", "prepared", "K", "N",
+                             "oldState", "cw", "cb", "dtBias", "dtLo", "dtHi"],
+                outputNames: ["y", "conv", "padded", "dt"],
+                source: $0, header: nemotronMultiRowQMVHeader, ensureRowContiguous: contiguous)
+        }
+    }
+    private static let dictKernelLN = leanKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_ln",
+        nemotronSBDictSource(nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue), contiguous: false)
+    private static let dictKernelU2LN = leanKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_u2_ln",
+        nemotronU2Source(nemotronSBDictSource(nemotronHeadPreparedQMVSource + nemotronMambaInProjConvDtEpilogue),
+                         loop: NemotronU2.qmvLoop, count: 1), contiguous: false)
+    private static let dictKernel32LN = leanKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_e32_ln", source32.flatMap { nemotronSBDictSource($0) }, contiguous: true)
+    private static let dictKernelU2_32LN = leanKernel(
+        "nemotron_mamba_in_proj_conv_dt_sbd_u2_e32_ln",
+        nemotronU2Source(source32.flatMap { nemotronSBDictSource($0) }, loop: NemotronU2.qmvLoop, count: 1),
+        contiguous: true)
 
     /// NEMOTRON_MTP_INPROJ_EPILOGUE_REGS=0 keeps the epilogue that reads the
     /// stored outputs back behind a device fence (see `nemotronInProjRegsSource`).
@@ -1159,7 +1335,7 @@ enum NemotronMambaInProjConvDt {
         oldState: MLXArray, convWeight: MLXArray, convBias: MLXArray,
         dtBias: MLXArray, timeStepLimit: (Float, Float),
         convStart: Int, convDim: Int, heads: Int, sbDict: Bool = true, u2: Bool? = nil, regs: Bool? = nil,
-        epilogue32: Bool? = nil, qmvTune: NemotronQMVTune.Config? = nil
+        epilogue32: Bool? = nil, qmvTune: NemotronQMVTune.Config? = nil, lean: Bool? = nil
     ) -> (projected: MLXArray, convolution: MLXArray, padded: MLXArray, dt: MLXArray)? {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         guard enabled, NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
@@ -1182,11 +1358,20 @@ enum NemotronMambaInProjConvDt {
         let unrolled = (u2 ?? NemotronU2.inProj) ? (dict != nil ? dictKernelU2 : kernelU2) : nil
         var chosen = unrolled ?? (dict != nil ? dictKernel! : kernel)
         let registerEpilogue = regs ?? regsVerified
+        var e32 = false
         if !registerEpilogue, epilogue32 ?? epilogue32Verified {
             // The 32-bit epilogue twin of the same launch (same unroll, same dictionary form).
             let twin = unrolled != nil ? (dict != nil ? dictKernelU2_32 : kernelU2_32)
                 : (dict != nil ? dictKernel32 : kernel32)
-            if let twin { chosen = twin }
+            if let twin { chosen = twin; e32 = true }
+        }
+        if !registerEpilogue, dict != nil, lean ?? NemotronQMVLean.active {
+            // The lean twin of the same dictionary launch (same unroll, same epilogue).
+            let twin = unrolled != nil ? (e32 ? dictKernelU2_32LN : dictKernelU2LN)
+                : (e32 ? dictKernel32LN : dictKernelLN)
+            if let twin { chosen = twin } else if lean == true { return nil }
+        } else if lean == true {
+            return nil
         }
         if registerEpilogue {
             // The register-epilogue twin of the same launch (same unroll, same dictionary form).
@@ -1456,14 +1641,15 @@ enum NemotronHeadPreparedActivation {
     }
     nonisolated(unsafe) private static var dictVariants: [String: MLXFast.MLXFastKernel?] = [:]
     /// The prepared QMV twin reading (scale, bias) through `NemotronSBDict`
-    /// (`nemotronSBDictSource` of the same body), or nil.
-    static func dictKernel(half: Bool, load: Int, nsg: Bool) -> MLXFast.MLXFastKernel? {
+    /// (`nemotronSBDictSource` of the same body), or nil. `lean`: that body through `nemotronQMVLeanSource`.
+    static func dictKernel(half: Bool, load: Int, nsg: Bool, lean: Bool = false) -> MLXFast.MLXFastKernel? {
         let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
-            + (nsg ? "_nsg" : "") + "_sbd"
+            + (nsg ? "_nsg" : "") + "_sbd" + (lean ? "_ln" : "")
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = dictVariants[name] { return kernel }
-        let kernel = nemotronSBDictSource(nemotronPreparedVariantSource(
-            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)).map {
+        let body = nemotronSBDictSource(nemotronPreparedVariantSource(
+            half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg))
+        let kernel = (lean ? nemotronQMVLeanSource(body) : body).map {
             MLXFast.metalKernel(
                 name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
                 outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
@@ -1481,15 +1667,16 @@ enum NemotronHeadPreparedActivation {
     /// for (decode form twin, load form, NSG template, dictionary): the same
     /// body with the pragma ahead of its main K loop, or nil. With load 0 and
     /// no NSG the body is the crown (`project`) or HF (`projectHalf`) source.
-    static func u2Kernel(half: Bool, load: Int, nsg: Bool, dict: Bool) -> MLXFast.MLXFastKernel? {
+    /// `lean`: the dictionary form through `nemotronQMVLeanSource` (nil without the dictionary).
+    static func u2Kernel(half: Bool, load: Int, nsg: Bool, dict: Bool, lean: Bool = false) -> MLXFast.MLXFastKernel? {
         let name = "nemotron_head_prepared_qmv" + (half ? "_hf" : "") + (load != 0 ? "_ld\(load)" : "")
-            + (nsg ? "_nsg" : "") + (dict ? "_sbd" : "") + "_u2"
+            + (nsg ? "_nsg" : "") + (dict ? "_sbd" : "") + "_u2" + (lean ? "_ln" : "")
         variantsLock.lock(); defer { variantsLock.unlock() }
         if let kernel = u2Variants[name] { return kernel }
         let body = nemotronPreparedVariantSource(
             half ? preparedHalfSource : nemotronHeadPreparedQMVSource, load: load, nsg: nsg)
-        let kernel = nemotronU2Source(dict ? nemotronSBDictSource(body) : body,
-                                      loop: NemotronU2.qmvLoop, count: 1).map {
+        let unrolled = nemotronU2Source(dict ? nemotronSBDictSource(body) : body, loop: NemotronU2.qmvLoop, count: 1)
+        let kernel = (lean ? (dict ? nemotronQMVLeanSource(unrolled) : nil) : unrolled).map {
             MLXFast.metalKernel(
                 name: name, inputNames: ["w", "scales", "biases", "prepared", "K", "N"],
                 outputNames: ["y"], source: $0, header: variantHeader(half: half, load: load))
@@ -1517,17 +1704,27 @@ enum NemotronHeadPreparedActivation {
     }
 
     /// projectLaunch's R = 3 launch with its kernel's dictionary twin, or nil.
-    private static func dictLaunch(k: Int, n: Int, rps: Int, u2: Bool = false)
+    /// `lean`: the selected kernel's `NemotronQMVLean` twin (nil: once admitted; true without a twin: nil).
+    private static func dictLaunch(k: Int, n: Int, rps: Int, u2: Bool = false, lean: Bool? = nil)
         -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
         let (_, hf) = projectKernel(rows: 3, fast: k % 512 == 0)
         let load = loadForm(k: k, n: n)
         let geometry = preparedGeometry[[k, n]] ?? (rps: rps, nsg: 2)
         let nsg = geometry.nsg != 2
         let extra: [(String, any KernelTemplateArg)] = nsg ? [("NSG", geometry.nsg)] : []
-        if u2, let twin = u2Kernel(half: !hf.isEmpty, load: load, nsg: nsg, dict: true) {
-            return (twin, hf + extra, geometry.rps, geometry.nsg)
+        // The record kernel, or its lean twin: when asked for (`lean` true) only the twin, by default the twin when
+        // built and the record kernel otherwise.
+        func pick(_ make: (Bool) -> MLXFast.MLXFastKernel?) -> MLXFast.MLXFastKernel? {
+            guard let record = make(false) else { return nil }
+            guard lean ?? NemotronQMVLean.active else { return record }
+            return make(true) ?? (lean == true ? nil : record)
         }
-        guard let kernel = dictKernel(half: !hf.isEmpty, load: load, nsg: nsg) else { return nil }
+        if u2, u2Kernel(half: !hf.isEmpty, load: load, nsg: nsg, dict: true) != nil {
+            guard let kernel = pick({ u2Kernel(half: !hf.isEmpty, load: load, nsg: nsg, dict: true, lean: $0) })
+            else { return nil }
+            return (kernel, hf + extra, geometry.rps, geometry.nsg)
+        }
+        guard let kernel = pick({ dictKernel(half: !hf.isEmpty, load: load, nsg: nsg, lean: $0) }) else { return nil }
         return (kernel, hf + extra, geometry.rps, geometry.nsg)
     }
 
@@ -1563,8 +1760,8 @@ enum NemotronHeadPreparedActivation {
         }
         return (same, cases)
     }
-    static func dictLaunchAvailable(k: Int, n: Int) -> Bool {
-        dictLaunch(k: k, n: n, rps: 2) != nil
+    static func dictLaunchAvailable(k: Int, n: Int, lean: Bool? = nil) -> Bool {
+        dictLaunch(k: k, n: n, rps: 2, lean: lean) != nil
     }
 
     /// The real [K, N] of every R = 3 prepared launch: JIT the non-crown
@@ -1699,9 +1896,10 @@ enum NemotronHeadPreparedActivation {
 
     /// `u2`: the R = 3 launch's unroll-by-two twin (nil: the admitted family, `NemotronU2.prepared`).
     /// `qmvDep`: a `NemotronQMVTune` launch's unread FP32 `dep` binding (nil: the prepared activation).
+    /// `lean`: the dictionary launch's `NemotronQMVLean` twin (nil: once admitted).
     static func apply(_ x: MLXArray, _ q: QuantizedLinear, relu2: Bool, rps: Int,
                       prepared: MLXArray? = nil, sbDict: Bool = true, u2: Bool? = nil,
-                      qmvTune: NemotronQMVTune.Config? = nil, qmvDep: MLXArray? = nil) -> MLXArray {
+                      qmvTune: NemotronQMVTune.Config? = nil, qmvDep: MLXArray? = nil, lean: Bool? = nil) -> MLXArray {
         let rows = x.dim(0), k = x.dim(1), n = q.weight.dim(0)
         let pv = k % 512 == 0 ? 16 : 8
         let packed = compatible(prepared, rows: rows, k: k)
@@ -1712,7 +1910,8 @@ enum NemotronHeadPreparedActivation {
         let unroll = rows == 3 && (u2 ?? NemotronU2.prepared(rows: rows, n: n))
         if sbDict, rows == 3, NemotronSBDict.enabled, let d = NemotronSBDict.dict(q) {
             let tuned = NemotronQMVTune.preparedLaunch(k: k, n: n, relu2: relu2, u2: unroll, config: qmvTune)
-            if case let (kernel, hf, launchRPS, nsg)? = tuned ?? dictLaunch(k: k, n: n, rps: rps, u2: unroll) {
+            if case let (kernel, hf, launchRPS, nsg)? = tuned
+                ?? dictLaunch(k: k, n: n, rps: rps, u2: unroll, lean: lean) {
                 return kernel([q.weight, d.index, d.table, packed, args.0, args.1]
                               + (tuned != nil ? [qmvDep ?? packed] : []),
                     template: [("T", x.dtype), ("R", rows), ("FAST", k % 512 == 0), ("RELU2", relu2),
