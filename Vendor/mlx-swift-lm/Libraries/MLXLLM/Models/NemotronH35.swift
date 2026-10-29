@@ -229,6 +229,26 @@ struct NemotronSeedCopy {
   }
 };
 
+// Four NAX lanes share coord.y and therefore this immutable (n, group)
+// coefficient pair. get_coord maps lane bits 0 and 3 only to coord.x:
+// clearing them elects the same-row leader; all 32 lanes execute both shuffles.
+// No reduction, dequantization, fragment, MMA or store order changes.
+template <bool SHARE, class BSrc>
+METAL_FUNC float2 nemotron_seed_direct_sb(
+    thread const BSrc& bsrc, const int n, const int g,
+    const bool valid, const uint lane) {
+  if constexpr (SHARE) {
+    float2 p = float2(0.0f);
+    if ((lane & 9u) == 0u && valid) {
+      p = bsrc.sb(n, g);
+    }
+    const ushort leader = ushort(lane & ~9u);
+    return float2(simd_shuffle(p.x, leader), simd_shuffle(p.y, leader));
+  } else {
+    return valid ? bsrc.sb(n, g) : float2(0.0f);
+  }
+}
+
 // The direct fc1's row-indexed A load (nemotron_load_routed), unchanged.
 template <typename Tile, typename T>
 METAL_FUNC void nemotron_seed_load_routed(
@@ -294,6 +314,7 @@ template <
     bool RELU2,
     bool ROUTED,
     bool PF,
+    bool SB_SHARE,
     class BSrc>
 METAL_FUNC void nemotron_seed_gather_impl(
     const device T* x,
@@ -378,7 +399,8 @@ METAL_FUNC void nemotron_seed_gather_impl(
           STEEL_PRAGMA_UNROLL
           for (short i = 0; i < 2; ++i) {
             const int n = y_col + tn + nn * 16 + bc.y + i * 8;
-            sbv[nn * 2 + i] = (ALIGN_N || n < N) ? bsrc.sb(n, kg / 64) : float2(0.0f);
+            sbv[nn * 2 + i] = nemotron_seed_direct_sb<SB_SHARE>(
+                bsrc, n, kg / 64, ALIGN_N || n < N, simd_lane_id);
           }
         }
       };
@@ -467,7 +489,8 @@ METAL_FUNC void nemotron_seed_gather_impl(
           STEEL_PRAGMA_UNROLL
           for (short i = 0; i < 2; ++i) {
             const int n = y_col + tn + nn * 16 + bc.y + i * 8;
-            sbv[nn * 2 + i] = (ALIGN_N || n < N) ? bsrc.sb(n, kg / 64) : float2(0.0f);
+            sbv[nn * 2 + i] = nemotron_seed_direct_sb<SB_SHARE>(
+                bsrc, n, kg / 64, ALIGN_N || n < N, simd_lane_id);
           }
         }
 
@@ -527,9 +550,23 @@ METAL_FUNC void nemotron_seed_gather_impl(
       const short lk = short((t % (BK / KPT)) * KPT);
       threadgroup T* wdst = Ws + lr * BK_padded + lk;
       const int ln = y_col + lr;
+      // Staged64x64w22 splits one row's64-K group across adjacent lane pairs.
+      // Both execute the shuffle outside the load predicate; only its even
+      // leader reads the immutable coefficient pair. No shared-memory change.
+      static_assert(!SB_SHARE || (BK == 64 && KPT == 32), "staged pair ownership");
+      auto shared_sb = [&](const int kb, const int klim) {
+        float2 p = float2(0.0f);
+        if ((simd_lane_id & 1u) == 0u && (ALIGN_N || lr < tgp_bn) && lk < klim) {
+          p = bsrc.sb(ln, (kb + lk) / 64);
+        }
+        const ushort leader = ushort(simd_lane_id & ~1u);
+        return float2(simd_shuffle(p.x, leader), simd_shuffle(p.y, leader));
+      };
       auto fill = [&](const int kb, const int klim) {
+        float2 coefficients = float2(0.0f);
+        if constexpr (SB_SHARE) { coefficients = shared_sb(kb, klim); }
         if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
-          const float2 p = bsrc.sb(ln, (kb + lk) / 64);
+          const float2 p = SB_SHARE ? coefficients : bsrc.sb(ln, (kb + lk) / 64);
           STEEL_PRAGMA_UNROLL
           for (short j = 0; j < KPT; j += 2) {
             T v0, v1;
@@ -550,8 +587,9 @@ METAL_FUNC void nemotron_seed_gather_impl(
       uint8_t pf_bytes[PF ? KPT / 2 : 1];
       float2 pf_sb = float2(0.0f);
       auto prefetch = [&](const int kb, const int klim) {
+        if constexpr (SB_SHARE) { pf_sb = shared_sb(kb, klim); }
         if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
-          pf_sb = bsrc.sb(ln, (kb + lk) / 64);
+          if constexpr (!SB_SHARE) { pf_sb = bsrc.sb(ln, (kb + lk) / 64); }
           STEEL_PRAGMA_UNROLL
           for (short j = 0; j < KPT; j += 2) {
             pf_bytes[j / 2] = bsrc.byte(ln, kb + lk + j);
@@ -666,7 +704,10 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// it qualifies.
 /// The pf rows are the same geometries with the next K step's B loads issued
 /// before this step's mma (same values, same mma order);
-/// NEMOTRON_SEED_RETILE_PF=0 leaves them out.
+/// NEMOTRON_SEED_RETILE_PF=0 leaves them out. The sb4 twins elect one lane
+/// per four same-row NAX lanes to read the immutable scale/bias pair; disable
+/// their offers with NEMOTRON_SEED_SB_SHARE=0. Existing bitwise and timing
+/// admission, original variants and fallbacks stay unchanged.
 enum NemotronSeedRetile {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE"] != "0"
     static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_FORCE"]
@@ -676,12 +717,14 @@ enum NemotronSeedRetile {
         let bn: Int, bk: Int, wm: Int, wn: Int
         let direct: Bool
         var pf: Bool = false
+        var shareSB: Bool = false
         var threads: Int { wm * wn * 32 }
     }
 
     /// NEMOTRON_SEED_RETILE_PF=0 stops offering the PF rows (the K loop with
     /// the next step's B loads issued before this step's mma).
     static let offerPF = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_PF"] != "0"
+    static let offerSBShare = ProcessInfo.processInfo.environment["NEMOTRON_SEED_SB_SHARE"] != "0"
 
     /// ws: B through threadgroup memory; d: B dequantized into the fragments.
     /// Name = path, BN (x BK), then WM WN (pf: prefetching K loop). ws64x64w22
@@ -698,7 +741,15 @@ enum NemotronSeedRetile {
     ] + (offerPF ? [
         Variant(name: "ws64x64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true),
         Variant(name: "d64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true),
-    ] : [])
+    ] : []) + (offerSBShare ? [
+        Variant(name: "d64w22sb4", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, shareSB: true),
+    ] + (offerPF ? [
+        Variant(name: "d64w22pfsb4", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true, shareSB: true),
+    ] : []) : []) + (offerSBShare ? [
+        Variant(name: "ws64x64w22sb2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, shareSB: true),
+    ] + (offerPF ? [
+        Variant(name: "ws64x64w22pfsb2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, shareSB: true),
+    ] : []) : [])
 
     enum Source: String, Sendable { case bank, dict, copy }
 
@@ -723,7 +774,7 @@ enum NemotronSeedRetile {
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
         func call(_ bm: String) -> String {
             """
-                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF>(
+                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF, SB_SHARE>(
                         x, \(rows), b, tiles, y, N, K, Ws,
                         threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup,
@@ -803,7 +854,8 @@ enum NemotronSeedRetile {
         return kernel(
             inputs,
             template: [("T", x.dtype), ("BM", tiles.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
-                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf)],
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf),
+                       ("SB_SHARE", v.shareSB)],
             grid: (((nOut + v.bn - 1) / v.bn) * v.threads, tiles.count, 1), threadGroup: (v.threads, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }
