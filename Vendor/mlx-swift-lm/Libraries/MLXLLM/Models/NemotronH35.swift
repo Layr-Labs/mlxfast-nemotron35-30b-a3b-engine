@@ -2810,3 +2810,32 @@ enum NemotronSeedSSMTune {
         report(parts.joined(separator: "; "))
     }
 }
+
+
+/// Request prefill (the seed) only: the MoE blocks at backbone indices `layers` (every third MoE block: 8 of the
+/// 23) run once more, the second run on a one-kernel copy of the block's input made after the first run's output;
+/// the block returns the second run's results (the same values). NEMOTRON_SEED_MOE_TWICE=0 runs each block once;
+/// NEMOTRON_SEED_MOE_TWICE_LAYERS="i,j,..." sets the indices.
+enum NemotronSeedMoETwice {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_MOE_TWICE"] != "0"
+    static let layers: Set<Int> = Set(
+        (ProcessInfo.processInfo.environment["NEMOTRON_SEED_MOE_TWICE_LAYERS"] ?? "1,8,15,22,29,36,43,49")
+            .split(separator: ",").compactMap { Int($0) })
+    private static let kernel = MLXFast.metalKernel(
+        name: "nemotron_seed_moe_link", inputNames: ["x", "after"], outputNames: ["y"],
+        source: """
+            const uint i = thread_position_in_grid.x;
+            if (i < uint(SIZE)) {
+              y[i] = x[i];
+            }
+            if (SIZE == 0) {
+              y[0] = static_cast<T>(after[0]);
+            }
+        """)
+
+    static func link(_ x: MLXArray, after: MLXArray) -> MLXArray {
+        kernel([x, after], template: [("T", x.dtype), ("SIZE", x.size)],
+               grid: (x.size, 1, 1), threadGroup: (min(256, x.size), 1, 1),
+               outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
+    }
+}
