@@ -162,6 +162,13 @@ enum CBv2MTPPrefillCarry {
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_PREFILL_CARRY"] != "0"
 }
 
+/// `NEMOTRON_MTP_PRIME_IN_SEED=0` leaves the first draft's history priming
+/// inside the request's first round (`CBv2MTPSeedHistoryPriming`).
+package enum CBv2MTPPrimeInSeed {
+    package static let enabled =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_PRIME_IN_SEED"] != "0"
+}
+
 enum CBv2MTPPolicyPacket {
     static let enabled =
         ProcessInfo.processInfo.environment["CBV2_MTP_PACK_POLICY_VALUES"] != "0"
