@@ -235,8 +235,35 @@ enum NemotronMTPSSMAnchor {
     static let arrival8 = "gr_last = prev == uint((512 / Dh) * (Dh / 8)) - 1u ? 1u : 0u;"
     static let arrival4 = "gr_last = prev == uint((512 / Dh) * (Dh / 4)) - 1u ? 1u : 0u;"
 
+    /// NEMOTRON_MTP_SSM_ANCHOR_TAPE=0 keeps the commit's concatenation. Otherwise a `none` launch with pending steps
+    /// also writes its extended tape: `tconv` [1, P + L, CD] = the P rows of `pconv` then the L rows of `conv`, and
+    /// `tdt` [1, P + L, H] likewise from `pdt` and `dt` (element copies, one element per thread, after the window
+    /// loop). The commit of an accepted prefix of `keep` steps then reads the contiguous prefix of P + keep rows,
+    /// which holds the same values as `concatenated([pconv, conv[..<keep]])`, instead of building that copy.
+    static var tapeOut: Bool { NemotronMTPSSMTape.qualified }
+    static let tapeCopy = """
+        {
+            static_assert((P + L) * CD <= 32 * Dh * H, "anchor tape copy grid");
+            const uint nst_tid = thread_position_in_grid.x
+                + 32u * (thread_position_in_grid.y + uint(Dh) * thread_position_in_grid.z);
+            if (nst_tid < uint((P + L) * CD)) {
+                static_assert(sizeof(T) == 2, "BF16 tape word");
+                reinterpret_cast<device ushort*>(tconv)[nst_tid] = nst_tid < uint(P * CD)
+                    ? reinterpret_cast<const device ushort*>(pconv)[nst_tid]
+                    : reinterpret_cast<const device ushort*>(conv)[nst_tid - uint(P * CD)];
+            }
+            if (nst_tid < uint((P + L) * H)) {
+                static_assert(sizeof(U) == 4, "FP32 tape word");
+                reinterpret_cast<device uint*>(tdt)[nst_tid] = nst_tid < uint(P * H)
+                    ? reinterpret_cast<const device uint*>(pdt)[nst_tid]
+                    : reinterpret_cast<const device uint*>(dt)[nst_tid - uint(P * H)];
+            }
+        }
+
+        """
+
     /// Tail form 0 record, 1 shuffle, 2 one barrier (as NemotronHCompactSSMGated's kernels).
-    private static func make(form: Int, pending: Bool, store: Store, tg4: Bool) -> MLXFast.MLXFastKernel? {
+    private static func make(form: Int, pending: Bool, store: Store, tg4: Bool, tape: Bool = false) -> MLXFast.MLXFastKernel? {
         let base = pending ? NemotronHCompactSSMGated.pendingSource : NemotronHCompactSSMGated.source
         guard base.components(separatedBy: windowStore).count == 2,
               base.components(separatedBy: windowLoop).count == 2,
@@ -244,6 +271,11 @@ enum NemotronMTPSSMAnchor {
         var source = base.replacingOccurrences(of: windowStore, with: "")
         if store == .anchor {
             source = source.replacingOccurrences(of: windowLoop, with: "\n" + anchorStore + windowLoop)
+        }
+        guard !tape || (pending && store == .none) else { return nil }
+        if tape {
+            guard source.components(separatedBy: tailStart).count == 2 else { return nil }
+            source = source.replacingOccurrences(of: tailStart, with: "\n" + tapeCopy + tailStart)
         }
         if loadsFirst, let s = loadsFirstSource(source, anchor: store == .anchor) {
             source = s
@@ -256,10 +288,11 @@ enum NemotronMTPSSMAnchor {
         }
         return MLXFast.metalKernel(
             name: "nemotron_mtp_ssm_compact_gated_prepared" + (pending ? "_pending" : "")
-                + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form] + (tg4 ? "_tg4" : ""),
+                + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form] + (tg4 ? "_tg4" : "") + (tape ? "_tape" : ""),
             inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
                          "eps", "counter"] + (pending ? ["pconv", "pdt"] : []),
-            outputNames: store == .anchor ? ["out", "state_out", "normed", "prepared"] : ["out", "normed", "prepared"],
+            outputNames: (store == .anchor ? ["out", "state_out", "normed", "prepared"] : ["out", "normed", "prepared"])
+                + (tape ? ["tconv", "tdt"] : []),
             source: tailed, mutableInputs: ["counter"])
     }
 
@@ -272,10 +305,24 @@ enum NemotronMTPSSMAnchor {
         }
     }
 
-    /// The form `compactSSMPreparedRows` launches by default after the load-time checks.
-    static func kernel(pending: Bool, store: Store, tg4: Bool = false) -> MLXFast.MLXFastKernel? {
-        let form = NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? 2
+    private static let tapeKernels: [[MLXFast.MLXFastKernel?]] = [false, true].map { quad in
+        (0 ..< 3).map { form in
+            NemotronMTPSSMTape.requested ? make(form: form, pending: true, store: .none, tg4: quad, tape: true) : nil
+        }
+    }
+    static var productionForm: Int {
+        NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? 2
             : NemotronHCompactSSMGated.shuffleQualified && NemotronHCompactSSMGated.shuffleKernel != nil ? 1 : 0
+    }
+    /// Tape and legacy kernels coexist; admission never changes the incumbent's kernel table.
+    static func kernel(pending: Bool, store: Store, tg4: Bool = false, tape: Bool = false,
+                       formOverride: Int? = nil) -> MLXFast.MLXFastKernel? {
+        let form = formOverride ?? productionForm
+        guard (0 ..< 3).contains(form) else { return nil }
+        if tape {
+            guard pending, store == .none else { return nil }
+            return tapeKernels[tg4 ? 1 : 0][form]
+        }
         return kernels[tg4 ? 1 : 0][form][pending ? 1 : 0][store == .anchor ? 1 : 0]
     }
 
@@ -377,13 +424,28 @@ enum NemotronMTPSSMAnchor {
             return r
         }
         func skipping(_ w: (conv: MLXArray, dt: MLXArray, projected: MLXArray), _ state: MLXArray, _ tape: Tape?,
-                      _ store: Store) -> (MLXArray, MLXArray, MLXArray?)? {
+                      _ store: Store) -> (MLXArray, MLXArray, MLXArray?, (conv: MLXArray, dt: MLXArray)?)? {
             guard let r = mixer.norm.compactSSMAnchorRows(
                 convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
                 projected: w.projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
                 pending: tape, store: store, tg4: false) else { return nil }
-            eval([r.0, r.1] + (r.2.map { [$0] } ?? []))
+            eval([r.0, r.1] + (r.2.map { [$0] } ?? []) + (r.3.map { [$0.conv, $0.dt] } ?? []))
             return r
+        }
+        // tapeOut: a `none` launch with pending steps returns its extended tape, bitwise the concatenation.
+        func tapeSame(_ r: (MLXArray, MLXArray, MLXArray?, (conv: MLXArray, dt: MLXArray)?), _ tape: Tape?,
+                      _ w: (conv: MLXArray, dt: MLXArray, projected: MLXArray)) -> Bool {
+            guard tapeOut, let tape else { return r.3 == nil }
+            guard let out = r.3 else { return false }
+            let whole = extend(tape, w, 3)
+            return bits(out.conv, whole.conv) && bits(out.dt, whole.dt)
+        }
+        // The commit's tape from the launch's extended tape (tapeOut), else concatenated.
+        func carry(_ r: (MLXArray, MLXArray, MLXArray?, (conv: MLXArray, dt: MLXArray)?), _ tape: Tape?,
+                   _ w: (conv: MLXArray, dt: MLXArray, projected: MLXArray), _ keep: Int) -> Tape {
+            guard let tape, let out = r.3 else { return extend(tape, w, keep) }
+            let steps = tape.steps + keep
+            return (out.conv[0..., ..<steps, 0...], out.dt[0..., ..<steps, 0...], steps)
         }
         var cases = 0
         var failure: String?
@@ -398,7 +460,7 @@ enum NemotronMTPSSMAnchor {
                 guard let reference = record(w, anchor, tape), let none = skipping(w, anchor, tape, .none) else {
                     failure = "launch unavailable at \(steps) pending steps"; break perCount
                 }
-                var same = bits(reference.0, none.0) && bits(reference.1, none.1)
+                var same = bits(reference.0, none.0) && bits(reference.1, none.1) && tapeSame(none, tape, w)
                 let after = replay(tape, anchor)
                 if steps > 0 {
                     guard let stored = skipping(w, anchor, tape, .anchor), let state = stored.2 else {
@@ -415,6 +477,7 @@ enum NemotronMTPSSMAnchor {
                 // Strict prefixes: the longer tape from the old anchor and the short one from the state after it.
                 for keep in 1 ... 2 where steps > 0 && steps + keep <= NemotronMTPPendingSSM.maxSteps {
                     same = same && bits(replay(extend(tape, w, keep), anchor), replay(extend(nil, w, keep), after))
+                        && bits(replay(carry(none, tape, w, keep), anchor), replay(extend(tape, w, keep), anchor))
                 }
                 cases += 1
                 if !same { failure = "differs at \(steps) pending steps"; break perCount }
@@ -446,7 +509,7 @@ enum NemotronMTPSSMAnchor {
                           !writes || b.2 != nil else {
                         failure = "sequence launch unavailable"; break sequence
                     }
-                    var same = bits(a.0, b.0) && bits(a.1, b.1)
+                    var same = bits(a.0, b.0) && bits(a.1, b.1) && (writes || tapeSame(b, skip.tape, w))
                     if keep == 3 {
                         record11 = (a.2, nil)
                     } else {
@@ -454,7 +517,7 @@ enum NemotronMTPSSMAnchor {
                         record11 = grown.steps <= NemotronMTPPendingSSM.strictSteps
                             ? (record11.anchor, grown) : (replay(grown, record11.anchor), nil)
                     }
-                    skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, extend(skip.tape, w, keep))
+                    skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, carry(b, skip.tape, w, keep))
                     same = same && (skip.tape?.steps ?? 0) <= top
                         && bits(replay(record11.tape, record11.anchor), replay(skip.tape, skip.anchor))
                     cases += 1
@@ -516,19 +579,30 @@ enum NemotronMTPSSMAnchor {
                     tape.steps + keep)
         }
         // One fused launch per evaluation: the launches share the arrival counters.
-        func launch(_ w: Window, _ state: MLXArray, _ tape: Tape?, _ store: Store, _ quad: Bool)
-            -> (MLXArray, MLXArray, MLXArray?)? {
+        typealias Launch = (MLXArray, MLXArray, MLXArray?, (conv: MLXArray, dt: MLXArray)?)
+        func launch(_ w: Window, _ state: MLXArray, _ tape: Tape?, _ store: Store, _ quad: Bool) -> Launch? {
             guard let r = mixer.norm.compactSSMAnchorRows(
                 convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
                 projected: w.projected, heads: heads, headDim: dim, groups: groups, stateDim: stateDim,
                 pending: tape, store: store, tg4: quad) else { return nil }
-            eval([r.0, r.1] + (r.2.map { [$0] } ?? []))
+            eval([r.0, r.1] + (r.2.map { [$0] } ?? []) + (r.3.map { [$0.conv, $0.dt] } ?? []))
             return r
         }
-        func same(_ a: (MLXArray, MLXArray, MLXArray?), _ b: (MLXArray, MLXArray, MLXArray?)) -> Bool {
+        func same(_ a: Launch, _ b: Launch) -> Bool {
             guard bits(a.0, b.0), bits(a.1, b.1) else { return false }
+            if let x = a.3, let y = b.3 {
+                guard bits(x.conv, y.conv), bits(x.dt, y.dt) else { return false }
+            } else if a.3 != nil || b.3 != nil {
+                return false
+            }
             if let x = a.2, let y = b.2 { return bits(x, y) }
             return a.2 == nil && b.2 == nil
+        }
+        // The commit's tape from the launch's extended tape (tapeOut), else concatenated.
+        func carry(_ r: Launch, _ tape: Tape?, _ w: Window, _ keep: Int) -> Tape {
+            guard let tape, let out = r.3 else { return extend(tape, w, keep) }
+            let steps = tape.steps + keep
+            return (out.conv[0..., ..<steps, 0...], out.dt[0..., ..<steps, 0...], steps)
         }
         var cases = 0
         var failure: String?
@@ -564,13 +638,13 @@ enum NemotronMTPSSMAnchor {
                 var runs: [(anchor: MLXArray, tape: Tape?)] = [(start, nil), (start, nil)]
                 for keep in keeps {
                     let w = window(scale)
-                    var outputs: [(MLXArray, MLXArray, MLXArray?)] = []
+                    var outputs: [Launch] = []
                     for g in 0 ..< 2 {
                         let writes = (runs[g].tape?.steps ?? 0) >= at
                         guard let r = launch(w, runs[g].anchor, runs[g].tape, writes ? .anchor : .none, g == 1),
                               !writes || r.2 != nil else { failure = "sequence launch unavailable"; break sequence }
                         outputs.append(r)
-                        runs[g] = writes ? (r.2!, extend(nil, w, keep)) : (runs[g].anchor, extend(runs[g].tape, w, keep))
+                        runs[g] = writes ? (r.2!, extend(nil, w, keep)) : (runs[g].anchor, carry(r, runs[g].tape, w, keep))
                     }
                     cases += 1
                     guard same(outputs[0], outputs[1]), (runs[1].tape?.steps ?? 0) <= top,
@@ -641,7 +715,7 @@ enum NemotronMTPSSMAnchor {
                                     convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: states[l],
                                     projected: projected, heads: heads, headDim: dim, groups: groups,
                                     stateDim: stateDim, pending: tapes[t], store: store, tg4: quad) else { return nil }
-                                outs += [r.0, r.1] + (r.2.map { [$0] } ?? [])
+                                outs += [r.0, r.1] + (r.2.map { [$0] } ?? []) + (r.3.map { [$0.conv, $0.dt] } ?? [])
                             }
                         }
                         return outs
@@ -733,6 +807,188 @@ enum NemotronMTPSSMAnchor {
     }
 }
 
+/// A separate admission for the new tape outputs. Failure keeps the incumbent
+/// anchor skip and its concatenation; it never resets that older admission.
+enum NemotronMTPSSMTape {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_ANCHOR_TAPE"] != "0"
+    private final class Admission {
+        weak var norm: NemotronHRMSNormGated?
+        init(_ norm: NemotronHRMSNormGated) { self.norm = norm }
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var owners: [ObjectIdentifier: Admission] = [:]
+    nonisolated(unsafe) private(set) static var qualified = false
+
+    static func enabled(_ norm: NemotronHRMSNormGated) -> Bool {
+        guard requested, qualified else { return false }
+        return lock.withLock { owners[ObjectIdentifier(norm)]?.norm === norm }
+    }
+
+    static func reset() { lock.withLock { owners.removeAll(); qualified = false } }
+
+    static func qualify(_ model: NemotronH35Model) {
+        reset()
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron mtp carried tape: \(message)\n".utf8))
+        }
+        guard requested, NemotronMTPPendingSSM.anchorSkip else { return report("off (setting/incumbent)") }
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard !mixers.isEmpty else { return report("off (no owners)") }
+        var admitted: [ObjectIdentifier: Admission] = [:]
+        var cases = 0
+        var expectedCases = 0
+        var seed: UInt64 = 0x57EC_19AF_4D20_8B63
+        func finite(_ rows: Int, _ width: Int, _ low: Float, _ high: Float, _ bf16: Bool) -> MLXArray {
+            let values = (0 ..< rows * width).map { _ -> Float in
+                seed = seed &* 6364136223846793005 &+ 1442695040888963407
+                return low + (high - low) * Float(seed >> 40) / Float(1 << 24)
+            }
+            let x = MLXArray(values, [1, rows, width])
+            return bf16 ? x.asType(.bfloat16) : x
+        }
+        func special(_ rows: Int, _ width: Int, _ bf16: Bool) -> MLXArray {
+            if bf16 {
+                let words: [UInt16] = [0, 0x8000, 0x7f80, 0xff80, 0x7fc1, 0x7f81, 1, 0x8001,
+                                        0x0080, 0x8080, 0x3f80, 0xbf80, 0x7f7f, 0xff7f, 0x3c00, 0xbc00]
+                return MLXArray((0 ..< rows * width).map { words[$0 % words.count] }, [1, rows, width])
+                    .view(dtype: .bfloat16)
+            }
+            let words: [UInt32] = [0, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00001, 0x7f800001,
+                                   1, 0x80000001, 0x00800000, 0x80800000, 0x3f800000, 0xbf800000,
+                                   0x7f7fffff, 0xff7fffff, 0x3c000000, 0xbc000000]
+            return MLXArray((0 ..< rows * width).map { words[$0 % words.count] }, [1, rows, width])
+                .view(dtype: .float32)
+        }
+        func bits(_ a: MLXArray, _ b: MLXArray) -> Bool {
+            guard a.shape == b.shape, a.dtype == b.dtype,
+                  a.dtype == .bfloat16 || a.dtype == .float32 else { return false }
+            let type: DType = a.dtype == .bfloat16 ? .uint16 : .uint32
+            return (a.view(dtype: type) .== b.view(dtype: type)).all().item(Bool.self)
+        }
+        typealias Tape = (conv: MLXArray, dt: MLXArray, steps: Int)
+        typealias Window = (conv: MLXArray, dt: MLXArray, projected: MLXArray)
+        typealias Launch = (MLXArray, MLXArray, MLXArray?, (conv: MLXArray, dt: MLXArray)?)
+        let forms = [0] + (NemotronHCompactSSMGated.shuffleQualified && NemotronHCompactSSMGated.shuffleKernel != nil ? [1] : [])
+            + (NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? [2] : [])
+        do {
+            let equal = try withError { () -> Bool in
+                for mixer in mixers {
+                    let norm = mixer.norm
+                    guard type(of: norm) == NemotronHRMSNormGated.self,
+                          mixer.convDim == 6144, mixer.numHeads == 64, mixer.headDim == 64,
+                          mixer.numGroups == 8, mixer.ssmStateSize == 128 else { return false }
+                    func call(_ w: Window, _ state: MLXArray, _ tape: Tape?, _ store: NemotronMTPSSMAnchor.Store,
+                              _ quad: Bool, _ form: Int, _ useTape: Bool) -> Launch? {
+                        norm.compactSSMAnchorRows(
+                            convolution: w.conv, ALog: mixer.aLog, D: mixer.D, dt: w.dt, state: state,
+                            projected: w.projected, heads: 64, headDim: 64, groups: 8, stateDim: 128,
+                            pending: tape, store: store, tg4: quad, tapeOverride: useTape, formOverride: form)
+                    }
+                    func replay(_ tape: Tape, _ state: MLXArray) -> MLXArray? {
+                        nemotronMTPSSMTapeReplayChecked(convolution: tape.conv, ALog: mixer.aLog, D: mixer.D,
+                            dt: tape.dt, state: state, steps: tape.steps)
+                    }
+                    func tapeMatches(_ output: Launch, _ old: Tape?, _ w: Window) -> Bool {
+                        guard let old else { return output.3 == nil }
+                        guard let out = output.3,
+                              out.conv.shape == [1, old.steps + 3, 6144], out.conv.dtype == .bfloat16,
+                              out.dt.shape == [1, old.steps + 3, 64], out.dt.dtype == .float32 else { return false }
+                        return bits(out.conv, concatenated([old.conv, w.conv], axis: 1))
+                            && bits(out.dt, concatenated([old.dt, w.dt], axis: 1))
+                    }
+                    // Reuse read-only seeded states across the metadata qualification cases.
+                    let states = (0 ..< 3).map { _ in
+                        finite(64, 64 * 128, -0.5, 0.5, false).reshaped([1, 64, 64, 128])
+                    }
+                    for form in forms {
+                        for quad in [false, true] {
+                            for steps in 1 ... NemotronMTPPendingSSM.maxSteps {
+                                for kind in 0 ..< 3 {
+                                    expectedCases += 1
+                                    let view = kind != 0
+                                    let extra = view ? 1 : 0
+                                    let pc = kind == 2 ? special(steps + extra, 6144, true)
+                                        : finite(steps + extra, 6144, -2, 2, true)
+                                    let pd = kind == 2 ? special(steps + extra, 64, false)
+                                        : finite(steps + extra, 64, 0.01, 0.5, false)
+                                    let wc = kind == 2 ? special(3 + extra, 6144, true)
+                                        : finite(3 + extra, 6144, -4, 4, true)
+                                    let wd = kind == 2 ? special(3 + extra, 64, false)
+                                        : finite(3 + extra, 64, 0.01, 0.5, false)
+                                    let tape: Tape = (pc[0..., ..<steps, 0...], pd[0..., ..<steps, 0...], steps)
+                                    let w: Window = (wc[0..., ..<3, 0...], wd[0..., ..<3, 0...], finite(3, 10304, -3, 3, true))
+                                    let state = states[kind]
+                                    guard let got = call(w, state, tape, .none, quad, form, true),
+                                          tapeMatches(got, tape, w), got.2 == nil else { return false }
+                                    if kind != 2 {
+                                        guard let old = call(w, state, tape, .none, quad, form, false), old.3 == nil,
+                                              bits(got.0, old.0), bits(got.1, old.1) else { return false }
+                                        if form == NemotronMTPSSMAnchor.productionForm, quad == NemotronMTPSSMAnchor.tg4Adopted {
+                                            guard let out = got.3 else { return false }
+                                            for keep in 1 ... 3 {
+                                                let count = steps + keep
+                                                let sliced: Tape = (out.conv[0..., ..<count, 0...], out.dt[0..., ..<count, 0...], count)
+                                                let joined: Tape = (concatenated([tape.conv, w.conv[0..., ..<keep, 0...]], axis: 1),
+                                                    concatenated([tape.dt, w.dt[0..., ..<keep, 0...]], axis: 1), count)
+                                                guard bits(sliced.conv, joined.conv), bits(sliced.dt, joined.dt),
+                                                      let x = replay(sliced, state), let y = replay(joined, state),
+                                                      bits(x, y) else { return false }
+                                            }
+                                        }
+                                    }
+                                    cases += 1
+                                }
+                            }
+                        }
+                    }
+                    // Actual full/strict/anchor transitions; compare two representations at every commit.
+                    for quad in [false, true] {
+                        var state = finite(64, 64 * 128, -0.5, 0.5, false).reshaped([1, 64, 64, 128])
+                        var a: Tape? = nil
+                        var b: Tape? = nil
+                        for keep in [1, 2, 3, 1, 3, 2, 1, 1, 3, 2, 3, 1, 2, 3, 1, 1, 1, 3, 2, 3] {
+                            expectedCases += 1
+                            let w: Window = (finite(3, 6144, -2, 2, true), finite(3, 64, 0.01, 0.5, false), finite(3, 10304, -3, 3, true))
+                            let writes = (a?.steps ?? 0) >= NemotronMTPPendingSSM.anchorAt
+                            let store: NemotronMTPSSMAnchor.Store = writes ? .anchor : .none
+                            guard let old = call(w, state, a, store, quad, NemotronMTPSSMAnchor.productionForm, false),
+                                  let got = call(w, state, b, store, quad, NemotronMTPSSMAnchor.productionForm, true),
+                                  bits(old.0, got.0), bits(old.1, got.1) else { return false }
+                            if writes {
+                                guard let x = old.2, let y = got.2, bits(x, y), got.3 == nil else { return false }
+                                state = x
+                                a = nil; b = nil
+                            } else if !tapeMatches(got, b, w) { return false }
+                            let count = (a?.steps ?? 0) + keep
+                            let ac = w.conv[0..., ..<keep, 0...], ad = w.dt[0..., ..<keep, 0...]
+                            a = (a.map { concatenated([$0.conv, ac], axis: 1) } ?? ac,
+                                 a.map { concatenated([$0.dt, ad], axis: 1) } ?? ad, count)
+                            if !writes, let out = got.3 {
+                                b = (out.conv[0..., ..<count, 0...], out.dt[0..., ..<count, 0...], count)
+                            } else { b = (ac, ad, keep) }
+                            guard let x = a, let y = b, x.steps == y.steps,
+                                  x.steps <= NemotronMTPPendingSSM.maxSteps,
+                                  bits(x.conv, y.conv), bits(x.dt, y.dt),
+                                  let rx = replay(x, state), let ry = replay(y, state), bits(rx, ry)
+                            else { return false }
+                            cases += 1
+                        }
+                    }
+                    let id = ObjectIdentifier(norm)
+                    guard admitted[id] == nil else { return false }
+                    admitted[id] = Admission(norm)
+                }
+                return true
+            }
+            let perOwner = forms.count * 2 * NemotronMTPPendingSSM.maxSteps * 3 + 40
+            guard equal, cases == expectedCases, cases == mixers.count * perOwner,
+                  admitted.count == mixers.count else { return report("off (incomplete/different)") }
+        } catch { return report("off (GPU error)") }
+        lock.withLock { owners = admitted; qualified = true }
+        report("on (\(mixers.count) owners, \(cases) complete cases, tape words/prefix replay/acceptance exact)")
+    }
+}
+
 extension NemotronHRMSNormGated {
     /// NEMOTRON_MTP_SSM_ANCHOR_SKIP: `compactSSMPreparedRows` (same guards, operands, tail form and
     /// pending fold) without the store of the state after the window; `.anchor` stores the state after
@@ -742,9 +998,10 @@ extension NemotronHRMSNormGated {
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?, store: NemotronMTPSSMAnchor.Store,
-        tg4: Bool? = nil
-    ) -> (MLXArray, MLXArray, MLXArray?)? {
+        tg4: Bool? = nil, tapeOverride: Bool? = nil, formOverride: Int? = nil
+    ) -> (MLXArray, MLXArray, MLXArray?, (conv: MLXArray, dt: MLXArray)?)? {
         let quad = tg4 ?? NemotronMTPSSMAnchor.tg4Adopted
+        let emitsTape = store == .none && pending != nil && (tapeOverride ?? NemotronMTPSSMTape.enabled(self))
         if let pending {
             guard (1 ... NemotronMTPPendingSSM.maxSteps).contains(pending.steps),
                   pending.conv.shape == [1, pending.steps, 6144], pending.conv.dtype == .bfloat16,
@@ -763,7 +1020,7 @@ extension NemotronHRMSNormGated {
               projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16,
               let counter = NemotronHCompactSSMGated.counter,
-              let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store, tg4: quad)
+              let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store, tg4: quad, tape: emitsTape, formOverride: formOverride)
         else { return nil }
         var inputs: [any ScalarOrArray] = [
             convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity, eps, counter]
@@ -776,12 +1033,20 @@ extension NemotronHRMSNormGated {
             template.append(("P", pending.steps))
         }
         let stores = store == .anchor
-        let outputs = kernel(
-            inputs, template: template,
-            grid: (32, 64, 64), threadGroup: (32, quad ? 4 : 8, 1),
-            outputShapes: [[1, 3, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, 3, 4096], [3, 8, 17 * 32]],
-            outputDTypes: [.bfloat16] + (stores ? [.float32] : []) + [.bfloat16, .float32])
-        return stores ? (outputs[2], outputs[3], outputs[1]) : (outputs[1], outputs[2], nil)
+        // NemotronMTPSSMAnchor.tapeOut: the extended tape (last two outputs) of a `none` launch with pending steps.
+        let tapeRows = emitsTape ? pending.map { $0.steps + 3 } : nil
+        let shapes = [[1, 3, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, 3, 4096], [3, 8, 17 * 32]]
+            + (tapeRows.map { [[1, $0, 6144], [1, $0, 64]] } ?? [])
+        let types: [DType] = [.bfloat16] + (stores ? [.float32] : []) + [.bfloat16, .float32]
+            + (tapeRows != nil ? [.bfloat16, .float32] : [])
+        let outputs = kernel(inputs, template: template,
+            grid: (32, 64, 64), threadGroup: (32, quad ? 4 : 8, 1), outputShapes: shapes, outputDTypes: types)
+        guard outputs.count == shapes.count, types.count == shapes.count else { return nil }
+        for i in outputs.indices {
+            guard outputs[i].shape == shapes[i], outputs[i].dtype == types[i] else { return nil }
+        }
+        let tape = tapeRows != nil ? (conv: outputs[3], dt: outputs[4]) : nil
+        return stores ? (outputs[2], outputs[3], outputs[1], nil) : (outputs[1], outputs[2], nil, tape)
     }
 }
 
@@ -821,13 +1086,15 @@ final class NemotronH35MTPCompactGraphCache {
     ) -> [MLXArray] {
         let fold = pending.map { (conv: $0.conv, dt: $0.dt, steps: $0.steps) }
         let joins = residual != nil && nextNorm != nil
+        let tapePolicy = store == NemotronMTPSSMAnchor.Store.none && pending != nil
+            && hidden.shape == [1, 3, 2688] && NemotronMTPSSMTape.enabled(owner.norm)
         func finish(_ values: [MLXArray], _ lhs: MLXArray?) -> [MLXArray] {
             guard joins, let lhs, let nextNorm else { return values }
             guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
                 lhs, values[0], norm: nextNorm) else {
                 preconditionFailure("Qualified Mamba compiled join became ineligible")
             }
-            return [joined.0] + Array(values[1...4]) + [joined.1, joined.2]
+            return [joined.0] + Array(values[1...4]) + [joined.1, joined.2] + Array(values[5...])
         }
         guard Self.enabled, NemotronMTPExecution.batchedM1, NemotronMTPExecution.batchedNorm,
               Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -839,7 +1106,7 @@ final class NemotronH35MTPCompactGraphCache {
         else {
             return finish(owner.mtpCompactArrays(
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
-                pending: fold, store: store), residual)
+                pending: fold, store: store, tapeOverride: tapePolicy), residual)
         }
         if joins, let nextNorm {
             identity += [ObjectIdentifier(nextNorm), ObjectIdentifier(nextNorm.weight)]
@@ -848,6 +1115,7 @@ final class NemotronH35MTPCompactGraphCache {
         let pendingSteps = pending?.steps ?? 0
         let slot = (usesPrepared ? 1 : 0) + (joins ? 2 : 0) + 4 * pendingSteps
             + 4 * (NemotronMTPPendingSSM.maxSteps + 1) * (store.map { $0 == .anchor ? 2 : 1 } ?? 0)
+            + (tapePolicy ? 12 * (NemotronMTPPendingSSM.maxSteps + 1) : 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             if let entry = entries[slot], entry.identity == identity { return entry }
@@ -859,13 +1127,13 @@ final class NemotronH35MTPCompactGraphCache {
                 let values = owner.mtpCompactArrays(
                     arrays[0], convState: arrays[1], initialSSM: arrays[2],
                     prepared: usesPrepared ? arrays[base] : nil,
-                    pending: pendingSteps > 0 ? (arrays[3], arrays[4], pendingSteps) : nil, store: store)
+                    pending: pendingSteps > 0 ? (arrays[3], arrays[4], pendingSteps) : nil, store: store, tapeOverride: tapePolicy)
                 guard joins, let nextNorm else { return values }
                 guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
                     arrays[base + (usesPrepared ? 1 : 0)], values[0], norm: nextNorm) else {
                     preconditionFailure("Qualified Mamba compiled join became ineligible")
                 }
-                return [joined.0] + Array(values[1...4]) + [joined.1, joined.2]
+                return [joined.0] + Array(values[1...4]) + [joined.1, joined.2] + Array(values[5...])
             }
             let replacement = Entry(identity: identity, function: function)
             retired = entries[slot]
@@ -877,16 +1145,18 @@ final class NemotronH35MTPCompactGraphCache {
                 + (pending.map { [$0.conv, $0.dt] } ?? []) + (prepared.map { [$0] } ?? [])
                 + (joins ? [residual!] : []))
         }
-        guard result.count == (joins ? 7 : 5) else {
+        // NemotronMTPSSMAnchor.tapeOut: a `none` window with pending steps returns its extended tape last.
+        let tapes = tapePolicy ? 2 : 0
+        guard result.count == (joins ? 7 : 5) + tapes else {
             // Retain any enclosing MLX error while avoiding empty indexing.
             return finish(owner.mtpCompactArrays(
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
-                pending: fold, store: store), residual)
+                pending: fold, store: store, tapeOverride: tapePolicy), residual)
         }
         guard NemotronMoELeader.selfTest else { return result }
         // Reference: in_proj prepares its activation from `hidden` itself.
         let expected = finish(owner.mtpCompactArrays(
-            hidden, convState: convState, initialSSM: initialSSM, pending: fold, store: store), residual)
+            hidden, convState: convState, initialSSM: initialSSM, pending: fold, store: store, tapeOverride: tapePolicy), residual)
         return zip(result, expected).enumerated().map {
             joins && $0.offset == 6 ? $0.element.0
                 : nemotronBitwiseOrNaN($0.element.0, $0.element.1)
@@ -1054,9 +1324,19 @@ extension NemotronHMamba2Mixer {
             owner: self, residual: residual, nextNorm: nextNorm)
         if anchorSkip {
             NemotronMTPSSMAnchor.lastPending = pending?.steps ?? 0
+            // NemotronMTPSSMAnchor.tapeOut: the carried steps' extended tape, the window's last two arrays.
+            let carried = writes ? nil : pending
+            let tape = carried.flatMap { carried -> (conv: MLXArray, dt: MLXArray)? in
+                let joined = residual != nil && nextNorm != nil
+                guard NemotronMTPSSMTape.enabled(norm), arrays.count == (joined ? 9 : 7) else { return nil }
+                let conv = arrays[arrays.count - 2], dt = arrays[arrays.count - 1]
+                guard conv.shape == [1, carried.steps + length, 6144], conv.dtype == .bfloat16,
+                      dt.shape == [1, carried.steps + length, 64], dt.dtype == .float32 else { return nil }
+                return (conv, dt)
+            }
             stageAnchorReplay(evaluation, modelLayerIndex: modelLayerIndex, length: length,
                 window: (arrays[1], arrays[2], arrays[3]), anchor: writes ? arrays[4] : start,
-                carried: writes ? nil : pending)
+                carried: carried, tape: tape)
             return arrays
         }
         if let residual, let nextNorm, pending == nil {
@@ -1126,18 +1406,24 @@ extension NemotronHMamba2Mixer {
     private func stageAnchorReplay(
         _ evaluation: CBv2RecurrentStateEvaluation, modelLayerIndex: Int, length: Int,
         window: (padded: MLXArray, convolution: MLXArray, dt: MLXArray), anchor: MLXArray,
-        carried: NemotronMTPPendingSSM.Pending?
+        carried: NemotronMTPPendingSSM.Pending?, tape extended: (conv: MLXArray, dt: MLXArray)? = nil
     ) {
         let (heads, dim, groups, state) = (numHeads, headDim, numGroups, ssmStateSize)
         let (logA, skip) = (self.aLog, self.D)
         let history = convKernelSize - 1
         let tape = [window.padded, window.convolution, window.dt]
-        let retained = tape + [anchor] + (carried.map { [$0.conv, $0.dt] } ?? [])
+        let retained = tape + [anchor]
+            + (extended.map { [$0.conv, $0.dt] } ?? carried.map { [$0.conv, $0.dt] } ?? [])
         let retainedBytes = retained.reduce(0) { $0 + $1.nbytes }
         func committed(_ keep: Int) -> CBv2RecurrentLayerState {
             var conv = window.convolution[0..., ..<keep, 0...]
             var dt = window.dt[0..., ..<keep, 0...]
-            if let carried {
+            if let carried, let extended {
+                // The launch's extended tape: the carried steps then the window's; its first
+                // `carried.steps + keep` rows are the concatenation below (contiguous prefix, no copy).
+                conv = extended.conv[0..., ..<(carried.steps + keep), 0...]
+                dt = extended.dt[0..., ..<(carried.steps + keep), 0...]
+            } else if let carried {
                 conv = concatenated([carried.conv, conv], axis: 1)
                 dt = concatenated([carried.dt, dt], axis: 1)
             }
@@ -1176,7 +1462,7 @@ extension NemotronHMamba2Mixer {
         _ hiddenStates: MLXArray, convState: MLXArray, initialSSM: MLXArray,
         prepared inputPrepared: MLXArray? = nil,
         pending: (conv: MLXArray, dt: MLXArray, steps: Int)? = nil,
-        store: NemotronMTPSSMAnchor.Store? = nil
+        store: NemotronMTPSSMAnchor.Store? = nil, tapeOverride: Bool? = nil
     ) -> [MLXArray] {
         let batch = hiddenStates.dim(0), length = hiddenStates.dim(1)
         // The window's conv, padded history and timestep come from in_proj's
@@ -1221,17 +1507,26 @@ extension NemotronHMamba2Mixer {
         func anchorOutput(_ begin: MLXArray, _ final: MLXArray) -> MLXArray {
             store.map { $0 == .anchor ? begin : initialSSM } ?? final
         }
-        func fusedRows() -> (MLXArray, MLXArray, MLXArray)? {
+        // NemotronMTPSSMAnchor.tapeOut: a `none` window with pending steps also returns its extended tape
+        // (the pending steps' conv/dt rows, then the window's) as two more arrays, from the fused launch or,
+        // without it, concatenated.
+        let tapes = store == NemotronMTPSSMAnchor.Store.none && (tapeOverride ?? NemotronMTPSSMTape.enabled(norm)) ? pending : nil
+        func tapeArrays(_ tape: (conv: MLXArray, dt: MLXArray)?) -> [MLXArray] {
+            guard let pending = tapes else { return [] }
+            return tape.map { [$0.conv, $0.dt] }
+                ?? [concatenated([pending.conv, convolution], axis: 1), concatenated([pending.dt, dt], axis: 1)]
+        }
+        func fusedRows() -> (MLXArray, MLXArray, MLXArray, (conv: MLXArray, dt: MLXArray)?)? {
             guard let store else {
                 return norm.compactSSMPreparedRows(
                     convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
                     projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
-                    pending: pending)
+                    pending: pending).map { ($0.0, $0.1, $0.2, nil) }
             }
             return norm.compactSSMAnchorRows(
                 convolution: convolution, ALog: logA, D: skip, dt: dt, state: initialSSM,
                 projected: projected, heads: heads, headDim: dim, groups: groups, stateDim: state,
-                pending: pending, store: store).map { ($0.0, $0.1, $0.2 ?? initialSSM) }
+                pending: pending, store: store, tapeOverride: tapes != nil).map { ($0.0, $0.1, $0.2 ?? initialSSM, $0.3) }
         }
         // NEMOTRON_SSM_GATED_FUSED: the compact SSM window, the gated RMS norm
         // and out_proj's prepared activation in one launch (see
@@ -1257,11 +1552,16 @@ extension NemotronHMamba2Mixer {
                     reference.output.reshaped(batch, length, heads * dim), gate: gate) {
                     fused = (nemotronBitwiseOrNaN(fused.0, pair.0),
                              nemotronBitwiseOrNaN(fused.1, pair.1),
-                             nemotronBitwiseOrNaN(fused.2, anchorOutput(begin, reference.finalState)))
+                             nemotronBitwiseOrNaN(fused.2, anchorOutput(begin, reference.finalState)),
+                             fused.3)
+                }
+                if let tape = fused.3, let pending = tapes {
+                    fused.3 = (nemotronBitwiseOrNaN(tape.conv, concatenated([pending.conv, convolution], axis: 1)),
+                               nemotronBitwiseOrNaN(tape.dt, concatenated([pending.dt, dt], axis: 1)))
                 }
             }
             return [nemotronMTPLinearRows(fused.0, outProj, prepared: fused.1),
-                    padded, convolution, dt, fused.2]
+                    padded, convolution, dt, fused.2] + tapeArrays(fused.3)
         }
         let begin = replayedPending(pending, initialSSM)
         let result = nemotronMTPSSMCompact(
@@ -1291,7 +1591,7 @@ extension NemotronHMamba2Mixer {
             prepared = nil
         }
         return [nemotronMTPLinearRows(normalized, outProj, prepared: prepared),
-                padded, convolution, dt, anchorOutput(begin, result.finalState)]
+                padded, convolution, dt, anchorOutput(begin, result.finalState)] + tapeArrays(nil)
     }
 
     /// The window's start state: `anchor` itself, or `anchor` advanced over

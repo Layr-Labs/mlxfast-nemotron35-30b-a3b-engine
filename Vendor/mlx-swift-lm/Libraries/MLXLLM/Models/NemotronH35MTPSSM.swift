@@ -359,3 +359,24 @@ final class NemotronMTPReplayGroup {
             steps: keep, writeOutput: false).finalState)
     }
 }
+
+
+/// Qualification-only wrapper of the unchanged compact replay kernel. An MLX
+/// error can return zero arrays: validate the ABI before indexing under withError.
+func nemotronMTPSSMTapeReplayChecked(convolution: MLXArray, ALog: MLXArray, D: MLXArray,
+                                    dt: MLXArray, state: MLXArray, steps: Int) -> MLXArray? {
+    guard steps > 0, convolution.shape == [1, steps, 6144], convolution.dtype == .bfloat16,
+          dt.shape == [1, steps, 64], dt.dtype == .float32,
+          state.shape == [1, 64, 64, 128], state.dtype == .float32 else { return nil }
+    let outputs = NemotronMTPCompactSSMKernel.kernel(
+        [convolution, ALog, D, dt, state],
+        template: [("T", convolution.dtype), ("U", DType.float32),
+                   ("Dh", 64), ("Ds", 128), ("H", 64), ("G", 8), ("L", steps),
+                   ("CD", 6144), ("BO", 4096), ("CO", 5120), ("WO", false)],
+        grid: (32, 64, 64), threadGroup: (32, 8, 1),
+        outputShapes: [[1], [1, 64, 64, 128]], outputDTypes: [.bfloat16, .float32])
+    guard outputs.count == 2 else { return nil }
+    guard outputs[0].shape == [1], outputs[0].dtype == .bfloat16,
+          outputs[1].shape == [1, 64, 64, 128], outputs[1].dtype == .float32 else { return nil }
+    return outputs[1]
+}
