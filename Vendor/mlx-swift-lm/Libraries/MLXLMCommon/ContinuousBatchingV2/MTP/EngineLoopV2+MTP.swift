@@ -64,6 +64,24 @@ extension EngineLoopV2 {
         CBv2MTPSubmitMerge.flush()
         asyncEval(graph.asyncEvalTargets)
         if let verify = graph.verify { mtpSpeculateAfterVerify(verify, driver: mtp) }
+        // Measurement entry: a step that completes a prompt (or seeds a decode) waits for its sampled tokens, then
+        // sleeps `CBv2SeedProbe.seedDelayMilliseconds`; the request's eighth verify round waits for its targets, then
+        // sleeps `CBv2SeedProbe.roundDelayMilliseconds`.
+        if !graph.prefillCarries.isEmpty || !graph.seedRows.isEmpty {
+            if CBv2SeedProbe.seedDelayMilliseconds > 0, let sampled = graph.sampledTokens {
+                eval(sampled)
+                Thread.sleep(forTimeInterval: Double(CBv2SeedProbe.seedDelayMilliseconds) / 1000)
+            }
+            CBv2SeedProbe.roundDelayPending = CBv2SeedProbe.roundDelayMilliseconds
+            CBv2SeedProbe.roundDelaySkip = 7
+        } else if graph.verify != nil, CBv2SeedProbe.roundDelayPending > 0, CBv2SeedProbe.roundDelaySkip > 0 {
+            // The first verify rounds can count toward the seed window; the wait lands in the eighth round.
+            CBv2SeedProbe.roundDelaySkip -= 1
+        } else if graph.verify != nil, CBv2SeedProbe.roundDelayPending > 0 {
+            eval(graph.asyncEvalTargets)
+            Thread.sleep(forTimeInterval: Double(CBv2SeedProbe.roundDelayPending) / 1000)
+            CBv2SeedProbe.roundDelayPending = 0
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
@@ -102,4 +120,14 @@ extension EngineLoopV2 {
         shapes?.attach()
         return step
     }
+}
+
+/// Measurement entry: milliseconds a prompt-completing (seed) step waits after its sampled tokens are evaluated,
+/// and milliseconds the request's eighth verify round waits after its targets are evaluated. Set once at load by
+/// the model; 0 waits nothing.
+public enum CBv2SeedProbe {
+    nonisolated(unsafe) public static var seedDelayMilliseconds = 0
+    nonisolated(unsafe) public static var roundDelayMilliseconds = 0
+    nonisolated(unsafe) static var roundDelayPending = 0
+    nonisolated(unsafe) static var roundDelaySkip = 0
 }
