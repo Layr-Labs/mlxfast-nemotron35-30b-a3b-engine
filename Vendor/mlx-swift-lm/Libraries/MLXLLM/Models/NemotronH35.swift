@@ -698,9 +698,19 @@ enum NemotronSeedRetile {
     ] + (offerPF ? [
         Variant(name: "ws64x64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true),
         Variant(name: "d64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true),
+        // The prefetching K loop at the other base geometries.
+        Variant(name: "ws64x128w22pf", bn: 64, bk: 128, wm: 2, wn: 2, direct: false, pf: true),
+        Variant(name: "ws128x64w24pf", bn: 128, bk: 64, wm: 2, wn: 4, direct: false, pf: true),
+        Variant(name: "d128w14pf", bn: 128, bk: 64, wm: 1, wn: 4, direct: true, pf: true),
+        Variant(name: "d128w24pf", bn: 128, bk: 64, wm: 2, wn: 4, direct: true, pf: true),
     ] : [])
 
     enum Source: String, Sendable { case bank, dict, copy }
+
+    /// The timing runs the four layers as one dependent chain (each layer's input a view of the previous layer's
+    /// output, where it is large enough), so a geometry's tail is timed as the seed meets it.
+    /// NEMOTRON_SEED_RETILE_CHAIN=0 keeps the independent launches on one input.
+    static let chainTiming = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_CHAIN"] != "0"
 
     /// The launch a role's incumbent uses at the seed.
     struct Role: Sendable, Equatable {
@@ -971,6 +981,8 @@ enum NemotronSeedRetile {
         // Time the incumbent and the survivors round robin on the 488-token
         // case, first four MoE layers per repetition; median ms per layer.
         let layers = Array(moes.prefix(4))
+        // 25 timed cycles, scaled by `nemotronTuneTimingScale` (even).
+        let timedCycles = max(25, Int((25 * nemotronTuneTimingScale).rounded()) / 2 * 2)
         var medians: [[(Variant?, Double)]] = [[], []]
         var verdicts: [NemotronTuneAdoption.Verdict?] = [nil, nil]
         var choice: [Variant?] = [nil, nil]
@@ -980,19 +992,30 @@ enum NemotronSeedRetile {
             var samples = Array(repeating: [Double](), count: candidates.count)
             do {
                 try withError {
-                    for rep in 0 ..< 30 {
+                    for rep in 0 ..< 5 + timedCycles {
                         for i in NemotronTuneAdoption.order(candidates.count, cycle: max(0, rep - 5)) {
                             let candidate = candidates[i]
                             let start = DispatchTime.now().uptimeNanoseconds
-                            let outs = layers.compactMap { m -> MLXArray? in
+                            // `chainTiming`: each layer's input is a view of the previous layer's output (same
+                            // shape and dtype as `x`), so the launches run back to back as in the seed.
+                            var current = x
+                            var outs: [MLXArray] = []
+                            var chained = chainTiming
+                            for m in layers {
                                 let lin = linear(m, r)
-                                if let candidate {
-                                    return launch(candidate, role: roles[r], x: x, lin: lin, rows: rows,
-                                                  tiles: cases[0].tiles)
+                                let out = candidate.map {
+                                    launch($0, role: roles[r], x: current, lin: lin, rows: rows, tiles: cases[0].tiles)
+                                } ?? incumbent(roles[r], x: current, lin: lin, rows: rows, tiles: cases[0].tiles)
+                                guard let out else { break }
+                                outs.append(out)
+                                if chained, out.dtype == x.dtype, out.size >= x.size {
+                                    current = out.reshaped(-1)[0 ..< x.size].reshaped(x.shape)
+                                } else {
+                                    chained = false
                                 }
-                                return incumbent(roles[r], x: x, lin: lin, rows: rows, tiles: cases[0].tiles)
                             }
-                            eval(outs)
+                            // A chain is complete once its last launch is; otherwise every launch is evaluated.
+                            if chained, let last = outs.last { eval(last) } else { eval(outs) }
                             Stream.gpu.synchronize()
                             let elapsed = DispatchTime.now().uptimeNanoseconds - start
                             if rep >= 5, outs.count == layers.count {
@@ -1005,7 +1028,7 @@ enum NemotronSeedRetile {
                 dropped[r].append("timing error")
                 continue
             }
-            guard samples.allSatisfy({ $0.count == 25 }) else { continue }
+            guard samples.allSatisfy({ $0.count == timedCycles }) else { continue }
             let verdict = NemotronTuneAdoption.decide(samples)
             verdicts[r] = verdict
             medians[r] = Array(zip(candidates, verdict.medians))
@@ -1529,10 +1552,19 @@ enum NemotronSeedDenseRetile {
     /// dense tune has no load-time cap, and each row adds a qualify and a timing pass over every layer.
     static let extraVariants: [Variant] = [
         Variant(64, 64, 64, wm: 2, wn: 2, pf: true),
+        // The other base geometries with the same K-loop prefetch (single stage; each fits 32 KB).
+        Variant(64, 128, 64, wm: 2, wn: 4, pf: true),
+        Variant(128, 64, 64, wm: 4, wn: 2, pf: true),
+        Variant(128, 128, 64, wm: 4, wn: 4, pf: true),
+        Variant(64, 64, 128, wm: 2, wn: 2, pf: true),
     ]
     /// NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out of this tune (the base rows only).
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X"] != "0"
     static let variants: [Variant] = baseVariants + (offerX ? extraVariants : [])
+    /// The timing runs every layer's launch as one dependent chain (each reads its pair table, or the copy's biases,
+    /// from a view of the previous launch's output), so a geometry's tail is timed as the seed meets it, not hidden
+    /// by the next layer's independent launch. NEMOTRON_SEED_DENSE_CHAIN=0 keeps the independent launches.
+    static let chainTiming = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_CHAIN"] != "0"
 
     enum Source: String, Sendable { case dict, copy }
 
@@ -1653,7 +1685,11 @@ enum NemotronSeedDenseRetile {
     /// robin on case 0, every layer per cycle: 1 warm-up and
     /// `NemotronTuneAdoption.minCycles` timed cycles (`NemotronTuneAdoption.order`),
     /// median ms per launch; `NemotronTuneAdoption.decide` picks.
-    private static func evaluate(cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?) -> Outcome {
+    /// `chain(v, layer, dep)` (when given): the case-0 launch of `layer` reading one operand from a view of `dep` (the
+    /// previous layer's output in the timing chain), so each timed launch waits for the one before it, as the seed's
+    /// projections run; nil `chain` keeps the independent per-layer launches.
+    private static func evaluate(cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?,
+                                 chain: ((Variant?, Int, MLXArray?) -> MLXArray?)? = nil) -> Outcome {
         var alive = variants.filter { $0.threadgroupBytes <= 32768 }
         var dropped: [String] = []
         caseLoop: for c in 0 ..< cases {
@@ -1688,14 +1724,32 @@ enum NemotronSeedDenseRetile {
         guard !alive.isEmpty else { return Outcome(alive: alive, dropped: dropped, medians: [], choice: nil) }
         let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
         var samples = Array(repeating: [Double](), count: candidates.count)
-        let timed = NemotronTuneAdoption.minCycles
+        let timed = max(NemotronTuneAdoption.minCycles,
+                        Int((Double(NemotronTuneAdoption.minCycles) * nemotronTuneTimingScale).rounded()) / 2 * 2)
         do {
             try withError {
                 for rep in 0 ..< 1 + timed {
                     for i in NemotronTuneAdoption.order(candidates.count, cycle: max(0, rep - 1)) {
                         let start = DispatchTime.now().uptimeNanoseconds
-                        let outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
-                        eval(outs)
+                        var outs: [MLXArray] = []
+                        if let chain {
+                            var previous: MLXArray? = nil
+                            for layer in 0 ..< layers {
+                                guard let out = chain(candidates[i], layer, previous) else { break }
+                                previous = out
+                                outs.append(out)
+                            }
+                            if outs.count == layers, let last = outs.last {
+                                eval(last)
+                            } else {
+                                // A link the chain cannot build: this sample times the independent launches.
+                                outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
+                                eval(outs)
+                            }
+                        } else {
+                            outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
+                            eval(outs)
+                        }
                         Stream.gpu.synchronize()
                         let elapsed = DispatchTime.now().uptimeNanoseconds - start
                         if rep >= 1, outs.count == layers {
@@ -1774,10 +1828,13 @@ enum NemotronSeedDenseRetile {
                 detail.append("\(kind) off (inputs)")
                 continue
             }
-            let o = evaluate(cases: xs.count, layers: all.count) { v, c, layer in
+            let o = evaluate(cases: xs.count, layers: all.count, run: { v, c, layer in
                 if let v { return launch(v, source: .dict, x: xs[c], linear: all[layer], relu2: relu2) }
                 return NemotronPrefillDenseDict.launch(xs[c], all[layer], relu2: relu2)
-            }
+            }, chain: chainTiming ? { v, layer, dep in
+                if let v { return launch(v, source: .dict, x: xs[0], linear: all[layer], relu2: relu2, dep: dep) }
+                return NemotronPrefillDenseDict.launch(xs[0], all[layer], relu2: relu2, dep: dep)
+            } : nil)
             if let pick = o.choice { choice[kind] = pick }
             note(kind, o)
         }
@@ -1786,10 +1843,13 @@ enum NemotronSeedDenseRetile {
             // The shared up's ReLU2 output, except the scaled case.
             let xs = inputs(first.weight.dim(1) * 8, seed: 0x5eed_de80, zeros: { $0 != 1 })
             if xs.count == rowCounts.count {
-                let o = evaluate(cases: xs.count, layers: downs.count) { v, c, layer in
+                let o = evaluate(cases: xs.count, layers: downs.count, run: { v, c, layer in
                     if let v { return launch(v, source: .copy, x: xs[c], linear: downs[layer], relu2: false) }
                     return NemotronPrefillSharedDownCopy.launch(xs[c], downs[layer])
-                }
+                }, chain: chainTiming ? { v, layer, dep in
+                    if let v { return launch(v, source: .copy, x: xs[0], linear: downs[layer], relu2: false, dep: dep) }
+                    return NemotronPrefillSharedDownCopy.launch(xs[0], downs[layer], dep: dep)
+                } : nil)
                 if let pick = o.choice { choice["shared_down"] = pick }
                 note("shared_down", o)
             } else {
@@ -1845,12 +1905,24 @@ enum NemotronSeedQMMTune {
         + (offerX ? NemotronSeedDenseRetile.extraVariants : [])
     /// Soft cap on the tune's own load time: no kind, variant or timing phase starts past it. 6 s for the base
     /// rows, scaled by the candidate count so the base rows keep their share of it when the pf row is offered.
-    static let budgetSeconds = 6.0 * Double(variants.count) / Double(NemotronSeedDenseRetile.baseVariants.count)
+    static let budgetSeconds = 6.0 * nemotronTuneBudgetScale * Double(variants.count)
+        / Double(NemotronSeedDenseRetile.baseVariants.count)
 
     /// Adopted variant per kind ("out_proj", "up_proj", "shared_down"), set once at load before any request.
     nonisolated(unsafe) private(set) static var choice: [String: Variant] = [:]
 
     static func adopted(_ kind: String) -> Bool { choice[kind] != nil }
+
+    /// Whether the seed's attention q_proj / o_proj join the tune (NEMOTRON_SEED_QMM_ATTN=0 leaves them stock).
+    static let attentionKinds = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_ATTN"] != "0"
+
+    /// The seed's attention projection `kind` ("q_proj", "o_proj") through the adopted launch, where the stock
+    /// product runs `qmm_nax` on the request's rows; nil otherwise (the caller runs its stock projection).
+    static func attention(_ x: MLXArray, _ linear: Linear, kind: String) -> MLXArray? {
+        guard attentionKinds, NemotronHPrefillX5.active, choice[kind] != nil, x.ndim == 3, x.dim(0) == 1,
+              x.dim(1) > 32, NemotronSBDict.dict(linear) != nil else { return nil }
+        return dense(x, linear, kind: kind, relu2: false)
+    }
 
     /// Whether MLX's quantized matmul runs `qmm_nax` for a BF16 [m, k] x [n, k]^T product (one batch, transposed,
     /// group size 64, NAX host): m at or above every `get_qmv_batch_limit` (at most 33) and `qmm_splitk`'s split
@@ -2133,6 +2205,20 @@ enum NemotronSeedQMMTune {
                                   source: .dict, relu2: kind == "up_proj", zeros: false))
             }
         }
+        // The seed's attention q_proj and o_proj (stock `linear(x)` on 488 rows, `qmm_nax`), reading the pair
+        // dictionaries `NemotronSBDict` builds for every 4-bit target projection; k_proj and v_proj run split K at
+        // 488 rows and stay stock. NEMOTRON_SEED_QMM_ATTN=0 leaves them out.
+        if attentionKinds {
+            let attentions = target.modules().compactMap { $0 as? NemotronHAttention }
+            for (kind, linears) in [("q_proj", attentions.map { $0.wq as Linear }),
+                                    ("o_proj", attentions.map { $0.wo as Linear })] where !linears.isEmpty {
+                if linears.allSatisfy({ ($0 as? QuantizedLinear).flatMap { NemotronSBDict.dict($0) } != nil }) {
+                    kinds.append(Kind(name: kind, linears: linears, source: .dict, relu2: false, zeros: false))
+                } else {
+                    parts.append("\(kind) off (no dictionary)")
+                }
+            }
+        }
         if NemotronPrefillSharedDownCopy.verified {
             parts.append("shared_down off (copy launch verified)")
         } else {
@@ -2216,7 +2302,7 @@ enum NemotronSeedSSMTune {
     ] + (offerX ? [Variant(name: "sk64", rows: 64, staging: .sk64, stage: nil)] : [])
     /// Soft cap on the tune's own load time: no variant or timing phase starts past it. 1.5 s for the two base
     /// rows per list, scaled by the candidate count so they keep their share of it when the third row is offered.
-    static let budgetSeconds = 1.5 * Double(stateVariants.count + scanVariants.count) / 4.0
+    static let budgetSeconds = 1.5 * nemotronTuneBudgetScale * Double(stateVariants.count + scanVariants.count) / 4.0
 
     /// Adopted variants (nil: the incumbent), set once at load before any request.
     nonisolated(unsafe) private(set) static var stateChoice: Variant? = nil
