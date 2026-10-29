@@ -278,6 +278,7 @@ extension EngineLoopV2 {
                 sources: draftSources.count == columns.count - 1 ? draftSources : [])
             defer { CBv2MTPVerifyWindowColumns.clear() }
             let output: (logits: MLXArray, lastHidden: MLXArray)
+            var producedPolicy: (ids: MLXArray, values: MLXArray, packet: MLXArray)?
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
                 // window; the model stages [1+k, ...] captured stacks per
@@ -298,9 +299,20 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds) }
+                if mtp.usesRequestStatefulDrafter, !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
+                   CBv2MTPHeadProducerKeys.enabled, tokens.shape == [1, 3] {
+                    let captured = try checkedModelForward(phase: .mtpVerification) {
+                        recurrentModel.forwardWithHiddenCapturedHead(
+                            tokens: tokens, caches: caches, recurrentState: evaluations,
+                            positionIds: positionIds, policyWindow: tokens)
+                    }
+                    output = (captured.logits, captured.lastHidden)
+                    producedPolicy = captured.policy
+                } else {
+                    output = try checkedModelForward(phase: .mtpVerification) { recurrentModel.forwardWithHiddenCaptured(
+                        tokens: tokens, caches: caches, recurrentState: evaluations,
+                        positionIds: positionIds) }
+                }
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,
@@ -327,6 +339,13 @@ extension EngineLoopV2 {
                 let flat = output.logits.reshaped([1, batch * width, vocabulary])
                 let topTwo: (ids: MLXArray, values: MLXArray)
                 if !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
+                   batch == 1, width == 3, vocabulary == 131072, output.logits.dtype == .bfloat16,
+                   let folded = producedPolicy, folded.ids.shape == [3, 2], folded.ids.dtype == .int32,
+                   folded.values.shape == [3, 2], folded.values.dtype == .float32,
+                   folded.packet.shape == [11], folded.packet.dtype == .int32 {
+                    topTwo = (folded.ids, folded.values)
+                    packet = folded.packet
+                } else if !useTargetPrefix, CBv2MTPPolicyPacket.enabled,
                     let folded = provider.cbv2MTPTopTwoPacket(flat, window: tokens)
                 {
                     topTwo = (folded.ids, folded.values)

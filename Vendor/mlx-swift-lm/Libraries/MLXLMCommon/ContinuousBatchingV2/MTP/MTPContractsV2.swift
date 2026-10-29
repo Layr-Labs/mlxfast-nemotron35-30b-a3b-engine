@@ -124,6 +124,28 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
     ) -> (logits: MLXArray, lastHidden: MLXArray)
 }
 
+/// Explicit results of one captured target transaction. Full logits and hidden stay available to every
+/// existing consumer; optional policy arrays belong only to this call's exact verify window.
+public struct CBv2MTPCapturedHeadOutput {
+    public let logits: MLXArray
+    public let lastHidden: MLXArray
+    public let policy: (ids: MLXArray, values: MLXArray, packet: MLXArray)?
+    public init(logits: MLXArray, lastHidden: MLXArray,
+                policy: (ids: MLXArray, values: MLXArray, packet: MLXArray)? = nil) {
+        self.logits = logits
+        self.lastHidden = lastHidden
+        self.policy = policy
+    }
+}
+
+public protocol CBv2RecurrentCaptureHeadMTPForwardable: CBv2RecurrentCaptureMTPForwardable {
+    func cbv2ForwardWithHiddenCapturedHead(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        policyWindow: MLXArray
+    ) -> CBv2MTPCapturedHeadOutput
+}
+
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
@@ -185,9 +207,27 @@ public protocol CBv2RecurrentMTPSteppableModel:
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray)
+
+    /// Optional numerical-head fusion around the SAME single captured forward. The default calls the
+    /// old seam once and returns no policy. It must never probe by forwarding and then forward again.
+    func forwardWithHiddenCapturedHead(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        policyWindow: MLXArray
+    ) -> CBv2MTPCapturedHeadOutput
 }
 
 extension CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenCapturedHead(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        policyWindow: MLXArray
+    ) -> CBv2MTPCapturedHeadOutput {
+        let output = forwardWithHiddenCaptured(tokens: tokens, caches: caches,
+            recurrentState: recurrentState, positionIds: positionIds)
+        return CBv2MTPCapturedHeadOutput(logits: output.logits, lastHidden: output.lastHidden)
+    }
+
     public func forwardWithHiddenForPrefill(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,

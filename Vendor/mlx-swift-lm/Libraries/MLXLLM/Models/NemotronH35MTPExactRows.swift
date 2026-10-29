@@ -3,6 +3,169 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+/// Source-only prototype: not wired into any production head dispatch. The caller must supply the exact
+/// selected prepared head body after its incumbent HF/load/NSG/U2/dictionary/vector-store transformations.
+/// A future remote gate must compare complete logits and tile keys before any dispatch is enabled.
+enum NemotronHeadKeyProducerSource {
+    static let tile = 512
+
+    static func make(_ original: String) -> String? {
+        let prefix = "  const device uint8_t* ws = (const device uint8_t*)w;\n"
+        let address = """
+          const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+              simd_gid * results_per_simdgroup;
+          if (out_row >= out_vec_size) {
+            return;
+          }
+        """
+        let store = "yp[r * out_vec_size + row] = h;"
+        let stores = original.components(separatedBy: store).count - 1
+        guard original.components(separatedBy: prefix).count == 2,
+              original.components(separatedBy: address).count == 2,
+              (1...2).contains(stores), !original.contains("threadgroup_barrier"),
+              !original.contains("threadgroup ")
+        else { return nil }
+        // K/N are runtime scalar buffers. Host eligibility must require N=131072 and exact512-column
+        // tiles; only the per-subtile geometry below is compile-time. Every thread executes every subtile.
+        var source = original.replacingOccurrences(of: address, with: """
+          const int out_row = int(tid.y) * 512 + nhp_block * (num_simdgroups * results_per_simdgroup) +
+              int(simd_gid) * results_per_simdgroup;
+        """)
+        guard !source.contains("return;") else { return nil }
+        source = source.replacingOccurrences(of: prefix, with: """
+          static_assert(512 % (num_simdgroups * results_per_simdgroup) == 0, "whole head subtiles");
+          ulong nhp_first[R] = {0};
+          ulong nhp_second[R] = {0};
+          for (int nhp_block = 0; nhp_block < 512 / (num_simdgroups * results_per_simdgroup); ++nhp_block) {
+          const device uint8_t* ws = (const device uint8_t*)w;
+
+        """)
+        // Store remains byte-for-byte the original BF16 rounding/store statement. The sidecar reads that
+        // same rounded h; it does not compare a pre-rounding accumulator or rescore a selected candidate.
+        source = source.replacingOccurrences(of: store, with: store + "\n"
+            + "          darkbloom_qwen35_mtp_top2_key_push(nhp_first[r], nhp_second[r],\n"
+            + "              darkbloom_qwen35_mtp_top2_key(bfloat16_t(h), uint(out_row + row)));\n")
+        return source + """
+          }
+          // All lanes reach this point: exact full tiles have no early return and no block-local barrier.
+          // Keep two keys per SIMD group and row, then merge its disjoint subtiles across the whole group.
+          threadgroup ulong nhp_scratch[R * num_simdgroups * 2];
+          for (int r = 0; r < R; ++r) {
+            const ulong first = darkbloom_qwen35_mtp_top2_key_max(nhp_first[r]);
+            const ulong second = darkbloom_qwen35_mtp_top2_key_max(
+                nhp_first[r] == first ? nhp_second[r] : nhp_first[r]);
+            if (simd_lid == 0) {
+              nhp_scratch[(r * num_simdgroups + simd_gid) * 2] = first;
+              nhp_scratch[(r * num_simdgroups + simd_gid) * 2 + 1] = second;
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (simd_gid == 0) {
+            for (int r = 0; r < R; ++r) {
+              ulong first = 0;
+              ulong second = 0;
+              for (int j = int(simd_lid); j < 2 * num_simdgroups; j += 32) {
+                darkbloom_qwen35_mtp_top2_key_push(first, second,
+                    nhp_scratch[r * num_simdgroups * 2 + j]);
+              }
+              const ulong a = darkbloom_qwen35_mtp_top2_key_max(first);
+              const ulong b = darkbloom_qwen35_mtp_top2_key_max(first == a ? second : first);
+              if (simd_lid == 0) {
+                partial_keys[(r * (N / 512) + tid.y) * 2] = a;
+                partial_keys[(r * (N / 512) + tid.y) * 2 + 1] = b;
+              }
+            }
+          }
+        """
+    }
+}
+
+/// Admission is immutable after load and belongs to the exact real target head. A different owner or
+/// changed production configuration falls back before a producer graph is constructed.
+enum NemotronHeadKeyProducer {
+    nonisolated(unsafe) private static var qualifiedHead: QuantizedLinear?
+    nonisolated(unsafe) private static var qualifiedSelection: String?
+
+    static func admitted(_ q: QuantizedLinear) -> Bool {
+        CBv2MTPHeadProducerKeys.enabled && qualifiedHead === q && qualifiedSelection != nil
+    }
+
+    static func apply(_ hidden: MLXArray, _ q: QuantizedLinear, prepared: MLXArray? = nil,
+                      force: Bool = false, sbDict: Bool = true)
+        -> (logits: MLXArray, partials: MLXArray, selection: String)? {
+        guard CBv2MTPHeadProducerKeys.enabled, NemotronMTPExecution.exactMultirowHead,
+              NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
+              !NemotronMoELeader.selfTest, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu, hidden.shape == [1, 3, 2688], hidden.dtype == .bfloat16,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil,
+              q.weight.shape == [131072, 336], q.weight.dtype == .uint32,
+              q.scales.shape == [131072, 42], q.scales.dtype == .bfloat16,
+              q.biases?.shape == [131072, 42], q.biases?.dtype == .bfloat16,
+              force || (qualifiedHead === q && qualifiedSelection != nil)
+        else { return nil }
+        return NemotronHeadPreparedActivation.producerRows(
+            hidden.reshaped(3, 2688), q, prepared: prepared, sbDict: sbDict,
+            allowedSelection: force ? nil : qualifiedSelection)
+    }
+
+    /// Real-weight load gate only; never called from a request. Every full-logit word, every tile pair,
+    /// and both final packet forms must match, for all eight inputs, both ingress and actual source forms.
+    static func qualify(_ q: QuantizedLinear?) {
+        qualifiedHead = nil
+        qualifiedSelection = nil
+        guard let q, CBv2MTPHeadProducerKeys.enabled else { return }
+        var cases = 0
+        var selected: String?
+        do {
+            let passed = try withError { () -> Bool in
+                for kind in 0..<8 {
+                    var hidden = MLXRandom.normal([1, 3, 2688],
+                        key: MLXRandom.key(UInt64(0x68b0 + kind))).asType(.bfloat16)
+                    if kind >= 2 {
+                        let patterns: [[UInt16]] = [
+                            [0x0000], [0x0000, 0x8000], [0x7f80, 0xff80, 0x7fc1, 0xffc2],
+                            [0x0001, 0x8001, 0x7f7f, 0xff7f], [0x3f80],
+                            [0x3f80, 0xbf80, 0x0080, 0x8080]
+                        ]
+                        let pool = patterns[kind - 2]
+                        hidden = MLXArray((0..<(3 * 2688)).map { pool[$0 % pool.count] })
+                            .view(dtype: .bfloat16).reshaped(1, 3, 2688)
+                    }
+                    guard let packed = NemotronHeadPreparedActivation.producerPack(hidden.reshaped(3, 2688))
+                    else { return false }
+                    for dictionary in [false, true] {
+                        for ingress in 0..<2 {
+                            let prepared: MLXArray? = ingress == 0 ? nil : packed
+                            guard let got = apply(hidden, q, prepared: prepared, force: true, sbDict: dictionary)
+                            else { return false }
+                            let expected = NemotronHeadPreparedActivation.apply(
+                                hidden.reshaped(3, 2688), q, relu2: false,
+                                rps: NemotronMultiRowQMV.headRPS(n: 131072),
+                                prepared: prepared, sbDict: dictionary).reshaped(1, 3, 131072)
+                            let windows: [[Int32]] = [[Int32.min, Int32.max, -1], [0, 131071, 131072], [3, 5, 7]]
+                            let window = MLXArray(windows[(kind + ingress) % windows.count]).reshaped(1, 3)
+                            guard expected.shape == got.logits.shape, expected.dtype == got.logits.dtype,
+                                  (got.logits.view(dtype: .uint16) .== expected.view(dtype: .uint16))
+                                    .all().item(Bool.self),
+                                  CBv2MTPHeadProducerKeys.matchesHead(got.partials, logits: expected, window: window)
+                            else { return false }
+                            if dictionary {
+                                if let selected, selected != got.selection { return false }
+                                selected = got.selection
+                            }
+                            cases += 1
+                        }
+                    }
+                }
+                return cases == 32 && selected != nil
+            }
+            if passed, let selected { qualifiedHead = q; qualifiedSelection = selected }
+        } catch { qualifiedHead = nil; qualifiedSelection = nil }
+        FileHandle.standardError.write(Data(
+            "nemotron real head producer: \(qualifiedHead == nil ? "off" : "on"), \(cases)/32 cases\n".utf8))
+    }
+}
+
 enum NemotronMTPExecution {
     private static func enabledByDefault(_ key: String) -> Bool {
         ProcessInfo.processInfo.environment[key] != "0"
@@ -1687,6 +1850,114 @@ enum NemotronHeadPreparedActivation {
         return prepare([x], template: [("T", x.dtype), ("K", k), ("PV", pv)],
             grid: (k / pv, rows, 1), threadGroup: (32, 1, 1),
             outputShapes: [[rows, (k / pv + 31) / 32, (pv + 1) * 32]], outputDTypes: [.float32])[0]
+    }
+
+    /// Guard count/shape before exposing an output to the new admission path. Original pack/apply stay
+    /// untouched; a failed producer prepare returns nil and the same captured hidden takes its old head.
+    static func producerPack(_ x: MLXArray) -> MLXArray? {
+        guard x.shape == [3, 2688], x.dtype == .bfloat16 else { return nil }
+        let shape = [3, (2688 / 8 + 31) / 32, 9 * 32]
+        let outputs = prepare([x], template: [("T", DType.bfloat16), ("K", 2688), ("PV", 8)],
+            grid: (2688 / 8, 3, 1), threadGroup: (32, 1, 1),
+            outputShapes: [shape], outputDTypes: [.float32])
+        guard outputs.count == 1, outputs[0].shape == shape, outputs[0].dtype == .float32
+        else { return nil }
+        return outputs[0]
+    }
+
+    private struct ProducerLaunch {
+        let kernel: MLXFast.MLXFastKernel
+        let extra: [(String, any KernelTemplateArg)]
+        let nsg: Int
+        let rps: Int
+        let dictionary: NemotronSBDict.Dict?
+        let unreadDep: Bool
+        let tag: String
+    }
+    private static let producerLock = NSLock()
+    nonisolated(unsafe) private static var producerKernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// Resolve exactly the incumbent apply selection: admitted QMV config first for dictionary heads,
+    /// else dictLaunch, else projectLaunch. Reuse its transforms and unread-dep input, with no search.
+    private static func producerLaunch(_ q: QuantizedLinear, sbDict: Bool) -> ProducerLaunch? {
+        let k = 2688, n = 131072
+        let unroll = NemotronU2.prepared(rows: 3, n: n)
+        var dictionary = sbDict && NemotronSBDict.enabled ? NemotronSBDict.dict(q) : nil
+        let tuned = dictionary != nil ? NemotronQMVTune.headProducerConfig(u2: unroll) : nil
+        let half: Int?
+        let load: Int, rps: Int, nsg: Int
+        let useNSG: Bool, actualU2: Bool, plainVS: Bool
+        if let tuned {
+            half = tuned.hf; load = tuned.load; rps = tuned.rps; nsg = tuned.nsg
+            useNSG = true; actualU2 = tuned.u2; plainVS = false
+        } else {
+            if dictionary != nil, dictLaunch(k: k, n: n,
+                rps: NemotronMultiRowQMV.headRPS(n: n), u2: unroll) == nil {
+                dictionary = nil
+            }
+            half = decodeForm(rows: 3, fast: false)
+            load = loadForm(k: k, n: n)
+            let geometry = preparedGeometry[[k, n]]
+                ?? (rps: NemotronMultiRowQMV.headRPS(n: n), nsg: 2)
+            rps = geometry.rps; nsg = geometry.nsg; useNSG = nsg != 2
+            actualU2 = unroll && u2Kernel(half: half != nil, load: load,
+                nsg: useNSG, dict: dictionary != nil) != nil
+            plainVS = dictionary == nil && !actualU2 && half == nil && load == 0 && !useNSG
+                && projectVSVerified && projectVS != nil
+        }
+        guard rps > 0, (1...32).contains(nsg), 512 % (rps * nsg) == 0 else { return nil }
+        let tag = "nemotron_head_producer_h\(half ?? 0)_l\(load)_r\(rps)_n\(nsg)"
+            + "_s\(useNSG ? 1 : 0)_d\(dictionary == nil ? 0 : 1)_u\(actualU2 ? 2 : 1)"
+            + "_t\(tuned == nil ? 0 : 1)_v\(plainVS ? 1 : 0)"
+        let kernel: MLXFast.MLXFastKernel? = producerLock.withLock {
+            if let kernel = producerKernels[tag] { return kernel }
+            let base = half == nil ? crownSource : preparedHalfSource
+            var body: String?
+            if let tuned {
+                body = NemotronQMVTune.source(base: base, load: tuned.load, u2: tuned.u2)
+            } else {
+                let loads: [Int: [(String, String, Int)]] = [
+                    1: nemotronPreparedW32Swaps, 2: nemotronPreparedHoistSwaps,
+                    3: nemotronPreparedPrefetchSwaps]
+                guard load == 0 || loads[load] != nil else { return nil }
+                body = nemotronCountedSwaps(base, (loads[load] ?? []) + (useNSG ? nemotronPreparedNSGSwaps : []))
+                if dictionary != nil { body = body.flatMap { nemotronSBDictSource($0) } }
+                if actualU2 { body = nemotronU2Source(body, loop: NemotronU2.qmvLoop, count: 1) }
+                if plainVS { body = body.flatMap { nemotronQMVVectorStoreSource($0) } }
+            }
+            guard let body, let source = NemotronHeadKeyProducerSource.make(body) else { return nil }
+            let kernel = MLXFast.metalKernel(
+                name: tag, inputNames: ["w", "scales", "biases", "prepared", "K", "N"]
+                    + (tuned == nil ? [] : ["dep"]), outputNames: ["y", "partial_keys"],
+                source: source, header: variantHeader(half: half != nil, load: load)
+                    + CBv2MTPHeadProducerKeys.metalHeader)
+            producerKernels[tag] = kernel
+            return kernel
+        }
+        guard let kernel else { return nil }
+        let hf: [(String, any KernelTemplateArg)] = half.map { [("HF", $0)] } ?? []
+        return ProducerLaunch(kernel: kernel, extra: hf + (useNSG ? [("NSG", nsg)] : []),
+            nsg: nsg, rps: rps, dictionary: dictionary, unreadDep: tuned != nil, tag: tag)
+    }
+
+    static func producerRows(_ x: MLXArray, _ q: QuantizedLinear, prepared: MLXArray?,
+                             sbDict: Bool, allowedSelection: String?)
+        -> (logits: MLXArray, partials: MLXArray, selection: String)? {
+        guard let launch = producerLaunch(q, sbDict: sbDict),
+              allowedSelection == nil || allowedSelection == launch.tag,
+              let packed = compatible(prepared, rows: 3, k: 2688) ?? producerPack(x),
+              let biases = q.biases else { return nil }
+        let args = NemotronMultiRowQMV.scalarPair(2688, 131072)
+        let outputs = launch.kernel(
+            [q.weight, launch.dictionary?.index ?? q.scales, launch.dictionary?.table ?? biases,
+             packed, args.0, args.1] + (launch.unreadDep ? [packed] : []),
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", false),
+                       ("RPS", launch.rps)] + launch.extra,
+            grid: (32, 256 * launch.nsg, 1), threadGroup: (32, launch.nsg, 1),
+            outputShapes: [[3, 131072], [3, 256, 2]], outputDTypes: [.bfloat16, .uint64])
+        guard outputs.count == 2, outputs[0].shape == [3, 131072], outputs[0].dtype == .bfloat16,
+              outputs[1].shape == [3, 256, 2], outputs[1].dtype == .uint64 else { return nil }
+        return (outputs[0].reshaped(1, 3, 131072), outputs[1], launch.tag)
     }
 
     static func compatible(_ prepared: MLXArray?, rows: Int, k: Int) -> MLXArray? {

@@ -6077,6 +6077,14 @@ enum NemotronQMVTune {
         return (kernel, hf + [("NSG", c.nsg)], c.rps, c.nsg)
     }
 
+    /// Read the exact production head choice after its original load-time admission. No new search or
+    /// forced configuration: the same failed-kernel fallback as preparedLaunch remains authoritative.
+    static func headProducerConfig(u2: Bool) -> Config? {
+        guard let pick = adopted[.head], pick.u2 == u2,
+              preparedKernel(pick.config) != nil else { return nil }
+        return pick.config
+    }
+
     /// The in_proj dictionary launch: `config` (a load-time check's), else the adopted config on the production
     /// call (`production`: no explicit unroll or epilogue choice), else nil (the record selection).
     static func inProjLaunch(_ config: Config?, production: Bool)

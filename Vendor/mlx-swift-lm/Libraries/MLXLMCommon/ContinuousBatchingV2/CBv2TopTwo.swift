@@ -727,6 +727,168 @@ private let cbv2TopTwoKeysFinalizeKernels: (window: MLXFast.MLXFastKernel, colum
             source: cbv2PacketColumnsSource($0), header: cbv2TopTwoKeysHeader, ensureRowContiguous: true))
     }
 
+/// Explicit policy evidence from a head producer. This helper owns no request or logits-identity cache.
+/// The caller keeps full vocabulary logits and supplies the producer's disjoint tile pairs as a current array.
+public enum CBv2MTPHeadProducerKeys {
+    public static let requested = ProcessInfo.processInfo.environment["CBV2_MTP_HEAD_PRODUCER_KEYS"] != "0"
+    nonisolated(unsafe) private static var verified = false
+    public static var enabled: Bool {
+        requested && verified && CBv2MTPTopTwoKeys.verified && CBv2MTPTopTwoPacket.enabled
+    }
+    /// Same exact BF16 value/id/payload ordering as the incumbent's admitted top-two keys.
+    public static var metalHeader: String { cbv2TopTwoKeysHeader }
+
+    private static let kernels: (window: MLXFast.MLXFastKernel, columns: MLXFast.MLXFastKernel)? = {
+        guard var source = cbv2TopTwoKeysFinalizeSource(cbv2TopTwoFinalizePacketShuffleSource) else { return nil }
+        let from = """
+            uint base = (row * 32 + lane) * 2;
+            const ulong first = partial_keys[base];
+            const ulong second = partial_keys[base + 1];
+        """
+        guard source.components(separatedBy: from).count == 2 else { return nil }
+        source = source.replacingOccurrences(of: from, with: """
+            ulong first = 0;
+            ulong second = 0;
+            for (uint group = lane; group < PARTS; group += 32) {
+                const uint base = (row * PARTS + group) * 2;
+                darkbloom_qwen35_mtp_top2_key_push(first, second, partial_keys[base]);
+                darkbloom_qwen35_mtp_top2_key_push(first, second, partial_keys[base + 1]);
+            }
+        """)
+        return (MLXFast.metalKernel(
+            name: "nemotron_head_producer_keys_finalize",
+            inputNames: ["partial_keys", "window"], outputNames: ["top_ids", "top_values", "packet"],
+            source: source, header: cbv2TopTwoKeysHeader, ensureRowContiguous: true),
+            MLXFast.metalKernel(
+            name: "nemotron_head_producer_keys_finalize_columns",
+            inputNames: ["partial_keys", "w1", "w2"], outputNames: ["top_ids", "top_values", "packet"],
+            source: cbv2PacketColumnsSource(source), header: cbv2TopTwoKeysHeader, ensureRowContiguous: true))
+    }()
+
+    /// Producer pairs [3, PARTS, 2], uint64, for the three-row target verify window.
+    /// The same registered draft columns feed the packet as in the incumbent; no new window materialization.
+    public static func finalize(_ partials: MLXArray, window: MLXArray, force: Bool = false)
+        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+        guard requested, force || verified, CBv2MTPTopTwoKeys.verified, CBv2MTPTopTwoPacket.enabled,
+              window.shape == [1, 3], window.dtype == .int32,
+              partials.ndim == 3, partials.dim(0) == 3, partials.dim(2) == 2,
+              partials.dtype == .uint64, (1...8192).contains(partials.dim(1))
+        else { return nil }
+        return launch(partials, window: window, columns: cbv2PacketDraftColumns(window))
+    }
+
+    private static func launch(_ partials: MLXArray, window: MLXArray, columns: [MLXArray]?)
+        -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+        guard let kernels else { return nil }
+        let outputs = (columns == nil ? kernels.window : kernels.columns)(
+            columns.map { [partials, $0[0], $0[1]] } ?? [partials, window],
+            template: [("PARTS", partials.dim(1))],
+            grid: (3 * 32, 1, 1), threadGroup: (32, 1, 1),
+            outputShapes: [[3, 2], [3, 2], [11]], outputDTypes: [.int32, .float32, .int32])
+        guard outputs.count == 3, outputs[0].shape == [3, 2], outputs[1].shape == [3, 2],
+              outputs[2].shape == [11], outputs[0].dtype == .int32,
+              outputs[1].dtype == .float32, outputs[2].dtype == .int32 else { return nil }
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// Remote load gate only. The actual head qualifier must additionally compare its complete logits and
+    /// tile-key producer against these reference tile pairs before production can use the producer.
+    public static func qualify() {
+        verified = false
+        guard requested, CBv2MTPTopTwoKeys.verified else { return }
+        var cases = 0
+        do {
+            verified = try withError { () -> Bool in
+                for parts in [1, 7, 32, 256] {
+                    for kind in 0..<8 {
+                        let count = parts * 512
+                        let seed = UInt64(0x58a0 + parts * 16 + kind)
+                        var values = MLXRandom.normal([1, 3, count], key: MLXRandom.key(seed)).asType(.bfloat16)
+                        if kind >= 2 {
+                            let patterns: [[UInt16]] = [
+                                [0x0000, 0x8000], [0x7f80, 0xff80, 0x7fc1, 0xffc2],
+                                [0x3f80], [0x7fc1, 0x7fc2, 0xffc3],
+                                [0x0001, 0x8001, 0x7f7f, 0xff7f], [0x3f80, 0xbf80, 0x0000, 0x8000]
+                            ]
+                            let pool = patterns[kind - 2]
+                            values = MLXArray((0..<(3 * count)).map { pool[$0 % pool.count] })
+                                .view(dtype: .bfloat16).reshaped(1, 3, count)
+                        }
+                        let window = MLXArray([Int32.min, Int32.max, -1]).reshaped(1, 3)
+                        // Original partial keys on each contiguous512-column tile, adjusted to global IDs
+                        // by a dedicated reference kernel. This is not the new head producer's own result.
+                        guard let reference = referenceTiles(values, parts: parts),
+                              let got = finalize(reference, window: window, force: true),
+                              let gotColumns = launch(reference, window: window,
+                                  columns: [window[0..., 1..<2].reshaped(1), window[0..., 2..<3].reshaped(1)]),
+                              let expected = cbv2TopTwoRowsPacket(values, window: window)
+                        else { return false }
+                        let equal = (got.ids .== expected.ids).all()
+                            .&& (got.values.view(dtype: .uint32) .== expected.values.view(dtype: .uint32)).all()
+                            .&& (got.packet .== expected.packet).all()
+                            .&& (gotColumns.ids .== expected.ids).all()
+                            .&& (gotColumns.values.view(dtype: .uint32) .== expected.values.view(dtype: .uint32)).all()
+                            .&& (gotColumns.packet .== expected.packet).all()
+                        if !equal.item(Bool.self) { return false }
+                        cases += 1
+                    }
+                }
+                return cases == 32
+            }
+        } catch { verified = false }
+        FileHandle.standardError.write(Data("nemotron head producer key finalize: \(verified ? "on" : "off"), \(cases) cases\n".utf8))
+    }
+
+    /// Independent scalar tile walk: one SIMD group per512-logit tile; all values/IDs are original logits.
+    private static let reference = MLXFast.metalKernel(
+        name: "nemotron_head_producer_keys_reference_tiles", inputNames: ["logits"], outputNames: ["keys"],
+        source: """
+            const uint lane = thread_index_in_simdgroup;
+            const uint tile = threadgroup_position_in_grid.x;
+            const uint row = threadgroup_position_in_grid.y;
+            ulong first = 0;
+            ulong second = 0;
+            for (uint j = lane; j < 512; j += 32) {
+                const uint id = tile * 512 + j;
+                darkbloom_qwen35_mtp_top2_key_push(first, second,
+                    darkbloom_qwen35_mtp_top2_key(logits[row * PARTS * 512 + id], id));
+            }
+            const ulong a = darkbloom_qwen35_mtp_top2_key_max(first);
+            const ulong b = darkbloom_qwen35_mtp_top2_key_max(first == a ? second : first);
+            if (lane == 0) { keys[(row * PARTS + tile) * 2] = a; keys[(row * PARTS + tile) * 2 + 1] = b; }
+        """, header: cbv2TopTwoKeysHeader, ensureRowContiguous: true)
+
+    public static func referenceTiles(_ logits: MLXArray, parts: Int) -> MLXArray? {
+        guard (1...8192).contains(parts), logits.shape == [1, 3, parts * 512], logits.dtype == .bfloat16
+        else { return nil }
+        let outputs = reference([logits], template: [("PARTS", parts)], grid: (32 * parts, 3, 1),
+            threadGroup: (32, 1, 1), outputShapes: [[3, parts, 2]], outputDTypes: [.uint64])
+        guard outputs.count == 1, outputs[0].shape == [3, parts, 2], outputs[0].dtype == .uint64
+        else { return nil }
+        return outputs[0]
+    }
+
+    /// Remote load qualification only: real head partials against a separate scalar walk, then both
+    /// packet input forms against the existing complete-logit policy. No production host readback.
+    public static func matchesHead(_ partials: MLXArray, logits: MLXArray, window: MLXArray) -> Bool {
+        guard enabled, logits.shape == [1, 3, 131072], logits.dtype == .bfloat16,
+              window.shape == [1, 3], window.dtype == .int32,
+              partials.shape == [3, 256, 2], partials.dtype == .uint64,
+              let reference = referenceTiles(logits, parts: 256),
+              let got = finalize(partials, window: window, force: true),
+              let columns = launch(partials, window: window,
+                  columns: [window[0..., 1..<2].reshaped(1), window[0..., 2..<3].reshaped(1)]),
+              let expected = cbv2TopTwoRowsPacket(logits, window: window) else { return false }
+        return ((partials .== reference).all()
+            .&& (got.ids .== expected.ids).all()
+            .&& (got.values.view(dtype: .uint32) .== expected.values.view(dtype: .uint32)).all()
+            .&& (got.packet .== expected.packet).all()
+            .&& (columns.ids .== expected.ids).all()
+            .&& (columns.values.view(dtype: .uint32) .== expected.values.view(dtype: .uint32)).all()
+            .&& (columns.packet .== expected.packet).all()).item(Bool.self)
+    }
+}
+
 /// The packet finalize of either form on the partials, reading the draft ids from `draftColumns` ([1] int32
 /// each, window columns 1 and 2) or from `window`.
 private func cbv2TopTwoPacketFinalize(

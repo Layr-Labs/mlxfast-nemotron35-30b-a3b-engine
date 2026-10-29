@@ -1394,6 +1394,39 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
     }
 }
 
+extension NemotronH35Model: CBv2RecurrentCaptureHeadMTPForwardable {
+    public func cbv2ForwardWithHiddenCapturedHead(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        policyWindow: MLXArray
+    ) -> CBv2MTPCapturedHeadOutput {
+        // All refusal checks precede any target transaction. The generic/off path calls the old
+        // capture seam once; after capture the only possible fallback is a head on that SAME hidden.
+        guard tokens.shape == [1, 3], policyWindow.shape == [1, 3], policyWindow.dtype == .int32,
+              let q = lmHead as? QuantizedLinear, NemotronHeadKeyProducer.admitted(q)
+        else {
+            let output = cbv2ForwardWithHiddenCaptured(tokens, caches: caches,
+                recurrentState: recurrentState, positionIds: positionIds)
+            return CBv2MTPCapturedHeadOutput(logits: output.logits, lastHidden: output.lastHidden)
+        }
+        precondition(positionIds == nil)
+        let hidden: MLXArray
+        let prepared: MLXArray?
+        if let fused = cbv2HiddenCapturedFused(tokens, caches: caches, recurrentState: recurrentState) {
+            hidden = fused.hidden; prepared = fused.prepared
+        } else {
+            hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState, captureMTP: true)
+            prepared = nil
+        }
+        if let produced = NemotronHeadKeyProducer.apply(hidden, q, prepared: prepared) {
+            let policy = CBv2MTPHeadProducerKeys.finalize(produced.partials, window: policyWindow)
+            return CBv2MTPCapturedHeadOutput(logits: produced.logits, lastHidden: hidden, policy: policy)
+        }
+        return CBv2MTPCapturedHeadOutput(
+            logits: nemotronMTPHeadRows(hidden, q, prepared: prepared), lastHidden: hidden)
+    }
+}
+
 extension NemotronH35Model {
     /// Compile, at load time, every SSM verify-kernel instantiation an MTP
     /// round can use (window widths 2...8; compact replay prefixes 1...7), so
