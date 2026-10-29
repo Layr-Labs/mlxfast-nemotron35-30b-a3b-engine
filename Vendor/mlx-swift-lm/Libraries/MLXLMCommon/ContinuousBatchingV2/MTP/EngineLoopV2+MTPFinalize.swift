@@ -713,11 +713,11 @@ public enum CBv2MTPDeviceAcceptWalk {
 
     /// Compile the pipelines at load so no JIT lands in a timed window: one
     /// packet under eight elements (constant argument space) and the depth-2
-    /// packet's eleven (device argument space).
+    /// packet's eleven and depth-3 packet's fifteen (device argument space).
     public static func warm() {
         guard CBv2CriticalPathCuts.acceptWalkKernel, CBv2MTPFirstDraftPrestage.deviceAccepted
         else { return }
-        for size in [6, 11] {
+        for size in [6, 11, 15] {
             if let walked = apply(MLXArray([Int32](repeating: 0, count: size)),
                                   count: 2, drafts: 0, targets: 2) {
                 eval(walked)
