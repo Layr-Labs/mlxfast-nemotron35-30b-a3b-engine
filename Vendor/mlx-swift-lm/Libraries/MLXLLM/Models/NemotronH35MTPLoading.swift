@@ -101,8 +101,11 @@ extension NemotronH35MTPAssistant {
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronQMVLean.qualify(target)
+        NemotronMambaInProjConvDt.qualifyTSL(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
+        NemotronDraftTune.tuneVerifyQKV(target)
         NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
@@ -127,6 +130,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronMTPVerifySDPA.tune(target)
+        NemotronMTPAttentionProjectionGraphAdmission.qualify(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
@@ -815,3 +819,5 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry 1 of this tree.
 
 // Measurement entry 1 of this tree.
+
+// Measurement entry 2 of this tree.
