@@ -100,6 +100,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
+        NemotronMambaInProjConvDt.qualifyTSL(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
@@ -526,7 +527,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 dense = [("up_proj", up)]
             }
             for (kind, linear) in dense
-            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind) {
+            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind)
+                || (kind == "up_proj" && NemotronSeedDenseRetile.choice["up_gather"] != nil) {
                 guard let q = linear as? QuantizedLinear, let d = NemotronSBDict.dict(q), let b = q.biases else { continue }
                 denseDicts[n, default: []] += [d.index, d.table]
                 denseMetadata.formUnion([ObjectIdentifier(q.scales), ObjectIdentifier(b)])
