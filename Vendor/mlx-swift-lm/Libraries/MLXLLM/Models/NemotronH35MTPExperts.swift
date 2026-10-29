@@ -563,6 +563,66 @@ private func nmlFC1UnrollSource(_ source: String) -> String? {
     return source.replacingOccurrences(of: loop, with: "    #pragma clang loop unroll_count(2)\n" + loop)
 }
 
+/// The plan-free triple FC1 (prepared activations, after the unroll, tail-8 and dictionary transforms; plain or
+/// pair-dictionary form) with fewer values live across its main K loops (NEMOTRON_FC1_LEAN). Each lane reads its
+/// code words, its (scale, bias) or pair-index words and its prepared activations through the arrays' base pointers
+/// plus 32-bit element offsets, where the record keeps a 64-bit pointer per stream (`ws`, `sc`, `bs`, `x0`, `x1`,
+/// `x2`) and steps each one per block:
+/// - `nlw` is `ws`'s byte offset from `w`, `expert * N * K / 2 + out_row * K / 2 + simd_lid * 4`, advanced by
+///   `block_size / 2` per block; every element of the 128 x 1856 x 1344-byte bank lies below 2^32.
+/// - The group word offset of `sc` and `bs` is `nlw >> 5`: a row holds K / 2 = 32 x K / 64 bytes, a lane's
+///   `simd_lid * 4` bytes are below 128 and its `simd_lid / 8` groups are `simd_lid * 4 / 32`, and each block adds
+///   `block_size / 2` = 32 x `block_size / 64` (the static_assert), so `nlw >> 5` is the record's `sc - scales`.
+/// - `nlx0`, `nlx1`, `nlx2` are `x0 - prepared`, ... (`row * PTILES * PSTRIDE + simd_lid`), advanced by `PSTRIDE`.
+/// Every load reads the record's address and every statement, product, term order, affine close, closing simd_sum
+/// and store is the record's. nil unless every replaced statement occurs as expected.
+func nmlFC1LeanSource(_ source: String) -> String? {
+    var s = source
+    func swap(_ old: String, _ new: String, _ count: Int = 1) -> Bool {
+        guard s.components(separatedBy: old).count == count + 1 else { return false }
+        s = s.replacingOccurrences(of: old, with: new)
+        return true
+    }
+    let dict = s.contains("  const device uint16_t* sc = scales + (ulong)expert")
+    let (stream, second) = dict ? ("uint16_t", "scales") : ("T", "biases")
+    guard swap("  const device uint8_t* ws = (const device uint8_t*)w +\n"
+                   + "      (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +\n      simd_lid * 4;\n",
+               "  static_assert(in_vec_size_w == 32 * in_vec_size_g && block_size / 2 == 32 * (block_size / 64),\n"
+                   + "                \"a lane's group word offset is its code byte offset / 32\");\n"
+                   + "  const device uint8_t* ws = (const device uint8_t*)w;\n"
+                   + "  uint nlw = expert * uint(N * in_vec_size_w) + uint(out_row * in_vec_size_w) + simd_lid * 4;\n"),
+          swap("  const device \(stream)* sc = scales + (ulong)expert * (N * in_vec_size_g) +\n"
+                   + "      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+                   + "  const device \(stream)* bs = \(second) + (ulong)expert * (N * in_vec_size_g) +\n"
+                   + "      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n",
+               "  const device \(stream)* sc = scales;\n  const device \(stream)* bs = \(second);\n"),
+          swap("(ws + r * in_vec_size_w)", "(ws + (nlw + uint(r * in_vec_size_w)))", 6),
+          swap("sc + r * in_vec_size_g;", "sc + ((nlw >> 5) + uint(r * in_vec_size_g));", 6),
+          swap("bs + r * in_vec_size_g;", "bs + ((nlw >> 5) + uint(r * in_vec_size_g));", 6),
+          swap("      ws += block_size / 2;\n", "      nlw += block_size / 2;\n", 3),
+          swap("      sc += block_size / 64;\n", "", 3),
+          swap("      bs += block_size / 64;\n", "", 3),
+          swap("  const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;\n",
+               "  const device float* x0 = prepared;\n  uint nlx0 = uint(row * (PTILES * PSTRIDE)) + simd_lid;\n"),
+          swap("    const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;\n",
+               "    const device float* x1 = prepared;\n"
+                   + "    uint nlx1 = uint((partner / TOPK) * (PTILES * PSTRIDE)) + simd_lid;\n", 2),
+          swap("    const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;\n",
+               "    const device float* x2 = prepared;\n"
+                   + "    uint nlx2 = uint((third / TOPK) * (PTILES * PSTRIDE)) + simd_lid;\n"),
+          swap("      x0 += PSTRIDE;\n", "      nlx0 += PSTRIDE;\n", 3),
+          swap("      x1 += PSTRIDE;\n", "      nlx1 += PSTRIDE;\n", 2),
+          swap("      x2 += PSTRIDE;\n", "      nlx2 += PSTRIDE;\n")
+    else { return nil }
+    for x in ["x0", "x1", "x2"] {
+        s = s.replacingOccurrences(of: ">(\(x), ", with: ">(\(x) + nl\(x), ")
+    }
+    guard !s.contains("(ulong)"), !s.contains("(x0, "), !s.contains("(x1, "), !s.contains("(x2, "),
+          !s.contains("ws +="), !s.contains("sc +="), !s.contains("bs +="), !s.contains(" x0 +="),
+          s.components(separatedBy: "(x0 + nlx0, ").count == 7 else { return nil }
+    return s
+}
+
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
 /// (`NemotronSBDict`). `scales` carries one uint16 pair index per group and
 /// `biases` the tensor's pair table as FP32 (scale, bias), each entry the exact
@@ -995,6 +1055,12 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
     let tripleGateUpTail8Unrolled: MLXFast.MLXFastKernel?
     let tripleGateUpDictUnrolled: MLXFast.MLXFastKernel?
     let tripleGateUpTail8DictUnrolled: MLXFast.MLXFastKernel?
+    /// The eight plan-free triple FC1 kernels above (record and unrolled loops, record and tail-8 tail, plain and
+    /// dictionary) through `nmlFC1LeanSource`, indexed by `leanIndex` (NEMOTRON_FC1_LEAN).
+    let tripleGateUpLean: [MLXFast.MLXFastKernel?]
+    static func leanIndex(tail8: Bool, dict: Bool, unrolled: Bool) -> Int {
+        (tail8 ? 1 : 0) + (dict ? 2 : 0) + (unrolled ? 4 : 0)
+    }
     private init() {
         let header = nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronMoELeaderPreparedHeader
         let preparedSource = nmlPreparedSource(nemotronMoELeaderSource, pointers: [
@@ -1128,6 +1194,22 @@ private final class NemotronMoELeaderPreparedKernels: Sendable {
                 inputNames: ["w", "scales", "biases", "prepared", "inds"],
                 outputNames: ["y"], source: $0,
                 header: header + nemotronMoETripleDecodeHeader)
+        }
+        // The same pipelines (unroll, tail-8, prepared pointers, dictionary), then the lean lane offsets.
+        tripleGateUpLean = (0 ..< 8).map { i -> MLXFast.MLXFastKernel? in
+            let (tail8, dict, unrolled) = (i & 1 != 0, i & 2 != 0, i & 4 != 0)
+            return (unrolled ? unrolledSource : tripleSource)
+                .flatMap { tail8 ? nmlTail8Source($0) : $0 }
+                .flatMap { nmlPreparedSource($0, pointers: triplePointers) }
+                .flatMap { dict ? nemotronSBDictSource($0) : $0 }
+                .flatMap(nmlFC1LeanSource).map {
+                    MLXFast.metalKernel(
+                        name: "nemotron_moe_triple_prepared_fc1" + (tail8 ? "_tail8" : "") + (dict ? "_sbd" : "")
+                            + (unrolled ? "_u2" : "") + "_ln",
+                        inputNames: ["w", "scales", "biases", "prepared", "inds"],
+                        outputNames: ["y"], source: $0,
+                        header: header + nemotronMoETripleDecodeHeader)
+                }
         }
     }
 }
@@ -1460,6 +1542,10 @@ enum NemotronMoELeader {
     static let fc1Unroll =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_FC1_UNROLL"] != "0"
     nonisolated(unsafe) private(set) static var fc1UnrollQualified = false
+    /// The plan-free triple FC1 with 32-bit lane offsets (`nmlFC1LeanSource`) unless NEMOTRON_FC1_LEAN=0, once
+    /// `qualifyFC1Lean` found it bit for bit equal to the kernel it replaces.
+    static let fc1Lean = ProcessInfo.processInfo.environment["NEMOTRON_FC1_LEAN"] != "0"
+    nonisolated(unsafe) private(set) static var fc1LeanQualified = false
     /// The same constant tail for the R != 3 (draft tail) leader and weighted
     /// kernels, through production-only kernel copies.
     static let leaderTail8 =
@@ -1532,10 +1618,11 @@ enum NemotronMoELeader {
     /// tuned: launch this `NemotronFC1Tune` geometry (nil when it cannot run);
     /// otherwise, with `unroll` nil, the geometry the load-time tune adopted.
     /// dep: the tune geometry's unread `dep` binding (nil: its prepared activation).
+    /// lean: the selected kernel's lean twin (nil: once `qualifyFC1Lean` admitted it; true without a twin: nil).
     static func applyTripleWithoutPlan(
         _ x: MLXArray, _ inds: MLXArray, bank: Bank, relu2: Bool,
         prepared: MLXArray?, dict: NemotronSBDict.Dict? = nil, unroll: Bool? = nil,
-        tuned: NemotronFC1Tune.Variant? = nil, dep: MLXArray? = nil
+        tuned: NemotronFC1Tune.Variant? = nil, dep: MLXArray? = nil, lean: Bool? = nil
     ) -> MLXArray? {
         let kernels = NemotronMoELeaderPreparedKernels.shared
         guard elideUnreadPlan, fuseBalancePlan, preparedGateUp, tripleGateUp,
@@ -1552,11 +1639,17 @@ enum NemotronMoELeader {
             : (tail8 ? kernels.tripleGateUpTail8 : kernels.tripleGateUp)
         else { return nil }
         let unrolled = unroll ?? (fc1Unroll && fc1UnrollQualified)
-        let kernel = (unrolled
+        let unrolledKernel = unrolled
             ? (useDict
                 ? (tail8 ? kernels.tripleGateUpTail8DictUnrolled : kernels.tripleGateUpDictUnrolled)
                 : (tail8 ? kernels.tripleGateUpTail8Unrolled : kernels.tripleGateUpUnrolled))
-            : nil) ?? record
+            : nil
+        let leanTwin = (lean ?? (fc1Lean && fc1LeanQualified))
+            ? kernels.tripleGateUpLean[NemotronMoELeaderPreparedKernels.leanIndex(
+                tail8: tail8, dict: useDict, unrolled: unrolledKernel != nil)]
+            : nil
+        if lean == true, leanTwin == nil { return nil }
+        let kernel = leanTwin ?? unrolledKernel ?? record
         let packed = NemotronHeadPreparedActivation.compatible(prepared, rows: 3, k: bank.k)
             ?? NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8)
         let rps = fc1Results ?? leaderResultsPerSimdgroup(rows: 3)
@@ -1640,6 +1733,78 @@ enum NemotronMoELeader {
         fc1UnrollQualified = true
         FileHandle.standardError.write(Data(
             "nemotron fc1 unroll on: \(layers) routed FC1 banks, plan-free triple FC1 bitwise equal to the record kernel\n".utf8))
+    }
+
+    /// Load time, after `qualifyFC1Unroll` and before `NemotronFC1Tune.tune`: the plan-free triple FC1 the verify
+    /// selects (unroll, tail-8, dictionary or plain per bank) against its lean twin (`nmlFC1LeanSource`), bit for
+    /// bit, on the real weights of every routed FC1 bank: routes with an expert in all three rows, experts in two
+    /// rows, the rest in one, all eighteen distinct and six experts in all three rows (experts 0 and 127, the
+    /// bank's first and last, included); seeded activations at two scales, ReLU2-sparse rows and rows carrying
+    /// infinities, NaNs, -0, tiny and large values; ReLU2 off and on. Any difference, a missing twin or an error
+    /// keeps the selected kernel. One stderr line; NEMOTRON_FC1_LEAN=0 keeps it too.
+    static func qualifyFC1Lean(_ model: Module) {
+        guard enabled else { return }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron fc1 lean: \(message)\n".utf8))
+        }
+        guard fc1Lean else { return report("off (setting)") }
+        let routes: [[UInt32]] = [
+            [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127],
+            [96, 30, 1, 65, 127, 33, 65, 2, 96, 40, 12, 7, 33, 96, 9, 19, 64, 65],
+            (0 ..< 18).map { UInt32($0 * 7 + ($0 == 17 ? 8 : 0)) },
+            [9, 44, 71, 2, 120, 33, 33, 120, 2, 9, 71, 44, 44, 9, 33, 71, 120, 2],
+        ]
+        let keys = MLXRandom.split(key: MLXRandom.key(0x1EA4), into: 6)
+        let column = MLXArray((0 ..< 2688).map(Int32.init)).reshaped(1, 2688)
+        let rowIndex = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        func at(_ r: Int, _ c: Int) -> MLXArray { (rowIndex .== MLXArray(Int32(r))) .&& (column .== MLXArray(Int32(c))) }
+        var special = MLXRandom.normal([3, 2688], key: keys[2]) * 4
+        for (r, c, v) in [(0, 5, Float.infinity), (1, 700, -.infinity), (2, 1301, .nan), (0, 2687, -0.0),
+                          (1, 64, 1e-38), (2, 2000, 3e38), (0, 1999, -3e38), (1, 2600, -1e-38)] {
+            special = which(at(r, c), MLXArray(v), special)
+        }
+        let relu = MLX.maximum(MLXRandom.normal([3, 2688], key: keys[3]) - 1, MLXArray(Float(0)))
+        let xs = [MLXRandom.normal([3, 2688], key: keys[0]) * 0.5, MLXRandom.normal([3, 2688], key: keys[1]) * 8,
+                  relu * relu, special].map { $0.asType(.bfloat16) }
+        var same = MLXArray(true)
+        var layers = 0
+        var cases = 0
+        do {
+            try withError {
+                for module in model.modules() {
+                    guard let moe = module as? NemotronHMoE,
+                          type(of: moe.switchMLP.fc1) == QuantizedSwitchLinear.self,
+                          let up = bank(moe.switchMLP.fc1, k: 2688, dtype: .bfloat16),
+                          up.weight.shape == [128, 1856, 336] else { continue }
+                    let dict = NemotronSBDict.enabled ? NemotronSBDict.dict(moe.switchMLP.fc1) : nil
+                    for (r, route) in routes.enumerated() {
+                        let inds = MLXArray(route)
+                        for (i, x) in xs.enumerated() where (i + r + layers) % 2 == 0 || i == 3 {
+                            for relu2 in [false, true] {
+                                guard let a = applyTripleWithoutPlan(
+                                          x, inds, bank: up, relu2: relu2, prepared: nil, dict: dict, lean: false),
+                                      let b = applyTripleWithoutPlan(
+                                          x, inds, bank: up, relu2: relu2, prepared: nil, dict: dict, lean: true)
+                                else { same = MLXArray(false); continue }
+                                same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                                cases += 1
+                            }
+                        }
+                    }
+                    layers += 1
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        guard layers > 0, same.item(Bool.self) else {
+            return report(layers > 0 ? "off (differs from the selected kernel)" : "off (no routed FC1 bank ran)")
+        }
+        fc1LeanQualified = true
+        report("on (\(cases) cases on \(layers) routed FC1 banks bitwise equal to the selected kernel: routes with an "
+            + "expert in three, two and one rows, experts 0 and 127; activations with infinities, NaNs, -0, tiny and "
+            + "large values; ReLU2 off and on)")
     }
 
     /// Same leader pairs as apply(), with separate FP32 products and the
@@ -5501,6 +5666,11 @@ enum NemotronFC1Tune {
             guard let d = nemotronSBDictSource(p) else { return nil }
             p = d
         }
+        // The incumbent's lean lane offsets once `qualifyFC1Lean` admitted them (V0's twin and every row).
+        if NemotronMoELeader.fc1Lean && NemotronMoELeader.fc1LeanQualified {
+            guard let l = nmlFC1LeanSource(p) else { return nil }
+            p = l
+        }
         return p
     }
 
@@ -5523,6 +5693,7 @@ enum NemotronFC1Tune {
 
     static func kernel(_ v: Variant, tail8: Bool, dict: Bool) -> MLXFast.MLXFastKernel? {
         let key = "\(v.name)_u\(unrollCount(v))_\(tail8 ? "t8" : "tr")_\(dict ? "sbd" : "bf")"
+            + (NemotronMoELeader.fc1Lean && NemotronMoELeader.fc1LeanQualified ? "_ln" : "")
         return lock.withLock { () -> MLXFast.MLXFastKernel? in
             if let made = kernels[key] { return made }
             var made: MLXFast.MLXFastKernel? = nil
@@ -6012,7 +6183,9 @@ enum NemotronQMVTune {
             s = s.replacingOccurrences(of: old, with: new)
         }
         guard let d = nemotronSBDictSource(s) else { return nil }
-        return u2 ? nemotronU2Source(d, loop: NemotronU2.qmvLoop, count: 1) : d
+        let body = u2 ? nemotronU2Source(d, loop: NemotronU2.qmvLoop, count: 1) : d
+        // The production bodies' lean form once `NemotronQMVLean` admitted it (V0's twin and every row).
+        return NemotronQMVLean.active ? nemotronQMVLeanSource(body) : body
     }
 
     private static let lock = NSLock()
@@ -6032,6 +6205,7 @@ enum NemotronQMVTune {
 
     static func preparedKernel(_ c: Config) -> MLXFast.MLXFastKernel? {
         let key = "nemotron_qmv_tune_prep_hf\(c.hf ?? 0)_l\(c.load)_u\(c.u2 ? 2 : 1)"
+            + (NemotronQMVLean.active ? "_ln" : "")
         return cached(key) {
             let base = c.hf != nil
                 ? NemotronHeadPreparedActivation.preparedHalfSource : NemotronHeadPreparedActivation.crownSource
@@ -6045,6 +6219,7 @@ enum NemotronQMVTune {
 
     static func inProjKernel(_ c: Config) -> MLXFast.MLXFastKernel? {
         let key = "nemotron_qmv_tune_inproj_rg\(c.regs ? 1 : 0)_l\(c.load)_u\(c.u2 ? 2 : 1)" + (c.e32 ? "_e32" : "")
+            + (NemotronQMVLean.active ? "_ln" : "")
         return cached(key) {
             NemotronMambaInProjConvDt.tuneBase(regs: c.regs, e32: c.e32)
                 .flatMap { source(base: $0, load: c.load, u2: c.u2) }.map {
