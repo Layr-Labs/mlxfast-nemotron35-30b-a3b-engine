@@ -862,6 +862,7 @@ enum NemotronSeedRetile {
         let tuneStart = DispatchTime.now().uptimeNanoseconds
         fc1Choice = nil
         fc2Choice = nil
+        NemotronSeedProfile.retile = []
         func report(_ message: String) {
             FileHandle.standardError.write(Data("nemotron seed retile: \(message)\n".utf8))
         }
@@ -1017,6 +1018,11 @@ enum NemotronSeedRetile {
         }
         fc1Choice = choice[0].map { (roles[0], $0) }
         fc2Choice = choice[1].map { (roles[1], $0) }
+        // Measurement entry: the median of each role's seed launch (`NemotronSeedProfile`).
+        NemotronSeedProfile.retile = (0 ..< 2).flatMap { r in
+            NemotronSeedProfile.entry(
+                target, r == 0 ? "fc1" : "fc2", medians[r].first(where: { $0.0 == choice[r] })?.1)
+        }
 
         func ms(_ r: Int, _ v: Variant?) -> String {
             guard let m = medians[r].first(where: { $0.0 == v }) else { return "n/a" }
@@ -1723,6 +1729,7 @@ enum NemotronSeedDenseRetile {
 
     static func tune(_ target: Module) {
         choice = [:]
+        NemotronSeedProfile.dense = []
         let t0 = DispatchTime.now().uptimeNanoseconds
         func report(_ message: String) {
             let s = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
@@ -1733,6 +1740,9 @@ enum NemotronSeedDenseRetile {
         var head: [String] = []
         var detail: [String] = []
         func note(_ kind: String, _ o: Outcome) {
+            // Measurement entry: the median of the kind's seed launch (`NemotronSeedProfile`).
+            NemotronSeedProfile.dense += NemotronSeedProfile.entry(
+                target, kind, o.medians.first(where: { $0.0 == o.choice })?.1)
             func ms(_ v: Variant?) -> String {
                 o.medians.first(where: { $0.0 == v }).map { String(format: "%.3f", $0.1) } ?? "n/a"
             }
@@ -1922,9 +1932,10 @@ enum NemotronSeedQMMTune {
         return r * r
     }
 
-    /// Check, time and pick for one kind; returns the pick and a report fragment.
-    private static func evaluate(_ kind: Kind, seed: UInt64, specials: MLXArray, elapsed: () -> Double)
-        -> (Variant?, String) {
+    /// Check, time and pick for one kind; returns the pick and a report fragment. `median`: the picked launch's
+    /// median (the stock path's when none is picked) when the kind was timed.
+    private static func evaluate(_ kind: Kind, seed: UInt64, specials: MLXArray, elapsed: () -> Double,
+                                 median: inout Double?) -> (Variant?, String) {
         let variants = Self.variants
         guard let first = kind.linears.first as? QuantizedLinear, let last = kind.linears.last,
               kind.linears.allSatisfy({ ($0 as? QuantizedLinear)?.weight.shape == first.weight.shape })
@@ -2104,6 +2115,7 @@ enum NemotronSeedQMMTune {
         }
         let times = medians.isEmpty ? [] : alive.map { "\($0.name) \(ms($0))\(won($0))" }
         let rule = verdict?.rule({ candidates[$0]?.name ?? "stock" }) ?? "no candidate timed"
+        if let i = candidates.firstIndex(of: picked), i < medians.count { median = medians[i] }
         return (picked, "\(why) \(picked?.name ?? "stock") \(ms(picked)) ms vs stock \(ms(nil)) ms per launch (\(rule);"
             + " median of \(reps), chains of \(chain.count); \(alive.count)/\(variants.count) bitwise over"
             + " \(rowCounts.count) cases x 3, smallest \(boundary) rows\(below)"
@@ -2114,6 +2126,7 @@ enum NemotronSeedQMMTune {
     /// Load time, after the seed retiles; NAX hosts only (`NemotronHPrefillX5.runGather`).
     static func tune(_ target: Module) {
         choice = [:]
+        NemotronSeedProfile.qmm = []
         let t0 = DispatchTime.now().uptimeNanoseconds
         func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
         func report(_ message: String) {
@@ -2147,9 +2160,12 @@ enum NemotronSeedQMMTune {
                 parts.append("\(kind.name) skipped (load budget)")
                 continue
             }
+            var median: Double? = nil
             let (pick, message) = evaluate(kind, seed: UInt64(0x5eed_9a00 + 16 * index), specials: specials,
-                                           elapsed: elapsed)
+                                           elapsed: elapsed, median: &median)
             if let pick { choice[kind.name] = pick }
+            // Measurement entry: the median of the kind's seed launch (`NemotronSeedProfile`).
+            NemotronSeedProfile.qmm += NemotronSeedProfile.entry(target, kind.name, median)
             parts.append(kind.name + " " + message)
         }
         report(parts.joined(separator: "; "))
@@ -2443,8 +2459,10 @@ enum NemotronSeedSSMTune {
 
     /// Check, time and pick over `variants`: `run(v, i)` is check case i's outputs (nil `v`: the production
     /// launch); `link(v, previous)` one timing-chain link after `previous` (nil for the first), returning what the
-    /// next link reads. Returns the pick and a report fragment.
+    /// next link reads. Returns the pick and a report fragment. `median`: the picked launch's median (the
+    /// incumbent's when none is picked) when the kernel was timed.
     private static func choose(_ variants: [Variant], cases: Int, chain: Int, elapsed: () -> Double,
+                               median: inout Double?,
                                run: (Variant?, Int) -> [MLXArray]?, link: (Variant?, MLXArray?) -> MLXArray?)
         -> (Variant?, String) {
         var references: [[MLXArray]] = []
@@ -2585,6 +2603,7 @@ enum NemotronSeedSSMTune {
             "\(v.name) \(ms(v)) \(candidates.firstIndex(of: v).flatMap { verdict?.won($0) } ?? "n/a")"
         }
         let rule = verdict?.rule({ candidates[$0]?.name ?? "V0" }) ?? "no candidate timed"
+        if let i = candidates.firstIndex(of: picked), i < medians.count { median = medians[i] }
         return (picked, "\(why) \(picked?.name ?? "V0") \(ms(picked)) ms vs V0 \(ms(nil)) ms per launch (\(rule);"
             + " median of \(reps), \(chain) chained launches/sample, chain outputs bitwise; \(alive.count)/\(variants.count)"
             + " bitwise over \(cases) cases x \(passes)" + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
@@ -2596,6 +2615,7 @@ enum NemotronSeedSSMTune {
         stateChoice = nil
         scanChoice = nil
         freshChoice = nil
+        NemotronSeedProfile.ssm = []
         let t0 = DispatchTime.now().uptimeNanoseconds
         func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
         func report(_ message: String) {
@@ -2663,8 +2683,9 @@ enum NemotronSeedSSMTune {
                                                            dh: dh, d: d)
                 }
                 var step = 0
+                var median: Double? = nil
                 let (pick, message) = choose(
-                    stateVariants, cases: cases.count, chain: 2 * layers, elapsed: elapsed,
+                    stateVariants, cases: cases.count, chain: 2 * layers, elapsed: elapsed, median: &median,
                     run: { v, i in launch(v, cases[i], cases[i].last).map { [$0] } },
                     link: { v, previous in
                         if previous == nil { step = 0 }
@@ -2674,6 +2695,8 @@ enum NemotronSeedSSMTune {
                             ?? c.last)
                     })
                 stateChoice = pick
+                // Measurement entry: the median of the seed's state-product launch (`NemotronSeedProfile`).
+                NemotronSeedProfile.ssm += NemotronSeedProfile.entry(target, "state", median)
                 parts.append("state " + message)
             } else {
                 parts.append("state off (inputs)")
@@ -2739,13 +2762,16 @@ enum NemotronSeedSSMTune {
                                                                g: g, dh: dh)
                 }
                 let c1 = cases[1]
+                var median: Double? = nil
                 let (pick, message) = choose(
-                    scanVariants, cases: cases.count, chain: layers, elapsed: elapsed,
+                    scanVariants, cases: cases.count, chain: layers, elapsed: elapsed, median: &median,
                     run: { v, i in launch(v, cases[i], cases[i].dtA).map { [$0.y, $0.last] } },
                     link: { v, previous in
                         launch(v, c1, previous.map { $0.reshaped(1, c1.n, h) } ?? c1.dtA)?.last
                     })
                 scanChoice = pick
+                // Measurement entry: the median of the seed's scan-decay launch (`NemotronSeedProfile`).
+                NemotronSeedProfile.ssm += NemotronSeedProfile.entry(target, "scan", median)
                 parts.append("scan " + message)
                 // The fresh window takes the scan's pick once its own form matches on
                 // `qualifyFresh`'s case kinds (three passes).
@@ -2808,5 +2834,90 @@ enum NemotronSeedSSMTune {
             parts.append(NemotronPrefillScanDecayGemm.verified ? "scan skipped (load budget)" : "scan off (not verified)")
         }
         report(parts.joined(separator: "; "))
+    }
+}
+
+// MARK: - Seed profile (measurement entry)
+
+/// Measurement entry: what the four seed tunes measured for the launches the seed makes after them. For every kind
+/// it timed, a tune records the median time per launch (ms) of the launch the seed uses after the tune (the adopted
+/// or forced candidate's median, else the incumbent's) and `launches`, that kind's launches in one 488-token seed:
+/// - `retile` (`NemotronSeedRetile`): routed fc1 and fc2, one each per MoE layer;
+/// - `dense` (`NemotronSeedDenseRetile`): Mamba in_proj and out_proj, one each per Mamba layer; the shared expert's
+///   up_proj and down_proj (shared_down), one each per MoE layer;
+/// - `qmm` (`NemotronSeedQMMTune`): the out_proj, up_proj and shared_down kinds the dense retile does not cover (the
+///   two tunes' kinds are disjoint), one per layer of the kind;
+/// - `ssm` (`NemotronSeedSSMTune`): the state product on each 256-token scan window (488 tokens: 256 and 232) of
+///   every Mamba layer; the scan decay GEMM on each window but a fresh request's first while that window runs the
+///   fresh-window form (which no tune times; not recorded).
+/// A tune that did not run, or did not time a kind, records nothing for it. Load time only, before any request.
+enum NemotronSeedProfile {
+    struct Entry {
+        let kind: String
+        let ms: Double
+        let launches: Int
+    }
+
+    nonisolated(unsafe) static var retile: [Entry] = []
+    nonisolated(unsafe) static var dense: [Entry] = []
+    nonisolated(unsafe) static var qmm: [Entry] = []
+    nonisolated(unsafe) static var ssm: [Entry] = []
+
+    /// The seed's tokens (the tunes' timed shapes) and the scan window.
+    static let seedTokens = 488
+    static let scanWindow = 256
+
+    /// `kind`'s launches in one seed, from the target's layers and the load-time results that pick the seed's path.
+    static func launches(_ target: Module, _ kind: String) -> Int {
+        let modules = target.modules()
+        let mambas = modules.filter { $0 is NemotronHMamba2Mixer }.count
+        let windows = (seedTokens + scanWindow - 1) / scanWindow
+        let fresh = NemotronHPrefillX5.ssmEpilogue && NemotronPrefillScanExp.scanExpVerified
+            && NemotronPrefillFreshWindowOut.verified && NemotronPrefillScanDecayGemm.freshVerified
+        switch kind {
+        case "fc1", "fc2": return modules.filter { $0 is NemotronHMoE }.count
+        case "in_proj", "out_proj", "up_proj": return NemotronPrefillDenseDict.linears(target, kind: kind).count
+        case "shared_down": return modules.compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }.count
+        case "state": return mambas * windows
+        case "scan": return mambas * (windows - (fresh ? 1 : 0))
+        default: return 0
+        }
+    }
+
+    /// `kind`'s entry when `ms` is a time, else none.
+    static func entry(_ target: Module, _ kind: String, _ ms: Double?) -> [Entry] {
+        guard let ms, ms.isFinite, ms >= 0 else { return [] }
+        return [Entry(kind: kind, ms: ms, launches: launches(target, kind))]
+    }
+
+    /// Sum of median x launches (ms): `moe` over the retile's fc1 and fc2, `other` over the dense, QMM and SSM kinds.
+    static func total(_ entries: [Entry]) -> Double { entries.reduce(0) { $0 + $1.ms * Double($1.launches) } }
+    static var moe: Double { total(retile) }
+    static var other: Double { total(dense + qmm + ssm) }
+
+    /// `ms` rounded to whole milliseconds and clamped to 0 ... `cap` (0 when not finite).
+    static func wait(_ ms: Double, cap: Int) -> Int {
+        ms.isFinite ? Int(min(max(ms.rounded(), 0), Double(cap))) : 0
+    }
+
+    /// NEMOTRON_SEED_PROFILE_FAKE=1 (local check of the encoding where the tunes do not run): fixed medians with the
+    /// counts above, in ms per launch: fc1 0.45, fc2 0.35; in_proj 0.30, out_proj 0.12, up_proj 0.14, shared_down
+    /// 0.10; state 0.05, scan 0.04; no QMM kind.
+    static func fake(_ target: Module) {
+        retile = entry(target, "fc1", 0.45) + entry(target, "fc2", 0.35)
+        dense = entry(target, "in_proj", 0.30) + entry(target, "out_proj", 0.12) + entry(target, "up_proj", 0.14)
+            + entry(target, "shared_down", 0.10)
+        qmm = []
+        ssm = entry(target, "state", 0.05) + entry(target, "scan", 0.04)
+    }
+
+    /// Both totals, then every entry (median ms x launches).
+    static var summary: String {
+        let groups = [("retile", retile), ("dense", dense), ("qmm", qmm), ("ssm", ssm)].filter { !$0.1.isEmpty }.map {
+            $0.0 + " " + $0.1.map { "\($0.kind) \(String(format: "%.4f", $0.ms)) ms x \($0.launches)" }
+                .joined(separator: ", ")
+        }
+        return String(format: "moe %.3f ms, other %.3f ms", moe, other)
+            + " (" + (groups.isEmpty ? "no tune timed" : groups.joined(separator: "; ")) + ")"
     }
 }
