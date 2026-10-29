@@ -1451,9 +1451,9 @@ final class NemotronH35MTPExpertBlock: Module {
                    draftDep: sx, activation: { fc1 = $0 }),
                routed.shape == [6 * 2688], let fc1,
                let shared = sharedExperts.draftDown(sx, dep: fc1),
-               let joined = NemotronHResidualRMSNorm.applySum(
+               let joined = NemotronHResidualRMSNorm.finalSumNormalized(
                    x, routed, shared: shared, norm: finalNorm, sharedFirst: true) {
-                return joined.1
+                return joined
             }
         }
         // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
@@ -1463,8 +1463,8 @@ final class NemotronH35MTPExpertBlock: Module {
                 h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
         let shared = early ?? sharedExperts(h)
-        if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
-            return joined.1
+        if let joined = NemotronHResidualRMSNorm.finalSumNormalized(x, routed, shared: shared, norm: finalNorm) {
+            return joined
         }
         return finalNorm(x + (routed + shared))
     }
