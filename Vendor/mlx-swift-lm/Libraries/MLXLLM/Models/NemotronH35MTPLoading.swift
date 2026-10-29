@@ -101,6 +101,7 @@ extension NemotronH35MTPAssistant {
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronQMVLean.qualify(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
         NemotronMTPSSMAnchor.tune(target)

@@ -6012,7 +6012,9 @@ enum NemotronQMVTune {
             s = s.replacingOccurrences(of: old, with: new)
         }
         guard let d = nemotronSBDictSource(s) else { return nil }
-        return u2 ? nemotronU2Source(d, loop: NemotronU2.qmvLoop, count: 1) : d
+        let body = u2 ? nemotronU2Source(d, loop: NemotronU2.qmvLoop, count: 1) : d
+        // The production bodies' lean form once `NemotronQMVLean` admitted it (V0's twin and every row).
+        return NemotronQMVLean.active ? nemotronQMVLeanSource(body) : body
     }
 
     private static let lock = NSLock()
@@ -6032,6 +6034,7 @@ enum NemotronQMVTune {
 
     static func preparedKernel(_ c: Config) -> MLXFast.MLXFastKernel? {
         let key = "nemotron_qmv_tune_prep_hf\(c.hf ?? 0)_l\(c.load)_u\(c.u2 ? 2 : 1)"
+            + (NemotronQMVLean.active ? "_ln" : "")
         return cached(key) {
             let base = c.hf != nil
                 ? NemotronHeadPreparedActivation.preparedHalfSource : NemotronHeadPreparedActivation.crownSource
@@ -6045,6 +6048,7 @@ enum NemotronQMVTune {
 
     static func inProjKernel(_ c: Config) -> MLXFast.MLXFastKernel? {
         let key = "nemotron_qmv_tune_inproj_rg\(c.regs ? 1 : 0)_l\(c.load)_u\(c.u2 ? 2 : 1)" + (c.e32 ? "_e32" : "")
+            + (NemotronQMVLean.active ? "_ln" : "")
         return cached(key) {
             NemotronMambaInProjConvDt.tuneBase(regs: c.regs, e32: c.e32)
                 .flatMap { source(base: $0, load: c.load, u2: c.u2) }.map {
