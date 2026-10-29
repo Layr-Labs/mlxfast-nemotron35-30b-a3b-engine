@@ -110,6 +110,7 @@ extension NemotronH35MTPAssistant {
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoKeysQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
+        NemotronTopTwoTune.tune(vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(

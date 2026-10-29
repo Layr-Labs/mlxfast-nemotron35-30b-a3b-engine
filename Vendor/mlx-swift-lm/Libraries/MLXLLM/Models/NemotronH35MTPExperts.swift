@@ -5402,8 +5402,9 @@ enum NemotronFC1Tune {
     /// An adopted variant's median is at most this fraction of the incumbent's.
     static let medianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE_BAR"] ?? "") ?? 0.995
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "")
-    /// Wall time of the timed rounds (graph building included), sized from the warm-up round.
-    static let timedMilliseconds = 600.0
+    /// Wall time of the timed rounds (graph building included), sized from the warm-up round; grown with
+    /// `variants` so each survivor keeps at least `NemotronTuneAdoption.minCycles` cycles.
+    static let timedMilliseconds = 800.0
 
     struct Variant: Sendable, Equatable {
         let name: String
@@ -5440,6 +5441,18 @@ enum NemotronFC1Tune {
         Variant(name: "r2n1u1", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 1),
         Variant(name: "r2n1u4", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 4),
         Variant(name: "r4n2u1", rps: 4, nsg: 2, slotX: false, w32: false, unroll: 1),
+        // The 32-bit word decode (`w32`) tried only at the incumbent's geometry so far, against the two-group, the
+        // four-output and the eight-output geometries, and with the slot axis; `slotX` at a four-output geometry.
+        // (The unroll axis is not extended: `unroll: 0` already resolves to the two-block count `qualifyFC1Unroll`
+        // admits, which is what this record runs, so `unroll: 2` would be a duplicate and 1 and 4 are already there.)
+        // These cross the axes the list above already holds one at a time.
+        Variant(name: "r2n2w", rps: 2, nsg: 2, slotX: false, w32: true, unroll: 0),
+        Variant(name: "r4n2w", rps: 4, nsg: 2, slotX: false, w32: true, unroll: 0),
+        Variant(name: "r8n2w", rps: 8, nsg: 2, slotX: false, w32: true, unroll: 0),
+        Variant(name: "r2n1wx", rps: 2, nsg: 1, slotX: true, w32: true, unroll: 0),
+        Variant(name: "r4n2x", rps: 4, nsg: 2, slotX: true, w32: false, unroll: 0),
+        Variant(name: "r4n2wx", rps: 4, nsg: 2, slotX: true, w32: true, unroll: 0),
+        Variant(name: "r2n2wx", rps: 2, nsg: 2, slotX: true, w32: true, unroll: 0),
     ]
 
     /// The same launch geometry and text (name aside).
@@ -5891,10 +5904,13 @@ enum NemotronQMVTune {
         return out
     }()
     /// Soft cap on the tune's own load time: no family, variant (its first launch JITs the pipeline) or timing
-    /// phase starts past it; what has not started keeps its incumbent.
-    static let budgetSeconds = 6.0
-    /// Wall time of one family's timed rounds (graph building included), sized from the last warm-up round.
-    static let timedMilliseconds = 900.0
+    /// phase starts past it; what has not started keeps its incumbent. The record's 6.0 s already ran out inside
+    /// the head family (the 131072-row launch's seven pipelines take most of it), so out_proj never reached its
+    /// timing phase. The cap now covers every family's qualify and timed rounds with the lists as they stand.
+    static let budgetSeconds = 14.0
+    /// Wall time of one family's timed rounds (graph building included), sized from the last warm-up round; grown
+    /// with the variant lists so each survivor keeps at least `NemotronTuneAdoption.minCycles` cycles.
+    static let timedMilliseconds = 1200.0
     /// Most timed cycles of one family.
     static let maxCycles = 93
 
@@ -5963,6 +5979,11 @@ enum NemotronQMVTune {
                 Variant(name: "r1n4", rps: 1, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n8", rps: 2, nsg: 8, load: nil, u2: nil),
                 Variant(name: "r2n2l2", rps: 2, nsg: 2, load: 2, u2: nil),
+                // Gaps in the cross-product: a four-output geometry with one group, the prefetch load form at the
+                // incumbent's geometry, and a load form with the pair unroll off.
+                Variant(name: "r4n1", rps: 4, nsg: 1, load: nil, u2: nil),
+                Variant(name: "r2n2l3", rps: 2, nsg: 2, load: 3, u2: nil),
+                Variant(name: "r2n2l1u0", rps: 2, nsg: 2, load: 1, u2: false),
             ]
         case .head:
             return [
@@ -5973,6 +5994,11 @@ enum NemotronQMVTune {
                 Variant(name: "r1n16", rps: 1, nsg: 16, load: nil, u2: nil),
                 Variant(name: "r2n32", rps: 2, nsg: 32, load: nil, u2: nil),
                 Variant(name: "r2n8l3", rps: 2, nsg: 8, load: 3, u2: nil),
+                // Gaps in the cross-product: the load forms at a four-output geometry (the list holds only the
+                // incumbent's two-output rows there) and the 32-bit word form at the incumbent's geometry.
+                Variant(name: "r4n8", rps: 4, nsg: 8, load: nil, u2: nil),
+                Variant(name: "r4n8l3", rps: 4, nsg: 8, load: 3, u2: nil),
+                Variant(name: "r8n8", rps: 8, nsg: 8, load: nil, u2: nil),
             ]
         case .outProj:
             return [
@@ -5984,6 +6010,11 @@ enum NemotronQMVTune {
                 Variant(name: "r1n4", rps: 1, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n8", rps: 2, nsg: 8, load: nil, u2: nil),
                 Variant(name: "r2n2l3", rps: 2, nsg: 2, load: 3, u2: nil),
+                // Gaps in the cross-product: a four-output geometry with one group, the hoist load form on the
+                // four-output row, and a load form with the pair unroll off (the list holds the unroll on only).
+                Variant(name: "r4n1", rps: 4, nsg: 1, load: nil, u2: nil),
+                Variant(name: "r4n2l2", rps: 4, nsg: 2, load: 2, u2: nil),
+                Variant(name: "r2n2l2u0", rps: 2, nsg: 2, load: 2, u2: false),
             ]
         case .sharedUp:
             return [
@@ -6404,8 +6435,9 @@ enum NemotronFC2Tune {
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC2_FORCE"] ?? "")
     static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] != "0"
     static let draftForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_DFC2_FORCE"] ?? "")
-    /// Wall time of one tune's timed rounds (graph building included), sized from the last warm-up round.
-    static let timedMilliseconds = 150.0
+    /// Wall time of one tune's timed rounds (graph building included), sized from the last warm-up round; grown with
+    /// `variants` so each survivor keeps at least `NemotronTuneAdoption.minCycles` cycles.
+    static let timedMilliseconds = 250.0
 
     struct Variant: Sendable, Equatable {
         let name: String
@@ -6427,6 +6459,14 @@ enum NemotronFC2Tune {
         Variant(name: "t3", sgs: 16, slotX: false, tiles: 3),
         Variant(name: "t7", sgs: 16, slotX: false, tiles: 7),
         Variant(name: "s8p", sgs: 8, slotX: false, tiles: 1, paired: true),
+        // Gaps in the cross-product, each one the kernel can launch (`SGS * 32 <= 1024` threads, `32 / SGS` even for
+        // the paired walk): a narrower threadgroup, the paired walk at the incumbent's width, the paired walk under
+        // the slot axis, and several tiles per threadgroup at the two widths the list leaves out (a 64-group
+        // threadgroup would be 2048 threads, and the paired walk needs `32 / SGS` even, so neither is a candidate).
+        Variant(name: "s4", sgs: 4, slotX: false, tiles: 1),
+        Variant(name: "p16", sgs: 16, slotX: false, tiles: 1, paired: true),
+        Variant(name: "x8p", sgs: 8, slotX: true, tiles: 1, paired: true),
+        Variant(name: "s8t3", sgs: 8, slotX: false, tiles: 3),
     ]
 
     /// The adopted geometries (nil: the incumbent), set once at load before any verify or draft graph is traced.
@@ -6566,7 +6606,9 @@ enum NemotronFC2Tune {
     /// The variant's kernel (with the `dep` input): the production dep twin when only SGS moves, else its own text.
     static func kernel(_ v: Variant, _ copy: NemotronZSkip.Copy) -> MLXFast.MLXFastKernel? {
         guard v.slotX || v.tiles > 1 || v.paired else { return NemotronZSkip.depKernel(for: copy) }
-        let key = (v.slotX ? "x" : v.paired ? "p" : "t\(v.tiles)")
+        // Every axis that moves the text names its kernel (`SGS` is a template argument, so two variants of the same
+        // text share one): the slot axis, the tile count and the paired walk each add their letter.
+        let key = (v.slotX ? "x" : "") + (v.tiles > 1 ? "t\(v.tiles)" : "") + (v.paired ? "p" : "")
             + (NemotronZSkip.vstore ? (NemotronZSkip.unmasked ? (NemotronZSkip.lean ? "_ln" : "_ul") : "_vs") : "")
         return lock.withLock { () -> MLXFast.MLXFastKernel? in
             if let made = kernels[key] { return made }
@@ -6672,7 +6714,7 @@ enum NemotronFC2Tune {
         let copies = all.filter(\.dict)
         guard !copies.isEmpty else { return report("off (no dictionary copy)") }
         let (picked, message) = run(copies: copies, slots: 18, densities: [0.0875, 0.45, 1], timedDensity: 0.0875,
-                                    chain: 2 * copies.count, forced: forced, budget: 1.0, elapsed: elapsed)
+                                    chain: 2 * copies.count, forced: forced, budget: 2.2, elapsed: elapsed)
         choice = picked
         report(message + ", dictionary copies \(copies.count)/\(all.count))")
     }
@@ -6700,7 +6742,7 @@ enum NemotronFC2Tune {
             return report("off (no draft dictionary copy with a dep twin)")
         }
         let (picked, message) = run(copies: dicts, slots: 6, densities: [0.45, 0.0875, 1, 0.2, 0.7], timedDensity: 0.45,
-                                    chain: 40, forced: draftForced, budget: 0.8, elapsed: elapsed)
+                                    chain: 40, forced: draftForced, budget: 2.0, elapsed: elapsed)
         draftChoice = picked
         report(message + ")")
     }

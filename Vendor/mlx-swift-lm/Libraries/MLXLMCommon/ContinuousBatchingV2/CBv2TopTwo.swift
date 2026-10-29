@@ -777,6 +777,14 @@ private func cbv2TopTwoRowsPacket(
     if keys ?? CBv2MTPTopTwoKeys.verified, logits.dtype == .bfloat16, rows * logits.dim(2) <= Int(UInt32.max),
         let finalize = cbv2TopTwoKeysFinalizeKernels
     {
+        // A geometry the load-time tune adopted replaces the record's stage one (its finalize merges the adopted
+        // pair count). The unread `dep` input binds the verify window, which the round publishes before the launch.
+        if let tuned = NemotronTopTwoTune.choice,
+           let out = NemotronTopTwoTune.launch(
+            tuned, logits, window: window, draftColumns: draftColumns, dep: window)
+        {
+            return out
+        }
         let partial = cbv2TopTwoKeysPartialKernel(
             [logits],
             grid: (rows * 32 * 256, 1, 1),
@@ -1130,6 +1138,531 @@ package func cbv2TopTwoKeysQualify(logitsDType: DType, vocabulary: Int) {
     report(CBv2MTPTopTwoKeys.verified
         ? "on (\(cases) cases bitwise equal to the record partial and finalize)"
         : "off (differs from the record partial and finalize after \(cases) cases)")
+}
+
+// MARK: - Load-time geometry tune of the top-2's stage one (NEMOTRON_TOP2_TUNE)
+//
+// The decode round's top-2 runs `cbv2TopTwoKeysPartialSource` once the keys form qualified: 32 threadgroups of 256
+// threads per row, each thread walking every 8192nd element of its row, a SIMD-group maximum over the lanes' pairs,
+// one barrier, then the threadgroup's eight SIMD-group pairs merged by its first group. That geometry came with the
+// tree partial and describes the M4-class host it was written on; the ranked host is an M5 with far more GPU cores.
+// `NemotronTopTwoTune` rebuilds the same body under other launch geometries. A variant moves only
+// - groups: threadgroups per row (the divisor of the row in `group_index`, and the 32 of the walk's stride);
+// - threads: threads per threadgroup (the lane bound, the `scratch` size, the SIMD-group count);
+// - unroll: loads per step of the main walk (1: the record's single-load loop only).
+// None of them touches the key, the ids, the per-thread walk itself (a different stride visits a disjoint set of
+// threads but the same elements of the row), the per-thread pair, the merge tree's comparisons or the stores. A
+// maximum over keys is a maximum over a set and keys are distinct within a row, so which thread or threadgroup
+// holds an element cannot change the row's two largest keys: every variant's ids, values and packet are the
+// record's, which is what `tune` proves bit for bit before it times anything.
+package enum NemotronTopTwoTune {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_TOP2_TUNE"] != "0"
+    /// NEMOTRON_TOP2_FORCE=<n> adopts variant n (1-based, `variants`) when it qualified; 0 keeps the incumbent.
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_TOP2_FORCE"] ?? "")
+    /// An adopted variant's median is at most this fraction of the incumbent's (the shared tune bar).
+    static let medianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_TOP2_BAR"] ?? "") ?? 0.97
+    /// Wall time of the timed rounds, sized from one warm-up round.
+    static let timedMilliseconds = 600.0
+
+    struct Variant: Sendable, Equatable {
+        let name: String
+        /// Threadgroups per row.
+        let groups: Int
+        /// Threads per threadgroup.
+        let threads: Int
+        /// Loads per step of the main walk.
+        let unroll: Int
+    }
+
+    /// The incumbent's geometry is `variants[0]` (32 x 256, four loads per step), the record's own.
+    static let variants: [Variant] = [
+        Variant(name: "g32t256u4", groups: 32, threads: 256, unroll: 4),
+        Variant(name: "g16t256u4", groups: 16, threads: 256, unroll: 4),
+        Variant(name: "g64t256u4", groups: 64, threads: 256, unroll: 4),
+        Variant(name: "g32t128u4", groups: 32, threads: 128, unroll: 4),
+        Variant(name: "g32t512u4", groups: 32, threads: 512, unroll: 4),
+        Variant(name: "g64t128u4", groups: 64, threads: 128, unroll: 4),
+        Variant(name: "g32t256u2", groups: 32, threads: 256, unroll: 2),
+        Variant(name: "g32t256u1", groups: 32, threads: 256, unroll: 1),
+    ]
+
+    /// The incumbent geometry through the tune's pipeline: the baseline every candidate is judged against.
+    static var incumbentTwin: Variant { variants[0] }
+
+    /// The adopted geometry (nil: the record's 32 x 256 x 4 launch). Set once at load, before any verify graph is
+    /// traced or warmed; `cbv2TopTwoRowsPacket` then takes the keys partial and finalize of this geometry.
+    nonisolated(unsafe) private(set) static var choice: Variant? = nil
+
+    /// Whether the kernel can launch the variant: whole SIMD groups, at most 512 threads (the merge reads at most
+    /// two pairs per lane), and a walk step the text supports.
+    static func eligible(_ v: Variant) -> Bool {
+        v.groups > 0 && v.threads >= 32 && v.threads <= 512 && v.threads % 32 == 0
+            && 2 * (v.threads / 32) <= 32 && [1, 2, 4].contains(v.unroll)
+    }
+
+    struct Kernels {
+        /// Stage one of this geometry; the unread `dep` input (int32) only orders the launch after its producer.
+        let partial: MLXFast.MLXFastKernel
+        let finalize: MLXFast.MLXFastKernel
+        /// The same finalize reading the verify columns (built on first use: the round takes this form only while
+        /// `CBv2MTPTopTwoPacketColumns` is verified).
+        let columns: @Sendable () -> MLXFast.MLXFastKernel
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cache: [String: Kernels?] = [:]
+
+    /// The record's key partial with the variant's geometry and walk step; every other statement is its text.
+    static func partialSource(_ v: Variant) -> String {
+        let stride = v.groups * v.threads
+        let entries = 2 * (v.threads / 32)
+        var main = ""
+        switch v.unroll {
+        case 4:
+            main = """
+                        for (; index < vocab && vocab - index > 3 * (\(stride)); index += 4 * (\(stride))) {
+                            const bfloat16_t x0 = t2_row[index];
+                            const bfloat16_t x1 = t2_row[index + \(stride)];
+                            const bfloat16_t x2 = t2_row[index + 2 * (\(stride))];
+                            const bfloat16_t x3 = t2_row[index + 3 * (\(stride))];
+                            darkbloom_qwen35_mtp_top2_key_push(
+                                first, second, darkbloom_qwen35_mtp_top2_key(x0, index));
+                            darkbloom_qwen35_mtp_top2_key_push(
+                                first, second, darkbloom_qwen35_mtp_top2_key(x1, index + \(stride)));
+                            darkbloom_qwen35_mtp_top2_key_push(
+                                first, second, darkbloom_qwen35_mtp_top2_key(x2, index + 2 * (\(stride))));
+                            darkbloom_qwen35_mtp_top2_key_push(
+                                first, second, darkbloom_qwen35_mtp_top2_key(x3, index + 3 * (\(stride))));
+                        }
+                """
+        case 2:
+            main = """
+                        for (; index < vocab && vocab - index > \(stride); index += 2 * (\(stride))) {
+                            const bfloat16_t x0 = t2_row[index];
+                            const bfloat16_t x1 = t2_row[index + \(stride)];
+                            darkbloom_qwen35_mtp_top2_key_push(
+                                first, second, darkbloom_qwen35_mtp_top2_key(x0, index));
+                            darkbloom_qwen35_mtp_top2_key_push(
+                                first, second, darkbloom_qwen35_mtp_top2_key(x1, index + \(stride)));
+                        }
+                """
+        default:
+            break
+        }
+        return """
+                uint lane = thread_position_in_threadgroup.x;
+                uint group_index = threadgroup_position_in_grid.x;
+                uint row = group_index / \(v.groups);
+                uint group = group_index % \(v.groups);
+                uint vocab = uint(logits_shape[2]);
+                const auto t2_row = logits + row * vocab;
+                ulong first = 0;
+                ulong second = 0;
+                uint index = group * \(v.threads) + lane;
+            \(main)        for (; index < vocab; index += \(stride)) {
+                    darkbloom_qwen35_mtp_top2_key_push(
+                        first, second, darkbloom_qwen35_mtp_top2_key(t2_row[index], index));
+                }
+
+                const uint simd_lane = thread_index_in_simdgroup;
+                const uint simd_group = simdgroup_index_in_threadgroup;
+                const ulong simd_first = darkbloom_qwen35_mtp_top2_key_max(first);
+                const ulong simd_second = darkbloom_qwen35_mtp_top2_key_max(first == simd_first ? second : first);
+
+                threadgroup ulong scratch[\(entries)];
+                if (simd_lane == 0) {
+                    scratch[2 * simd_group] = simd_first;
+                    scratch[2 * simd_group + 1] = simd_second;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (simd_group == 0) {
+                    const ulong key = simd_lane < \(entries) ? scratch[simd_lane] : 0ul;
+                    const ulong group_first = darkbloom_qwen35_mtp_top2_key_max(key);
+                    const ulong group_second = darkbloom_qwen35_mtp_top2_key_max(key == group_first ? 0ul : key);
+                    if (simd_lane == 0) {
+                        partial_keys[(row * \(v.groups) + group) * 2] = group_first;
+                        partial_keys[(row * \(v.groups) + group) * 2 + 1] = group_second;
+                    }
+                }
+            """
+    }
+
+    /// The record's key finalize with the row's `groups` pairs taken as one SIMD group: each lane folds the pairs it
+    /// owns with the same `key_push` (a maximum over the row's keys does not depend on how they are dealt out), then
+    /// the row's two largest keys come from the record's two `key_max` passes and its stores write them.
+    static func finalizeSource(_ v: Variant) -> String {
+        """
+                uint lane = thread_position_in_threadgroup.x;
+                uint row = threadgroup_position_in_grid.x;
+                ulong first = 0;
+                ulong second = 0;
+                for (uint part = lane; part < \(v.groups); part += 32) {
+                    darkbloom_qwen35_mtp_top2_key_push(
+                        first, second, partial_keys[(row * \(v.groups) + part) * 2]);
+                    darkbloom_qwen35_mtp_top2_key_push(
+                        first, second, partial_keys[(row * \(v.groups) + part) * 2 + 1]);
+                }
+                const ulong row_first = darkbloom_qwen35_mtp_top2_key_max(first);
+                const ulong row_second = darkbloom_qwen35_mtp_top2_key_max(first == row_first ? second : first);
+                darkbloom_qwen35_mtp_top2_state local = darkbloom_qwen35_mtp_top2_key_state(row_first, row_second);
+
+                if (lane == 0) {
+                    uint output_base = row * 2;
+                    top_ids[output_base] = int(local.first_id);
+                    top_ids[output_base + 1] = int(local.second_id);
+                    top_values[output_base] = local.first_value;
+                    top_values[output_base + 1] = local.second_value;
+
+                    uint batch = uint(window_shape[0]);
+                    uint width = uint(window_shape[1]);
+                    uint drafts = batch * (width - 1);
+                    uint rows = batch * width;
+                    packet[drafts + row] = int(local.first_id);
+                    packet[drafts + rows + output_base] = as_type<int>(local.first_value);
+                    packet[drafts + rows + output_base + 1] = as_type<int>(local.second_value);
+                    uint column = row % width;
+                    if (column > 0) {
+                        packet[(row / width) * (width - 1) + (column - 1)] = window[row];
+                    }
+                }
+            """
+    }
+
+    static func kernels(_ v: Variant) -> Kernels? {
+        lock.withLock { () -> Kernels? in
+            if let made = cache[v.name] { return made }
+            var made: Kernels? = nil
+            guard eligible(v) else {
+                cache[v.name] = made
+                return made
+            }
+            let partial = MLXFast.metalKernel(
+                name: "darkbloom_qwen35_mtp_top2_partial_keys_" + v.name,
+                inputNames: ["logits", "dep"],
+                outputNames: ["partial_keys"],
+                source: partialSource(v),
+                header: cbv2TopTwoKeysHeader,
+                ensureRowContiguous: true)
+            let body = finalizeSource(v)
+            made = Kernels(
+                partial: partial,
+                finalize: MLXFast.metalKernel(
+                    name: "darkbloom_qwen35_mtp_top2_finalize_packet_keys_" + v.name,
+                    inputNames: ["partial_keys", "window"],
+                    outputNames: ["top_ids", "top_values", "packet"],
+                    source: body, header: cbv2TopTwoKeysHeader, ensureRowContiguous: true),
+                columns: {
+                    MLXFast.metalKernel(
+                        name: "darkbloom_qwen35_mtp_top2_finalize_packet_keys_cols_" + v.name,
+                        inputNames: ["partial_keys", "w1", "w2"],
+                        outputNames: ["top_ids", "top_values", "packet"],
+                        source: cbv2PacketColumnsSource(body), header: cbv2TopTwoKeysHeader,
+                        ensureRowContiguous: true)
+                })
+            cache[v.name] = made
+            return made
+        }
+    }
+
+    /// One variant launch of the packet path on `logits`: nil when the kernel is ineligible. `dep` (int32, unread by
+    /// the partial) only orders the launch after its producer; production binds the verify window there.
+    static func launch(
+        _ v: Variant, _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, dep: MLXArray
+    ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+        guard let k = kernels(v) else { return nil }
+        let rows = logits.dim(1)
+        let drafts = window.dim(0) * (window.dim(1) - 1)
+        let partial = k.partial(
+            [logits, dep],
+            grid: (rows * v.groups * v.threads, 1, 1),
+            threadGroup: (v.threads, 1, 1),
+            outputShapes: [[rows, v.groups, 2]],
+            outputDTypes: [.uint64])[0]
+        let columns = window.shape == [1, 3] ? draftColumns : nil
+        let outputs = (columns == nil ? k.finalize : k.columns())(
+            columns.map { [partial, $0[0], $0[1]] } ?? [partial, window],
+            grid: (rows * 32, 1, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[rows, 2], [rows, 2], [drafts + rows * 3]],
+            outputDTypes: [.int32, .float32, .int32])
+        return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// The shared adoption rule, replicated from `NemotronTuneAdoption` (MLXLLM), which this module cannot see:
+    /// each cycle takes one sample of every candidate in `order`; the candidate with the lowest median is adopted
+    /// only when its median is at most `medianBar` of the incumbent's and it was faster than the incumbent in at
+    /// least `winBar` of the cycles. Otherwise the incumbent stays.
+    enum Adoption {
+        static let minCycles = 16
+        static let winBar = 0.75
+
+        static func order(_ count: Int, cycle: Int) -> [Int] {
+            let rotated = (0 ..< count).map { ($0 + cycle / 2) % count }
+            return cycle % 2 == 0 ? rotated : Array(rotated.reversed())
+        }
+
+        static func cycles(target: Double, wall: Double, cap: Int) -> Int {
+            let n = max(minCycles, min(cap, Int(target / max(wall, 0.01))))
+            return n - n % 2
+        }
+
+        struct Verdict {
+            let medians: [Double]
+            let wins: [Int]
+            let cycles: Int
+            let best: Int?
+            let adopted: Int?
+
+            func won(_ i: Int) -> String { i < wins.count ? "\(wins[i])/\(cycles)" : "n/a" }
+
+            func rule(_ name: (Int) -> String) -> String {
+                guard let b = best, medians[0] > 0 else { return "no candidate timed" }
+                return "best \(name(b)) " + String(format: "%+.1f%%", 100 * (medians[b] / medians[0] - 1))
+                    + " wins \(won(b))"
+            }
+        }
+
+        static func decide(_ samples: [[Double]], medianBar: Double) -> Verdict {
+            let cycles = samples.first?.count ?? 0
+            let medians = samples.map { $0.isEmpty ? Double.nan : $0.sorted()[$0.count / 2] }
+            let wins = samples.map { s in zip(s, samples[0]).filter { $0.0 < $0.1 }.count }
+            let best = medians.indices.dropFirst().min(by: { medians[$0] < medians[$1] })
+            var adopted: Int? = nil
+            if let b = best, cycles > 0, samples.allSatisfy({ $0.count == cycles }),
+               medians[b] <= medianBar * medians[0], Double(wins[b]) >= winBar * Double(cycles) {
+                adopted = b
+            }
+            return Verdict(medians: medians, wins: wins, cycles: cycles, best: best, adopted: adopted)
+        }
+    }
+
+    private static func millis(_ d: Duration) -> Double {
+        let c = d.components
+        return Double(c.seconds) * 1000 + Double(c.attoseconds) / 1e15
+    }
+
+    /// Load time, after `cbv2TopTwoKeysQualify` and before any verify graph is traced or warmed: every variant
+    /// against the production packet launch bit for bit in the ids, the values (as bits) and the packet on seeded
+    /// BF16 logits (Gaussian, exact ties, NaNs, infinities, signed zeros, constant rows, rows of one repeated
+    /// pattern, a short vocabulary and the verify width), then the survivors timed round robin as chains of
+    /// partial+finalize pairs chained through the unread `dep` input, and the winner adopted only by the rule.
+    /// NEMOTRON_TOP2_TUNE=0 keeps the record geometry; NEMOTRON_TOP2_FORCE=<n> adopts variant n when it qualified.
+    package static func tune(vocabulary: Int) {
+        choice = nil
+        let clock = CBv2Clock.continuous
+        let started = clock.now()
+        func report(_ message: String) {
+            let s = millis(clock.now() - started) / 1000
+            FileHandle.standardError.write(Data(
+                "nemotron top2 tune: \(message) (\(String(format: "%.2f", s)) s)\n".utf8))
+        }
+        guard enabled else { return report("off (setting)") }
+        guard CBv2MTPTopTwoPacket.enabled else { return report("off (packet finalize off)") }
+        guard CBv2MTPTopTwoKeys.verified else { return report("off (keys form not in use)") }
+        guard vocabulary >= 2 else { return report("off (vocabulary \(vocabulary))") }
+
+        struct Case {
+            let logits: MLXArray
+            let window: MLXArray
+        }
+        var cases: [Case] = []
+        var timedLogits: MLXArray? = nil
+        var timedWindow: MLXArray? = nil
+        do {
+            cases = try withError { () -> [Case] in
+                var made: [Case] = []
+                for (vocab, rows) in [(vocabulary, 3), (vocabulary, 1), (5003, 3), (64, 2)] {
+                    for kind in 0 ..< 5 {
+                        let key = MLXRandom.key(UInt64(0x7090_0000 + vocab * 64 + rows * 8 + kind))
+                        var logits = MLXRandom.normal([1, rows, vocab], key: key) * 3
+                        switch kind {
+                        case 1: logits = round(logits)
+                        case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)), MLXArray(Float.nan), logits)
+                        case 3:
+                            logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                                which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                        case 4: logits = MLXArray.zeros([1, rows, vocab]) + MLXArray(Float(0.5))
+                        default: break
+                        }
+                        let typed = logits.asType(.bfloat16)
+                        var window = MLXRandom.randInt(
+                            0 ..< Int32(min(vocab, Int(Int32.max))), [1, rows],
+                            key: MLXRandom.key(UInt64(0x7091_0000 + vocab * 64 + rows * 8 + kind)))
+                            .asType(.int32)
+                        if rows < 2 {
+                            window = concatenated([window, window], axis: 1)
+                        }
+                        let l = rows < 2 ? concatenated([typed, typed], axis: 1) : typed
+                        eval([l, window])
+                        if vocab == vocabulary, rows == 3, kind == 0 {
+                            timedLogits = l
+                            timedWindow = window
+                        }
+                        made.append(Case(logits: l, window: window))
+                    }
+                }
+                return made
+            }
+        } catch {
+            return report("off (inputs: \(error))")
+        }
+        guard let timedL = timedLogits, let timedW = timedWindow, !cases.isEmpty else {
+            return report("off (no timed case)")
+        }
+
+        // The production launch the round takes today (the record's 32 x 256 x 4 keys partial + its finalize). While
+        // `CBv2MTPTopTwoPacketColumns` is verified the round takes the column-reading finalize instead, so that form
+        // is a production form too and is checked on every case as well; one reference evaluation per form.
+        func incumbent(_ c: Case, _ columns: [MLXArray]?) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
+            cbv2TopTwoRowsPacket(c.logits, window: c.window, draftColumns: columns, shuffle: nil, keys: nil)
+        }
+        func draftColumns(_ c: Case) -> [MLXArray]? {
+            guard CBv2MTPTopTwoPacketColumns.verified, c.window.shape == [1, 3] else { return nil }
+            return [c.window[0..., 1].reshaped(1), c.window[0..., 2].reshaped(1)]
+        }
+        var forms: [[MLXArray]?] = [nil]
+        if let columns = draftColumns(cases[0]) { forms.append(columns) }
+
+        // Qualify: bit for bit against the production launch; a mismatch, a missing kernel or a Metal error drops
+        // the variant. The incumbent geometry runs through the tune's own pipeline too (the timing twin).
+        var alive = variants.filter(eligible)
+        var dropped: [String] = []
+        var checks = 0
+        for (ci, c) in cases.enumerated() {
+            // One reference evaluation per production form of this case.
+            let references: [[Int32]]
+            do {
+                references = try withError { () -> [[Int32]] in
+                    var made: [[Int32]] = []
+                    for columns in forms {
+                        guard let reference = incumbent(c, columns) else { return [] }
+                        eval(reference.ids, reference.values, reference.packet)
+                        made.append(reference.ids.asArray(Int32.self) + reference.packet.asArray(Int32.self)
+                            + reference.values.view(dtype: .uint32).asArray(UInt32.self)
+                            .map { Int32(bitPattern: $0) })
+                    }
+                    return made
+                }
+            } catch {
+                return report("off (production unavailable in case \(ci))")
+            }
+            guard references.count == forms.count else {
+                return report("off (production unavailable in case \(ci))")
+            }
+            alive = alive.filter { v in
+                do {
+                    let same = try withError { () -> Bool in
+                        for (columns, referenceValues) in zip(forms, references) {
+                            guard let out = launch(v, c.logits, window: c.window, draftColumns: columns,
+                                                   dep: c.window) else { return false }
+                            eval(out.ids, out.values, out.packet)
+                            let got = out.ids.asArray(Int32.self) + out.packet.asArray(Int32.self)
+                                + out.values.view(dtype: .uint32).asArray(UInt32.self).map { Int32(bitPattern: $0) }
+                            if got != referenceValues { return false }
+                        }
+                        return true
+                    }
+                    if !same { dropped.append("\(v.name) differs@\(ci)") }
+                    return same
+                } catch {
+                    dropped.append("\(v.name) error")
+                    return false
+                }
+            }
+            checks += 1
+            if alive.isEmpty { break }
+        }
+        guard !alive.isEmpty else { return report("off (no variant bitwise equal: \(dropped.prefix(6).joined(separator: ", ")))") }
+        let twin = incumbentTwin
+        guard alive.contains(twin) else { return report("off (incumbent twin not bitwise equal)") }
+        let candidates: [Variant] = [twin] + alive.filter { $0 != twin }
+
+        // Time the twin and the survivors round robin: each sample is a chain of partial+finalize pairs at the
+        // record's verify width, every finalize's packet bound as the next partial's `dep` so one launch starts only
+        // after the one before it finished, as in the round. The chains are built before the clock starts.
+        let chain = 8
+        var medians: [Double] = []
+        var verdict: Adoption.Verdict? = nil
+        var reps = 0
+        var samples = Array(repeating: [Double](), count: candidates.count)
+        do {
+            try withError {
+                func build(_ i: Int) -> MLXArray? {
+                    var prev = timedW
+                    for _ in 0 ..< chain {
+                        guard let out = launch(candidates[i], timedL, window: timedW, draftColumns: nil, dep: prev)
+                        else { return nil }
+                        prev = out.packet
+                    }
+                    return prev
+                }
+                func round(_ order: [Int]) -> [Double?] {
+                    let chains = order.map { build($0) }
+                    return chains.map { last -> Double? in
+                        guard let last else { return nil }
+                        let start = clock.now()
+                        eval(last)
+                        Stream.gpu.synchronize()
+                        return millis(clock.now() - start) / Double(chain)
+                    }
+                }
+                let warm = clock.now()
+                _ = round(Array(candidates.indices))
+                let wall = millis(clock.now() - warm)
+                reps = Adoption.cycles(target: timedMilliseconds, wall: wall, cap: 41)
+                for rep in 0 ..< reps {
+                    let order = Adoption.order(candidates.count, cycle: rep)
+                    for (i, ms) in zip(order, round(order)) {
+                        if let ms { samples[i].append(ms) }
+                    }
+                }
+            }
+        } catch {
+            dropped.append("timing error")
+            samples = Array(repeating: [], count: candidates.count)
+        }
+        if samples.allSatisfy({ $0.count == reps }), reps > 0 {
+            verdict = Adoption.decide(samples, medianBar: medianBar)
+            medians = verdict?.medians ?? []
+        } else {
+            dropped.append("timing incomplete")
+        }
+
+        var picked: Variant? = nil
+        var why = "kept"
+        if !medians.isEmpty {
+            if let f = forced {
+                if f >= 1, f <= variants.count, let i = candidates.firstIndex(of: variants[f - 1]) {
+                    picked = candidates[i]
+                    why = "forced"
+                } else {
+                    why = f == 0 ? "forced V0" : "forced \(f) not qualified, kept"
+                }
+            } else if let best = verdict?.adopted {
+                picked = candidates[best]
+                why = "adopted"
+            }
+        } else if let f = forced, f == 0 {
+            why = "forced V0"
+        }
+        choice = picked
+
+        func ms(_ v: Variant) -> String {
+            guard let i = candidates.firstIndex(of: v), i < medians.count else { return "n/a" }
+            return String(format: "%.4f", medians[i])
+        }
+        let times = candidates.indices.dropFirst().map {
+            "\(candidates[$0].name) \(ms(candidates[$0])) \(verdict?.won($0) ?? "n/a")"
+        }
+        let rule = verdict?.rule({ candidates[$0].name }) ?? "no candidate timed"
+        report("\(why) \(picked?.name ?? "record 32x256u4") \(ms(picked ?? twin)) ms vs V0 (g32t256u4)"
+            + " \(ms(twin)) ms per launch (\(rule); median of \(reps), \(chain) chained partial+finalize pairs"
+            + " per sample at \(timedL.dim(1)) rows x \(timedL.dim(2)); \(candidates.count)/\(variants.count)"
+            + " bitwise over \(checks) cases against the production launch"
+            + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
+            + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(8).joined(separator: ", ")))
+    }
 }
 
 /// Load-time JIT of the packet finalize (its pipeline depends only on the

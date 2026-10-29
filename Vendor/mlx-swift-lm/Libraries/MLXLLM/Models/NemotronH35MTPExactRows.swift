@@ -6313,7 +6313,7 @@ enum NemotronScreenPicks {
 // `NemotronTuneAdoption.decide` admits it (median at least 3% below V0's twin and faster than V0's twin in at least
 // 75% of the cycles, paired within each cycle).
 // The chains read cold data as the round does: fc1 cycles 16 routes through the bank, the other families cycle copies
-// of their weights (an integer add of zero, about 96 MB per pass). Load cap 3 s.
+// of their weights (an integer add of zero, about 96 MB per pass). Load cap 4.5 s.
 // NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; NEMOTRON_DRAFT_FORCE=<n> adopts variant n (1-based, `variants`) of
 // every family that qualified it, <family>:<n>[,<family>:<n>] of the named families; 0 keeps the incumbent.
 enum NemotronDraftTune {
@@ -6330,10 +6330,14 @@ enum NemotronDraftTune {
         return (nil, out)
     }()
     /// Soft cap on the tune's own load time: no family, variant (its first launch JITs its pipeline) or timing phase
-    /// starts past it; what has not started keeps its incumbent. A forced run checks every family.
-    static let budgetSeconds = forced.all != nil || !forced.families.isEmpty ? 60.0 : 3.0
-    /// Wall time of one family's timed cycles (graph building included), sized from the warm-up cycle.
-    static let timedMilliseconds = 100.0
+    /// starts past it; what has not started keeps its incumbent. A forced run checks every family. Raised with the
+    /// widened variant lists: the bit checks cost about a launch each and 76 variants now run where 54 did.
+    static let budgetSeconds = forced.all != nil || !forced.families.isEmpty ? 60.0 : 4.5
+    /// Wall time of one family's timed cycles (graph building included), sized from the warm-up cycle. `cycles` is
+    /// `target / wall` and `wall` is one round of every candidate, so a round's cost and the cycle count move
+    /// oppositely: the target is raised in proportion to the longest list (ehp, 7 -> 11 rows) to hold each
+    /// candidate's sample count where it was, and `minCycles` still floors every family at 16.
+    static let timedMilliseconds = 160.0
 
     /// In tune order (sdpa: `tuneSDPA`, after the draft attention's checks).
     enum Family: String, CaseIterable, Sendable {
@@ -6398,16 +6402,26 @@ enum NemotronDraftTune {
                              packed: packed, vs: inc.vs)
             return (g.description, g)
         }
+        // Each list ends with cross-products the family's siblings carry and it lacked: fc1's slot axis and
+        // unroll at the wide row counts, the QMV/QKV families' r8n1 and their unrolled r8n2, the screen's
+        // eight-group rows, and ehp's three load forms it never tried next to its rps/nsg crosses. Every one
+        // is guarded by the same launch helpers as the rows above it, so a shape the kernel cannot express
+        // drops as `n/a` at its bit check and the list costs only its check.
         switch f {
         case .fc1:
             return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 1), v(8, 2), v(4, 2, slotX: true),
-                    v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4)]
+                    v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4),
+                    v(8, 2, slotX: true), v(4, 1, slotX: true),
+                    v(8, 2, unroll: inc.unroll == 2 ? 4 : 2), v(2, 4, unroll: inc.unroll == 2 ? 4 : 2)]
         case .screen:
-            return [v(4, 2), v(16, 2), v(8, 1), v(8, 4), v(16, 1), v(32, 1), v(4, 4), v(16, 4)]
+            return [v(4, 2), v(16, 2), v(8, 1), v(8, 4), v(16, 1), v(32, 1), v(4, 4), v(16, 4),
+                    v(8, 8), v(16, 8), v(32, 4), v(4, 8)]
         case .wo, .up, .down, .eh, .qkv:
-            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2)]
+            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2), v(8, 1),
+                    v(8, 2, unroll: 2)]
         case .ehp:
-            return [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2)]
+            return [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2),
+                    v(2, 2, load: 1), v(2, 2, load: 3), v(2, 4, load: 2), v(4, 2, load: 3)]
         case .sdpa:
             return [v(1, 32, unroll: 8, keys: 2, packed: true), v(1, 32, unroll: 8, keys: 2),
                     v(1, 32, unroll: 8, keys: 1), v(1, 32, unroll: 4, keys: 2), v(1, 32, unroll: 4, keys: 1)]
@@ -6571,7 +6585,7 @@ enum NemotronDraftTune {
                     let start = DispatchTime.now().uptimeNanoseconds
                     _ = round(Array(candidates.indices))
                     let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
-                    reps = NemotronTuneAdoption.cycles(target: timed, wall: wall, cap: 41)
+                    reps = NemotronTuneAdoption.cycles(target: timed, wall: wall, cap: 58)
                     for rep in 0 ..< reps {
                         let order = NemotronTuneAdoption.order(candidates.count, cycle: rep)
                         for (i, ms) in zip(order, round(order)) {
