@@ -5660,6 +5660,7 @@ class NemotronHAttention: Module, NemotronHMixer {
     @ModuleInfo(key: "k_proj") var wk: Linear
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
+    let mtpProjectionJoinCache = NemotronMTPAttentionProjectionJoinCache()
 
     // NOTE: NemotronH attention does NOT use RoPE (unlike most transformer models)
     // The Python implementation at mlx_lm/models/nemotron_h.py lines 247-274 shows
@@ -5725,7 +5726,7 @@ class NemotronHAttention: Module, NemotronHMixer {
                 : outputs
         }
         return (
-            captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
+            captureMTP ? nemotronMTPLinearRows(x, wq) : NemotronSeedQMMTune.attention(x, wq, kind: "q_proj") ?? wq(x),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
     }
@@ -5738,7 +5739,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         captureMTP: Bool = false,
         targetQKV: Bool = false,
         prepared: MLXArray? = nil,
-        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil
+        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil,
+        projectRows: (([MLXArray], Linear) -> MLXArray)? = nil
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
@@ -5783,7 +5785,7 @@ class NemotronHAttention: Module, NemotronHMixer {
             let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
                 queries: queries, written: qkv.0, scale: scale, sinks: nil,
                 attendRows: NemotronMTPVerifySDPA.rows)
-            return NemotronMTPAttentionDirect.project(rows, wo)
+            return projectRows?(rows, wo) ?? NemotronMTPAttentionDirect.project(rows, wo)
         }
         let (q, k, v) = precomputed ?? cbv2Projections(
             x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
@@ -5806,7 +5808,7 @@ class NemotronHAttention: Module, NemotronHMixer {
            let rows = layerCache.updateAndAttendSerialQueryRows(
                queries: queries, keys: keys, values: values, scale: scale, sinks: nil,
                attendRows: NemotronMTPVerifySDPA.rows) {
-            return NemotronMTPAttentionDirect.project(rows, wo)
+            return projectRows?(rows, wo) ?? NemotronMTPAttentionDirect.project(rows, wo)
         }
         let output = cache.updateAndAttend(
             queries: queries,
@@ -5815,7 +5817,8 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo)
+            : NemotronSeedQMMTune.attention(merged, wo, kind: "o_proj") ?? nemotronR1Linear(merged, wo)
     }
 
     // Protocol conformance
@@ -8624,15 +8627,19 @@ enum NemotronPrefillDenseDict {
         return NemotronSeedDenseRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    /// `dep` (load-time timing chains only, `NemotronSeedDenseRetile`): the pair table is read from a view of `dep`'s
+    /// leading bytes, so the launch waits for `dep`'s producer.
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
               !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
               q.weight.dtype == .uint32, q.weight.ndim == 2,
-              let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
-              d.table.dtype == .float32
+              let d0 = NemotronSBDict.dict(q), d0.index.shape == q.scales.shape, d0.index.dtype == .uint16,
+              d0.table.dtype == .float32,
+              let table = dep.map({ NemotronSeedQMMTune.operandView($0, like: d0.table) }) ?? d0.table
         else { return nil }
+        let d = (index: d0.index, table: table)
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64] else { return nil }
         // Row tiles of 64 over the request's tokens, at least three descriptors
@@ -8760,12 +8767,16 @@ enum NemotronPrefillSharedDownCopy {
         return NemotronSeedDenseRetile.sharedDown(x, down) ?? launch(x, down)
     }
 
-    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    /// `dep` (load-time timing chains only, `NemotronSeedDenseRetile`): the BF16 biases are read from a view of `dep`'s
+    /// leading bytes, so the launch waits for `dep`'s producer.
+    static func launch(_ x: MLXArray, _ down: Linear, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
-              let copy = NemotronSharedDownZSkip.copyArrays(for: down)
+              let copy0 = NemotronSharedDownZSkip.copyArrays(for: down),
+              let chainedBiases = dep.map({ NemotronSeedQMMTune.operandView($0, like: copy0.biases) }) ?? copy0.biases
         else { return nil }
+        let copy = (codes: copy0.codes, scales: copy0.scales, biases: chainedBiases)
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
               copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
@@ -9573,9 +9584,28 @@ private class NemotronHBlock: Module {
             guard let attentionCache else {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
-            output = (mixer as! NemotronHAttention).cbv2Forward(
+            let attention = mixer as! NemotronHAttention
+            var projectionJoin: (MLXArray, MLXArray, MLXArray)?
+            output = attention.cbv2Forward(
                 hidden, cache: attentionCache, captureMTP: true, targetQKV: true,
-                prepared: prepared)
+                prepared: prepared, projectRows: { rows, wo in
+                    if attention.mtpProjectionJoinCache.isReady(wo: wo, norm: nextNorm),
+                       rows.count == 3,
+                       rows.allSatisfy({ $0.shape == [1, 32, 1, 128] && $0.dtype == .bfloat16 }),
+                       let packed = NemotronMTPVerifySDPA.takePrepared(rows) {
+                        if let joined = attention.mtpProjectionJoinCache.run(
+                            packed, residual: x, wo: wo, norm: nextNorm) {
+                            projectionJoin = joined
+                            return joined.0
+                        }
+                        // The payload was consumed, so the incumbent may
+                        // re-prepare the same rows. SDPA preparation was
+                        // admitted bitwise against that original path.
+                        return NemotronMTPAttentionDirect.project(rows, wo)
+                    }
+                    return NemotronMTPAttentionDirect.project(rows, wo)
+                })
+            if let projectionJoin { return projectionJoin }
         case .mlp:
             precondition(
                 attentionCache == nil,
@@ -9605,6 +9635,18 @@ private class NemotronHBlock: Module {
         if let shared { output = output + shared }
         let residual = x + output
         return (residual, nemotronMTPNormRows(residual) { nextNorm($0) }, nil)
+    }
+}
+
+enum NemotronMTPAttentionProjectionGraphAdmission {
+    static func qualify(_ target: Module) {
+        guard let backbone = target.modules().compactMap({ $0 as? NemotronHBackbone }).first else { return }
+        let layers = backbone.layers
+        for i in layers.indices {
+            guard let attention = layers[i].mixer as? NemotronHAttention else { continue }
+            let nextNorm = i + 1 < layers.count ? layers[i + 1].norm : backbone.normF
+            attention.mtpProjectionJoinCache.qualify(wo: attention.wo, norm: nextNorm, layerIndex: i)
+        }
     }
 }
 
