@@ -650,6 +650,65 @@ enum NemotronHResidualRMSNorm {
         outputNames: ["residual", "normalized"],
         source: oneBarrierSource(withProductsReduce(sumSource())), ensureRowContiguous: true)
 
+    /// Final draft norm consumes only normalized output. Delete the dead residual output AFTER the
+    /// incumbent's counted source transforms, retaining its load scheduling, reductions and barriers.
+    private static func finalOnlySource(products: Bool) -> String? {
+        var s = oneBarrierSource(products ? withProductsReduce(sumSource()) : sumSource())
+        let stores = ["residual[offset + i] = sum;", "residual[offset + i] = static_cast<T>(thread_x[i]);"]
+        guard stores.reduce(0, { $0 + s.components(separatedBy: $1).count - 1 }) == 1 else { return nil }
+        for store in stores { s = s.replacingOccurrences(of: store, with: "") }
+        guard !s.contains("residual[") else { return nil }
+        return s
+    }
+    private static let finalDenseOnlyKernel = finalOnlySource(products: false).map {
+        MLXFast.metalKernel(name: name("nemotron_draft_final_sum_only"),
+            inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+            outputNames: ["normalized"], source: $0, ensureRowContiguous: true)
+    }
+    private static let finalProductsOnlyKernel = finalOnlySource(products: true).map {
+        MLXFast.metalKernel(name: name("nemotron_draft_final_products_only"),
+            inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+            outputNames: ["normalized"], source: $0, ensureRowContiguous: true)
+    }
+    private static let finalProductsSharedFirstOnlyKernel = finalOnlySource(products: true).map {
+        MLXFast.metalKernel(name: name("nemotron_draft_final_products_sf_only"),
+            inputNames: ["lhs", "shared", "rhs", "weight", "axis_size", "eps"],
+            outputNames: ["normalized"], source: $0, ensureRowContiguous: true)
+    }
+    static let draftFinalOnlyRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FINAL_ONLY"] != "0"
+    nonisolated(unsafe) private static var draftFinalOnlyQualified = false
+
+    static func runFinalOnly(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray,
+                                     norm: RMSNorm, sharedFirst: Bool) -> MLXArray? {
+        let products = rhs.shape == [6 * 2688] && rhs.dtype == .float32
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              lhs.shape == [1, 1, 2688], lhs.dtype == .bfloat16,
+              shared.shape == lhs.shape, shared.dtype == .bfloat16,
+              products || (rhs.shape == lhs.shape && rhs.dtype == .bfloat16),
+              type(of: norm) == RMSNorm.self, norm.weight.shape == [2688], norm.weight.dtype == .bfloat16,
+              let kernel = products ? (sharedFirst ? finalProductsSharedFirstOnlyKernel : finalProductsOnlyKernel)
+                                    : finalDenseOnlyKernel else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let inputs: [MLXArray] = products && sharedFirst
+            ? [lhs, shared, rhs, norm.weight, axis, eps] : [lhs, rhs, shared, norm.weight, axis, eps]
+        return kernel(inputs, template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func admitDraftFinalOnly(_ qualified: Bool) { draftFinalOnlyQualified = qualified }
+
+    /// Same eligibility/fallback as applySum at the two final-tail sites; no intermediate residual escapes.
+    static func finalSumNormalized(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray,
+                                   norm: RMSNorm, sharedFirst: Bool = false) -> MLXArray? {
+        if draftFinalOnlyQualified, !NemotronMoELeader.selfTest,
+           let output = runFinalOnly(lhs, rhs, shared: shared, norm: norm, sharedFirst: sharedFirst) {
+            return output
+        }
+        return applySum(lhs, rhs, shared: shared, norm: norm, sharedFirst: sharedFirst)?.1
+    }
+
     /// Load time: the one-row products join against the separate top-six
     /// reduce plus `applySum`, bit for bit, on seeded rows and the head's norms.
     static func checkDraftProductsJoin(_ head: Module) -> Bool {
