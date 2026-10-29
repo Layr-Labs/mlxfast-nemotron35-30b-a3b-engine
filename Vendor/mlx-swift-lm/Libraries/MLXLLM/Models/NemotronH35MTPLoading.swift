@@ -100,6 +100,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
+        NemotronMambaInProjConvDt.qualifyTSL(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
@@ -127,6 +128,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronMTPVerifySDPA.tune(target)
+        NemotronMTPAttentionProjectionGraphAdmission.qualify(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
@@ -164,6 +166,20 @@ extension NemotronH35MTPAssistant {
         NemotronSeedDenseRetile.tune(target)
         NemotronSeedQMMTune.tune(target)
         NemotronSeedSSMTune.tune(target)
+        // Measurement entry: the waits encode what the four seed tunes measured for one seed's launches
+        // (`NemotronSeedProfile`: median ms per launch x launches per seed). The seed step waits half the routed
+        // fc1 + fc2 total, rounded, at most 38 ms; the third verify round waits the dense retile + QMM + SSM total,
+        // rounded, at most 150 ms. NEMOTRON_SEED_PROBE=0 waits nothing; NEMOTRON_SEED_PROFILE_FAKE=1 replaces the
+        // tunes' medians with `NemotronSeedProfile.fake`'s fixed ones.
+        let fakeProfile = ProcessInfo.processInfo.environment["NEMOTRON_SEED_PROFILE_FAKE"] == "1"
+        if fakeProfile { NemotronSeedProfile.fake(target) }
+        if ProcessInfo.processInfo.environment["NEMOTRON_SEED_PROBE"] != "0" {
+            CBv2SeedProbe.seedDelayMilliseconds = NemotronSeedProfile.wait(NemotronSeedProfile.moe / 2, cap: 38)
+            CBv2SeedProbe.roundDelayMilliseconds = NemotronSeedProfile.wait(NemotronSeedProfile.other, cap: 150)
+        }
+        FileHandle.standardError.write(Data(("nemotron seed probe: " + NemotronSeedProfile.summary
+            + (fakeProfile ? " (fake medians)" : "") + "; seed \(CBv2SeedProbe.seedDelayMilliseconds) ms,"
+            + " third round \(CBv2SeedProbe.roundDelayMilliseconds) ms\n").utf8))
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().

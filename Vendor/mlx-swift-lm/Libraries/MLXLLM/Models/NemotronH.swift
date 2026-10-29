@@ -2092,7 +2092,7 @@ extension NemotronHRMSNormGated {
 enum NemotronHPrefillX5 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_X5"] != "0"
     /// The run gather clones the NAX kernel; without NAX stock runs another one.
-    static let runGather = enabled && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    static let runGather = enabled && nemotronNAXOrForced
     /// The state update `product + exp(cumsum)[-1] * previous` is one kernel.
     /// `NEMOTRON_PREFILL_SSM_STATE_UPDATE=0` restores the stock pair.
     static let ssmStateUpdate = enabled
@@ -5660,6 +5660,7 @@ class NemotronHAttention: Module, NemotronHMixer {
     @ModuleInfo(key: "k_proj") var wk: Linear
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
+    let mtpProjectionJoinCache = NemotronMTPAttentionProjectionJoinCache()
 
     // NOTE: NemotronH attention does NOT use RoPE (unlike most transformer models)
     // The Python implementation at mlx_lm/models/nemotron_h.py lines 247-274 shows
@@ -5738,7 +5739,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         captureMTP: Bool = false,
         targetQKV: Bool = false,
         prepared: MLXArray? = nil,
-        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil
+        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil,
+        projectRows: (([MLXArray], Linear) -> MLXArray)? = nil
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
@@ -5783,7 +5785,7 @@ class NemotronHAttention: Module, NemotronHMixer {
             let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
                 queries: queries, written: qkv.0, scale: scale, sinks: nil,
                 attendRows: NemotronMTPVerifySDPA.rows)
-            return NemotronMTPAttentionDirect.project(rows, wo)
+            return projectRows?(rows, wo) ?? NemotronMTPAttentionDirect.project(rows, wo)
         }
         let (q, k, v) = precomputed ?? cbv2Projections(
             x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
@@ -5806,7 +5808,7 @@ class NemotronHAttention: Module, NemotronHMixer {
            let rows = layerCache.updateAndAttendSerialQueryRows(
                queries: queries, keys: keys, values: values, scale: scale, sinks: nil,
                attendRows: NemotronMTPVerifySDPA.rows) {
-            return NemotronMTPAttentionDirect.project(rows, wo)
+            return projectRows?(rows, wo) ?? NemotronMTPAttentionDirect.project(rows, wo)
         }
         let output = cache.updateAndAttend(
             queries: queries,
@@ -9573,9 +9575,28 @@ private class NemotronHBlock: Module {
             guard let attentionCache else {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
-            output = (mixer as! NemotronHAttention).cbv2Forward(
+            let attention = mixer as! NemotronHAttention
+            var projectionJoin: (MLXArray, MLXArray, MLXArray)?
+            output = attention.cbv2Forward(
                 hidden, cache: attentionCache, captureMTP: true, targetQKV: true,
-                prepared: prepared)
+                prepared: prepared, projectRows: { rows, wo in
+                    if attention.mtpProjectionJoinCache.isReady(wo: wo, norm: nextNorm),
+                       rows.count == 3,
+                       rows.allSatisfy({ $0.shape == [1, 32, 1, 128] && $0.dtype == .bfloat16 }),
+                       let packed = NemotronMTPVerifySDPA.takePrepared(rows) {
+                        if let joined = attention.mtpProjectionJoinCache.run(
+                            packed, residual: x, wo: wo, norm: nextNorm) {
+                            projectionJoin = joined
+                            return joined.0
+                        }
+                        // The payload was consumed, so the incumbent may
+                        // re-prepare the same rows. SDPA preparation was
+                        // admitted bitwise against that original path.
+                        return NemotronMTPAttentionDirect.project(rows, wo)
+                    }
+                    return NemotronMTPAttentionDirect.project(rows, wo)
+                })
+            if let projectionJoin { return projectionJoin }
         case .mlp:
             precondition(
                 attentionCache == nil,
@@ -9605,6 +9626,18 @@ private class NemotronHBlock: Module {
         if let shared { output = output + shared }
         let residual = x + output
         return (residual, nemotronMTPNormRows(residual) { nextNorm($0) }, nil)
+    }
+}
+
+enum NemotronMTPAttentionProjectionGraphAdmission {
+    static func qualify(_ target: Module) {
+        guard let backbone = target.modules().compactMap({ $0 as? NemotronHBackbone }).first else { return }
+        let layers = backbone.layers
+        for i in layers.indices {
+            guard let attention = layers[i].mixer as? NemotronHAttention else { continue }
+            let nextNorm = i + 1 < layers.count ? layers[i + 1].norm : backbone.normF
+            attention.mtpProjectionJoinCache.qualify(wo: attention.wo, norm: nextNorm, layerIndex: i)
+        }
     }
 }
 
