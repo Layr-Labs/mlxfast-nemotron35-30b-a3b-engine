@@ -84,6 +84,8 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronFC1Tune.tune(target)
+        NemotronD3Quad.qualify(target)
+        NemotronD3Quad.timeAgainstTriple(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
