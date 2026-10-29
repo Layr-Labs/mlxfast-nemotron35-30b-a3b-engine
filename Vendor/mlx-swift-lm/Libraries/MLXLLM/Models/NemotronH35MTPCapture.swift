@@ -230,7 +230,7 @@ enum NemotronMTPSSMAnchor {
     static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] != "0"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "")
     /// Soft cap on the tune's load time: the timing does not start past it.
-    static let tuneBudgetSeconds = 1.2
+    static let tuneBudgetSeconds = 1.2 * nemotronTuneBudgetScale
     nonisolated(unsafe) static var tg4Adopted = false
     static let arrival8 = "gr_last = prev == uint((512 / Dh) * (Dh / 8)) - 1u ? 1u : 0u;"
     static let arrival4 = "gr_last = prev == uint((512 / Dh) * (Dh / 4)) - 1u ? 1u : 0u;"
