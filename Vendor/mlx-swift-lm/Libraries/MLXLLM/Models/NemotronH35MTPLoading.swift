@@ -76,29 +76,38 @@ extension NemotronH35MTPAssistant {
             activationDType: target.mtpEmbedding(MLXArray([Int32(0)]).reshaped([1, 1])).dtype)
         CBv2MTPDeviceAcceptWalk.warm()
         NemotronMTPDraftRowPick.qualify()
+        NemotronTargetQKV.qualifyVectorStore(target: target, head: assistant.module)
         // Load-time JIT of the exact verify kernels (kernel agent hook).
         NemotronSharedUpPacking.verify(target)
         NemotronZSkip.prepare(target)
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
+        NemotronFC2Tune.tune(target)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronFC2Tune.tuneDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
+        NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronQMVTune.tune(target)
+        assistant.tuneDraftKernels()
+        NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
+        cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
@@ -116,6 +125,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPFrontRowsKVDirect.qualify(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
+        NemotronMTPVerifySDPA.tune(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
@@ -146,9 +156,13 @@ extension NemotronH35MTPAssistant {
             assistant.module.layers[0] as! NemotronH35MTPAttentionBlock,
             norm: (assistant.module.layers[1] as! NemotronH35MTPExpertBlock).norm)
         NemotronMTPDraftSDPA.qualifyFence(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
+        NemotronDraftTune.tuneSDPA(assistant.module.layers[0] as! NemotronH35MTPAttentionBlock)
         cbv2PagedHostWriteFenceReport()
         // After every seed qualify (the GPU is warm): retiled seed fc1/fc2.
         NemotronSeedRetile.tune(target)
+        NemotronSeedDenseRetile.tune(target)
+        NemotronSeedQMMTune.tune(target)
+        NemotronSeedSSMTune.tune(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -484,10 +498,11 @@ final class NemotronDecodeResidency: @unchecked Sendable {
         // (bank words and their scale/bias form), then its routed fc2 (the decode copy when verified).
         let split = Self.splitExpertGroups
         func key(_ layer: Int, _ part: Int) -> Int { split ? 3 * layer + part : layer }
-        // With `NemotronPrefillSharedDownCopy.verified`, the request prefill's shared down reads the layer's
-        // shared-down decode copy (as the verify does) instead of the dense weights.
+        // With `NemotronPrefillSharedDownCopy.verified` (or the copy launch `NemotronSeedQMMTune` adopted), the
+        // request prefill's shared down reads the layer's shared-down decode copy (as the verify does) instead of
+        // the dense weights.
         var sharedCopies: [Int: [MLXArray]] = [:]
-        if NemotronPrefillSharedDownCopy.verified {
+        if NemotronPrefillSharedDownCopy.verified || NemotronSeedQMMTune.adopted("shared_down") {
             for (name, module) in model.namedModules() {
                 let parts = name.split(separator: ".")
                 guard let i = parts.firstIndex(of: "layers"), i + 1 < parts.count, let n = Int(parts[i + 1]),
@@ -496,8 +511,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 sharedCopies[n] = [c.codes, c.scales, c.biases]
             }
         }
-        // With a `NemotronPrefillDenseDict` kind admitted, the request prefill reads that kind's pair dictionaries
-        // (as the verify does) instead of its BF16 scales and biases.
+        // With a `NemotronPrefillDenseDict` kind admitted (or adopted by `NemotronSeedQMMTune`), the request
+        // prefill reads that kind's pair dictionaries (as the verify does) instead of its BF16 scales and biases.
         var denseDicts: [Int: [MLXArray]] = [:]
         var denseMetadata = Set<ObjectIdentifier>()
         for (name, module) in model.namedModules() {
@@ -509,7 +524,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
             } else if let moe = module as? NemotronHMoE, let up = moe.sharedExperts?.upProj {
                 dense = [("up_proj", up)]
             }
-            for (kind, linear) in dense where NemotronPrefillDenseDict.kinds.contains(kind) {
+            for (kind, linear) in dense
+            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind) {
                 guard let q = linear as? QuantizedLinear, let d = NemotronSBDict.dict(q), let b = q.biases else { continue }
                 denseDicts[n, default: []] += [d.index, d.table]
                 denseMetadata.formUnion([ObjectIdentifier(q.scales), ObjectIdentifier(b)])
@@ -794,5 +810,7 @@ final class NemotronCPUWarm: @unchecked Sendable {
 }
 
 // Measurement entry of the carried 3f932e3c tree.
+
+// Measurement entry 1 of this tree.
 
 // Measurement entry 1 of this tree.
