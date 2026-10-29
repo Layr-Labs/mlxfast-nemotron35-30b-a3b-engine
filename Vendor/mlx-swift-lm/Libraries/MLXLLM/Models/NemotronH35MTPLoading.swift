@@ -83,6 +83,7 @@ extension NemotronH35MTPAssistant {
         NemotronSharedDownZSkip.prepare(target)
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
+        NemotronMoELeader.qualifyFC1Lean(target)
         NemotronFC1Tune.tune(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
@@ -90,10 +91,12 @@ extension NemotronH35MTPAssistant {
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         NemotronFC2Tune.tune(target)
+        NemotronZSkip.qualifySparseOperandsTarget(target)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronFC2Tune.tuneDraft(assistant.module)
+        NemotronZSkip.qualifySparseOperandsDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
@@ -103,9 +106,11 @@ extension NemotronH35MTPAssistant {
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
+        NemotronDraftTune.tuneVerifyQKV(target)
         NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronHResidualRMSNorm.qualifyDraftFinalOnly(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
@@ -164,6 +169,8 @@ extension NemotronH35MTPAssistant {
         NemotronSeedDenseRetile.tune(target)
         NemotronSeedQMMTune.tune(target)
         NemotronSeedSSMTune.tune(target)
+        // New integer route-discovery mechanism after all original tunes; official-worker qualification only.
+        NemotronFC1Tune.qualifyRouteBallot(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -813,5 +820,4 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry of the carried 3f932e3c tree.
 
 // Measurement entry 1 of this tree.
-
-// Measurement entry 1 of this tree.
+// e-man07: composition c83 (first measurement).
