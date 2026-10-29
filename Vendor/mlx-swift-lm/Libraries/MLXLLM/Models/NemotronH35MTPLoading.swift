@@ -106,6 +106,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronHResidualRMSNorm.qualifyDraftFinalOnly(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
@@ -597,7 +598,9 @@ final class NemotronDecodeResidency: @unchecked Sendable {
     init?(head: [MLXArray], layers: [[MLXArray]], owners: [ObjectIdentifier], target: [[MLXArray]],
           extras: [MLXArray], late: [MLXArray] = []) {
         guard Self.enabled, let device = MTLCreateSystemDefaultDevice() else { return nil }
-        let targetSets = Self.targetEnabled ? Self.makeTargetSets(device, target) : []
+        var targetSets = Self.targetEnabled ? Self.makeTargetSets(device, target) : []
+        // Measurement entry: never-read buffers requested in the middle of the target's request order.
+        targetSets.insert(contentsOf: NemotronResidencyProbe.sets(device), at: targetSets.count / 2)
         let lateSets = Self.extrasEnabled && !late.isEmpty ? Self.makeTargetSets(device, [late]) : []
         // Without a late set the banks go back with the extras (requested before the decode).
         let extraArrays = lateSets.isEmpty ? extras + late : extras
@@ -815,3 +818,42 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry 1 of this tree.
 
 // Measurement entry 1 of this tree.
+
+
+/// Load-time buffers that are never read: `megabytes`-MiB shared buffers, `total` MiB in all, filled once and
+/// grouped about 1 GiB per residency set (NEMOTRON_RESIDENCY_PROBE_TOTAL sets the total in MiB). Their sets are
+/// inserted halfway through the target's request order (after the first half of the target's sets), so each lease
+/// requests them between the target's groups. NEMOTRON_RESIDENCY_PROBE=0 makes none.
+@available(macOS 15.0, *)
+enum NemotronResidencyProbe {
+    static let megabytes = 64
+    static let total = Int(ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_PROBE_TOTAL"] ?? "") ?? 4096
+    nonisolated(unsafe) private static var buffers: [any MTLBuffer] = []
+
+    static func sets(_ device: any MTLDevice) -> [any MTLResidencySet] {
+        guard ProcessInfo.processInfo.environment["NEMOTRON_RESIDENCY_PROBE"] != "0" else { return [] }
+        let count = total / megabytes
+        let perSet = max(1, 1024 / megabytes)
+        var sets: [any MTLResidencySet] = []
+        var made: [any MTLBuffer] = []
+        for first in stride(from: 0, to: count, by: perSet) {
+            let descriptor = MTLResidencySetDescriptor()
+            descriptor.initialCapacity = perSet
+            guard let set = try? device.makeResidencySet(descriptor: descriptor) else { return [] }
+            for _ in first ..< min(count, first + perSet) {
+                guard let buffer = device.makeBuffer(
+                    length: megabytes << 20, options: [.storageModeShared, .hazardTrackingModeUntracked])
+                else { return [] }
+                memset(buffer.contents(), 1, buffer.length)
+                set.addAllocation(buffer)
+                made.append(buffer)
+            }
+            set.commit()
+            sets.append(set)
+        }
+        buffers = made
+        FileHandle.standardError.write(Data(
+            "nemotron residency probe: \(made.count) x \(megabytes) MiB buffers in \(sets.count) sets (mid-order)\n".utf8))
+        return sets
+    }
+}
