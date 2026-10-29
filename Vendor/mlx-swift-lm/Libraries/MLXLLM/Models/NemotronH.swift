@@ -5725,7 +5725,7 @@ class NemotronHAttention: Module, NemotronHMixer {
                 : outputs
         }
         return (
-            captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
+            captureMTP ? nemotronMTPLinearRows(x, wq) : NemotronSeedQMMTune.attention(x, wq, kind: "q_proj") ?? wq(x),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
     }
@@ -5815,7 +5815,8 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo)
+            : NemotronSeedQMMTune.attention(merged, wo, kind: "o_proj") ?? nemotronR1Linear(merged, wo)
     }
 
     // Protocol conformance
@@ -8624,15 +8625,19 @@ enum NemotronPrefillDenseDict {
         return NemotronSeedDenseRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    /// `dep` (load-time timing chains only, `NemotronSeedDenseRetile`): the pair table is read from a view of `dep`'s
+    /// leading bytes, so the launch waits for `dep`'s producer.
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
               !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
               q.weight.dtype == .uint32, q.weight.ndim == 2,
-              let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
-              d.table.dtype == .float32
+              let d0 = NemotronSBDict.dict(q), d0.index.shape == q.scales.shape, d0.index.dtype == .uint16,
+              d0.table.dtype == .float32,
+              let table = dep.map({ NemotronSeedQMMTune.operandView($0, like: d0.table) }) ?? d0.table
         else { return nil }
+        let d = (index: d0.index, table: table)
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64] else { return nil }
         // Row tiles of 64 over the request's tokens, at least three descriptors
@@ -8760,12 +8765,16 @@ enum NemotronPrefillSharedDownCopy {
         return NemotronSeedDenseRetile.sharedDown(x, down) ?? launch(x, down)
     }
 
-    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    /// `dep` (load-time timing chains only, `NemotronSeedDenseRetile`): the BF16 biases are read from a view of `dep`'s
+    /// leading bytes, so the launch waits for `dep`'s producer.
+    static func launch(_ x: MLXArray, _ down: Linear, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
-              let copy = NemotronSharedDownZSkip.copyArrays(for: down)
+              let copy0 = NemotronSharedDownZSkip.copyArrays(for: down),
+              let chainedBiases = dep.map({ NemotronSeedQMMTune.operandView($0, like: copy0.biases) }) ?? copy0.biases
         else { return nil }
+        let copy = (codes: copy0.codes, scales: copy0.scales, biases: chainedBiases)
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
               copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
