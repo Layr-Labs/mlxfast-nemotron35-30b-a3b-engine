@@ -791,6 +791,7 @@ extension NemotronHRMSNormGated {
 final class NemotronH35MTPCompactGraphCache {
     private struct Entry {
         let identity: [ObjectIdentifier]
+        let nativeIdentity: NativeKey?
         let function: @Sendable ([MLXArray]) -> [MLXArray]
     }
     private static let enabled =
@@ -810,7 +811,8 @@ final class NemotronH35MTPCompactGraphCache {
         Self.enabled && NemotronMTPExecution.batchedM1 && NemotronMTPExecution.batchedNorm
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
             && hidden.shape == [1, 3, 2688] && hidden.dtype == .bfloat16
-            && Self.nativeIdentity(owner) != nil
+            && (NemotronMTPFixedGraphIdentity.active
+                ? Self.fixedIdentity(owner, nextNorm: nil) != nil : Self.nativeIdentity(owner) != nil)
     }
 
     func callAsFunction(
@@ -835,14 +837,16 @@ final class NemotronH35MTPCompactGraphCache {
               hidden.dim(2) == 2688, hidden.dtype == .bfloat16,
               convState.shape == [1, 3, 6144], convState.dtype == .bfloat16,
               initialSSM.shape == [1, 64, 64, 128], initialSSM.dtype == .float32,
-              var identity = Self.nativeIdentity(owner)
+              let seed = Self.identitySeed(owner, nextNorm: joins ? nextNorm : nil)
         else {
             return finish(owner.mtpCompactArrays(
                 hidden, convState: convState, initialSSM: initialSSM, prepared: prepared,
                 pending: fold, store: store), residual)
         }
-        if joins, let nextNorm {
-            identity += [ObjectIdentifier(nextNorm), ObjectIdentifier(nextNorm.weight)]
+        let fixed = seed.0
+        var identity = seed.1
+        if fixed == nil, joins, let nextNorm {
+            identity! += [ObjectIdentifier(nextNorm), ObjectIdentifier(nextNorm.weight)]
         }
         let usesPrepared = prepared != nil
         let pendingSteps = pending?.steps ?? 0
@@ -850,7 +854,10 @@ final class NemotronH35MTPCompactGraphCache {
             + 4 * (NemotronMTPPendingSSM.maxSteps + 1) * (store.map { $0 == .anchor ? 2 : 1 } ?? 0)
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
-            if let entry = entries[slot], entry.identity == identity { return entry }
+            if let entry = entries[slot] {
+                if let fixed, entry.nativeIdentity == fixed { return entry }
+                if fixed == nil, entry.identity == identity! { return entry }
+            }
             let state = owner.innerState() + (joins ? [nextNorm!.weight] : [])
             let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) {
                 [weak owner] arrays in
@@ -867,7 +874,9 @@ final class NemotronH35MTPCompactGraphCache {
                 }
                 return [joined.0] + Array(values[1...4]) + [joined.1, joined.2]
             }
-            let replacement = Entry(identity: identity, function: function)
+            let replacement = Entry(identity: fixed?.legacy ?? identity!,
+                nativeIdentity: fixed ?? Self.fixedIdentity(owner, nextNorm: joins ? nextNorm : nil),
+                function: function)
             retired = entries[slot]
             entries[slot] = replacement
             return replacement
@@ -964,6 +973,85 @@ final class NemotronH35MTPCompactGraphCache {
         let data = try! JSONSerialization.data(withJSONObject: record, options: [.sortedKeys])
         try! data.write(to: URL(fileURLWithPath: directory)
             .appendingPathComponent("layer-\(layerIndex).json"), options: .atomic)
+    }
+
+    private struct NativeKey: Equatable {
+        var owner: ObjectIdentifier
+        var input: ObjectIdentifier
+        var conv: ObjectIdentifier
+        var gatedNorm: ObjectIdentifier
+        var output: ObjectIdentifier
+        var norm: ObjectIdentifier? = nil
+        var normWeight: ObjectIdentifier? = nil
+        // Original sequence for cold creation/admission only (no hit-path array).
+        var legacy: [ObjectIdentifier] {
+            var result = [owner, input, conv, gatedNorm, output]
+            if let norm, let normWeight { result += [norm, normWeight] }
+            return result
+        }
+    }
+    private static func fixedIdentity(_ owner: NemotronHMamba2Mixer, nextNorm: RMSNorm?) -> NativeKey? {
+        func linear(_ value: Linear) -> Bool {
+            type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
+        }
+        guard type(of: owner) == NemotronHMamba2Mixer.self,
+              owner.numHeads == 64, owner.headDim == 64, owner.ssmStateSize == 128,
+              owner.numGroups == 8, owner.convKernelSize == 4, owner.convDim == 6144,
+              type(of: owner.conv1d) == Conv1d.self,
+              type(of: owner.norm) == NemotronHRMSNormGated.self,
+              linear(owner.inProj), linear(owner.outProj) else { return nil }
+        var result = NativeKey(owner: ObjectIdentifier(owner), input: ObjectIdentifier(owner.inProj),
+            conv: ObjectIdentifier(owner.conv1d), gatedNorm: ObjectIdentifier(owner.norm),
+            output: ObjectIdentifier(owner.outProj))
+        if let nextNorm {
+            result.norm = ObjectIdentifier(nextNorm)
+            result.normWeight = ObjectIdentifier(nextNorm.weight)
+        }
+        return result
+    }
+
+    static func checkFixedIdentities(_ model: Module) -> Int {
+        let norms = model.modules().compactMap { $0 as? RMSNorm }
+        guard !norms.isEmpty else { return 0 }
+        var owners = 0
+        for module in model.modules() {
+            guard let owner = module as? NemotronHMamba2Mixer else { continue }
+            guard let old = nativeIdentity(owner) else {
+                guard fixedIdentity(owner, nextNorm: nil) == nil else { return 0 }
+                continue
+            }
+            guard let plain = fixedIdentity(owner, nextNorm: nil), plain.legacy == old else { return 0 }
+            for norm in norms {
+                guard let joined = fixedIdentity(owner, nextNorm: norm),
+                      joined.legacy == old + [ObjectIdentifier(norm), ObjectIdentifier(norm.weight)],
+                      joined != plain else { return 0 }
+            }
+            guard let joined = fixedIdentity(owner, nextNorm: norms[0]) else { return 0 }
+            let sentinel = ObjectIdentifier(model)
+            var changed = joined
+            changed.owner = sentinel; guard changed != joined else { return 0 }
+            changed = joined; changed.input = sentinel; guard changed != joined else { return 0 }
+            changed = joined; changed.conv = sentinel; guard changed != joined else { return 0 }
+            changed = joined; changed.gatedNorm = sentinel; guard changed != joined else { return 0 }
+            changed = joined; changed.output = sentinel; guard changed != joined else { return 0 }
+            changed = joined; changed.norm = sentinel; guard changed != joined else { return 0 }
+            changed = joined; changed.normWeight = sentinel; guard changed != joined else { return 0 }
+            let cache = owner.mtpCompactGraphCache
+            guard cache.lock.withLock({ cache.entries.values.allSatisfy { entry in
+                entry.nativeIdentity.map { $0.legacy == entry.identity } ?? true
+            } }) else { return 0 }
+            owners += 1
+        }
+        return owners
+    }
+
+    private static func identitySeed(_ owner: NemotronHMamba2Mixer, nextNorm: RMSNorm?)
+        -> (NativeKey?, [ObjectIdentifier]?)? {
+        if NemotronMTPFixedGraphIdentity.active, let fixed = fixedIdentity(owner, nextNorm: nextNorm) {
+            return (fixed, nil)
+        }
+        guard let legacy = nativeIdentity(owner) else { return nil }
+        return (nil, legacy)
     }
 
     private static func nativeIdentity(_ owner: NemotronHMamba2Mixer) -> [ObjectIdentifier]? {
