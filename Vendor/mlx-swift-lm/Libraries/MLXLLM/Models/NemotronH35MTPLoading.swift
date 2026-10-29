@@ -84,16 +84,19 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronFC1Tune.tune(target)
+        NemotronFC1Tune.qualifyLean(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         NemotronFC2Tune.tune(target)
+        NemotronZSkip.qualifySparseOperandsTarget(target)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
         NemotronZSkip.prepareDraft(assistant.module)
         NemotronFC2Tune.tuneDraft(assistant.module)
+        NemotronZSkip.qualifySparseOperandsDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
@@ -102,10 +105,12 @@ extension NemotronH35MTPAssistant {
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronQMVTune.tune(target)
+        NemotronQMVTune.qualifyLean(target)
         assistant.tuneDraftKernels()
         NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronHResidualRMSNorm.qualifyDraftFinalOnly(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
@@ -164,6 +169,22 @@ extension NemotronH35MTPAssistant {
         NemotronSeedDenseRetile.tune(target)
         NemotronSeedQMMTune.tune(target)
         NemotronSeedSSMTune.tune(target)
+        // Measurement entry: the seed step's wait encodes which lean forms were admitted (4 ms: routed FC1;
+        // 8 ms: shared-expert down; 16 ms: all four dense QMV families); the first verify round's wait encodes
+        // four other load-time results (12 ms: the verify's sparse FC2 operands; 24 ms: the seed's NAX run gather;
+        // 48 ms: the seed's fc2 decode-copy run gather; 96 ms: the seed retile adopted a variant for fc1 or fc2).
+        // NEMOTRON_SEED_PROBE=0 waits nothing.
+        if ProcessInfo.processInfo.environment["NEMOTRON_SEED_PROBE"] != "0" {
+            CBv2SeedProbe.seedDelayMilliseconds = (NemotronFC1Tune.lean ? 4 : 0)
+                + (NemotronSharedDownZSkip.lean ? 8 : 0)
+                + (NemotronQMVTune.Family.allCases.allSatisfy { NemotronQMVTune.lean($0) } ? 16 : 0)
+            CBv2SeedProbe.roundDelayMilliseconds = (NemotronZSkip.sparseTargetAdmitted ? 12 : 0)
+                + (NemotronHPrefillX5.runGather ? 24 : 0)
+                + (NemotronPrefillFC2Copy.verified ? 48 : 0)
+                + (NemotronSeedRetile.fc1Choice != nil || NemotronSeedRetile.fc2Choice != nil ? 96 : 0)
+        }
+        FileHandle.standardError.write(Data(("nemotron seed probe: seed \(CBv2SeedProbe.seedDelayMilliseconds) ms,"
+            + " first round \(CBv2SeedProbe.roundDelayMilliseconds) ms\n").utf8))
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
