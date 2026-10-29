@@ -1038,6 +1038,24 @@ enum NemotronSeedRetile {
     }
 }
 
+// MARK: - Seed BK 32 staging rows
+
+/// BK 32 rows for the seed's dense NAX GEMM tunes (dense retile, stock QMM tune): the incumbent geometry's kernel
+/// with a 32-k threadgroup block (5,120 B of B staging instead of 9,216 B, so more resident threadgroups per core)
+/// and one 32-k mma step between barrier pairs (one stage, or two stages with one barrier per block). Each output
+/// keeps the incumbent's mma sequence over k chunks in order on the same A fragments and the same dequantized B
+/// values (the same deq statements, the scale and bias of group k / 64 read at the same index); only how many
+/// chunks sit in a stage changes. Rows are appended after every existing row (FORCE indices and names keep their
+/// meaning), qualify bit for bit like every other row, and are adopted only by each tune's own rule.
+/// NEMOTRON_SEED_BK32=0 leaves them out (the variant lists are the base ones).
+enum NemotronSeedBK32 {
+    static let offered = ProcessInfo.processInfo.environment["NEMOTRON_SEED_BK32"] != "0"
+    static let dense: [NemotronSeedDenseRetile.Variant] = offered ? [
+        .init(64, 64, 32, wm: 2, wn: 2),
+        .init(64, 64, 32, wm: 2, wn: 2, db: true),
+    ] : []
+}
+
 // MARK: - Seed dense retile
 
 /// The seed's dense run gathers (one "expert", `tiles[t]` = (first row, rows <=
@@ -1325,7 +1343,8 @@ METAL_FUNC void nemotron_seed_dense_impl(
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
   static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
-  static_assert(BK % 64 == 0, "B blocks start on a quantization group");
+  // BK 32: a block is half a group; every fill reads group (k / 64) per thread.
+  static_assert(BK % 32 == 0, "B blocks are whole 32-k steps inside quantization groups");
 
   const int y_col = tid.x * BN;
   const short tgp_bm = short(min(BM, tile_rows));
@@ -1532,7 +1551,7 @@ enum NemotronSeedDenseRetile {
     ]
     /// NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out of this tune (the base rows only).
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X"] != "0"
-    static let variants: [Variant] = baseVariants + (offerX ? extraVariants : [])
+    static let variants: [Variant] = baseVariants + (offerX ? extraVariants : []) + NemotronSeedBK32.dense
 
     enum Source: String, Sendable { case dict, copy }
 
@@ -1842,7 +1861,7 @@ enum NemotronSeedQMMTune {
     /// NEMOTRON_SEED_QMM_TUNE_X=0 leaves the pf row out. FORCE indices 1 ... 7 name the base rows either way.
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE_X"] != "0"
     static let variants: [Variant] = NemotronSeedDenseRetile.baseVariants
-        + (offerX ? NemotronSeedDenseRetile.extraVariants : [])
+        + (offerX ? NemotronSeedDenseRetile.extraVariants : []) + NemotronSeedBK32.dense
     /// Soft cap on the tune's own load time: no kind, variant or timing phase starts past it. 6 s for the base
     /// rows, scaled by the candidate count so the base rows keep their share of it when the pf row is offered.
     static let budgetSeconds = 6.0 * Double(variants.count) / Double(NemotronSeedDenseRetile.baseVariants.count)
