@@ -563,6 +563,80 @@ private func nmlFC1UnrollSource(_ source: String) -> String? {
     return source.replacingOccurrences(of: loop, with: "    #pragma clang loop unroll_count(2)\n" + loop)
 }
 
+/// The plan-free triple FC1 (prepared activations, after the unroll, tail-8 and dictionary transforms; plain or
+/// pair-dictionary form) with fewer values live across its main K loops: the text of `NemotronFC1Tune`'s lean rows
+/// (NEMOTRON_FC1_LEAN_ROWS). Each lane reads its code words, its (scale, bias) or pair-index words and its prepared
+/// activations through the arrays' base pointers plus 32-bit element offsets, where the record keeps a 64-bit
+/// pointer per stream (`ws`, `sc`, `bs`, `x0`, `x1`, `x2`) and steps each one per block:
+/// - `nlw` is `ws`'s byte offset from `w`, `expert * N * K / 2 + out_row * K / 2 + simd_lid * 4`, advanced by
+///   `block_size / 2` per block; every element of the 128 x 1856 x 1344-byte bank lies below 2^32.
+/// - The group word offset of `sc` and `bs` is `nlw >> 5`: a row holds K / 2 = 32 x K / 64 bytes, a lane's
+///   `simd_lid * 4` bytes are below 128 and its `simd_lid / 8` groups are `simd_lid * 4 / 32`, and each block adds
+///   `block_size / 2` = 32 x `block_size / 64` (the static_assert), so `nlw >> 5` is the record's `sc - scales`.
+/// - `nlx0`, `nlx1`, `nlx2` are `x0 - prepared`, ... (`row * PTILES * PSTRIDE + simd_lid`), advanced by `PSTRIDE`.
+/// Every load reads the record's address and every statement, product, term order, affine close, closing simd_sum
+/// and store is the record's. nil unless every replaced statement occurs as expected.
+private func nmlFC1LeanSource(_ source: String) -> String? {
+    var s = source
+    func swap(_ old: String, _ new: String, _ count: Int = 1) -> Bool {
+        guard s.components(separatedBy: old).count == count + 1 else { return false }
+        s = s.replacingOccurrences(of: old, with: new)
+        return true
+    }
+    let dict = s.contains("  const device uint16_t* sc = scales + (ulong)expert")
+    let (stream, second) = dict ? ("uint16_t", "scales") : ("T", "biases")
+    guard swap("  const device uint8_t* ws = (const device uint8_t*)w +\n"
+                   + "      (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +\n      simd_lid * 4;\n",
+               "  static_assert(in_vec_size_w == 32 * in_vec_size_g && block_size / 2 == 32 * (block_size / 64),\n"
+                   + "                \"a lane's group word offset is its code byte offset / 32\");\n"
+                   + "  const device uint8_t* ws = (const device uint8_t*)w;\n"
+                   + "  uint nlw = expert * uint(N * in_vec_size_w) + uint(out_row * in_vec_size_w) + simd_lid * 4;\n"),
+          swap("  const device \(stream)* sc = scales + (ulong)expert * (N * in_vec_size_g) +\n"
+                   + "      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+                   + "  const device \(stream)* bs = \(second) + (ulong)expert * (N * in_vec_size_g) +\n"
+                   + "      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n",
+               "  const device \(stream)* sc = scales;\n  const device \(stream)* bs = \(second);\n"),
+          swap("(ws + r * in_vec_size_w)", "(ws + (nlw + uint(r * in_vec_size_w)))", 6),
+          swap("sc + r * in_vec_size_g;", "sc + ((nlw >> 5) + uint(r * in_vec_size_g));", 6),
+          swap("bs + r * in_vec_size_g;", "bs + ((nlw >> 5) + uint(r * in_vec_size_g));", 6),
+          swap("      ws += block_size / 2;\n", "      nlw += block_size / 2;\n", 3),
+          swap("      sc += block_size / 64;\n", "", 3),
+          swap("      bs += block_size / 64;\n", "", 3),
+          swap("  const device float* x0 = prepared + row * (PTILES * PSTRIDE) + simd_lid;\n",
+               "  const device float* x0 = prepared;\n  uint nlx0 = uint(row * (PTILES * PSTRIDE)) + simd_lid;\n"),
+          swap("    const device float* x1 = prepared + (partner / TOPK) * (PTILES * PSTRIDE) + simd_lid;\n",
+               "    const device float* x1 = prepared;\n"
+                   + "    uint nlx1 = uint((partner / TOPK) * (PTILES * PSTRIDE)) + simd_lid;\n", 2),
+          swap("    const device float* x2 = prepared + (third / TOPK) * (PTILES * PSTRIDE) + simd_lid;\n",
+               "    const device float* x2 = prepared;\n"
+                   + "    uint nlx2 = uint((third / TOPK) * (PTILES * PSTRIDE)) + simd_lid;\n"),
+          swap("      x0 += PSTRIDE;\n", "      nlx0 += PSTRIDE;\n", 3),
+          swap("      x1 += PSTRIDE;\n", "      nlx1 += PSTRIDE;\n", 2),
+          swap("      x2 += PSTRIDE;\n", "      nlx2 += PSTRIDE;\n")
+    else { return nil }
+    for x in ["x0", "x1", "x2"] {
+        s = s.replacingOccurrences(of: ">(\(x), ", with: ">(\(x) + nl\(x), ")
+    }
+    guard !s.contains("(ulong)"), !s.contains("(x0, "), !s.contains("(x1, "), !s.contains("(x2, "),
+          !s.contains("ws +="), !s.contains("sc +="), !s.contains("bs +="), !s.contains(" x0 +="),
+          s.components(separatedBy: "(x0 + nlx0, ").count == 7 else { return nil }
+    return s
+}
+
+/// Three BF16 rows of `k` seeded normal values times `scale` carrying an infinity, a negative infinity, a NaN, -0,
+/// tiny values of both signs and large values of both signs: the lean load checks' inputs, on which the FC1 and QMV
+/// tunes also check their lean rows.
+func nemotronLeanCheckRows(_ k: Int, seed: UInt64, scale: Float) -> MLXArray {
+    let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+    let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+    var x = MLXRandom.normal([3, k], key: MLXRandom.key(seed)) * scale
+    for (r, c, v) in [(0, 3, Float.infinity), (1, k / 3, -.infinity), (2, k / 2, .nan), (0, k - 1, -0.0),
+                      (1, 70, 1e-38), (2, k - 9, 3e38), (0, k / 4, -3e38), (1, k - 64, -1e-38)] {
+        x = which((row .== MLXArray(Int32(r))) .&& (column .== MLXArray(Int32(c))), MLXArray(v), x)
+    }
+    return x.asType(.bfloat16)
+}
+
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
 /// (`NemotronSBDict`). `scales` carries one uint16 pair index per group and
 /// `biases` the tensor's pair table as FP32 (scale, bias), each entry the exact
@@ -2609,6 +2683,76 @@ private func nemotronZSkipLeanSource(_ source: String) -> String? {
     return s
 }
 
+/// The zero-skip slot kernel's text with the slot's score read first (`NemotronZSkip`, NEMOTRON_ZSKIP_SCORE_ENTRY):
+/// `const float nmz_score = scores[slot];` right after the expert id load `const uint expert = inds[slot];`, and the
+/// product store `float(h) * scores[slot] + 0.0f` multiplying by `nmz_score` (the same value); every other statement is
+/// the record's text. nil when either statement is not found exactly once.
+func nemotronZSkipScoreEntrySource(_ source: String) -> String? {
+    nemotronCountedSwaps(source, [
+        ("  const uint expert = inds[slot];\n",
+         "  const uint expert = inds[slot];\n  const float nmz_score = scores[slot];\n", 1),
+        ("* scores[slot] + 0.0f;", "* nmz_score + 0.0f;", 1),
+    ])
+}
+
+// The shared-down zero-skip kernel (tile-major or wide, vector-store form) with fewer values live across its chunk
+// loops (NEMOTRON_ZSKIP_SHARED_LEAN). Each lane reads its code words and its scale and bias words through the copy's
+// base pointers plus 32-bit element offsets `wo` and `so`: the record's per-lane pointers `wq`, `sq` and `bq` less
+// their bases (the tile body: `tb * K * 32 + lid` codes and `tb * groups * OT + 4 * lid` words; the wide body:
+// `tb * K * 16 + lid` 32-bit code words, two neighbouring tiles' codes in each). The shared copy holds one expert
+// (the shared-down inds are zero): every element a lane reads lies below 21 x 3712 x 32. A line's chunk loop runs
+// c = l, l + 32, ... while c < chunks, where the record counts j up to full + 1 or full and forms
+// c = j < full ? l + 32 j : 32 full + l: both visit c = l + 32 j for every j with l + 32 j < chunks (32 full + l is
+// a chunk exactly when l < tail), in the same order. Every load reads the record's address and every path keeps the
+// record's statements. nil unless every replaced statement occurs as expected.
+private func nemotronZSkipSharedLeanSource(_ source: String) -> String? {
+    var s = source
+    func swap(_ old: String, _ new: String) -> Bool {
+        guard s.components(separatedBy: old).count == 2 else { return false }
+        s = s.replacingOccurrences(of: old, with: new)
+        return true
+    }
+    guard swap("  const device uint16_t* wq = (const device uint16_t*)wk + tb * K * 32 + lid;\n"
+                   + "  const device T* sq = sk + tb * groups * OT + 4 * lid;\n"
+                   + "  const device T* bq = bk + tb * groups * OT + 4 * lid;\n",
+               "  const device uint16_t* wq = (const device uint16_t*)wk;\n"
+                   + "  const uint wo = uint(tb) * (K * 32) + uint(lid);\n"
+                   + "  const device T* sq = sk;\n  const device T* bq = bk;\n"
+                   + "  const uint so = uint(tb) * (groups * OT) + 4 * uint(lid);\n"),
+          swap("    const int count = l < tail ? full + 1 : full;\n    for (int j = 0; j < count; j++) {\n"
+                   + "      const int c = j < full ? l + 32 * j : 32 * full + l;\n",
+               "    for (int c = l; c < chunks; c += 32) {\n")
+    else { return nil }
+    let wide = s.contains("    const device uint* wq = (const device uint*)(wk + tb * K * 32) + lid;\n")
+    if wide {
+        guard swap("    const device uint* wq = (const device uint*)(wk + tb * K * 32) + lid;\n"
+                       + "    const device T* sq = sk + tb * groups * OT + 4 * lid;\n"
+                       + "    const device T* bq = bk + tb * groups * OT + 4 * lid;\n",
+                   "    const device uint* wq = (const device uint*)wk;\n"
+                       + "    const uint wo = uint(tb) * (K * 16) + uint(lid);\n"
+                       + "    const device T* sq = sk;\n    const device T* bq = bk;\n"
+                       + "    const uint so = uint(tb) * (groups * OT) + 4 * uint(lid);\n"),
+              swap("      const int count = l < tail ? full + 1 : full;\n      for (int j = 0; j < count; j++) {\n"
+                       + "        const int c = j < full ? l + 32 * j : 32 * full + l;\n",
+                   "      for (int c = l; c < chunks; c += 32) {\n"),
+              swap("(sq + h * groups * OT + gi * OT)", "(sq + (so + uint(h * groups * OT + gi * OT)))"),
+              swap("(bq + h * groups * OT + gi * OT)", "(bq + (so + uint(h * groups * OT + gi * OT)))")
+        else { return nil }
+    }
+    guard let codes = try? NSRegularExpression(pattern: "wq\\[\\((8 \\* c \\+ [a-z0-9 +]+)\\) \\* 32\\]")
+    else { return nil }
+    let range = NSRange(s.startIndex..., in: s)
+    guard codes.numberOfMatches(in: s, range: range) == (wide ? 16 : 8) else { return nil }
+    s = codes.stringByReplacingMatches(in: s, range: range, withTemplate: "wq[wo + uint(($1) * 32)]")
+    for stream in ["sq", "bq"] {
+        let old = "(\(stream) + gi * OT)"
+        guard s.components(separatedBy: old).count == 5 else { return nil }
+        s = s.replacingOccurrences(of: old, with: "(\(stream) + (so + uint(gi * OT)))")
+    }
+    guard !s.contains("wq[("), !s.contains("j < count") else { return nil }
+    return s
+}
+
 private func nemotronZSkipVectorStoreSource(_ source: String) -> String? {
     let pattern = "(?m)^( *)for \\(int q = 0; q < OT / SGS; q\\+\\+\\) \\{\\n"
         + "\\1  const int n = sg \\* \\(OT / SGS\\) \\+ q;\\n"
@@ -3180,6 +3324,106 @@ enum NemotronZSkip {
     private static let tiledFastDictSlotKernelDepLN = leanKernel(
         "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_vs_ul_ln", nemotronZSkipDictSource(nemotronZSkipTiledFastSource),
         dep: true)
+    /// NEMOTRON_ZSKIP_SCORE_ENTRY=0 keeps the draft tail's lean dep slot kernels reading the slot's score at the
+    /// product store (the draft's six scores are a 6-element input). Otherwise `products` launches their twins built
+    /// from the same text with `nemotronZSkipScoreEntrySource` (name + "_se"), once `qualifyScoreEntry` matched them.
+    static let scoreEntryRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_SCORE_ENTRY"] != "0"
+    nonisolated(unsafe) private(set) static var scoreEntryVerified = false
+    /// The load check's choice while it runs (nil outside it).
+    nonisolated(unsafe) private static var scoreEntryForced: Bool?
+    private static func scoreEntryKernel(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        source.flatMap(nemotronZSkipVectorStoreSource).flatMap(nemotronZSkipUnmaskedLoadsSource)
+            .flatMap(nemotronZSkipLeanSource).flatMap(nemotronZSkipScoreEntrySource).map {
+                MLXFast.metalKernel(
+                    name: name, inputNames: ["wk", "sk", "bk", "x", "inds", "scores", "dep"],
+                    outputNames: ["prod"], source: $0,
+                    header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                    ensureRowContiguous: true)
+            }
+    }
+    private static let tiledFastSlotKernelDepSE = scoreEntryKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_dep_vs_ul_ln_se", nemotronZSkipTiledFastSource)
+    private static let tiledFastDictSlotKernelDepSE = scoreEntryKernel(
+        "nemotron_zskip_fc2_slots_tiled_fast_sbd_dep_vs_ul_ln_se", nemotronZSkipDictSource(nemotronZSkipTiledFastSource))
+    /// The score-first twin of the dep slot kernel `record` (a lean dep form), when admitted (or forced by the check).
+    private static func scoreEntryTwin(of record: MLXFast.MLXFastKernel) -> MLXFast.MLXFastKernel? {
+        guard scoreEntryForced ?? scoreEntryVerified else { return nil }
+        if let lean = tiledFastDictSlotKernelDepLN, record === lean { return tiledFastDictSlotKernelDepSE }
+        if let lean = tiledFastSlotKernelDepLN, record === lean { return tiledFastSlotKernelDepSE }
+        return nil
+    }
+
+    /// Load time, after `prepareDraft` and before `NemotronFC2Tune.tuneDraft` and any draft graph is traced: the draft
+    /// tail's slot launch (`draftProducts` with a `dep`) with the score-first twin against the lean dep kernel it
+    /// replaces, on every draft copy (the MTP head's real routed FC2 bank): ReLU2 rows at densities 8.75%, 45% and full
+    /// with an all-zero and a one-hot slot, infinities, NaNs, -0, tiny and large values; experts 0 and 127 among the
+    /// six; scores seeded and with 0, -0, NaN and infinities. The slot products bit for bit. Engages only if every
+    /// case matches.
+    static func qualifyScoreEntry() {
+        scoreEntryVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron zskip score entry: \(message)\n".utf8))
+        }
+        guard scoreEntryRequested else { return report("off (setting)") }
+        guard lean, tiledFastSlotKernelDepSE != nil, tiledFastDictSlotKernelDepSE != nil else {
+            return report("off (lean slot kernels off or their text not found)")
+        }
+        let copies = lock.withLock { Array(draftCopies.values) }
+        guard !copies.isEmpty else { return report("off (no draft copy)") }
+        let k = 1856
+        let zero = MLXArray(Float(0))
+        let bf16 = { (v: Float) in MLXArray(v).asType(.bfloat16) }
+        let slot = MLXArray((0 ..< 6).map(Int32.init)).reshaped(6, 1)
+        let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+        func at(_ s: Int, _ c: Int) -> MLXArray { (slot .== MLXArray(Int32(s))) .&& (column .== MLXArray(Int32(c))) }
+        func rows(_ density: Float, seed: UInt64) -> MLXArray {
+            let r = MLXRandom.split(key: MLXRandom.key(seed), into: 2)
+            let h = abs(MLXRandom.normal([6, k], key: r[0])) * 0.5 + 1e-3
+            let u = MLXRandom.uniform(Float(0) ..< 1, [6, k], key: r[1])
+            let oneHot = which(column .== MLXArray(Int32(k - 56)), MLXArray(Float(1.5)), zero)
+            let picked = which(slot .== MLXArray(Int32(1)), zero,
+                               which(slot .== MLXArray(Int32(2)), oneHot, which(u .< MLXArray(density), h, zero)))
+            let squared = (picked.asType(.bfloat16) * picked.asType(.bfloat16)).asType(.bfloat16)
+            return which(at(3, 77), bf16(.infinity), which(at(4, 901), bf16(.nan), which(at(5, 1300), bf16(1e-35),
+                which(at(0, 500), bf16(3.0e38), which(at(3, 1001), bf16(-0.0), squared)))))
+        }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for (c, copy) in copies.enumerated() {
+                    for (set, density) in [Float(0.0875), 0.45, 1.0].enumerated() {
+                        let seed = UInt64(0x5c71 + 8 * c + set)
+                        let x = rows(density, seed: seed)
+                        let inds = MLXArray([UInt32(0), 127, UInt32(5 + 11 * set), 64, UInt32(100 + set), 127])
+                        var scores = MLXRandom.uniform(Float(0) ..< 1, [6], key: MLXRandom.key(seed + 1))
+                        if set == 1 {
+                            scores = MLXArray([Float(0), -0.0, .nan, .infinity, -.infinity, 0.25])
+                        } else if set == 2 {
+                            scores = MLXArray([Float(1e-38), 3e38, -2.5, 0.125, 1, 7e-45])
+                        }
+                        let dep = MLXRandom.normal([1, 3712], key: MLXRandom.key(seed + 2)).asType(.bfloat16)
+                        func run(_ twin: Bool) -> MLXArray {
+                            scoreEntryForced = twin
+                            defer { scoreEntryForced = nil }
+                            return products(x, inds, scores, copy: copy, rows: 1, dep: dep)
+                        }
+                        let a = run(false), b = run(true)
+                        same = same .&& (a.view(dtype: .uint32) .== b.view(dtype: .uint32)).all()
+                        cases += 1
+                    }
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        scoreEntryVerified = cases > 0 && same.item(Bool.self)
+        report(scoreEntryVerified
+            ? "on (\(cases) draft slot launches over \(copies.count) draft copies bitwise equal to the lean dep kernels)"
+            : "off (differs from the lean dep kernels)")
+    }
+
     static let leanRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_LEAN"] != "0"
     nonisolated(unsafe) fileprivate static var leanVerified = false
     static var lean: Bool { unmasked && leanRequested && leanVerified }
@@ -3337,7 +3581,8 @@ enum NemotronZSkip {
         let slots = rows * 6
         let threads = 32 * sgs
         let twin = dep.flatMap { _ in depKernel(for: copy) }
-        return (twin ?? (copy.dict ? dictKernel! : kernel))(
+        let entry = twin.flatMap { scoreEntryTwin(of: $0) }
+        return (entry ?? twin ?? (copy.dict ? dictKernel! : kernel))(
             [NemotronBankBinding.bind(copy.codes), NemotronBankBinding.bind(copy.scales),
              NemotronBankBinding.bind(copy.biases), x, inds, scores] + (twin != nil ? [dep!] : []),
             template: [("T", x.dtype), ("K", 1856), ("N", 2688), ("SGS", sgs)],
@@ -4094,6 +4339,22 @@ enum NemotronSharedDownZSkip {
                 header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
                 ensureRowContiguous: true)
         }
+    /// The two vector-store kernels above with 32-bit lane offsets and one-counter chunk loops
+    /// (`nemotronZSkipSharedLeanSource`), used unless NEMOTRON_ZSKIP_SHARED_LEAN=0 once `qualifyLean` matched each to
+    /// its vector-store form.
+    private static func leanKernel(_ name: String, _ source: String?) -> MLXFast.MLXFastKernel? {
+        source.flatMap(nemotronZSkipVectorStoreSource).flatMap(nemotronZSkipSharedLeanSource).map {
+            MLXFast.metalKernel(
+                name: name, inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"], source: $0,
+                header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+                ensureRowContiguous: true)
+        }
+    }
+    fileprivate static let kernelLN = leanKernel("nemotron_zskip_shared_down_tiled_fast_vs_ln", source)
+    fileprivate static let wideKernelLN = leanKernel("nemotron_zskip_shared_down_wide_vs_ln", wideSource)
+    static let leanRequested = ProcessInfo.processInfo.environment["NEMOTRON_ZSKIP_SHARED_LEAN"] != "0"
+    nonisolated(unsafe) fileprivate static var leanVerified = false
+    static var lean: Bool { NemotronZSkip.vstore && leanRequested && leanVerified }
 
     fileprivate struct Copy {
         let codes: MLXArray
@@ -4149,7 +4410,7 @@ enum NemotronSharedDownZSkip {
     /// The shared-down kernel that reads `copy`'s decode codes (the vector-store form once qualified).
     fileprivate static func kernel(for copy: Copy) -> MLXFast.MLXFastKernel? {
         if NemotronZSkip.vstore {
-            return copy.wide ? wideKernelVS : kernelVS
+            return copy.wide ? ((lean ? wideKernelLN : nil) ?? wideKernelVS) : ((lean ? kernelLN : nil) ?? kernelVS)
         }
         return copy.wide ? wideKernel : kernel
     }
@@ -4193,7 +4454,15 @@ enum NemotronSharedDownZSkip {
         let zeros = MLXArray.zeros([3], dtype: .uint32)
         eval(zeros)
         let wide = wideEnabled && wideKernel != nil && qualifyWide(model, zeros)
-        let (accepted, checked, wideMissed) = build(model, zeros, wide: wide)
+        qualifyLean(zeros)
+        var (accepted, checked, wideMissed) = build(model, zeros, wide: wide)
+        if !accepted || wideMissed, lean {
+            // A lean kernel missed a layer's record check: the vector-store kernels, every layer again.
+            leanVerified = false
+            FileHandle.standardError.write(
+                Data("nemotron shared down zskip: lean kernel differs; vector-store kernels\n".utf8))
+            (accepted, checked, wideMissed) = build(model, zeros, wide: wide)
+        }
         if wideMissed {
             FileHandle.standardError.write(Data(
                 "nemotron shared down zskip: wide kernel differs from the record; tile-major copy\n".utf8))
@@ -4207,6 +4476,81 @@ enum NemotronSharedDownZSkip {
         FileHandle.standardError.write(Data((accepted
             ? "nemotron shared down zskip on: \(built.count) layers\(form)\n"
             : "nemotron shared down zskip off\n").utf8))
+    }
+
+    /// Load time, before any copy is built: the two lean kernels against their vector-store forms, bit for bit, on
+    /// synthetic tile-major and wide copies (random codes; scales and biases with zeros, -0, infinities and NaNs) and
+    /// synthetic rows: ReLU2-like rows at the verify (13.4%), draft-head (45%) and full densities with an all-zero and
+    /// a one-hot row and -0 for some zeros, and rows with an infinity, a NaN, tiny values of both signs (the dense-path
+    /// sentinel) and a large finite value added. The vector-store kernels stay on any miss. One stderr line.
+    fileprivate static func qualifyLean(_ zeros: MLXArray) {
+        leanVerified = false
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data("nemotron shared down zskip lean: \(message)\n".utf8))
+        }
+        guard leanRequested else { return report("off (setting)") }
+        guard NemotronZSkip.vstore else { return report("off (vector store off)") }
+        guard let narrowVS = kernelVS, let wideVS = wideKernelVS, let narrowLN = kernelLN, let wideLN = wideKernelLN
+        else { return report("off (a shared-down source no longer matches)") }
+        let tiles = n / 128, groups = k / 64
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5d1e), into: 8)
+        let specials = MLXArray([Float(0), -0.0, .infinity, -.infinity, .nan])
+        func values(_ u: MLXArray, _ key: MLXArray, low: Float = -1, high: Float = 2) -> MLXArray {
+            which(logicalOr(u .< MLXArray(low), u .> MLXArray(high)),
+                  take(specials, (u * 100_000).asType(.int32) % MLXArray(Int32(5))),
+                  MLXRandom.normal(u.shape, key: key) * 0.01).asType(.bfloat16)
+        }
+        let u = MLXRandom.uniform(Float(0) ..< 1, [1, tiles, groups, 128], key: keys[0])
+        var copy = Copy(
+            codes: MLXRandom.randInt(Int32(0) ..< 65536, [1, tiles, k, 32], key: keys[1]).asType(.uint16),
+            scales: values(u, keys[2], low: 0.0005), biases: values(u, keys[3], high: 0.9995))
+        let narrow = copy
+        copy.wideCodes = MLXRandom.randInt(Int32(0) ..< 65536, [1, tiles * k * 32], key: keys[4]).asType(.uint16)
+        let zero = MLXArray(Float(0))
+        let bf16 = { (v: Float) in MLXArray(v).asType(.bfloat16) }
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(3, 1)
+        let column = MLXArray((0 ..< k).map(Int32.init)).reshaped(1, k)
+        func at(_ r: Int, _ c: Int) -> MLXArray {
+            logicalAnd(row .== MLXArray(Int32(r)), column .== MLXArray(Int32(c)))
+        }
+        var xs: [MLXArray] = []
+        for (i, density) in [Float(0.134), 0.45, 1].enumerated() {
+            let r = MLXRandom.split(key: MLXRandom.key(UInt64(0x5d20 + i)), into: 3)
+            let h = abs(MLXRandom.normal([3, k], key: r[0])) * 0.5 + 1e-3
+            let picked = which(MLXRandom.uniform(Float(0) ..< 1, [3, k], key: r[1]) .< MLXArray(density), h, zero)
+            let rows = which(row .== MLXArray(Int32(1)), zero, which(at(2, k - 56), MLXArray(Float(1.5)),
+                                                                   which(row .== MLXArray(Int32(2)), zero, picked)))
+            let squared = (rows.asType(.bfloat16) * rows.asType(.bfloat16)).asType(.bfloat16)
+            let negative = MLXRandom.uniform(Float(0) ..< 1, [3, k], key: r[2]) .< MLXArray(Float(0.05))
+            let signed = which(logicalAnd(squared .== bf16(0), negative), bf16(-0.0), squared)
+            xs.append(signed)
+            let flipped = which(at(0, k - 1), -signed, signed)
+            xs.append(which(at(0, 77), bf16(.infinity), which(at(1, 901), bf16(.nan), which(at(2, 1300), bf16(1e-35),
+                which(at(0, 2000), bf16(-2e-38), which(at(1, 3000), bf16(3.0e38), flipped))))))
+        }
+        var cases = 0
+        var admitted = false
+        do {
+            admitted = try withError { () -> Bool in
+                var ok = MLXArray(true)
+                for (vs, ln, c) in [(narrowVS, narrowLN, narrow), (wideVS, wideLN, copy)] {
+                    for x in xs {
+                        let a = dispatch(x, c, zeros, vs)
+                        let b = dispatch(x, c, zeros, ln)
+                        ok = ok .&& (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all()
+                        cases += 1
+                    }
+                }
+                return ok.item(Bool.self)
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        leanVerified = admitted
+        report(admitted
+            ? "on (\(cases) cases bitwise equal to the vector-store form: tile-major and wide shared down; densities "
+                + "13.4%, 45% and full; zeros, -0, tiny, large, negative, infinite and NaN values included)"
+            : "off (differs from the vector-store form)")
     }
 
     /// Drops every copy's wide codes when any has them (true), for a consumer whose own check missed with the
@@ -5378,10 +5722,15 @@ extension NemotronU2 {
 // - W32: the HALF decode takes its n2/n3 halfwords from the 32-bit word it
 //   already loads (the same bits, so the same half and FP32 operands);
 // - unroll: `#pragma clang loop unroll_count` on the three main K loops (1:
-//   no pragma, the record loops; 4: four blocks per unrolled step).
+//   no pragma, the record loops; 4: four blocks per unrolled step);
+// - lean (the rows appended last): the text through `nmlFC1LeanSource`, each
+//   lane reading through the arrays' base pointers plus 32-bit element offsets
+//   (the record's addresses) instead of six stepped 64-bit pointers.
 // None of these touches the lane split, the K order, a term, a rounding point
 // or the cross-lane reduction tree. Every tune kernel carries an unread `dep`
 // input (FP32): production binds the launch's own prepared activation there.
+// The lean rows are candidates like any other: production launches a lean
+// kernel only when the tune adopted (or a FORCE picked) a lean row.
 // `tune` (load time, untimed) still checks every variant bit for bit against
 // the launch production makes today on seeded inputs and routes over the real
 // routed FC1 banks (every case on every MoE layer), drops any mismatch or Metal
@@ -5392,18 +5741,31 @@ extension NemotronU2 {
 // launch binds the previous launch's output as `dep`, so the launches run one
 // after another as in the round, and adopts the fastest only when
 // `NemotronTuneAdoption.decide` admits it (at least 0.5% faster by median, `medianBar`, where the shared rule asks 3%,
-// and faster in at least 75% of the cycles). NEMOTRON_FC1_TUNE_BAR sets the median bar (0.97 is the shared one).
+// and faster in at least 60% of the cycles, `winBar`, where the shared rule asks 75%; of the variants that pass both,
+// the lowest median). NEMOTRON_FC1_TUNE_BAR sets the median bar (0.97 is the shared one), NEMOTRON_FC1_TUNE_WINS the
+// fraction (0.75 is the shared one).
 // The pair-dictionary form and the plain form are adopted separately: the
 // plain form only when some bank without a dictionary took part in the check.
+// A lean row that passed is also checked on the lean load check's inputs
+// (activations with infinities, NaNs, -0, tiny and large values on routes with
+// experts in three, two and one rows and with all eighteen distinct, experts 0
+// and 127) against the production launch on every bank, and dropped on a miss.
 // NEMOTRON_FC1_TUNE=0 keeps the incumbent; NEMOTRON_FC1_FORCE=<n> adopts
 // variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
+// NEMOTRON_FC1_LEAN_ROWS=0 leaves the lean rows out (the 18 record-text rows).
 enum NemotronFC1Tune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE"] != "0"
     /// An adopted variant's median is at most this fraction of the incumbent's.
     static let medianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE_BAR"] ?? "") ?? 0.995
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "")
+    /// The fraction of the paired cycles an adopted variant beats the incumbent in (`NemotronTuneAdoption.decide`'s
+    /// `winBar`; the shared rule asks 75%).
+    static let winBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE_WINS"] ?? "")
+        .map { min(max($0, 0.5), 1.0) } ?? 0.6
     /// Wall time of the timed rounds (graph building included), sized from the warm-up round.
-    static let timedMilliseconds = 600.0
+    static let timedMilliseconds = 1200.0
+    /// Fewest timed cycles (twice `NemotronTuneAdoption.minCycles`).
+    static let minCycles = 32
 
     struct Variant: Sendable, Equatable {
         let name: String
@@ -5418,9 +5780,15 @@ enum NemotronFC1Tune {
         /// unroll_count of the three main K loops; 0: the incumbent's (2 once
         /// `qualifyFC1Unroll` admitted it, else none).
         let unroll: Int
+        /// The text through `nmlFC1LeanSource` (base pointers plus 32-bit lane offsets), last in the pipeline.
+        var lean = false
     }
 
-    /// The incumbent is r2n1 (two outputs, one SIMD group, slot on z).
+    /// The lean rows (NEMOTRON_FC1_LEAN_ROWS=0 leaves them out).
+    static let leanRows = ProcessInfo.processInfo.environment["NEMOTRON_FC1_LEAN_ROWS"] != "0"
+
+    /// The incumbent is r2n1 (two outputs, one SIMD group, slot on z). The lean rows come last (the record rows
+    /// keep their FORCE indices): the incumbent's geometry and the slot-on-x geometries, with the lean text.
     static let variants: [Variant] = [
         Variant(name: "r2n2", rps: 2, nsg: 2, slotX: false, w32: false, unroll: 0),
         Variant(name: "r2n4", rps: 2, nsg: 4, slotX: false, w32: false, unroll: 0),
@@ -5440,11 +5808,16 @@ enum NemotronFC1Tune {
         Variant(name: "r2n1u1", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 1),
         Variant(name: "r2n1u4", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 4),
         Variant(name: "r4n2u1", rps: 4, nsg: 2, slotX: false, w32: false, unroll: 1),
-    ]
+    ] + (leanRows ? [
+        Variant(name: "r2n1ln", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 0, lean: true),
+        Variant(name: "r2n2xln", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0, lean: true),
+        Variant(name: "r2n4xln", rps: 2, nsg: 4, slotX: true, w32: false, unroll: 0, lean: true),
+    ] : [])
 
     /// The same launch geometry and text (name aside).
     static func sameGeometry(_ a: Variant, _ b: Variant) -> Bool {
         a.rps == b.rps && a.nsg == b.nsg && a.slotX == b.slotX && a.w32 == b.w32 && unrollCount(a) == unrollCount(b)
+            && a.lean == b.lean
     }
 
     /// The incumbent's geometry through the tune's pipeline (the timing twin of the production launch).
@@ -5470,7 +5843,8 @@ enum NemotronFC1Tune {
 
     /// The incumbent's source pipeline (`NemotronMoELeaderPreparedKernels`:
     /// unroll, then tail-8, prepared pointers and pair dictionary) with the
-    /// variant's slot axis; nil when the record text moved.
+    /// variant's slot axis, and for a lean row `nmlFC1LeanSource` last; nil
+    /// when the record text moved.
     static func source(_ v: Variant, tail8: Bool, dict: Bool) -> String? {
         var s = nemotronMoETripleGateUpSource.replacingOccurrences(
             of: "x2 += block_size;", with: "x2 += PSTRIDE;")
@@ -5501,6 +5875,10 @@ enum NemotronFC1Tune {
             guard let d = nemotronSBDictSource(p) else { return nil }
             p = d
         }
+        if v.lean {
+            guard let l = nmlFC1LeanSource(p) else { return nil }
+            p = l
+        }
         return p
     }
 
@@ -5522,7 +5900,7 @@ enum NemotronFC1Tune {
     }
 
     static func kernel(_ v: Variant, tail8: Bool, dict: Bool) -> MLXFast.MLXFastKernel? {
-        let key = "\(v.name)_u\(unrollCount(v))_\(tail8 ? "t8" : "tr")_\(dict ? "sbd" : "bf")"
+        let key = "\(v.name)_u\(unrollCount(v))_\(tail8 ? "t8" : "tr")_\(dict ? "sbd" : "bf")" + (v.lean ? "_ln" : "")
         return lock.withLock { () -> MLXFast.MLXFastKernel? in
             if let made = kernels[key] { return made }
             var made: MLXFast.MLXFastKernel? = nil
@@ -5723,6 +6101,58 @@ enum NemotronFC1Tune {
                 + dropped.prefix(4).joined(separator: ", ") + ")")
         }
         alive.removeFirst()
+        // Lean rows that passed: also the lean load check's inputs, bit for bit against the production launch on
+        // every bank (activations carrying infinities, NaNs, -0, tiny and large values on routes with an expert in
+        // three, two and one rows, all eighteen distinct with experts 0 and 127, and six experts in all three rows);
+        // a lean row that differs, is missing or errs is dropped.
+        var leanChecks = 0
+        let leanRoutes: [[UInt32]] = [
+            [3, 17, 42, 77, 100, 121, 17, 5, 64, 90, 3, 11, 3, 8, 50, 66, 101, 127],
+            [96, 30, 1, 65, 127, 33, 65, 2, 96, 40, 12, 7, 33, 96, 9, 19, 64, 65],
+            (0 ..< 18).map { UInt32($0 * 7 + ($0 == 17 ? 8 : 0)) },
+            [9, 44, 71, 2, 120, 33, 33, 120, 2, 9, 71, 44, 44, 9, 33, 71, 120, 2],
+        ]
+        for (ri, route) in leanRoutes.enumerated() where alive.contains(where: { $0.lean }) {
+            var references: [MLXArray] = []
+            var special: Case? = nil
+            do {
+                (special, references) = try withError { () -> (Case?, [MLXArray]) in
+                    let x = nemotronLeanCheckRows(2688, seed: 0xFC1_1EA4, scale: 4)
+                    let c = Case(packed: NemotronHeadPreparedActivation.prepareContiguousRows(x, pv: 8),
+                                 inds: MLXArray(route), x: x)
+                    let outs = layers.indices.compactMap { incumbent($0, c) }
+                    guard outs.count == layers.count else { return (nil, []) }
+                    eval(outs)
+                    return (c, outs)
+                }
+            } catch {
+                references = []
+            }
+            guard let c = special, references.count == layers.count else {
+                dropped += alive.filter { $0.lean }.map { "\($0.name) lean check unavailable" }
+                alive.removeAll { $0.lean }
+                break
+            }
+            alive = alive.filter { v in
+                guard v.lean else { return true }
+                do {
+                    let same = try withError { () -> Bool in
+                        var ok = MLXArray(true)
+                        for (l, reference) in references.enumerated() {
+                            guard let out = variant(v, l, c) else { return false }
+                            ok = ok .&& (out.view(dtype: .uint16) .== reference.view(dtype: .uint16)).all()
+                        }
+                        return ok.item(Bool.self)
+                    }
+                    if !same { dropped.append("\(v.name) differs@lean\(ri)") }
+                    return same
+                } catch {
+                    dropped.append("\(v.name) error")
+                    return false
+                }
+            }
+            leanChecks += layers.count
+        }
         let dictLayers = layers.filter { $0.dict != nil }.count
 
         // Time V0's twin and the survivors round robin (`NemotronTuneAdoption.order`): one
@@ -5767,7 +6197,7 @@ enum NemotronFC1Tune {
                     let warm = DispatchTime.now().uptimeNanoseconds
                     _ = round(Array(candidates.indices))
                     let wall = Double(DispatchTime.now().uptimeNanoseconds - warm) / 1e6
-                    reps = NemotronTuneAdoption.cycles(target: timedMilliseconds, wall: wall, cap: 41)
+                    reps = max(minCycles, NemotronTuneAdoption.cycles(target: timedMilliseconds, wall: wall, cap: 82))
                     for rep in 0 ..< reps {
                         let order = NemotronTuneAdoption.order(candidates.count, cycle: rep)
                         for (i, ms) in zip(order, round(order)) {
@@ -5780,7 +6210,7 @@ enum NemotronFC1Tune {
                 alive = []
             }
             if !alive.isEmpty, samples.allSatisfy({ $0.count == reps }) {
-                verdict = NemotronTuneAdoption.decide(samples, medianBar: medianBar)
+                verdict = NemotronTuneAdoption.decide(samples, medianBar: medianBar, winBar: winBar)
                 medians = verdict?.medians ?? []
             } else {
                 if !alive.isEmpty { dropped.append("timing incomplete") }
@@ -5816,7 +6246,8 @@ enum NemotronFC1Tune {
         let rule = verdict?.rule({ candidates[$0].name }) ?? "no candidate timed"
         report("\(why) \(picked?.name ?? "V0") \(ms(picked)) ms vs V0 (\(twin.name)) \(ms(nil)) ms per launch"
             + " (\(rule); median of \(reps), \(chain) chained launches/sample on \(layers.count) layers x 2 routes;"
-            + " \(alive.count)/\(variants.count) bitwise over \(checks) layer cases, V0 twin bitwise,"
+            + " \(alive.count)/\(variants.count) bitwise over \(checks) layer cases"
+            + (leanChecks > 0 ? " (lean rows also over \(leanChecks) special-value cases)" : "") + ", V0 twin bitwise,"
             + " dict \(dictLayers)/\(layers.count), plain \(plainQualified ? "on" : "off")"
             + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
             + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(8).joined(separator: ", ")) + ")")
@@ -5840,7 +6271,11 @@ enum NemotronFC1Tune {
 // - NSG: how many SIMD groups share a threadgroup (the row -> SIMD-group map);
 // - load: the main-loop load form (`nemotronPreparedVariantSource`: 32-bit word loads, hoisted loads, next-block
 //   prefetch; the same bits reach the same decode lines);
-// - u2: `#pragma clang loop unroll_count(2)` on the main K loop (`NemotronU2`).
+// - u2: `#pragma clang loop unroll_count(2)` on the main K loop (`NemotronU2`);
+// - lean (the rows appended last): the body through `nemotronQMVLeanSource`, each lane reading through the arrays'
+//   base pointers plus 32-bit element offsets (the record's addresses) instead of stepped 64-bit pointers (not with
+//   the in_proj register epilogue). Production launches a lean body only when the tune adopted (or a FORCE picked)
+//   a lean row.
 // The decode form, dictionary, epilogue and every template argument but RPS / NSG stay the incumbent's. The
 // head, out_proj and shared-up tune kernels carry an unread `dep` input (FP32): production binds the launch's own
 // prepared activation there.
@@ -5849,7 +6284,9 @@ enum NemotronFC1Tune {
 // (all four in_proj outputs), drops any mismatch, missing kernel or Metal error, times the incumbent and the
 // survivors round robin (`NemotronTuneAdoption.order`, median) and adopts the fastest only when
 // `NemotronTuneAdoption.decide` admits it (at least 0.5% faster by median for in_proj, the head and out_proj, the
-// family's `medianBar`, where the shared rule and the shared up ask 3%, and faster in at least 75% of the cycles).
+// family's `medianBar`, where the shared rule and the shared up ask 3%, and faster in at least 60% of the cycles,
+// `winBar`, where the shared rule asks 75%; NEMOTRON_QMV_TUNE_WINS sets it; of the variants that pass both, the
+// lowest median).
 // NEMOTRON_QMV_TUNE_BAR=<x> sets every family's median bar, <family>:<x>[,<family>:<x>] the named families' (0.97 is
 // the shared bar). The
 // timing runs one chain per sample in which each launch depends on the one before it, so the launches run one
@@ -5864,9 +6301,14 @@ enum NemotronFC1Tune {
 // NEMOTRON_QMV_FORCE=<family>:<n>[,<family>:<n>] (families inproj, head, outproj, sharedup) adopts variant n
 // (1-based, `variants`) of that family when it qualified, 0 keeps its incumbent. The shared up runs beside the
 // router in one barrier stage, where a geometry timed alone does not carry over, so its family keeps the incumbent
-// unless NEMOTRON_QMV_TUNE_SHAREDUP=1 (or a sharedup force) asks for it.
+// unless NEMOTRON_QMV_TUNE_SHAREDUP=1 (or a sharedup force) asks for it. A lean row that passed its family's check is
+// also checked on the lean load check's inputs (`nemotronLeanCheckRows`: rows carrying infinities, NaNs, -0, tiny and
+// large values, on every tensor of the family, all four in_proj outputs) against the production launch, and dropped
+// on a miss. NEMOTRON_QMV_LEAN_ROWS=0 leaves the lean rows out (each family's record-body rows).
 enum NemotronQMVTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_QMV_TUNE"] != "0"
+    /// The lean rows (NEMOTRON_QMV_LEAN_ROWS=0 leaves them out).
+    static let leanRows = ProcessInfo.processInfo.environment["NEMOTRON_QMV_LEAN_ROWS"] != "0"
     static let sharedUpTuned = ProcessInfo.processInfo.environment["NEMOTRON_QMV_TUNE_SHAREDUP"] == "1"
     static let forced: [Family: Int] = {
         var out: [Family: Int] = [:]
@@ -5892,11 +6334,15 @@ enum NemotronQMVTune {
     }()
     /// Soft cap on the tune's own load time: no family, variant (its first launch JITs the pipeline) or timing
     /// phase starts past it; what has not started keeps its incumbent.
-    static let budgetSeconds = 6.0
+    static let budgetSeconds = 12.0 * nemotronWindowTuneBudgetScale
     /// Wall time of one family's timed rounds (graph building included), sized from the last warm-up round.
-    static let timedMilliseconds = 900.0
+    static let timedMilliseconds = 1800.0
     /// Most timed cycles of one family.
-    static let maxCycles = 93
+    static let maxCycles = 186
+    /// The fraction of the paired cycles an adopted variant beats the incumbent in (`NemotronTuneAdoption.decide`'s
+    /// `winBar`; the shared rule asks 75%). NEMOTRON_QMV_TUNE_WINS=<x> sets it (0.75 restores the shared fraction).
+    static let winBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_QMV_TUNE_WINS"] ?? "")
+        .map { min(max($0, 0.5), 1.0) } ?? 0.6
 
     enum Family: String, CaseIterable, Sendable {
         case inProj = "inproj", head = "head", outProj = "outproj", sharedUp = "sharedup"
@@ -5933,6 +6379,10 @@ enum NemotronQMVTune {
         let regs: Bool
         /// In_proj 32-bit epilogue (`NemotronMambaInProjConvDt.epilogue32Verified`); the incumbent's.
         var e32 = false
+        /// The body through `nemotronQMVLeanSource` (base pointers plus 32-bit lane offsets), last in the pipeline.
+        var lean = false
+        /// In_proj time-step limits as template constants (`NemotronMambaInProjConvDt.tslVerified`); the incumbent's.
+        var tsl = false
     }
 
     struct Variant: Sendable, Equatable {
@@ -5942,16 +6392,85 @@ enum NemotronQMVTune {
         /// nil: the incumbent's load form / unroll.
         let load: Int?
         let u2: Bool?
+        /// A lean row (`Config.lean`).
+        var lean = false
         func resolved(_ inc: Config) -> Config {
             Config(rps: rps, nsg: nsg, load: load ?? inc.load, u2: u2 ?? inc.u2, hf: inc.hf, regs: inc.regs,
-                   e32: inc.e32)
+                   e32: inc.e32, lean: lean, tsl: inc.tsl)
         }
     }
 
     /// Incumbents: in_proj r2n2 crown load 0 (u2 once admitted); head r2n8 load 2 (u2 once admitted);
     /// out_proj / o_proj r2n2 HF2 load 2; shared up r2n2 crown load 0. A variant that resolves to the
-    /// incumbent is skipped.
+    /// incumbent is skipped. The lean rows (`leanVariants`) follow the record rows and the wider rows
+    /// (`widerVariants`) come last, so the record and lean rows keep their FORCE indices.
     static func variants(_ family: Family) -> [Variant] {
+        recordVariants(family) + (leanRows ? leanVariants(family) : []) + widerVariants(family)
+    }
+
+    /// More geometries x load forms for in_proj, the head and out_proj (the record body; the rule's paired win test
+    /// guards the wider pick). Appended after the lean rows.
+    static func widerVariants(_ family: Family) -> [Variant] {
+        switch family {
+        case .inProj:
+            return [
+                Variant(name: "r2n4l2", rps: 2, nsg: 4, load: 2, u2: nil),
+                Variant(name: "r2n2l3", rps: 2, nsg: 2, load: 3, u2: nil),
+                Variant(name: "r1n2", rps: 1, nsg: 2, load: nil, u2: nil),
+                Variant(name: "r4n1", rps: 4, nsg: 1, load: nil, u2: nil),
+                Variant(name: "r1n8", rps: 1, nsg: 8, load: nil, u2: nil),
+            ]
+        case .head:
+            return [
+                Variant(name: "r4n8", rps: 4, nsg: 8, load: nil, u2: nil),
+                Variant(name: "r1n8", rps: 1, nsg: 8, load: nil, u2: nil),
+                Variant(name: "r2n4l3", rps: 2, nsg: 4, load: 3, u2: nil),
+                Variant(name: "r2n16l3", rps: 2, nsg: 16, load: 3, u2: nil),
+            ]
+        case .outProj:
+            return [
+                Variant(name: "r2n4l3", rps: 2, nsg: 4, load: 3, u2: nil),
+                Variant(name: "r1n2", rps: 1, nsg: 2, load: nil, u2: nil),
+                Variant(name: "r4n1", rps: 4, nsg: 1, load: nil, u2: nil),
+                Variant(name: "r2n1l3", rps: 2, nsg: 1, load: 3, u2: nil),
+                Variant(name: "r1n8", rps: 1, nsg: 8, load: nil, u2: nil),
+            ]
+        case .sharedUp:
+            return []
+        }
+    }
+
+    /// Each family's lean rows: the incumbent's geometry and load form (V0's lean twin) and the load forms or
+    /// geometries the family's record rows contest, with the lean body.
+    static func leanVariants(_ family: Family) -> [Variant] {
+        switch family {
+        case .inProj:
+            return [
+                Variant(name: "r2n2ln", rps: 2, nsg: 2, load: nil, u2: nil, lean: true),
+                Variant(name: "r2n2l1ln", rps: 2, nsg: 2, load: 1, u2: nil, lean: true),
+                Variant(name: "r2n2l2ln", rps: 2, nsg: 2, load: 2, u2: nil, lean: true),
+            ]
+        case .head:
+            return [
+                Variant(name: "r2n8ln", rps: 2, nsg: 8, load: nil, u2: nil, lean: true),
+                Variant(name: "r2n16ln", rps: 2, nsg: 16, load: nil, u2: nil, lean: true),
+            ]
+        case .outProj:
+            return [
+                Variant(name: "r2n2ln", rps: 2, nsg: 2, load: nil, u2: nil, lean: true),
+                Variant(name: "r2n1ln", rps: 2, nsg: 1, load: nil, u2: nil, lean: true),
+                Variant(name: "r2n2l0ln", rps: 2, nsg: 2, load: 0, u2: nil, lean: true),
+            ]
+        case .sharedUp:
+            return [
+                Variant(name: "r2n2ln", rps: 2, nsg: 2, load: nil, u2: nil, lean: true),
+                Variant(name: "r2n2l1ln", rps: 2, nsg: 2, load: 1, u2: nil, lean: true),
+                Variant(name: "r2n2l2ln", rps: 2, nsg: 2, load: 2, u2: nil, lean: true),
+            ]
+        }
+    }
+
+    private static func recordVariants(_ family: Family) -> [Variant] {
         switch family {
         case .inProj:
             return [
@@ -6001,8 +6520,9 @@ enum NemotronQMVTune {
 
     /// The variant body: the incumbent's record body (`base`) through the counted load-form and NSG swaps of
     /// `nemotronPreparedVariantSource` (nil instead of a trap when a swap's text moved), the pair dictionary
-    /// (`nemotronSBDictSource`, vector-store closing loops) and, with `u2`, the unroll pragma on the main K loop.
-    static func source(base: String, load: Int, u2: Bool) -> String? {
+    /// (`nemotronSBDictSource`, vector-store closing loops), with `u2` the unroll pragma on the main K loop and,
+    /// with `lean`, `nemotronQMVLeanSource` last.
+    static func source(base: String, load: Int, u2: Bool, lean: Bool = false) -> String? {
         let loads: [Int: [(String, String, Int)]] = [
             1: nemotronPreparedW32Swaps, 2: nemotronPreparedHoistSwaps, 3: nemotronPreparedPrefetchSwaps]
         guard load == 0 || loads[load] != nil else { return nil }
@@ -6012,7 +6532,8 @@ enum NemotronQMVTune {
             s = s.replacingOccurrences(of: old, with: new)
         }
         guard let d = nemotronSBDictSource(s) else { return nil }
-        return u2 ? nemotronU2Source(d, loop: NemotronU2.qmvLoop, count: 1) : d
+        let body = u2 ? nemotronU2Source(d, loop: NemotronU2.qmvLoop, count: 1) : d
+        return lean ? nemotronQMVLeanSource(body) : body
     }
 
     private static let lock = NSLock()
@@ -6031,11 +6552,11 @@ enum NemotronQMVTune {
     }
 
     static func preparedKernel(_ c: Config) -> MLXFast.MLXFastKernel? {
-        let key = "nemotron_qmv_tune_prep_hf\(c.hf ?? 0)_l\(c.load)_u\(c.u2 ? 2 : 1)"
+        let key = "nemotron_qmv_tune_prep_hf\(c.hf ?? 0)_l\(c.load)_u\(c.u2 ? 2 : 1)" + (c.lean ? "_ln" : "")
         return cached(key) {
             let base = c.hf != nil
                 ? NemotronHeadPreparedActivation.preparedHalfSource : NemotronHeadPreparedActivation.crownSource
-            return source(base: base, load: c.load, u2: c.u2).map {
+            return source(base: base, load: c.load, u2: c.u2, lean: c.lean).map {
                 MLXFast.metalKernel(
                     name: key, inputNames: ["w", "scales", "biases", "prepared", "K", "N", "dep"], outputNames: ["y"],
                     source: $0, header: NemotronHeadPreparedActivation.variantHeader(half: c.hf != nil, load: c.load))
@@ -6045,9 +6566,11 @@ enum NemotronQMVTune {
 
     static func inProjKernel(_ c: Config) -> MLXFast.MLXFastKernel? {
         let key = "nemotron_qmv_tune_inproj_rg\(c.regs ? 1 : 0)_l\(c.load)_u\(c.u2 ? 2 : 1)" + (c.e32 ? "_e32" : "")
+            + (c.lean ? "_ln" : "") + (c.tsl ? "_tsl" : "")
         return cached(key) {
-            NemotronMambaInProjConvDt.tuneBase(regs: c.regs, e32: c.e32)
-                .flatMap { source(base: $0, load: c.load, u2: c.u2) }.map {
+            // The register epilogue keeps its text (no lean form).
+            NemotronMambaInProjConvDt.tuneBase(regs: c.regs, e32: c.e32, tsl: c.tsl)
+                .flatMap { c.lean && c.regs ? nil : source(base: $0, load: c.load, u2: c.u2, lean: c.lean) }.map {
                 MLXFast.metalKernel(
                     name: key,
                     inputNames: ["w", "scales", "biases", "prepared", "K", "N",
@@ -6078,12 +6601,13 @@ enum NemotronQMVTune {
     }
 
     /// The in_proj dictionary launch: `config` (a load-time check's), else the adopted config on the production
-    /// call (`production`: no explicit unroll or epilogue choice), else nil (the record selection).
+    /// call (`production`: no explicit unroll or epilogue choice), else nil (the record selection). The last element
+    /// is the config's `tsl` (the launch then also takes the limits' template arguments).
     static func inProjLaunch(_ config: Config?, production: Bool)
-        -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int)? {
+        -> (MLXFast.MLXFastKernel, [(String, any KernelTemplateArg)], Int, Int, Bool)? {
         guard let c = config ?? (production ? adopted[.inProj]?.config : nil),
               let kernel = inProjKernel(c) else { return nil }
-        return (kernel, [("NSG", c.nsg)], c.rps, c.nsg)
+        return (kernel, [("NSG", c.nsg)], c.rps, c.nsg, c.tsl)
     }
 
     /// One family's check cases: each runs the production launch (nil) or a config's.
@@ -6126,6 +6650,10 @@ enum NemotronQMVTune {
         var checks: [Run] = []
         var steps: [Step] = []
         var layers = 0
+        // The lean rows' extra cases (one per tensor, on `nemotronLeanCheckRows`), built only when the family offers
+        // lean rows.
+        let offersLean = variants(family).contains(where: { $0.lean })
+        var leanChecks: [Run] = []
         do {
             try withError {
                 if family == .inProj {
@@ -6152,6 +6680,21 @@ enum NemotronQMVTune {
                             checks.append { c in launch(c, state).map { [$0.projected, $0.convolution, $0.padded, $0.dt] } }
                             // Timing link: the previous link's convolution output is this launch's conv state.
                             if seed == 0 { steps.append { c, previous in launch(c, previous ?? state)?.convolution } }
+                        }
+                        if offersLean {
+                            let x = nemotronLeanCheckRows(k, seed: UInt64(0x9e30 + layers), scale: 2)
+                            let stateKey = MLXRandom.key(UInt64(0x9e50 + layers))
+                            let state = (MLXRandom.normal([1, 3, mixer.convDim], key: stateKey) * 0.5).asType(.bfloat16)
+                            let packed = NemotronHeadPreparedActivation.pack(x)
+                            eval(x, state, packed)
+                            leanChecks.append { c in
+                                NemotronMambaInProjConvDt.apply(
+                                    x, q, prepared: packed, oldState: state, convWeight: mixer.conv1d.weight,
+                                    convBias: convBias, dtBias: mixer.dtBias, timeStepLimit: mixer.timeStepLimit,
+                                    convStart: mixer.intermediateSize, convDim: mixer.convDim,
+                                    heads: mixer.numHeads, qmvTune: c)
+                                    .map { [$0.projected, $0.convolution, $0.padded, $0.dt] }
+                            }
                         }
                         layers += 1
                     }
@@ -6180,6 +6723,15 @@ enum NemotronQMVTune {
                                 steps += Array(repeating: step, count: family == .head ? 4 : 1)
                             }
                         }
+                        if offersLean {
+                            let x = nemotronLeanCheckRows(k, seed: UInt64(0x9e70 + layers) ^ UInt64(n), scale: 2)
+                            let packed = NemotronHeadPreparedActivation.pack(x)
+                            eval(x, packed)
+                            leanChecks.append { c in
+                                [NemotronHeadPreparedActivation.apply(x, q, relu2: family.relu2, rps: callerRPS,
+                                                                      prepared: packed, qmvTune: c)]
+                            }
+                        }
                         layers += 1
                     }
                 }
@@ -6189,9 +6741,10 @@ enum NemotronQMVTune {
         }
         guard !checks.isEmpty else { return "off (no dictionary launch of this family)" }
         if family == .inProj {
+            let e32 = NemotronMambaInProjConvDt.epilogue32Verified && !NemotronMambaInProjConvDt.regsVerified
             inc = Config(rps: 2, nsg: 2, load: 0, u2: NemotronU2.inProj, hf: nil,
-                         regs: NemotronMambaInProjConvDt.regsVerified,
-                         e32: NemotronMambaInProjConvDt.epilogue32Verified && !NemotronMambaInProjConvDt.regsVerified)
+                         regs: NemotronMambaInProjConvDt.regsVerified, e32: e32,
+                         tsl: e32 && NemotronMambaInProjConvDt.tslVerified)
         } else {
             let callerRPS = NemotronMultiRowQMV.headRPS(n: n)
             let geometry = NemotronHeadPreparedActivation.preparedGeometry[[k, n]] ?? (rps: callerRPS, nsg: 2)
@@ -6267,6 +6820,49 @@ enum NemotronQMVTune {
             }
             alive.removeFirst()
         }
+        // Lean rows that passed: also the lean load check's inputs (`leanChecks`), bit for bit against the production
+        // launch; a lean row that differs, is missing, errs or would start past the load budget is dropped.
+        var leanChecked = 0
+        if alive.contains(where: { $0.variant.lean }) {
+            var leanReferences: [[MLXArray]] = []
+            do {
+                leanReferences = try withError { () -> [[MLXArray]] in
+                    let outs = leanChecks.compactMap { $0(nil) }
+                    guard outs.count == leanChecks.count else { return [] }
+                    eval(outs.flatMap { $0 })
+                    return outs
+                }
+            } catch {
+                leanReferences = []
+            }
+            alive = alive.filter { entry in
+                guard entry.variant.lean else { return true }
+                guard !leanReferences.isEmpty else {
+                    dropped.append("\(entry.variant.name) lean check unavailable")
+                    return false
+                }
+                guard elapsed() < budgetSeconds else {
+                    dropped.append("\(entry.variant.name) budget")
+                    return false
+                }
+                do {
+                    let same = try withError { () -> Bool in
+                        var ok = MLXArray(true)
+                        for (i, run) in leanChecks.enumerated() {
+                            guard let out = run(entry.config), out.count == leanReferences[i].count else { return false }
+                            for (a, b) in zip(out, leanReferences[i]) { ok = logicalAnd(ok, NemotronU2.equal(a, b)) }
+                        }
+                        return ok.item(Bool.self)
+                    }
+                    if !same { dropped.append("\(entry.variant.name) differs@lean") }
+                    return same
+                } catch {
+                    dropped.append("\(entry.variant.name) error")
+                    return false
+                }
+            }
+            leanChecked = leanChecks.count
+        }
 
         // Time V0 and the survivors round robin (`NemotronTuneAdoption.order`): one chain of every timing link per
         // sample, each link depending on the one before it, built before the clock starts; median ms per launch.
@@ -6322,7 +6918,8 @@ enum NemotronQMVTune {
                 alive = []
             }
             if !alive.isEmpty, samples.allSatisfy({ $0.count == reps }) {
-                verdict = NemotronTuneAdoption.decide(samples, medianBar: medianBars[family] ?? family.medianBar)
+                verdict = NemotronTuneAdoption.decide(samples, medianBar: medianBars[family] ?? family.medianBar,
+                                                      winBar: winBar)
                 medians = verdict?.medians ?? []
             } else {
                 if !alive.isEmpty { dropped.append("timing incomplete") }
@@ -6354,12 +6951,14 @@ enum NemotronQMVTune {
         let pickedIndex = picked.flatMap { p in alive.firstIndex(where: { $0.variant == p.variant }).map { $0 + 1 } }
         let times = alive.indices.map { "\(alive[$0].variant.name) \(ms($0 + 1)) \(verdict?.won($0 + 1) ?? "n/a")" }
         let incName = "r\(inc.rps)n\(inc.nsg)l\(inc.load)u\(inc.u2 ? 1 : 0)\(inc.hf.map { "hf\($0)" } ?? "")"
-            + (inc.regs ? "rg" : "") + (inc.e32 ? "e32" : "")
+            + (inc.regs ? "rg" : "") + (inc.e32 ? "e32" : "") + (inc.tsl ? "t" : "")
         let rule = verdict?.rule({ alive[$0 - 1].variant.name }) ?? "no candidate timed"
         return "\(why) \(picked?.variant.name ?? "V0") \(ms(pickedIndex ?? 0)) ms vs V0 (\(incName)) \(ms(0)) ms per launch"
             + " (\(rule); median of \(reps), \(chain) chained launches/sample; \(alive.count)/\(all.count)"
             + " bitwise over"
-            + " \(checks.count) cases on \(layers) tensors" + (twin != nil ? ", V0 twin bitwise" : "")
+            + " \(checks.count) cases on \(layers) tensors"
+            + (leanChecked > 0 ? " (lean rows also over \(leanChecked) special-value cases)" : "")
+            + (twin != nil ? ", V0 twin bitwise" : "")
             + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
             + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(8).joined(separator: ", ")) + ")"
     }
@@ -6672,7 +7271,8 @@ enum NemotronFC2Tune {
         let copies = all.filter(\.dict)
         guard !copies.isEmpty else { return report("off (no dictionary copy)") }
         let (picked, message) = run(copies: copies, slots: 18, densities: [0.0875, 0.45, 1], timedDensity: 0.0875,
-                                    chain: 2 * copies.count, forced: forced, budget: 1.0, elapsed: elapsed)
+                                    chain: 2 * copies.count, forced: forced,
+                                    budget: 1.0 * nemotronWindowTuneBudgetScale, elapsed: elapsed)
         choice = picked
         report(message + ", dictionary copies \(copies.count)/\(all.count))")
     }
@@ -6700,7 +7300,8 @@ enum NemotronFC2Tune {
             return report("off (no draft dictionary copy with a dep twin)")
         }
         let (picked, message) = run(copies: dicts, slots: 6, densities: [0.45, 0.0875, 1, 0.2, 0.7], timedDensity: 0.45,
-                                    chain: 40, forced: draftForced, budget: 0.8, elapsed: elapsed)
+                                    chain: 40, forced: draftForced,
+                                    budget: 0.8 * nemotronWindowTuneBudgetScale, elapsed: elapsed)
         draftChoice = picked
         report(message + ")")
     }
@@ -6918,21 +7519,54 @@ extension NemotronMoELeader {
 
 // MARK: - Shared adoption rule of the load-time tunes
 //
-// Every load-time tune (FC1, dictionary QMV, verify and draft FC2, SSM anchor, verify SDPA, the seed retiles and
-// the seed SSM tune) times its incumbent (candidate 0) and the candidates that passed its bit check in cycles: each
-// cycle takes one sample of every candidate, in `order`. `decide` picks the candidate with the lowest median and
-// adopts it only when both hold:
-// - its median is at least 3% below the incumbent's;
+// Every load-time tune (FC1, dictionary QMV, verify and draft FC2, the draft families and draft SDPA, SSM anchor,
+// verify SDPA, the seed retiles, the seed QMM tune and the seed SSM tune) times its incumbent (candidate 0) and the
+// candidates that passed its bit check in cycles: each cycle takes one sample of every candidate, in `order`.
+// The decode-round tunes take the single-tier rule: `decide` picks the candidate with the lowest median and adopts
+// it only when both hold:
+// - its median is at least 3% below the incumbent's (`medianBar`, or the tune's own bar);
 // - it was faster than the incumbent in at least 75% of the cycles (each cycle's two samples compared).
-// Otherwise the incumbent stays. Every tune times at least `minCycles` cycles. A tune's FORCE switch is applied by
-// the tune before the rule and bypasses it.
+// Otherwise the incumbent stays; `cycles` and the tunes' load caps are unscaled.
+// The seed tunes (`seed: true`) take the seed rule: the two-tier shared bar (`seedMedianBar`, `strongBar`,
+// `narrowWinBar`) or their own bar (`nemotronSeedTuneMedianBar`, with `winBar` throughout); of the candidates that
+// pass, the lowest median; timed cycles scaled by `nemotronTuneTimingScale` and load caps by
+// `nemotronTuneBudgetScale`. NEMOTRON_WINDOW_TUNE_RULE=two-tier gives the decode-round tunes the seed rule too.
+// Every tune times at least `minCycles` cycles. A tune's FORCE switch is applied by the tune before the rule and
+// bypasses it.
+/// Multiplier on the seed tunes' timed cycles (`NemotronTuneAdoption.cycles(seed: true)`, the seed retiles' fixed
+/// counts). NEMOTRON_TUNE_TIMING_SCALE=1 restores the earlier counts.
+let nemotronTuneTimingScale: Double = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_TIMING_SCALE"] ?? "")
+    .map { min(max($0, 0.5), 8) } ?? 2.0
+/// Multiplier on the seed tunes' soft load caps (seed QMM and seed scan-window tunes). The caps only bound the
+/// untimed load: each variant's first launch JITs its pipeline, so a cap sized on a warm cache can stop a tune before
+/// its later kinds, variants or timing phase start on a fresh ranked load. NEMOTRON_TUNE_BUDGET_SCALE=1 restores the
+/// earlier caps.
+let nemotronTuneBudgetScale: Double = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_BUDGET_SCALE"] ?? "")
+    .map { min(max($0, 0.25), 20) } ?? 3.0
+/// NEMOTRON_WINDOW_TUNE_RULE=two-tier: the decode-round tunes (FC1, QMV, verify and draft FC2, the draft families and
+/// draft SDPA, verify SDPA, SSM anchor) take the seed rule as well (the two-tier shared bar, both scales). Otherwise
+/// they keep the single-tier rule, unscaled cycles and unscaled load caps.
+let nemotronWindowTuneTwoTier = ProcessInfo.processInfo.environment["NEMOTRON_WINDOW_TUNE_RULE"] == "two-tier"
+/// Multiplier on the decode-round tunes' soft load caps (QMV, FC2 verify and draft, draft chain, SSM anchor): 1, or
+/// `nemotronTuneBudgetScale` under NEMOTRON_WINDOW_TUNE_RULE=two-tier.
+let nemotronWindowTuneBudgetScale: Double = nemotronWindowTuneTwoTier ? nemotronTuneBudgetScale : 1.0
+
 enum NemotronTuneAdoption {
     /// Fewest timed cycles of a tune.
     static let minCycles = 16
-    /// An adopted candidate's median is at most this fraction of the incumbent's.
-    static let medianBar = 0.97
+    /// The decode-round tunes' shared bar: an adopted candidate's median is at most this fraction of the
+    /// incumbent's (`seedMedianBar` under NEMOTRON_WINDOW_TUNE_RULE=two-tier).
+    static let medianBar = nemotronWindowTuneTwoTier ? seedMedianBar : 0.97
+    /// The seed rule's shared bar. NEMOTRON_TUNE_BAR sets it (0.97 makes it single-tier).
+    static let seedMedianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_BAR"] ?? "")
+        .map { min(max($0, 0.5), 1.0) } ?? 0.99
     /// An adopted candidate beats the incumbent in at least this fraction of the cycles.
     static let winBar = 0.75
+    /// Two-tier rule for the tunes on the seed rule's shared bar: a candidate whose median is at least 3% below the
+    /// incumbent's (`strongBar`) needs `winBar`; one between 1% and 3% below (`seedMedianBar` .. `strongBar`) needs
+    /// `narrowWinBar` of the paired cycles. Tunes that pass their own bar keep `winBar` throughout.
+    static let strongBar = 0.97
+    static let narrowWinBar = 0.85
 
     /// The candidates' order in cycle `cycle`: rotated by cycle / 2, reversed on odd cycles. Over each pair of
     /// cycles every candidate takes mirrored positions and every two candidates run in both orders, so a drift
@@ -6942,9 +7576,16 @@ enum NemotronTuneAdoption {
         return cycle % 2 == 0 ? rotated : Array(rotated.reversed())
     }
 
-    /// Timed cycles for rounds of `wall` ms: `target` ms worth, at least `minCycles`, at most `cap`, even.
-    static func cycles(target: Double, wall: Double, cap: Int) -> Int {
-        let n = max(minCycles, min(cap, Int(target / max(wall, 0.01))))
+    /// Timed cycles for rounds of `wall` ms: `target` ms worth, at least `minCycles`, at most `cap`, even. On the seed
+    /// rule (`seed`, or NEMOTRON_WINDOW_TUNE_RULE=two-tier), target and cap are scaled by `nemotronTuneTimingScale`
+    /// (more paired cycles behind every verdict of the two-tier rule).
+    static func cycles(target: Double, wall: Double, cap: Int, seed: Bool = false) -> Int {
+        guard seed || nemotronWindowTuneTwoTier else {
+            let n = max(minCycles, min(cap, Int(target / max(wall, 0.01))))
+            return n - n % 2
+        }
+        let scaledCap = max(minCycles, Int((Double(cap) * nemotronTuneTimingScale).rounded()))
+        let n = max(minCycles, min(scaledCap, Int(target * nemotronTuneTimingScale / max(wall, 0.01))))
         return n - n % 2
     }
 
@@ -6954,7 +7595,8 @@ enum NemotronTuneAdoption {
         /// Cycles in which each candidate was faster than the incumbent (0 for the incumbent).
         let wins: [Int]
         let cycles: Int
-        /// The candidate with the lowest median besides the incumbent.
+        /// The candidate with the lowest median besides the incumbent (on the seed rule, the adopted candidate when
+        /// there is one).
         let best: Int?
         /// `best` when it passes both bars.
         let adopted: Int?
@@ -6972,18 +7614,52 @@ enum NemotronTuneAdoption {
 
     /// `samples[i][c]`: candidate i's time in cycle c (i = 0: the incumbent); every candidate has the same cycles.
     /// `eligible(i)`: whether candidate i may be judged (a tune that drops a candidate after its timing leaves it
-    /// out; its median and wins are still reported).
+    /// out; its median and wins are still reported). `ownBar`: the tune's own median bar (nil: its rule's shared bar).
+    /// `ownWinBar`: the tune's own fraction of cycles an adopted candidate wins (nil: `winBar`; the two-tier rule's
+    /// narrow band keeps `narrowWinBar`). With it, the single tier picks as the two-tier rule does: of the
+    /// candidates that pass both bars, the lowest median.
+    /// `seed`: the seed rule (the decode-round tunes take it only under NEMOTRON_WINDOW_TUNE_RULE=two-tier).
     static func decide(_ samples: [[Double]], eligible: (Int) -> Bool = { _ in true },
-                       medianBar bar: Double = medianBar) -> Verdict {
+                       medianBar ownBar: Double? = nil, winBar ownWinBar: Double? = nil,
+                       seed: Bool = false) -> Verdict {
         let cycles = samples.first?.count ?? 0
         let medians = samples.map { $0.isEmpty ? Double.nan : $0.sorted()[$0.count / 2] }
         let wins = samples.map { s in zip(s, samples[0]).filter { $0.0 < $0.1 }.count }
         let best = medians.indices.dropFirst().filter(eligible).min(by: { medians[$0] < medians[$1] })
+        let twoTier = seed || nemotronWindowTuneTwoTier
+        let bar = ownBar ?? (twoTier ? seedMedianBar : medianBar)
         var adopted: Int? = nil
-        if let b = best, cycles > 0, samples.allSatisfy({ $0.count == cycles }), medians[b] <= bar * medians[0],
-           Double(wins[b]) >= winBar * Double(cycles) {
-            adopted = b
+        guard twoTier else {
+            if let own = ownWinBar {
+                // Single tier on the tune's own win bar: of the candidates that pass both bars, the lowest median.
+                if cycles > 0, samples.allSatisfy({ $0.count == cycles }) {
+                    adopted = medians.indices.dropFirst()
+                        .filter { eligible($0) && medians[$0] <= bar * medians[0]
+                            && Double(wins[$0]) >= own * Double(cycles) }
+                        .min(by: { medians[$0] < medians[$1] })
+                }
+                return Verdict(medians: medians, wins: wins, cycles: cycles, best: adopted ?? best, adopted: adopted)
+            }
+            // Single tier: the lowest median, adopted only when it passes both bars.
+            if let b = best, cycles > 0, samples.allSatisfy({ $0.count == cycles }), medians[b] <= bar * medians[0],
+               Double(wins[b]) >= winBar * Double(cycles) {
+                adopted = b
+            }
+            return Verdict(medians: medians, wins: wins, cycles: cycles, best: best, adopted: adopted)
         }
-        return Verdict(medians: medians, wins: wins, cycles: cycles, best: best, adopted: adopted)
+        // The seed rule's shared bar is two-tier (`strongBar`, `narrowWinBar`); a tune's own bar keeps `winBar`
+        // throughout.
+        let tiered = bar == seedMedianBar && bar > strongBar
+        func passes(_ i: Int) -> Bool {
+            guard medians[i] <= bar * medians[0] else { return false }
+            let needed = tiered && medians[i] > strongBar * medians[0] ? narrowWinBar : (ownWinBar ?? winBar)
+            return Double(wins[i]) >= needed * Double(cycles)
+        }
+        // Of the candidates that pass both bars, the lowest median.
+        if cycles > 0, samples.allSatisfy({ $0.count == cycles }) {
+            adopted = medians.indices.dropFirst().filter { eligible($0) && passes($0) }
+                .min(by: { medians[$0] < medians[$1] })
+        }
+        return Verdict(medians: medians, wins: wins, cycles: cycles, best: adopted ?? best, adopted: adopted)
     }
 }
