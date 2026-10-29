@@ -61,6 +61,8 @@ private final class NemotronMTPDraftHead {
         /// The B1 select without the ticket (`NemotronHeadScreen.noTicketEnabled`),
         /// set once its pick, kept rows and chunk bests matched the fused B1 select.
         var noTicket = false
+        /// Identical native screen policy, omitting outputs never consumed by greedy calls.
+        var bestOnly = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -90,6 +92,16 @@ private final class NemotronMTPDraftHead {
         else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
         // `NemotronDraftTune` (screen): the paired 2-bit partial pass at the geometry adopted at load.
         let tuned = screen.records2 != nil && screen.paired ? NemotronDraftTune.adopted[.screen] : nil
+        if screen.bestOnly, !NemotronHeadScreen.check, let records2 = screen.records2,
+           let result = NemotronHeadScreen.runBestOnly(hidden,
+            weight: screen.weight, scales: screen.scales, biases: screen.biases,
+            records2: records2, groups: screen.groups, groupCount: screen.groupCount,
+            chunk: screen.chunk, keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
+            upperGroupCount: upper ? screen.upperGroupCount : 0, paired: screen.paired,
+            rowsPerSimdgroup: tuned?.rps ?? 8, simdgroups: tuned?.nsg ?? 2, tunedPartial: tuned != nil) {
+            NemotronScreenPicks.register(result.id, .init(values: result.bestValues, ids: result.bestIds))
+            return result.id
+        }
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
@@ -105,6 +117,76 @@ private final class NemotronMTPDraftHead {
             checkAgainstStock(hidden, result, screen)
         }
         return result.id
+    }
+
+    /// Official-worker only: identical original producer and native winner/pick semantics; no counter mutation.
+    private func qualifyBestOnly(_ plan: Screen, gamma: MLXArray) -> Bool {
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron draft bests only: \(text)\n".utf8))
+        }
+        guard NemotronHeadScreen.bestOnlyRequested, plan.noTicket, plan.b1,
+              let records2 = plan.records2, let prefix, let head = target.lmHead as? QuantizedLinear else {
+            report("off (setting or no admitted plan)")
+            return false
+        }
+        var cases = 0
+        do {
+            let equal = try withError { () -> Bool in
+                var state: UInt64 = 0x082E_FA98_EC4E_6C89
+                var checks: [MLXArray] = []
+                for round in 0 ..< 12 {
+                    let values = (0 ..< 2688).map { _ -> Float in
+                        state = state &* 6364136223846793005 &+ 1442695040888963407
+                        return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                    }
+                    var x = (MLXArray(values) * gamma.asType(.float32) * Float(1 + round % 3))
+                        .asType(.bfloat16).reshaped(1, 1, 2688)
+                    if round == 6 { x = MLXArray.zeros([1, 1, 2688], dtype: .bfloat16) }
+                    if round == 7 { x = MLXArray([Float](repeating: -0.0, count: 2688))
+                        .asType(.bfloat16).reshaped(1, 1, 2688) }
+                    if round == 8 {
+                        let padded = concatenated([MLXArray.zeros([1], dtype: .bfloat16), x.reshaped(2688)], axis: 0)
+                        x = padded[1 ..< 2689].reshaped(1, 1, 2688)
+                    }
+                    if round >= 9 {
+                        var special = values
+                        special[(round * 223) % 2688] = round == 9 ? Float.infinity
+                            : (round == 10 ? -Float.infinity : Float.nan)
+                        x = MLXArray(special).asType(.bfloat16).reshaped(1, 1, 2688)
+                    }
+                    for full in plan.upperGroups == nil ? [false] : [false, true] {
+                        let old = NemotronHeadScreen.run(x,
+                            weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: plan.groupCount, chunk: plan.chunk, keep: plan.keep,
+                            upperGroups: full ? plan.upperGroups : nil, upperGroupCount: full ? plan.upperGroupCount : 0,
+                            records2: records2, paired: plan.paired, b1: true, noTicket: true)
+                        guard let new = NemotronHeadScreen.runBestOnly(x,
+                            weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            records2: records2, groups: plan.groups, groupCount: plan.groupCount,
+                            chunk: plan.chunk, keep: plan.keep, upperGroups: full ? plan.upperGroups : nil,
+                            upperGroupCount: full ? plan.upperGroupCount : 0, paired: plan.paired),
+                              let bestValues = old.bestValues, let bestIds = old.bestIds else { return false }
+                        checks.append((old.scores.view(dtype: .uint32) .== new.scores.view(dtype: .uint32)).all()
+                            .&& (bestValues.view(dtype: .uint32) .== new.bestValues.view(dtype: .uint32)).all()
+                            .&& (bestIds .== new.bestIds).all() .&& (old.id .== new.id).all())
+                        if round < 9 {
+                            let logits = (full ? head(x) : prefix(x))[0, -1].asType(.float32)
+                            let expected = take(logits, bestIds, axis: 0)
+                            checks.append((expected.view(dtype: .uint32) .== new.bestValues.view(dtype: .uint32)).all())
+                        }
+                        cases += 1
+                    }
+                }
+                eval(checks)
+                return !checks.isEmpty && checks.allSatisfy { $0.item(Bool.self) }
+            }
+            report(equal ? "on (\(cases) partial/best/pick cases bitwise equal; candidate stores omitted)"
+                         : "off (source or output words differ)")
+            return equal
+        } catch {
+            report("off (\(error))")
+            return false
+        }
     }
 
     /// NEMOTRON_MTP_HEAD_SCREEN_CHECK=1 only: synchronous comparison with the
@@ -677,6 +759,7 @@ private final class NemotronMTPDraftHead {
         } else {
             partialOffset32Note = "off (no paired full-head 2-bit screen)"
         }
+        plan.bestOnly = qualifyBestOnly(plan, gamma: gamma)
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -901,6 +984,11 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
                               from: MLXArray)?
         var deferredSecondRow: (keys: MLXArray, values: MLXArray)?
+        /// The prompt history `primeHistoryAfterSeed` primed ahead of the first
+        /// draft step and the head-cache offset it started at. Kept until the
+        /// first round finalizes; an observation before then restores the
+        /// unprimed state first (`unprimeSeedHistory`).
+        var seedPrimed: (tokens: [MLXArray], hidden: [MLXArray], offset: Int)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -917,9 +1005,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             return [snapshot.keys, snapshot.values]
         }
         var arrays: [MLXArray] {
-            let base: [MLXArray] = (paged?.cache.innerState() ?? [])
+            var base: [MLXArray] = (paged?.cache.innerState() ?? [])
                 + pendingTokens + pendingHidden + savedTokens + savedHidden
                 + [frontier, savedFrontier].compactMap { $0 } + roots
+            if let primed = seedPrimed { base += primed.tokens + primed.hidden }
             guard let row = deferredSecondRow else { return base }
             return base + [row.keys, row.values]
         }
@@ -1058,6 +1147,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         let n = observation.tokens.dim(1)
         precondition(observation.tokens.shape == [1, n] && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
         guard n > 0 else { return }
+        unprimeSeedHistory(s)
         // Keep every known (next token, previous target hidden) pair, including
         // the bridge between prefill chunks. The final frontier pairs with the
         // next observed token or the seed supplied to draftStep.
@@ -1109,16 +1199,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // matters for quantized projections whose selected graph may depend
         // on row count. It also bounds temporary fused/K/V tensors.
         if primePromptHistory && !s.started && !s.pendingTokens.isEmpty {
-            let ids = concatenated(s.pendingTokens, axis: 1)
-            let rows = concatenated(s.pendingHidden, axis: 1)
-            for start in stride(from: 0, to: ids.dim(1), by: 512) {
-                let end = min(start + 512, ids.dim(1))
-                let primed = module.appendTrustedKV(
-                    hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
-                asyncEval(primed)
-                s.roots = primed
-            }
+            primeHistory(s)
         } else {
             // Post-prefill accepted target rows retain one-token arithmetic.
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
@@ -1156,6 +1237,21 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         return (ids, out)
     }
 
+    /// The fixed-width priming of the pending prompt history: 512-row
+    /// chunks of the concatenated rows, each appended and submitted.
+    private func primeHistory(_ s: State) {
+        let ids = concatenated(s.pendingTokens, axis: 1)
+        let rows = concatenated(s.pendingHidden, axis: 1)
+        for start in stride(from: 0, to: ids.dim(1), by: 512) {
+            let end = min(start + 512, ids.dim(1))
+            let primed = module.appendTrustedKV(
+                hidden: rows[0..., start..<end, 0...],
+                embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+            asyncEval(primed)
+            s.roots = primed
+        }
+    }
+
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { state(requestState).arrays }
     public func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
         committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {
@@ -1190,6 +1286,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         s.committedInputCount += confirmedInputTokens
         s.canPrestageFirstDraft = s.started
         s.started = true
+        s.seedPrimed = nil
         s.paged!.row.commitSpeculativeWrite()
         clearRound(s)
         // The engine has already read and reconciled exact target acceptance.
@@ -1225,8 +1322,38 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         clearRound(s)
         s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
         s.paged?.release(); s.paged = nil
-        s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil
+        s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil; s.seedPrimed = nil
         s.committedInputCount = 0; s.released = true
+    }
+}
+
+extension NemotronH35MTPAssistant: CBv2MTPSeedHistoryPriming {
+    /// `draftStep`'s prompt-history priming for the request's first draft,
+    /// issued at the end of the step that produced its carry: the same
+    /// pending rows, chunks and appends (`primeHistory`), before the first
+    /// round opens. The frontier stays for that draft's seed row.
+    public func primeHistoryAfterSeed(requestState: any CBv2MTPRequestState) {
+        let s = state(requestState)
+        guard primePromptHistory, !s.started, s.stagedInputCount == 0, s.seedPrimed == nil,
+              s.paged != nil, !s.pendingTokens.isEmpty
+        else { return }
+        s.seedPrimed = (tokens: s.pendingTokens, hidden: s.pendingHidden, offset: s.cacheOffset)
+        primeHistory(s)
+        s.pendingTokens = []
+        s.pendingHidden = []
+    }
+
+    /// Undoes `primeHistoryAfterSeed` before the history grows: the head
+    /// cache back to the offset it started at and the primed rows pending
+    /// again ahead of anything queued since, so `draftStep` primes the whole
+    /// history in its fixed-width chunks.
+    fileprivate func unprimeSeedHistory(_ s: State) {
+        guard let primed = s.seedPrimed else { return }
+        s.seedPrimed = nil
+        s.paged!.row.rollback(s.cacheOffset - primed.offset)
+        s.pendingTokens = primed.tokens + s.pendingTokens
+        s.pendingHidden = primed.hidden + s.pendingHidden
+        s.roots = []
     }
 }
 
