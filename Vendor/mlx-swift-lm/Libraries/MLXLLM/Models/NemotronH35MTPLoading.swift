@@ -127,6 +127,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronMTPVerifySDPA.tune(target)
+        NemotronMTPAttentionProjectionGraphAdmission.qualify(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
