@@ -1451,9 +1451,9 @@ final class NemotronH35MTPExpertBlock: Module {
                    draftDep: sx, activation: { fc1 = $0 }),
                routed.shape == [6 * 2688], let fc1,
                let shared = sharedExperts.draftDown(sx, dep: fc1),
-               let joined = NemotronHResidualRMSNorm.applySum(
+               let joined = NemotronHResidualRMSNorm.finalSumNormalized(
                    x, routed, shared: shared, norm: finalNorm, sharedFirst: true) {
-                return joined.1
+                return joined
             }
         }
         // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
@@ -1463,8 +1463,8 @@ final class NemotronH35MTPExpertBlock: Module {
                 h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
         let shared = early ?? sharedExperts(h)
-        if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
-            return joined.1
+        if let joined = NemotronHResidualRMSNorm.finalSumNormalized(x, routed, shared: shared, norm: finalNorm) {
+            return joined
         }
         return finalNorm(x + (routed + shared))
     }
@@ -2501,18 +2501,99 @@ extension NemotronMTPDraftSDPA {
     }
 
     /// The paged launch's outputs: [out], or with `live` (a [1] int32 fence) its fenced twin's [out, live + 1].
+    /// `NemotronDraftTune` (sdpa): the form (fenced or not) the tune checked launches the adopted variant.
     private static func pagedOutputs(
         queries: MLXArray, read: CBv2PagedDirectRead, own: (keys: MLXArray, values: MLXArray)?,
         scale: Float, mask: MLXArray, live: MLXArray?
+    ) -> [MLXArray]? {
+        let tuned = NemotronDraftTune.adopted[.sdpa].flatMap { (live != nil) == NemotronDraftTune.sdpaFenced ? $0 : nil }
+        return tuneOutputs(tuned, queries: queries, read: read, own: own, scale: scale, mask: mask, live: live,
+                           dep: queries)
+    }
+
+    /// `NemotronDraftTune` (sdpa): the paged launch's text under geometry `g` by counted swaps (nil when a statement
+    /// moved). `g.unroll` 8: eight keys per step of the key loop (their mask, K and V loads first, then the same
+    /// per-key statements in key order; the one-key remainder loop unchanged). `g.keys` 1: key offsets in 32 bits
+    /// (`nmp_at`, `vbase`: the same element addresses); 2: in 32 bits, and lane l holds the page of its SIMD group's
+    /// key simd_gid + 32 l (one load per lane before the key loop), which `nmp_at` takes by `simd_shuffle` (the slot
+    /// is the SIMD group's constant: 32 keys are two 16-slot pages). `g.packed`: the step's K and V stay T until their
+    /// products (`static_cast<U>`, the values the incumbent converts at the load). Every score, online-softmax
+    /// update, aggregation and store keeps the incumbent's statements and order.
+    static func tuneSource(_ g: NemotronDraftTune.Geometry, own: Bool) -> String? {
+        guard let s = pagedSource(own: own), g.unroll == 4 || g.unroll == 8, (0 ... 2).contains(g.keys) else { return nil }
+        let at64 = "auto nmp_at = [&](int key) -> size_t {\n"
+            + "  const int off = first_slot + key;\n"
+            + "  return ((size_t(pages[off / PS]) * KVH + kv_head_idx) * PS + size_t(off % PS)) * D;\n"
+            + "};\n"
+        let at32 = "auto nmp_at = [&](int key) -> uint {\n"
+            + "  const uint off = uint(first_slot + key);\n"
+            + "  return ((uint(pages[off / PS]) * KVH + uint(kv_head_idx)) * PS + off % PS) * D;\n"
+            + "};\n"
+        let atLanes = "// Lane l: the page of this SIMD group's key simd_gid + l * BN (keys below L).\n"
+            + "static_assert(BN % PS == 0, \"the slot of a SIMD group's keys is constant\");\n"
+            + "const uint nmp_off0 = uint(first_slot) + simd_gid;\n"
+            + "const uint nmp_slot = (uint(kv_head_idx) * PS + nmp_off0 % PS) * D;\n"
+            + "uint nmp_pg = 0;\n"
+            + "if (int(simd_gid + simd_lid * BN) < L) {\n"
+            + "  nmp_pg = uint(pages[(nmp_off0 + simd_lid * BN) / PS]);\n"
+            + "}\n"
+            + "auto nmp_at = [&](int key) -> uint {\n"
+            + "  const uint page = simd_shuffle(nmp_pg, ushort(uint(key - int(simd_gid)) / BN));\n"
+            + "  return page * (KVH * PS * D) + nmp_slot;\n"
+            + "};\n"
+        var swaps: [(String, String, Int)] = []
+        if g.keys > 0 {
+            swaps += [("const size_t vbase = size_t(uint(prm[2]));\n", "const uint vbase = uint(prm[2]);\n", 1),
+                      ("const size_t at = ", "const uint at = ", 2),
+                      (at64, g.keys == 1 ? at32 : atLanes, 1)]
+        }
+        if g.unroll == 8 {
+            swaps += [("for (; i + 3 * BN < N; i += 4 * BN) {\n", "for (; i + 7 * BN < N; i += 8 * BN) {\n", 1),
+                      ("T mk[4];\n", "T mk[8];\n", 1),
+                      ("U kk[4][qk_per_thread];\n", "U kk[8][qk_per_thread];\n", 1),
+                      ("U vv[4][v_per_thread];\n", "U vv[8][v_per_thread];\n", 1),
+                      ("for (int u = 0; u < 4; u++) {\n", "for (int u = 0; u < 8; u++) {\n", 3),
+                      ("U key_scores[4];\n", "U key_scores[8];\n", 1),
+                      ("fm += 4 * BN * mask_kv_seq_stride;\n", "fm += 8 * BN * mask_kv_seq_stride;\n", 1)]
+        }
+        if g.packed {
+            swaps += [("U kk[\(g.unroll)][qk_per_thread];\n", "T kk[\(g.unroll)][qk_per_thread];\n", 1),
+                      ("U vv[\(g.unroll)][v_per_thread];\n", "T vv[\(g.unroll)][v_per_thread];\n", 1),
+                      ("score += q[j] * kk[u][j];\n", "score += q[j] * static_cast<U>(kk[u][j]);\n", 1),
+                      ("o[j] = o[j] * factor + exp_score * vv[u][j];\n",
+                       "o[j] = o[j] * factor + exp_score * static_cast<U>(vv[u][j]);\n", 1)]
+        }
+        return nemotronCountedSwaps(s, swaps)
+    }
+
+    private static func tuneKernel(_ g: NemotronDraftTune.Geometry, own: Bool, fenced: Bool) -> MLXFast.MLXFastKernel? {
+        let name = "nemotron_draft_tune_sdpa_\(g)" + (own ? "_own" : "") + (fenced ? "_fe" : "")
+        return NemotronDraftTune.cached(name) {
+            tuneSource(g, own: own).map {
+                MLXFast.metalKernel(
+                    name: name,
+                    inputNames: ["queries", "storage", "pages", "prm", "fmask", "scale", "fence"]
+                        + (own ? ["own_keys", "own_values"] : []) + (fenced ? ["live"] : []) + ["dep"],
+                    outputNames: ["out"] + (fenced ? ["fence_out"] : []),
+                    source: (fenced ? fenceStore : "") + $0, ensureRowContiguous: false)
+            }
+        }
+    }
+
+    /// The paged launch's outputs through the incumbent kernels (`g` nil) or through `NemotronDraftTune`'s sdpa
+    /// kernel of geometry `g` (`tuneSource`; its unread `dep` input bound last). Nil outside the served shapes.
+    static func tuneOutputs(
+        _ g: NemotronDraftTune.Geometry?, queries: MLXArray, read: CBv2PagedDirectRead,
+        own: (keys: MLXArray, values: MLXArray)?, scale: Float, mask: MLXArray, live: MLXArray?, dep: MLXArray
     ) -> [MLXArray]? {
         let n = read.count + (own == nil ? 0 : 1)
         guard pagedEnabled, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
               servesPaged(read), queries.shape == [1, 32, 1, 128], queries.dtype == .bfloat16,
               (1 ..< 1024).contains(n), mask.shape == [1, 1, 1, n], mask.dtype == .bfloat16,
               live.map({ $0.shape == [1] && $0.dtype == .int32 }) ?? true,
-              let kernel = live == nil
+              let kernel = g.map({ tuneKernel($0, own: own != nil, fenced: live != nil) }) ?? (live == nil
                 ? (own == nil ? pagedKernel : pagedOwnKernel)
-                : (own == nil ? pagedFencedKernel : pagedOwnFencedKernel)
+                : (own == nil ? pagedFencedKernel : pagedOwnFencedKernel))
         else { return nil }
         if let own {
             guard own.keys.shape == [1, 2, 1, 128], own.values.shape == [1, 2, 1, 128],
@@ -2522,7 +2603,7 @@ extension NemotronMTPDraftSDPA {
         }
         let prm = MLXArray([Int32(read.count), Int32(read.firstSlot), Int32(read.valueOffset)])
         let inputs = [queries, read.storage, read.pages, prm, mask, scaleArray(scale), read.writeFence]
-            + (own.map { [$0.keys, $0.values] } ?? []) + (live.map { [$0] } ?? [])
+            + (own.map { [$0.keys, $0.values] } ?? []) + (live.map { [$0] } ?? []) + (g == nil ? [] : [dep])
         return kernel(
             inputs, template: [("T", DType.bfloat16), ("D", 128), ("V", 128), ("OWN", own != nil),
                                ("KVH", 2), ("PS", 16)],
