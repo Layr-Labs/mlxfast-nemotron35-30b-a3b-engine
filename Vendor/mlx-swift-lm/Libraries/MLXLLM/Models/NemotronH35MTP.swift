@@ -61,6 +61,8 @@ private final class NemotronMTPDraftHead {
         /// The B1 select without the ticket (`NemotronHeadScreen.noTicketEnabled`),
         /// set once its pick, kept rows and chunk bests matched the fused B1 select.
         var noTicket = false
+        /// Identical native screen policy, omitting outputs never consumed by greedy calls.
+        var bestOnly = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -90,6 +92,16 @@ private final class NemotronMTPDraftHead {
         else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
         // `NemotronDraftTune` (screen): the paired 2-bit partial pass at the geometry adopted at load.
         let tuned = screen.records2 != nil && screen.paired ? NemotronDraftTune.adopted[.screen] : nil
+        if screen.bestOnly, !NemotronHeadScreen.check, let records2 = screen.records2,
+           let result = NemotronHeadScreen.runBestOnly(hidden,
+            weight: screen.weight, scales: screen.scales, biases: screen.biases,
+            records2: records2, groups: screen.groups, groupCount: screen.groupCount,
+            chunk: screen.chunk, keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
+            upperGroupCount: upper ? screen.upperGroupCount : 0, paired: screen.paired,
+            rowsPerSimdgroup: tuned?.rps ?? 8, simdgroups: tuned?.nsg ?? 2, tunedPartial: tuned != nil) {
+            NemotronScreenPicks.register(result.id, .init(values: result.bestValues, ids: result.bestIds))
+            return result.id
+        }
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
@@ -105,6 +117,76 @@ private final class NemotronMTPDraftHead {
             checkAgainstStock(hidden, result, screen)
         }
         return result.id
+    }
+
+    /// Official-worker only: identical original producer and native winner/pick semantics; no counter mutation.
+    private func qualifyBestOnly(_ plan: Screen, gamma: MLXArray) -> Bool {
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron draft bests only: \(text)\n".utf8))
+        }
+        guard NemotronHeadScreen.bestOnlyRequested, plan.noTicket, plan.b1,
+              let records2 = plan.records2, let prefix, let head = target.lmHead as? QuantizedLinear else {
+            report("off (setting or no admitted plan)")
+            return false
+        }
+        var cases = 0
+        do {
+            let equal = try withError { () -> Bool in
+                var state: UInt64 = 0x082E_FA98_EC4E_6C89
+                var checks: [MLXArray] = []
+                for round in 0 ..< 12 {
+                    let values = (0 ..< 2688).map { _ -> Float in
+                        state = state &* 6364136223846793005 &+ 1442695040888963407
+                        return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                    }
+                    var x = (MLXArray(values) * gamma.asType(.float32) * Float(1 + round % 3))
+                        .asType(.bfloat16).reshaped(1, 1, 2688)
+                    if round == 6 { x = MLXArray.zeros([1, 1, 2688], dtype: .bfloat16) }
+                    if round == 7 { x = MLXArray([Float](repeating: -0.0, count: 2688))
+                        .asType(.bfloat16).reshaped(1, 1, 2688) }
+                    if round == 8 {
+                        let padded = concatenated([MLXArray.zeros([1], dtype: .bfloat16), x.reshaped(2688)], axis: 0)
+                        x = padded[1 ..< 2689].reshaped(1, 1, 2688)
+                    }
+                    if round >= 9 {
+                        var special = values
+                        special[(round * 223) % 2688] = round == 9 ? Float.infinity
+                            : (round == 10 ? -Float.infinity : Float.nan)
+                        x = MLXArray(special).asType(.bfloat16).reshaped(1, 1, 2688)
+                    }
+                    for full in plan.upperGroups == nil ? [false] : [false, true] {
+                        let old = NemotronHeadScreen.run(x,
+                            weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: plan.groupCount, chunk: plan.chunk, keep: plan.keep,
+                            upperGroups: full ? plan.upperGroups : nil, upperGroupCount: full ? plan.upperGroupCount : 0,
+                            records2: records2, paired: plan.paired, b1: true, noTicket: true)
+                        guard let new = NemotronHeadScreen.runBestOnly(x,
+                            weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            records2: records2, groups: plan.groups, groupCount: plan.groupCount,
+                            chunk: plan.chunk, keep: plan.keep, upperGroups: full ? plan.upperGroups : nil,
+                            upperGroupCount: full ? plan.upperGroupCount : 0, paired: plan.paired),
+                              let bestValues = old.bestValues, let bestIds = old.bestIds else { return false }
+                        checks.append((old.scores.view(dtype: .uint32) .== new.scores.view(dtype: .uint32)).all()
+                            .&& (bestValues.view(dtype: .uint32) .== new.bestValues.view(dtype: .uint32)).all()
+                            .&& (bestIds .== new.bestIds).all() .&& (old.id .== new.id).all())
+                        if round < 9 {
+                            let logits = (full ? head(x) : prefix(x))[0, -1].asType(.float32)
+                            let expected = take(logits, bestIds, axis: 0)
+                            checks.append((expected.view(dtype: .uint32) .== new.bestValues.view(dtype: .uint32)).all())
+                        }
+                        cases += 1
+                    }
+                }
+                eval(checks)
+                return !checks.isEmpty && checks.allSatisfy { $0.item(Bool.self) }
+            }
+            report(equal ? "on (\(cases) partial/best/pick cases bitwise equal; candidate stores omitted)"
+                         : "off (source or output words differ)")
+            return equal
+        } catch {
+            report("off (\(error))")
+            return false
+        }
     }
 
     /// NEMOTRON_MTP_HEAD_SCREEN_CHECK=1 only: synchronous comparison with the
@@ -155,11 +237,14 @@ private final class NemotronMTPDraftHead {
         let environment = ProcessInfo.processInfo.environment
         // NEMOTRON_MTP_HEAD_SCREEN_BITS=4 keeps the 4-bit screen (12 groups,
         // upper 8, keep 16 per 1024 rows); the default 2-bit records read 16 /
-        // 6 groups and keep 12 rows per 512-row chunk for the exact rescore.
+        // 6 groups and keep 8 rows per 512-row chunk for the exact rescore
+        // (NEMOTRON_MTP_HEAD_SCREEN_KEEP=12 keeps the previous 12). The 2-bit
+        // screen reads 12 of the head's column groups (the 6 most important
+        // aligned pairs; NEMOTRON_MTP_HEAD_SCREEN_GROUPS=16 keeps the previous 16).
         let bits = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_BITS"] ?? "") ?? 2
-        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? (bits == 2 ? 16 : 12)
+        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 12
         let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? (bits == 2 ? 512 : 1024)
-        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 12 : 16)
+        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 8 : 16)
         let k = NemotronHeadScreen.width, rows = NemotronHeadScreen.rows
         guard (2...16).contains(groupCount), groupCount % 2 == 0,
               [512, 1024, 2048].contains(chunk), keep % 4 == 0, (4...min(chunk / 8, 64)).contains(keep),
@@ -677,6 +762,7 @@ private final class NemotronMTPDraftHead {
         } else {
             partialOffset32Note = "off (no paired full-head 2-bit screen)"
         }
+        plan.bestOnly = qualifyBestOnly(plan, gamma: gamma)
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
