@@ -230,13 +230,30 @@ enum NemotronMTPSSMAnchor {
     static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] != "0"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "")
     /// Soft cap on the tune's load time: the timing does not start past it.
-    static let tuneBudgetSeconds = 1.2
+    static let tuneBudgetSeconds = 1.2 * nemotronWindowTuneBudgetScale
     nonisolated(unsafe) static var tg4Adopted = false
     static let arrival8 = "gr_last = prev == uint((512 / Dh) * (Dh / 8)) - 1u ? 1u : 0u;"
     static let arrival4 = "gr_last = prev == uint((512 / Dh) * (Dh / 4)) - 1u ? 1u : 0u;"
 
     /// Tail form 0 record, 1 shuffle, 2 one barrier (as NemotronHCompactSSMGated's kernels).
     private static func make(form: Int, pending: Bool, store: Store, tg4: Bool) -> MLXFast.MLXFastKernel? {
+        source(form: form, pending: pending, store: store, tg4: tg4).map {
+            launchKernel(name(form: form, pending: pending, store: store, tg4: tg4), $0, pending: pending, store: store)
+        }
+    }
+    static func launchKernel(_ name: String, _ source: String, pending: Bool, store: Store) -> MLXFast.MLXFastKernel {
+        MLXFast.metalKernel(
+            name: name,
+            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
+                         "eps", "counter"] + (pending ? ["pconv", "pdt"] : []),
+            outputNames: store == .anchor ? ["out", "state_out", "normed", "prepared"] : ["out", "normed", "prepared"],
+            source: source, mutableInputs: ["counter"])
+    }
+    static func name(form: Int, pending: Bool, store: Store, tg4: Bool) -> String {
+        "nemotron_mtp_ssm_compact_gated_prepared" + (pending ? "_pending" : "")
+            + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form] + (tg4 ? "_tg4" : "")
+    }
+    static func source(form: Int, pending: Bool, store: Store, tg4: Bool) -> String? {
         let base = pending ? NemotronHCompactSSMGated.pendingSource : NemotronHCompactSSMGated.source
         guard base.components(separatedBy: windowStore).count == 2,
               base.components(separatedBy: windowLoop).count == 2,
@@ -254,13 +271,7 @@ enum NemotronMTPSSMAnchor {
             guard tailed.components(separatedBy: arrival8).count == 2 else { return nil }
             tailed = tailed.replacingOccurrences(of: arrival8, with: arrival4)
         }
-        return MLXFast.metalKernel(
-            name: "nemotron_mtp_ssm_compact_gated_prepared" + (pending ? "_pending" : "")
-                + (store == .anchor ? "_anchor" : "_nostore") + ["", "_sh", "_sh1b"][form] + (tg4 ? "_tg4" : ""),
-            inputNames: ["conv", "A_log", "D", "dt", "state_in", "proj", "weight", "identity",
-                         "eps", "counter"] + (pending ? ["pconv", "pdt"] : []),
-            outputNames: store == .anchor ? ["out", "state_out", "normed", "prepared"] : ["out", "normed", "prepared"],
-            source: tailed, mutableInputs: ["counter"])
+        return tailed
     }
 
     /// [tg4][form][pending][anchor]
@@ -272,11 +283,13 @@ enum NemotronMTPSSMAnchor {
         }
     }
 
+    static var form: Int {
+        NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? 2
+            : NemotronHCompactSSMGated.shuffleQualified && NemotronHCompactSSMGated.shuffleKernel != nil ? 1 : 0
+    }
     /// The form `compactSSMPreparedRows` launches by default after the load-time checks.
     static func kernel(pending: Bool, store: Store, tg4: Bool = false) -> MLXFast.MLXFastKernel? {
-        let form = NemotronHCompactSSMGated.rowsTailQualified && NemotronHCompactSSMGated.rowsKernel != nil ? 2
-            : NemotronHCompactSSMGated.shuffleQualified && NemotronHCompactSSMGated.shuffleKernel != nil ? 1 : 0
-        return kernels[tg4 ? 1 : 0][form][pending ? 1 : 0][store == .anchor ? 1 : 0]
+        kernels[tg4 ? 1 : 0][form][pending ? 1 : 0][store == .anchor ? 1 : 0]
     }
 
     /// The pending count of the latest anchor-skip window (warm-up bookkeeping).
@@ -742,7 +755,7 @@ extension NemotronHRMSNormGated {
         convolution: MLXArray, ALog: MLXArray, D: MLXArray, dt: MLXArray,
         state: MLXArray, projected: MLXArray, heads: Int, headDim: Int, groups: Int,
         stateDim: Int, pending: (conv: MLXArray, dt: MLXArray, steps: Int)?, store: NemotronMTPSSMAnchor.Store,
-        tg4: Bool? = nil
+        tg4: Bool? = nil, tail32: Bool? = nil, tc: Bool? = nil
     ) -> (MLXArray, MLXArray, MLXArray?)? {
         let quad = tg4 ?? NemotronMTPSSMAnchor.tg4Adopted
         if let pending {
@@ -763,8 +776,12 @@ extension NemotronHRMSNormGated {
               projected.shape == [1, 3, 10304], projected.dtype == .bfloat16,
               weight.shape == [4096], weight.dtype == .bfloat16,
               let counter = NemotronHCompactSSMGated.counter,
-              let kernel = NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store, tg4: quad)
+              let kernel = ((tail32 ?? NemotronSSMTail32.admits(tg4: quad))
+                  ? NemotronSSMTail32.kernel(pending: pending != nil, store: store, tg4: quad) : nil)
+                  ?? NemotronMTPSSMAnchor.kernel(pending: pending != nil, store: store, tg4: quad)
         else { return nil }
+        let o32 = (tail32 ?? NemotronSSMTail32.admits(tg4: quad))
+            && NemotronSSMTail32.kernel(pending: pending != nil, store: store, tg4: quad) != nil
         var inputs: [any ScalarOrArray] = [
             convolution, ALog, D, dt, state, projected, weight, NemotronHGatedRMSKernel.identity, eps, counter]
         var template: [(String, any KernelTemplateArg)] = [
@@ -776,8 +793,11 @@ extension NemotronHRMSNormGated {
             template.append(("P", pending.steps))
         }
         let stores = store == .anchor
-        let outputs = kernel(
-            inputs, template: template,
+        let constants = (tc ?? NemotronSSMTailTC.admits(tg4: quad, eps: eps))
+            ? NemotronSSMTailTC.kernel(pending: pending != nil, store: store, tg4: quad, o32: o32)
+                .flatMap { twin in NemotronSSMTailTC.template(eps: eps).map { (twin, $0) } } : nil
+        let outputs = (constants?.0 ?? kernel)(
+            inputs, template: template + (constants?.1 ?? []),
             grid: (32, 64, 64), threadGroup: (32, quad ? 4 : 8, 1),
             outputShapes: [[1, 3, 64, 64]] + (stores ? [[1, 64, 64, 128]] : []) + [[1, 3, 4096], [3, 8, 17 * 32]],
             outputDTypes: [.bfloat16] + (stores ? [.float32] : []) + [.bfloat16, .float32])

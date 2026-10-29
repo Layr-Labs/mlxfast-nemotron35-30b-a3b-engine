@@ -90,10 +90,15 @@ extension NemotronH35MTPAssistant {
         NemotronBankBinding.warm(target, extra: NemotronZSkip.copyArrays + NemotronSBDict.indexArrays)
         NemotronBankBinding.warm(assistant.module, extra: NemotronSBDict.draftBankIndexArrays)
         NemotronFC2Tune.tune(target)
+        NemotronZSkip.qualifySparseOperandsTarget(target)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        NemotronJoin32.qualify(target, head: assistant.module)
+        NemotronJoinEps.qualify(target, head: assistant.module)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronZSkip.qualifyScoreEntry()
         NemotronFC2Tune.tuneDraft(assistant.module)
+        NemotronZSkip.qualifySparseOperandsDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
         NemotronMTPRouterRowsSelect.qualify(target)
@@ -101,15 +106,22 @@ extension NemotronH35MTPAssistant {
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronQMVLean.qualify(target)
+        NemotronMambaInProjConvDt.qualifyTSL(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
+        NemotronDraftTune.tuneVerifyQKV(target)
         NemotronMTPSSMAnchor.tune(target)
+        NemotronSSMTail32.qualify(target)
+        NemotronSSMTailTC.qualify(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronHResidualRMSNorm.qualifyDraftFinalOnly(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoKeysQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
+        cbv2TopTwoColumnsEntryQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -127,6 +139,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronMTPVerifySDPA.tune(target)
+        NemotronMTPAttentionProjectionGraphAdmission.qualify(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
@@ -164,6 +177,7 @@ extension NemotronH35MTPAssistant {
         NemotronSeedDenseRetile.tune(target)
         NemotronSeedQMMTune.tune(target)
         NemotronSeedSSMTune.tune(target)
+        NemotronFC1Tune.qualifyRouteBallot(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -814,4 +828,3 @@ final class NemotronCPUWarm: @unchecked Sendable {
 
 // Measurement entry 1 of this tree.
 
-// Measurement entry 1 of this tree.

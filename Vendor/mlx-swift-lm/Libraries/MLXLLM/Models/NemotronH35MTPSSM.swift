@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXNN
 
 private enum NemotronMTPSSMKernel {
     static let kernel = MLXFast.metalKernel(
@@ -357,5 +358,289 @@ final class NemotronMTPReplayGroup {
             convolution: m.convolution, ALog: m.aLog, D: m.D, dt: m.dt, state: m.state,
             heads: m.heads, headDim: m.headDim, groups: m.groups, stateDim: m.stateDim,
             steps: keep, writeOutput: false).finalState)
+    }
+}
+
+
+func nemotronSSMTail32Source(_ source: String) -> String? {
+    guard let s = nemotronCountedSwaps(source, [
+        ("nst_w[i] = weight[int64_t(grp) * 512 + int64_t(lid) * 4 + int64_t(i)];",
+         "nst_w[i] = (weight + (grp * 512 + lid * 4))[i];", NemotronHCompactSSMGated.tailWeightAhead ? 1 : 0),
+        ("int64_t feature = int64_t(grp) * 512 + int64_t(lid) * 4;", "const uint feature = grp * 512 + lid * 4;", 2),
+        ("int64_t f = feature + int64_t(i);", "", 2),
+        ("T g = proj[int64_t(row) * PS + f];", "T g = (proj + (uint(row) * uint(PS) + feature))[i];", 1),
+        ("T gated = out[int64_t(row) * (H * Dh) + f] * activated;",
+         "T gated = (out + (uint(row) * uint(H * Dh) + feature))[i] * activated;", 1),
+        ("normed[int64_t(row) * (H * Dh) + f] = weighted;",
+         "(normed + (uint(row) * uint(H * Dh) + feature))[i] = weighted;", 1),
+        ("T weighted = weight[f] * unweighted;", "T weighted = (weight + feature)[i] * unweighted;",
+         NemotronHCompactSSMGated.tailWeightAhead ? 0 : 1),
+    ]), !s.contains("int64_t"), !s.contains("size_t") else { return nil }
+    return s
+}
+
+enum NemotronSSMTail32 {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_TAIL32"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+    nonisolated(unsafe) private(set) static var checkedTG4 = false
+    private static let kernels: [[[MLXFast.MLXFastKernel?]]] = [false, true].map { tg4 in
+        [false, true].map { pending in
+            [NemotronMTPSSMAnchor.Store.none, .anchor].map { store -> MLXFast.MLXFastKernel? in
+                guard store == .none || pending else { return nil }
+                return NemotronMTPSSMAnchor.source(form: 2, pending: pending, store: store, tg4: tg4)
+                    .flatMap(nemotronSSMTail32Source).map {
+                        NemotronMTPSSMAnchor.launchKernel(
+                            NemotronMTPSSMAnchor.name(form: 2, pending: pending, store: store, tg4: tg4) + "_o32", $0,
+                            pending: pending, store: store)
+                    }
+            }
+        }
+    }
+
+    static func kernel(pending: Bool, store: NemotronMTPSSMAnchor.Store, tg4: Bool) -> MLXFast.MLXFastKernel? {
+        guard NemotronMTPSSMAnchor.form == 2 else { return nil }
+        return kernels[tg4 ? 1 : 0][pending ? 1 : 0][store == .anchor ? 1 : 0]
+    }
+
+    static func admits(tg4: Bool) -> Bool { verified && tg4 == checkedTG4 }
+
+    static func qualify(_ model: Module) {
+        verified = false
+        let tg4 = NemotronMTPSSMAnchor.tg4Adopted
+        checkedTG4 = tg4
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func report(_ message: String) {
+            let seconds = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+            FileHandle.standardError.write(Data(
+                "nemotron mtp ssm tail32: \(message) (\(String(format: "%.2f", seconds)) s)\n".utf8))
+        }
+        guard requested else { return report("off (setting)") }
+        guard NemotronMTPPendingSSM.anchorSkip else { return report("off (anchor skip off)") }
+        guard NemotronMTPSSMAnchor.form == 2, kernels.joined().joined().compactMap({ $0 }).count == 6 else {
+            return report("off (one-barrier tail or its text not found)")
+        }
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard let first = mixers.first else { return report("off (no Mamba layer)") }
+        let top = NemotronMTPPendingSSM.anchorAt + 2
+        let (heads, dim, groups, stateDim) = (first.numHeads, first.headDim, first.numGroups, first.ssmStateSize)
+        let convDim = first.convDim
+        let width = first.intermediateSize + convDim + heads
+        let specials: [Float] = [.infinity, -.infinity, .nan, -0.0, 1e-38, 3e38, -3e38, -1e-38]
+        func special(_ x: MLXArray, _ positions: [Int]) -> MLXArray {
+            let index = MLXArray(Int32(0) ..< Int32(x.size)).reshaped(x.shape)
+            var y = x
+            for (k, i) in positions.enumerated() {
+                y = which(index .== MLXArray(Int32(i)), MLXArray(specials[k % specials.count]).asType(x.dtype), y)
+            }
+            return y
+        }
+        var same = MLXArray(true)
+        var cases = 0
+        do {
+            try withError {
+                for (l, mixer) in mixers.enumerated() {
+                    for set in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5f31 + 2 * l + set)), into: 6)
+                        var conv = MLXRandom.uniform(Float(-2) ..< 2, [1, 3, convDim], key: keys[0])
+                        let dt = MLXRandom.uniform(Float(0.01) ..< 0.5, [1, 3, heads], key: keys[1])
+                        var state = MLXRandom.uniform(Float(-0.5) ..< 0.5, [1, heads, dim, stateDim], key: keys[2])
+                        var projected = MLXRandom.uniform(Float(-3) ..< 3, [1, 3, width], key: keys[3])
+                        if set == 1 {
+                            projected = special(projected, [7, 600, 1500, 4095, width + 77, width + 2048,
+                                                            2 * width + 3, 2 * width + 3000])
+                            conv = special(conv, [10, 4100, 5200, convDim + 63, convDim + 4500, 2 * convDim + 6000])
+                            state = special(state, [5, 70_000, 300_001, 524_287])
+                        }
+                        let window = (conv.asType(.bfloat16), projected.asType(.bfloat16))
+                        let tapes = (1 ... top).map { steps -> (conv: MLXArray, dt: MLXArray, steps: Int) in
+                            let k = MLXRandom.split(key: MLXRandom.key(UInt64(0x5f71 + 32 * l + 2 * steps + set)), into: 2)
+                            return (MLXRandom.uniform(Float(-2) ..< 2, [1, steps, convDim], key: k[0]).asType(.bfloat16),
+                                    MLXRandom.uniform(Float(0.01) ..< 0.5, [1, steps, heads], key: k[1]), steps)
+                        }
+                        for steps in 0 ... top {
+                            for store in steps == 0 ? [NemotronMTPSSMAnchor.Store.none] : [.none, .anchor] {
+                                func run(_ twin: Bool) -> [MLXArray]? {
+                                    mixer.norm.compactSSMAnchorRows(
+                                        convolution: window.0, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                                        projected: window.1, heads: heads, headDim: dim, groups: groups,
+                                        stateDim: stateDim, pending: steps == 0 ? nil : tapes[steps - 1],
+                                        store: store, tg4: tg4, tail32: twin
+                                    ).map { [$0.0, $0.1] + ($0.2.map { [$0] } ?? []) }
+                                }
+                                guard let a = run(false), let b = run(true), a.count == b.count else {
+                                    same = MLXArray(false)
+                                    return
+                                }
+                                for (u, v) in zip(a, b) {
+                                    same = same .&& (u.dtype == .float32
+                                        ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                        : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                                }
+                                cases += 1
+                            }
+                        }
+                    }
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        verified = cases > 0 && same.item(Bool.self)
+        report(verified
+            ? "on (\(cases) launch pairs at \(tg4 ? 4 : 8) d's per thread group over \(mixers.count) Mamba layers x 2 operand"
+                + " sets, pending 0 ... \(top), no store and anchor store: normalized rows, prepared activation and"
+                + " state bitwise equal to the record tail)"
+            : "off (differs from the record tail)")
+    }
+}
+
+
+func nemotronSSMTailTCSource(_ source: String) -> String? {
+    nemotronCountedSwaps(source, [
+        ("const float inv_mean = metal::precise::rsqrt(total_sq / 512 + eps);",
+         "const float inv_mean = metal::precise::rsqrt(total_sq / 512 + as_type<float>(NMEPS));", 1),
+        ("T unweighted = identity * normalized;", "T unweighted = as_type<T>(ushort(NMID)) * normalized;", 1),
+    ])
+}
+
+enum NemotronSSMTailTC {
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_MTP_SSM_TAIL_TC"] != "0"
+    nonisolated(unsafe) private(set) static var verified = false
+    nonisolated(unsafe) private(set) static var checkedTG4 = false
+    nonisolated(unsafe) private static var checkedEps: Set<Int> = []
+    nonisolated(unsafe) private(set) static var identityBits: Int?
+    private static let kernels: [[[[MLXFast.MLXFastKernel?]]]] = [false, true].map { o32 in
+        [false, true].map { tg4 in
+            [false, true].map { pending in
+                [NemotronMTPSSMAnchor.Store.none, .anchor].map { store -> MLXFast.MLXFastKernel? in
+                    guard store == .none || pending else { return nil }
+                    return NemotronMTPSSMAnchor.source(form: 2, pending: pending, store: store, tg4: tg4)
+                        .flatMap { o32 ? nemotronSSMTail32Source($0) : $0 }
+                        .flatMap(nemotronSSMTailTCSource).map {
+                            NemotronMTPSSMAnchor.launchKernel(
+                                NemotronMTPSSMAnchor.name(form: 2, pending: pending, store: store, tg4: tg4)
+                                    + (o32 ? "_o32_tc" : "_tc"), $0, pending: pending, store: store)
+                        }
+                }
+            }
+        }
+    }
+
+    static func kernel(pending: Bool, store: NemotronMTPSSMAnchor.Store, tg4: Bool, o32: Bool) -> MLXFast.MLXFastKernel? {
+        guard NemotronMTPSSMAnchor.form == 2 else { return nil }
+        return kernels[o32 ? 1 : 0][tg4 ? 1 : 0][pending ? 1 : 0][store == .anchor ? 1 : 0]
+    }
+
+    static func template(eps: Float) -> [(String, any KernelTemplateArg)]? {
+        guard let identityBits, eps.bitPattern < 0x8000_0000 else { return nil }
+        return [("NMEPS", Int(eps.bitPattern)), ("NMID", identityBits)]
+    }
+
+    static func admits(tg4: Bool, eps: Float) -> Bool {
+        verified && tg4 == checkedTG4 && checkedEps.contains(Int(eps.bitPattern))
+    }
+
+    static func qualify(_ model: Module) {
+        verified = false
+        checkedEps = []
+        let tg4 = NemotronMTPSSMAnchor.tg4Adopted
+        checkedTG4 = tg4
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func report(_ message: String) {
+            let seconds = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9
+            FileHandle.standardError.write(Data(
+                "nemotron mtp ssm tail tc: \(message) (\(String(format: "%.2f", seconds)) s)\n".utf8))
+        }
+        guard requested else { return report("off (setting)") }
+        guard NemotronMTPPendingSSM.anchorSkip else { return report("off (anchor skip off)") }
+        guard NemotronMTPSSMAnchor.form == 2, kernels.joined().joined().joined().compactMap({ $0 }).count == 12 else {
+            return report("off (one-barrier tail or its text not found)")
+        }
+        let identity = NemotronHGatedRMSKernel.identity
+        guard identity.dtype == .bfloat16, identity.size == 1 else { return report("off (identity scale)") }
+        identityBits = Int(identity.view(dtype: .uint16).item(UInt16.self))
+        let mixers = model.modules().compactMap { $0 as? NemotronHMamba2Mixer }
+        guard let first = mixers.first else { return report("off (no Mamba layer)") }
+        let top = NemotronMTPPendingSSM.anchorAt + 2
+        let (heads, dim, groups, stateDim) = (first.numHeads, first.headDim, first.numGroups, first.ssmStateSize)
+        let convDim = first.convDim
+        let width = first.intermediateSize + convDim + heads
+        let specials: [Float] = [.infinity, -.infinity, .nan, -0.0, 1e-38, 3e38, -3e38, -1e-38]
+        func special(_ x: MLXArray, _ positions: [Int]) -> MLXArray {
+            let index = MLXArray(Int32(0) ..< Int32(x.size)).reshaped(x.shape)
+            var y = x
+            for (k, i) in positions.enumerated() {
+                y = which(index .== MLXArray(Int32(i)), MLXArray(specials[k % specials.count]).asType(x.dtype), y)
+            }
+            return y
+        }
+        var same = MLXArray(true)
+        var cases = 0
+        var patterns = Set<Int>()
+        do {
+            try withError {
+                for (l, mixer) in mixers.enumerated() {
+                    guard template(eps: mixer.norm.eps) != nil else {
+                        same = MLXArray(false)
+                        return
+                    }
+                    patterns.insert(Int(mixer.norm.eps.bitPattern))
+                    for set in 0 ..< 2 {
+                        let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x5e31 + 2 * l + set)), into: 6)
+                        var conv = MLXRandom.uniform(Float(-2) ..< 2, [1, 3, convDim], key: keys[0])
+                        let dt = MLXRandom.uniform(Float(0.01) ..< 0.5, [1, 3, heads], key: keys[1])
+                        var state = MLXRandom.uniform(Float(-0.5) ..< 0.5, [1, heads, dim, stateDim], key: keys[2])
+                        var projected = MLXRandom.uniform(Float(-3) ..< 3, [1, 3, width], key: keys[3])
+                        if set == 1 {
+                            projected = special(projected, [7, 600, 1500, 4095, width + 77, width + 2048,
+                                                            2 * width + 3, 2 * width + 3000])
+                            conv = special(conv, [10, 4100, 5200, convDim + 63, convDim + 4500, 2 * convDim + 6000])
+                            state = special(state, [5, 70_000, 300_001, 524_287])
+                        }
+                        let window = (conv.asType(.bfloat16), projected.asType(.bfloat16))
+                        let tapes = (1 ... top).map { steps -> (conv: MLXArray, dt: MLXArray, steps: Int) in
+                            let k = MLXRandom.split(key: MLXRandom.key(UInt64(0x5e71 + 32 * l + 2 * steps + set)), into: 2)
+                            return (MLXRandom.uniform(Float(-2) ..< 2, [1, steps, convDim], key: k[0]).asType(.bfloat16),
+                                    MLXRandom.uniform(Float(0.01) ..< 0.5, [1, steps, heads], key: k[1]), steps)
+                        }
+                        for steps in 0 ... top {
+                            for store in steps == 0 ? [NemotronMTPSSMAnchor.Store.none] : [.none, .anchor] {
+                                func run(_ twin: Bool) -> [MLXArray]? {
+                                    mixer.norm.compactSSMAnchorRows(
+                                        convolution: window.0, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                                        projected: window.1, heads: heads, headDim: dim, groups: groups,
+                                        stateDim: stateDim, pending: steps == 0 ? nil : tapes[steps - 1],
+                                        store: store, tg4: tg4, tc: twin
+                                    ).map { [$0.0, $0.1] + ($0.2.map { [$0] } ?? []) }
+                                }
+                                guard let a = run(false), let b = run(true), a.count == b.count else {
+                                    same = MLXArray(false)
+                                    return
+                                }
+                                for (u, v) in zip(a, b) {
+                                    same = same .&& (u.dtype == .float32
+                                        ? (u.view(dtype: .uint32) .== v.view(dtype: .uint32)).all()
+                                        : (u.view(dtype: .uint16) .== v.view(dtype: .uint16)).all())
+                                }
+                                cases += 1
+                            }
+                        }
+                    }
+                    eval(same)
+                }
+            }
+        } catch {
+            return report("off (\(error))")
+        }
+        verified = cases > 0 && same.item(Bool.self)
+        if verified { checkedEps = patterns }
+        let values = patterns.sorted().map { "\(Float(bitPattern: UInt32($0)))" }.joined(separator: ", ")
+        report(verified
+            ? "on (\(cases) launch pairs at \(tg4 ? 4 : 8) d's per thread group over \(mixers.count) Mamba layers x 2 operand"
+                + " sets, pending 0 ... \(top), no store and anchor store, eps \(values) and identity"
+                + " 0x\(String(identityBits ?? 0, radix: 16)) as template bits: normalized rows, prepared activation and"
+                + " state bitwise equal to the record tail)"
+            : "off (differs from the record tail)")
     }
 }
