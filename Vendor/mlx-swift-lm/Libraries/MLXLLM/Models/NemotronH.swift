@@ -9289,10 +9289,10 @@ enum NemotronPrefillSharedUpGather {
 
     static func apply(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, up)
+        return NemotronSeedDenseRetile.sharedUp(x, up) ?? launch(x, up)
     }
 
-    private static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let q = up as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
               q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases = q.biases,
               x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
