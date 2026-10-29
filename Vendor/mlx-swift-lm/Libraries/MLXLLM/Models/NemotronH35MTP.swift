@@ -863,6 +863,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         /// The second draft chained on the prestaged first one; handed out
         /// only for the first draft's own `hidden` output object.
         var prestagedSecond: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
+        /// Depth 3: the third draft chained on the prestaged second one; handed
+        /// out only for the second draft's own `hidden` output object.
+        var prestagedThird: (tokens: MLXArray, hidden: MLXArray, parent: MLXArray)?
         // The engine can build the first verify before the seed consumer has
         // replied. Keep sv out of that round and its finalize boundary.
         var canPrestageFirstDraft = false
@@ -1050,7 +1053,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
     }
     public func observeCommittedTarget(_ observation: CBv2MTPCommittedTargetObservation, requestState: any CBv2MTPRequestState) {
         let s = state(requestState)
-        if s.prestagedResult != nil || s.prestagedSecond != nil {
+        if s.prestagedResult != nil || s.prestagedSecond != nil || s.prestagedThird != nil {
             discardRound(requestState: requestState)
         }
         s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
@@ -1082,14 +1085,21 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             let carry = s.prestagedHidden
             s.prestagedResult = nil
             s.prestagedHidden = nil
-            let staged = s.prestagedSecond == nil ? 1 : 2
+            let staged = s.prestagedSecond == nil ? 1 : (s.prestagedThird == nil ? 2 : 3)
             if s.stagedInputCount == staged, let carry, carry === hidden { return prestaged }
             discardRound(requestState: requestState)
         } else if let second = s.prestagedSecond {
             // The second call chains on the first draft's own output.
             s.prestagedSecond = nil
-            if s.stagedInputCount == 2, second.parent === hidden {
+            if s.stagedInputCount == (s.prestagedThird == nil ? 2 : 3), second.parent === hidden {
                 return (second.tokens, second.hidden)
+            }
+            discardRound(requestState: requestState)
+        } else if let third = s.prestagedThird {
+            // The third call chains on the second draft's own output.
+            s.prestagedThird = nil
+            if s.stagedInputCount == 3, third.parent === hidden {
+                return (third.tokens, third.hidden)
             }
             discardRound(requestState: requestState)
         }
@@ -1213,7 +1223,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         clearRound(s)
     }
     private func clearRound(_ s: State) {
-        s.prestagedHidden = nil; s.prestagedResult = nil; s.prestagedSecond = nil
+        s.prestagedHidden = nil; s.prestagedResult = nil; s.prestagedSecond = nil; s.prestagedThird = nil
         s.speculation = nil
         s.stagedInputCount = 0
         s.savedTokens = []; s.savedHidden = []; s.savedFrontier = nil; s.roots = []
@@ -1322,6 +1332,24 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         s.roots.append(contentsOf: [out, ids])
         CBv2MTPSubmitMerge.submit([ids, out] + s.arrays)
         s.prestagedSecond = (tokens: ids, hidden: out, parent: first.hidden)
+        // Depth 3 (`NemotronD3Port.third`): the third draft on the second, the same ops on the same inputs as the
+        // third `draftStep` (the held second K/V row appended first, then one head step); only the submission
+        // moves earlier.
+        guard NemotronD3Port.third, depth >= 3, draftLimit >= 3, s.prestagedThird == nil, s.stagedInputCount == 2
+        else { return }
+        if let row = s.deferredSecondRow {
+            s.deferredSecondRow = nil
+            s.roots += s.cache.appendTrusted(keys: row.keys, values: row.values)
+        }
+        NemotronMTPFirstRoundDraft.firstRound = !s.started
+        let out3 = module.pagedForward(
+            hidden: out, embedding: target.mtpEmbedding(ids.reshaped([1, 1])), cache: s.cache)
+        NemotronMTPFirstRoundDraft.firstRound = false
+        let ids3 = draftHead.greedy(out3, upper: s.screensUpper(firstDraft: false))
+        s.stagedInputCount += 1
+        s.roots.append(contentsOf: [out3, ids3])
+        CBv2MTPSubmitMerge.submit([ids3, out3] + s.arrays)
+        s.prestagedThird = (tokens: ids3, hidden: out3, parent: out)
     }
 
     /// Called right after the round's verify graph is submitted (before the
@@ -1335,7 +1363,8 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
         let s = state(requestState)
         let width = s.stagedInputCount + 1
         guard s.started, kvOnlyHistory, s.paged != nil, s.stagedInputCount > 0, s.speculation == nil,
-              s.prestagedResult == nil, s.prestagedSecond == nil, targetTokens.shape == [1, width],
+              s.prestagedResult == nil, s.prestagedSecond == nil, s.prestagedThird == nil,
+              targetTokens.shape == [1, width],
               targetHidden.shape == [1, width, target.configuration.hiddenSize]
         else { return }
         // Chained draft rows are never trusted; drop them before appending.
@@ -1729,6 +1758,21 @@ enum NemotronMTPDraftRowPick {
     static let loadsFirstRequested =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_ROW_PICK_LOADS_FIRST"] != "0"
     nonisolated(unsafe) static var loadsFirstVerified = false
+    /// Depth 3: the same checks on width-4 post-verify rows (accept counts 0...3). Width 4 needs these once
+    /// `NemotronD3Port.front4` (=0: the record's width-3 flags); width 3 keeps the flags above alone.
+    nonisolated(unsafe) static var verified4 = false
+    nonisolated(unsafe) static var loadsFirstVerified4 = false
+    /// A depth-(width - 1) acceptance packet of `size` elements: drafts at 0..<k, targets at k..<2k+1, filler.
+    static func packet(width: Int, size: Int, accepted: Int) -> CBv2MTPDeviceAcceptWalk.Operands {
+        let k = width - 1
+        var host = [Int32](repeating: 7, count: size)
+        for j in 0 ..< k {
+            host[j] = Int32(11 + j)
+            host[k + j] = accepted > j ? Int32(11 + j) : Int32(21 + j)
+        }
+        host[2 * k] = Int32(11 + k)
+        return CBv2MTPDeviceAcceptWalk.Operands(packet: MLXArray(host), count: k, drafts: 0, targets: k)
+    }
     private static let loadsFirstSource: String? = {
         let anchor = "const int last = a + params[3];\n"
         let copies = "if (i < FW) {\n    fused_row[i] = fused[a * fused_strides[1] + i * fused_strides[2]];\n}\n"
@@ -1782,7 +1826,7 @@ enum NemotronMTPDraftRowPick {
     ) -> (first: MLXArray, second: MLXArray, fused: MLXArray, queries: MLXArray,
           keys: MLXArray, values: MLXArray)?
     {
-        guard enabled, force || verified, length > 0,
+        guard enabled, force || (fused.dim(1) == 4 && NemotronD3Port.front4 ? verified4 : verified), length > 0,
               dtype == .bfloat16 || dtype == .float16 || dtype == .float32,
               walk.packet.ndim == 1, walk.packet.dtype == .int32,
               fused.ndim == 3, fused.dim(0) == 1, walk.count < fused.dim(1),
@@ -1795,7 +1839,8 @@ enum NemotronMTPDraftRowPick {
                                Int32(firstSpeculated), Int32(length)])
         let widest = max(length + 1, fused.dim(2), queries.dim(1) * headDim, keys.dim(1) * headDim)
         // The loads-first twin once verified (`loadsFirst` names the form for the load-time check).
-        let chosen = (loadsFirst ?? (loadsFirstRequested && loadsFirstVerified)) ? loadsFirstKernel ?? kernel : kernel
+        let chosen = (loadsFirst ?? (loadsFirstRequested
+            && (fused.dim(1) == 4 && NemotronD3Port.front4 ? loadsFirstVerified4 : loadsFirstVerified))) ? loadsFirstKernel ?? kernel : kernel
         let out = chosen(
             [walk.packet, params, fused, queries, keys, values],
             template: [("T", dtype), ("FW", fused.dim(2)), ("QH", queries.dim(1)),
@@ -1815,17 +1860,30 @@ enum NemotronMTPDraftRowPick {
     /// views). Engages only if all match; also compiles both pipelines.
     static func qualify() {
         verified = false
+        verified4 = false
         guard enabled else { return }
         func report(_ message: String) {
             FileHandle.standardError.write(Data("nemotron mtp draft row pick: \(message)\n".utf8))
         }
+        verified = matches(width: 3)
+        report(verified ? "on (bitwise equal, accept counts 0...2)" : "off (differs or failed)")
+        if NemotronD3Port.front4 {
+            verified4 = verified && matches(width: 4)
+            report(verified4 ? "width 4 on (bitwise equal, accept counts 0...3)" : "width 4 off (differs or failed)")
+        }
+        qualifyLoadsFirst()
+    }
+
+    /// `qualify`'s check at one post-verify width (3: the record's seeds and packets of 6 and 11).
+    private static func matches(width: Int) -> Bool {
         func bits(_ a: MLXArray) -> MLXArray {
             a.view(dtype: a.itemSize == 2 ? .uint16 : (a.itemSize == 4 ? .uint32 : .uint8))
         }
+        let salt: UInt64 = width == 3 ? 0 : 0x100
         func seeded(_ shape: [Int], _ seed: UInt64) -> MLXArray {
-            MLXRandom.normal(shape, key: MLXRandom.key(seed)).asType(.bfloat16)
+            MLXRandom.normal(shape, key: MLXRandom.key(seed + salt)).asType(.bfloat16)
         }
-        let width = 3, length = 600
+        let length = 600
         let fused = seeded([1, width, 2688], 0x7069_636b)
         let queries = seeded([1, width, 4096], 0x7069_636c)
             .reshaped(1, width, 32, 128).transposed(0, 2, 1, 3)
@@ -1834,18 +1892,11 @@ enum NemotronMTPDraftRowPick {
         let values = seeded([1, width, 256], 0x7069_636e)
             .reshaped(1, width, 2, 128).transposed(0, 2, 1, 3)
         do {
-            let matched = try withError { () -> Bool in
+            return try withError { () -> Bool in
                 var ok = MLXArray(true)
-                for size in [6, 11] {
-                    for accepted in 0 ... 2 {
-                        // drafts at 0..<2, targets at 2..<5; the rest is filler.
-                        var host = [Int32](repeating: 7, count: size)
-                        host[0] = 11; host[1] = 12
-                        host[2] = accepted >= 1 ? 11 : 21
-                        host[3] = accepted >= 2 ? 12 : 22
-                        host[4] = 13
-                        let walk = CBv2MTPDeviceAcceptWalk.Operands(
-                            packet: MLXArray(host), count: 2, drafts: 0, targets: 2)
+                for size in width == 3 ? [6, 11] : [8, 15] {
+                    for accepted in 0 ..< width {
+                        let walk = packet(width: width, size: size, accepted: accepted)
                         let row = MLXArray([Int32(accepted)])
                         guard let picked = pick(
                                 walk: walk, fused: fused, queries: queries, keys: keys,
@@ -1869,12 +1920,9 @@ enum NemotronMTPDraftRowPick {
                 }
                 return ok.item(Bool.self)
             }
-            verified = matched
         } catch {
-            verified = false
+            return false
         }
-        report(verified ? "on (bitwise equal, accept counts 0...2)" : "off (differs or failed)")
-        qualifyLoadsFirst()
     }
 
     /// Load time, after `qualify`: the loads-first launch against the record launch, all six outputs bit for bit,
@@ -1883,21 +1931,38 @@ enum NemotronMTPDraftRowPick {
     /// -0, infinities and NaN among their values. Engages only if every case matches. One stderr line.
     private static func qualifyLoadsFirst() {
         loadsFirstVerified = false
+        loadsFirstVerified4 = false
         func report(_ message: String) {
             FileHandle.standardError.write(Data("nemotron mtp draft row pick loads first: \(message)\n".utf8))
         }
         guard loadsFirstRequested else { return report("off (setting)") }
         guard verified, loadsFirstKernel != nil else { return report("off (record launch off or source moved)") }
+        let three = loadsFirstMatches(width: 3)
+        loadsFirstVerified = three.matched
+        if let error = three.error { return report("off (\(error))") }
+        report(loadsFirstVerified
+            ? "on (\(three.cases) cases bitwise equal to the record launch: masks and walked rows, accept counts 0...2, "
+                + "zeros, -0, infinities and NaN included)"
+            : "off (differs from the record launch)")
+        if NemotronD3Port.front4, verified4, loadsFirstVerified {
+            let four = loadsFirstMatches(width: 4)
+            loadsFirstVerified4 = four.matched && four.error == nil
+            report(loadsFirstVerified4 ? "width 4 on (\(four.cases) cases, accept counts 0...3)" : "width 4 off")
+        }
+    }
+
+    /// `qualifyLoadsFirst`'s check at one post-verify width (3: the record's seeds and packets of 6 and 11).
+    private static func loadsFirstMatches(width: Int) -> (matched: Bool, cases: Int, error: Error?) {
         func bits(_ a: MLXArray) -> MLXArray {
             a.view(dtype: a.itemSize == 2 ? .uint16 : (a.itemSize == 4 ? .uint32 : .uint8))
         }
         let specials = MLXArray([Float(0), -0.0, .infinity, -.infinity, .nan, 1e-30, -3.5, 65504])
+        let salt: UInt64 = width == 3 ? 0 : 0x100
         func seeded(_ shape: [Int], _ seed: UInt64) -> MLXArray {
             let count = shape.reduce(1, *)
-            let values = MLXRandom.normal([count], key: MLXRandom.key(seed))
+            let values = MLXRandom.normal([count], key: MLXRandom.key(seed + salt))
             return concatenated([specials, values[8...]]).reshaped(shape).asType(.bfloat16)
         }
-        let width = 3
         let fused = seeded([1, width, 2688], 0x6c66_0001)
         let queries = seeded([1, width, 4096], 0x6c66_0002).reshaped(1, width, 32, 128).transposed(0, 2, 1, 3)
         let keys = seeded([1, width, 256], 0x6c66_0003).reshaped(1, width, 2, 128).transposed(0, 2, 1, 3)
@@ -1907,15 +1972,9 @@ enum NemotronMTPDraftRowPick {
             let matched = try withError { () -> Bool in
                 var ok = MLXArray(true)
                 for length in [600, 5000] {
-                    for size in [6, 11] {
-                        for accepted in 0 ... 2 {
-                            var host = [Int32](repeating: 7, count: size)
-                            host[0] = 11; host[1] = 12
-                            host[2] = accepted >= 1 ? 11 : 21
-                            host[3] = accepted >= 2 ? 12 : 22
-                            host[4] = 13
-                            let walk = CBv2MTPDeviceAcceptWalk.Operands(
-                                packet: MLXArray(host), count: 2, drafts: 0, targets: 2)
+                    for size in width == 3 ? [6, 11] : [8, 15] {
+                        for accepted in 0 ..< width {
+                            let walk = packet(width: width, size: size, accepted: accepted)
                             func picked(_ loadsFirst: Bool) -> [MLXArray]? {
                                 pick(walk: walk, fused: fused, queries: queries, keys: keys, values: values,
                                      firstSpeculated: length - width, length: length, dtype: .bfloat16,
@@ -1934,14 +1993,10 @@ enum NemotronMTPDraftRowPick {
                 }
                 return ok.item(Bool.self)
             }
-            loadsFirstVerified = matched
+            return (matched, cases, nil)
         } catch {
-            return report("off (\(error))")
+            return (false, cases, error)
         }
-        report(loadsFirstVerified
-            ? "on (\(cases) cases bitwise equal to the record launch: masks and walked rows, accept counts 0...2, "
-                + "zeros, -0, infinities and NaN included)"
-            : "off (differs from the record launch)")
     }
 }
 
@@ -2033,4 +2088,24 @@ extension NemotronH35MTPAssistant {
             discardRound(requestState: requestState)
         }
     }
+}
+
+// MARK: - Depth 3 (R = 4 verify): shared expert, draft chain, post-verify rows
+//
+// Each switch acts only at R = 4 / depth 3; R = 3 (depth 2) keeps every kernel, launch and selection.
+// =0 ablates one piece (the generic R = 4 path or the round-build draft stands in).
+enum NemotronD3Port {
+    private static let environment = ProcessInfo.processInfo.environment
+    /// Shared up on the unpacked prepared QMV and shared down on its zero-skip copy at R = 4.
+    static let shared4 = environment["NEMOTRON_D3_SHARED4"] != "0"
+    /// The shared down launched ahead of the routed FC2 at R = 4 (the R = 3 early form).
+    static let sdEarly4 = shared4 && environment["NEMOTRON_D3_SD_EARLY4"] != "0"
+    /// One prepared activation for the routed FC1 and the shared up at R = 4.
+    static let packed4 = environment["NEMOTRON_D3_PACKED4"] != "0"
+    /// The third draft chained on the prestaged second one (depth >= 3).
+    static let third = environment["NEMOTRON_D3_THIRD"] != "0"
+    /// Width-4 post-verify front joins.
+    static let front4 = environment["NEMOTRON_D3_FRONT4"] != "0"
+
+    static func sharedRows(_ rows: Int) -> Bool { rows == 3 || (rows == 4 && shared4) }
 }

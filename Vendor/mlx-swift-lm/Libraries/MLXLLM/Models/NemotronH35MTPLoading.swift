@@ -84,6 +84,8 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronFC1Tune.tune(target)
+        NemotronD3Quad.qualify(target)
+        NemotronD3Quad.timeAgainstTriple(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -101,6 +103,7 @@ extension NemotronH35MTPAssistant {
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronQMVLean.qualify(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
         NemotronMTPSSMAnchor.tune(target)
@@ -204,6 +207,13 @@ extension NemotronH35MTPAssistant {
             if prefillLength > 0 { try warmUpPrefill(length: prefillLength) }
             try runWarmUp(depth: depth, promptLength: promptLength,
                           postVerifyWarmupWidth: &postVerifyWarmupWidth)
+            // Also warm the depth-3 (four-row verify) shapes, so a depth-3 declaration does not pay the
+            // four-row kernel JIT and graph traces in its first timed rounds. Throwaway state as above.
+            if environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] == nil, depth < 3,
+               (maximumDraftTokens ?? 7) >= 3, environment["NEMOTRON_D3_WARMUP"] != "0" {
+                var depth3Width: Int?
+                try runWarmUp(depth: 3, promptLength: promptLength, postVerifyWarmupWidth: &depth3Width)
+            }
         } catch {
             FileHandle.standardError.write(Data("nemotron mtp warm-up skipped: \(error)\n".utf8))
         }
