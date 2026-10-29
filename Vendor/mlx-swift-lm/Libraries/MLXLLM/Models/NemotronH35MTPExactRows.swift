@@ -400,6 +400,63 @@ func nemotronPreparedVariantSource(_ base: String, load: Int, nsg: Bool) -> Stri
     return s
 }
 
+/// A prepared QMV body (crown or HF decode, any load form, NSG, unroll, pair-dictionary or BF16 form, the in_proj
+/// epilogues included) with fewer values live across its main K loop: the body of `NemotronQMVTune`'s lean rows
+/// (NEMOTRON_QMV_LEAN_ROWS). Each lane reads its code words and its pair-index (or scale and bias) words through the
+/// arrays' base pointers plus 32-bit element offsets, `nlw` (the record's `ws` less `w`: `out_row * K / 2 + simd_lid
+/// * packs_per_thread * 4`) and `nls` (the record's `sc` less `scales`: `out_row * K / 64 + simd_lid /
+/// scale_step_per_thread`), each stepped by the record's block step, where the record steps 64-bit pointers `ws`,
+/// `sc` and `bs` (`bs` reads the same words as `sc`, from `scales` in the dictionary form or `biases`). Every element
+/// a lane reads lies below N x K / 2 bytes (2^28 for the 131,072-row head), so every load reads the record's address;
+/// every statement, decode, product, order, affine close, closing simd_sum and store is the record's. nil unless
+/// every replaced statement occurs as expected.
+func nemotronQMVLeanSource(_ source: String?) -> String? {
+    guard var s = source else { return nil }
+    func swap(_ old: String, _ new: String, _ count: Int = 1) -> Bool {
+        guard s.components(separatedBy: old).count == count + 1 else { return false }
+        s = s.replacingOccurrences(of: old, with: new)
+        return true
+    }
+    let offset = "  uint nls = uint(out_row * in_vec_size_g + simd_lid / scale_step_per_thread);\n"
+    let streams = { (type: String, second: String) in
+        "  const device \(type)* sc = scales + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+            + "  const device \(type)* bs = \(second) + out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+    }
+    guard swap("  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;\n",
+               "  uint nlw = uint(out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack);\n"),
+          swap(streams("uint16_t", "scales"),
+               "  const device uint16_t* sc = scales;\n  const device uint16_t* bs = scales;\n" + offset)
+              || swap(streams("T", "biases"),
+                      "  const device T* sc = scales;\n  const device T* bs = biases;\n" + offset),
+          swap("    ws += block_size * bytes_per_pack / pack_factor;\n",
+               "    nlw += block_size * bytes_per_pack / pack_factor;\n"),
+          swap("    sc += block_size / group_size;\n", "    nls += block_size / group_size;\n"),
+          swap("    bs += block_size / group_size;\n", "")
+    else { return nil }
+    var uses = 0
+    for (old, new) in [
+        ("(ws + row * in_vec_size_w)", "(ws + (nlw + uint(row * in_vec_size_w)))"),
+        ("(ws + row * in_vec_size_w, ", "(ws + (nlw + uint(row * in_vec_size_w)), "),
+        ("(ws + block_size * bytes_per_pack / pack_factor + row * in_vec_size_w, ",
+         "(ws + (nlw + uint(block_size * bytes_per_pack / pack_factor + row * in_vec_size_w)), "),
+        ("sc + row * in_vec_size_g;", "sc + (nls + uint(row * in_vec_size_g));"),
+        ("bs + row * in_vec_size_g;", "bs + (nls + uint(row * in_vec_size_g));"),
+        ("sc[row * in_vec_size_g]", "sc[nls + uint(row * in_vec_size_g)]"),
+        ("bs[row * in_vec_size_g]", "bs[nls + uint(row * in_vec_size_g)]"),
+        ("sc[block_size / group_size + row * in_vec_size_g]",
+         "sc[nls + uint(block_size / group_size + row * in_vec_size_g)]"),
+        ("bs[block_size / group_size + row * in_vec_size_g]",
+         "bs[nls + uint(block_size / group_size + row * in_vec_size_g)]"),
+    ] {
+        uses += s.components(separatedBy: old).count - 1
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    guard uses > 0, ![" ws +=", " sc +=", " bs +=", "(ws + row", "(ws + block", "sc + row", "bs + row", "sc[row",
+                      "bs[row", "sc[block", "bs[block"].contains(where: { s.contains($0) })
+    else { return nil }
+    return s
+}
+
 private let nemotronMultiRowQMVCrownSource = """
   constexpr int num_simdgroups = 2;
   constexpr int results_per_simdgroup = RPS;

@@ -146,6 +146,69 @@ METAL_FUNC void nemotron_seed_deq2(
   v1 = static_cast<T>(sc[1] * (byte & 0xf0) + b);
 }
 
+// WF (wide fill) of a bank-layout source (the bank, its pair dictionary):
+// thread t of NT takes the per-row fill's KPT consecutive k of one output row
+// and reads their codes as 32-bit words (little endian: byte j = bits 8j ...
+// 8j + 7) instead of one byte per k pair, with the per-row fill's scale and
+// bias (`sb`). `load` reads them into registers under the per-row fill's
+// predicate; `store` writes the per-row fill's values from them with its
+// statements (zeros outside the predicate).
+template <int BN, int BK, int NT>
+struct NemotronSeedWordRegs {
+  uint word[(BN * BK / NT) / 8];
+  float2 p;
+};
+
+template <int BN, int BK, int NT, bool ALIGN_N, class S>
+METAL_FUNC void nemotron_seed_word_load(
+    thread const S& s, thread NemotronSeedWordRegs<BN, BK, NT>& r, const int t,
+    const int y_col, const int N, const int kb, const int klim) {
+  constexpr int KPT = BN * BK / NT;
+  static_assert(KPT % 8 == 0 && KPT <= 64 && 64 % KPT == 0, "word fill split");
+  const int lr = t / (BK / KPT);
+  const int lk = (t % (BK / KPT)) * KPT;
+  const int n = y_col + lr;
+  if ((ALIGN_N || n < N) && lk < klim) {
+    r.p = s.sb(n, (kb + lk) / 64);
+    const device uint32_t* src = (const device uint32_t*)(
+        s.w + size_t(n) * size_t(s.K / 2) + size_t((kb + lk) / 2));
+    STEEL_PRAGMA_UNROLL
+    for (short q = 0; q < KPT / 8; ++q) {
+      r.word[q] = src[q];
+    }
+  }
+}
+
+template <typename T, int BN, int BK, int NT, bool ALIGN_N>
+METAL_FUNC void nemotron_seed_word_store(
+    threadgroup T* ws, thread const NemotronSeedWordRegs<BN, BK, NT>& r, const int t,
+    const int y_col, const int N, const int klim) {
+  constexpr int BK_padded = BK + 16 / sizeof(T);
+  constexpr int KPT = BN * BK / NT;
+  const int lr = t / (BK / KPT);
+  const int lk = (t % (BK / KPT)) * KPT;
+  const int n = y_col + lr;
+  threadgroup T* dst = ws + lr * BK_padded + lk;
+  if ((ALIGN_N || n < N) && lk < klim) {
+    STEEL_PRAGMA_UNROLL
+    for (short q = 0; q < KPT / 8; ++q) {
+      const uint word = r.word[q];
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < 4; ++j) {
+        T v0, v1;
+        nemotron_seed_deq2(uint8_t((word >> (8 * j)) & 0xffu), r.p.x, r.p.y, v0, v1);
+        dst[q * 8 + 2 * j] = v0;
+        dst[q * 8 + 2 * j + 1] = v1;
+      }
+    }
+  } else {
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < KPT; ++j) {
+      dst[j] = T(0);
+    }
+  }
+}
+
 // B source: the bank (codes [E, N, K / 8] uint32, BF16 scales and biases
 // [E, N, K / 64]); scale and bias widen as in dequantize.
 template <typename T>
@@ -167,6 +230,20 @@ struct NemotronSeedBank {
   }
   METAL_FUNC uint8_t byte(const int n, const int k) const thread {
     return w[size_t(n) * size_t(K / 2) + size_t(k >> 1)];
+  }
+
+  // WF: the word fill (nemotron_seed_word_load / _store).
+  template <int BN, int BK, int NT>
+  using Regs = NemotronSeedWordRegs<BN, BK, NT>;
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void load(thread Regs<BN, BK, NT>& r, const int t, const int y_col, const int N,
+                       const int kb, const int klim) const thread {
+    nemotron_seed_word_load<BN, BK, NT, ALIGN_N>(*this, r, t, y_col, N, kb, klim);
+  }
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void store(threadgroup T* ws, thread const Regs<BN, BK, NT>& r, const int t, const int y_col,
+                        const int N, const int klim) const thread {
+    nemotron_seed_word_store<T, BN, BK, NT, ALIGN_N>(ws, r, t, y_col, N, klim);
   }
 };
 
@@ -195,6 +272,20 @@ struct NemotronSeedDict {
   }
   METAL_FUNC uint8_t byte(const int n, const int k) const thread {
     return w[size_t(n) * size_t(K / 2) + size_t(k >> 1)];
+  }
+
+  // WF: the word fill (nemotron_seed_word_load / _store).
+  template <int BN, int BK, int NT>
+  using Regs = NemotronSeedWordRegs<BN, BK, NT>;
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void load(thread Regs<BN, BK, NT>& r, const int t, const int y_col, const int N,
+                       const int kb, const int klim) const thread {
+    nemotron_seed_word_load<BN, BK, NT, ALIGN_N>(*this, r, t, y_col, N, kb, klim);
+  }
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void store(threadgroup T* ws, thread const Regs<BN, BK, NT>& r, const int t, const int y_col,
+                        const int N, const int klim) const thread {
+    nemotron_seed_word_store<T, BN, BK, NT, ALIGN_N>(ws, r, t, y_col, N, klim);
   }
 };
 
@@ -226,6 +317,82 @@ struct NemotronSeedCopy {
     const uint lo = (uint(c[0]) >> (4 * o)) & 0xfu;
     const uint hi = (uint(c[32]) >> (4 * o)) & 0xfu;
     return uint8_t(lo | (hi << 4));
+  }
+
+  // WF: thread t of NT holds four consecutive outputs n ... n + 3 (one code
+  // word lane, n a multiple of 4) and CK consecutive k, as the fc2 copy
+  // loader, so each code word is read once for its four outputs. `load` reads
+  // the CK code words and the four outputs' `sb` under the per-row fill's
+  // predicate (N % 4 == 0: the four outputs are in range together); `store`
+  // rebuilds each bank byte as `byte` does and writes the per-row fill's values
+  // at the per-row fill's positions (zeros outside the predicate).
+  template <int BN, int BK, int NT>
+  struct Regs {
+    uint16_t c[BK * (BN / 4) / NT];
+    float s[4];
+    float b[4];
+  };
+
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void load(thread Regs<BN, BK, NT>& r, const int t, const int y_col, const int N,
+                       const int kb, const int klim) const thread {
+    constexpr int CK = BK * (BN / 4) / NT;
+    static_assert(CK % 2 == 0 && CK <= 64 && 64 % CK == 0 && NT % (BN / 4) == 0, "copy fill split");
+    const int cm = t % (BN / 4);
+    const int cc = t / (BN / 4);
+    const int n = y_col + 4 * cm;
+    const int k0 = kb + cc * CK;
+    if ((ALIGN_N || n < N) && cc * CK < klim) {
+      const device uint16_t* c =
+          codes + (size_t(n / 128) * size_t(K) + size_t(k0)) * 32 + size_t((n % 128) / 4);
+      // sb(n + o, k0 / 64)'s pair index for o = 0 ... 3: n % 4 == 0, so
+      // (n + o) / 128 == n / 128 and (n + o) % 128 == n % 128 + o.
+      const device uint16_t* si =
+          sidx + (size_t(n / 128) * size_t(K / 64) + size_t(k0 / 64)) * 128 + size_t(n % 128);
+      STEEL_PRAGMA_UNROLL
+      for (short o = 0; o < 4; o++) {
+        const uint pair = uint(si[o]);
+        r.s[o] = table[2 * pair];
+        r.b[o] = table[2 * pair + 1];
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short j = 0; j < CK; ++j) {
+        r.c[j] = c[j * 32];
+      }
+    }
+  }
+
+  template <int BN, int BK, int NT, bool ALIGN_N>
+  METAL_FUNC void store(threadgroup T* ws, thread const Regs<BN, BK, NT>& r, const int t, const int y_col,
+                        const int N, const int klim) const thread {
+    constexpr int BK_padded = BK + 16 / sizeof(T);
+    constexpr int CK = BK * (BN / 4) / NT;
+    const int cm = t % (BN / 4);
+    const int cc = t / (BN / 4);
+    const int n = y_col + 4 * cm;
+    threadgroup T* dst = ws + (4 * cm) * BK_padded + cc * CK;
+    if ((ALIGN_N || n < N) && cc * CK < klim) {
+      STEEL_PRAGMA_UNROLL
+      for (short o = 0; o < 4; o++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < CK; j += 2) {
+          const uint lo = (uint(r.c[j]) >> (4 * o)) & 0xfu;
+          const uint hi = (uint(r.c[j + 1]) >> (4 * o)) & 0xfu;
+          T v0, v1;
+          nemotron_seed_deq2(uint8_t(lo | (hi << 4)), r.s[o], r.b[o], v0, v1);
+          dst[o * BK_padded + j] = v0;
+          dst[o * BK_padded + j + 1] = v1;
+        }
+      }
+    } else {
+      STEEL_PRAGMA_UNROLL
+      for (short o = 0; o < 4; o++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < CK; ++j) {
+          dst[o * BK_padded + j] = T(0);
+        }
+      }
+    }
   }
 };
 
@@ -294,6 +461,8 @@ template <
     bool RELU2,
     bool ROUTED,
     bool PF,
+    bool DB,
+    bool WF,
     class BSrc>
 METAL_FUNC void nemotron_seed_gather_impl(
     const device T* x,
@@ -515,6 +684,146 @@ METAL_FUNC void nemotron_seed_gather_impl(
           }
         }
       }
+    } else if constexpr (DB || WF) {
+      // The threadgroup-staged path below over blocks b = 0, 1, ... of BK k
+      // (the last one K - b * BK k when BK does not divide K: the same blocks
+      // and the same compute statements). WF: the B source's wide fill
+      // (`load` then `store`) writes each block; otherwise the per-row fill
+      // below. Both write the same value to every Ws slot the compute reads.
+      // DB: two stages, block b in stage b & 1, one barrier per block (block
+      // b + 1 is written while block b is read; the barrier closing iteration
+      // b - 1 orders both). PF: each block's B loads are issued into registers
+      // one block ahead (two with DB), before the current block's mma.
+      constexpr int NT = WM * WN * 32;
+      constexpr int STAGE = BN * BK_padded;
+      constexpr int KPT = BN * BK / NT;
+      static_assert(WF || (KPT % 4 == 0 && KPT <= 64 && 64 % KPT == 0 && BK % KPT == 0), "loader split");
+      // The per-row fill's split (unused with WF).
+      constexpr int KPR = WF ? 1 : BK / KPT;
+      const int t = int(simd_group_id) * 32 + int(simd_lane_id);
+      const int nb = (K + BK - 1) / BK;
+      const short lr = short(t / KPR);
+      const short lk = short((t % KPR) * KPT);
+      const int ln = y_col + lr;
+      typename BSrc::template Regs<BN, BK, NT> wregs;
+      uint8_t pf_bytes[WF ? 1 : KPT / 2];
+      float2 pf_sb = float2(0.0f);
+      auto pf_load = [&](const int b) {
+        const int kb = b * BK;
+        const int klim = min(BK, K - kb);
+        if constexpr (WF) {
+          bsrc.template load<BN, BK, NT, ALIGN_N>(wregs, t, y_col, N, kb, klim);
+        } else {
+          if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
+            pf_sb = bsrc.sb(ln, (kb + lk) / 64);
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < KPT; j += 2) {
+              pf_bytes[j / 2] = bsrc.byte(ln, kb + lk + j);
+            }
+          }
+        }
+      };
+      auto pf_store = [&](threadgroup T* ws, const int b) {
+        const int klim = min(BK, K - b * BK);
+        if constexpr (WF) {
+          bsrc.template store<BN, BK, NT, ALIGN_N>(ws, wregs, t, y_col, N, klim);
+        } else {
+          threadgroup T* wdst = ws + lr * BK_padded + lk;
+          if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
+            const float2 p = pf_sb;
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < KPT; j += 2) {
+              T v0, v1;
+              nemotron_seed_deq2(pf_bytes[j / 2], p.x, p.y, v0, v1);
+              wdst[j] = v0;
+              wdst[j + 1] = v1;
+            }
+          } else {
+            STEEL_PRAGMA_UNROLL
+            for (short j = 0; j < KPT; ++j) {
+              wdst[j] = T(0);
+            }
+          }
+        }
+      };
+      auto fill = [&](threadgroup T* ws, const int b) {
+        pf_load(b);
+        pf_store(ws, b);
+      };
+      auto compute = [&](threadgroup T* ws, const int b) {
+        const int kb = b * BK;
+        const int klim = min(BK, K - kb);
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < klim; kk1 += SK) {
+          if (sg_active) {
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            nemotron_seed_load_a<ROUTED, aligned_m, SK>(Atile, xn, routed, kb + kk1, K, sgp_sm);
+
+            Btile.template load<T, BK_padded, 1>(ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
+          }
+        }
+      };
+      if constexpr (DB && PF) {
+        pf_load(0);
+        pf_store(Ws, 0);
+        if (1 < nb) {
+          pf_load(1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int b = 0; b < nb; b++) {
+          if (b + 1 < nb) {
+            pf_store(Ws + ((b + 1) & 1) * STAGE, b + 1);
+            if (b + 2 < nb) {
+              pf_load(b + 2);
+            }
+          }
+          compute(Ws + (b & 1) * STAGE, b);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      } else if constexpr (DB) {
+        fill(Ws, 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int b = 0; b < nb; b++) {
+          if (b + 1 < nb) {
+            fill(Ws + ((b + 1) & 1) * STAGE, b + 1);
+          }
+          compute(Ws + (b & 1) * STAGE, b);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      } else if constexpr (PF) {
+        pf_load(0);
+        for (int b = 0; b < nb; b++) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          pf_store(Ws, b);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (b + 1 < nb) {
+            pf_load(b + 1);
+          }
+          compute(Ws, b);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      } else {
+        for (int b = 0; b < nb; b++) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          fill(Ws, b);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          compute(Ws, b);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
     } else {
       // Threadgroup weight block BN x BK: thread t dequantizes KPT
       // consecutive k (inside one group) of one row, then the run gather's
@@ -666,7 +975,10 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// it qualifies.
 /// The pf rows are the same geometries with the next K step's B loads issued
 /// before this step's mma (same values, same mma order);
-/// NEMOTRON_SEED_RETILE_PF=0 leaves them out.
+/// NEMOTRON_SEED_RETILE_PF=0 leaves them out. NEMOTRON_SEED_RETILE_X=0 leaves out
+/// `extraVariants` (pf on more geometries, BN 128 on a 2 x 2 grid);
+/// NEMOTRON_SEED_RETILE_DB=0 `stagedVariants` (two threadgroup stages);
+/// NEMOTRON_SEED_RETILE_WF=0 `wideVariants` (the B source's wide fill).
 enum NemotronSeedRetile {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE"] != "0"
     static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_FORCE"]
@@ -676,7 +988,12 @@ enum NemotronSeedRetile {
         let bn: Int, bk: Int, wm: Int, wn: Int
         let direct: Bool
         var pf: Bool = false
+        /// Two threadgroup stages, one barrier per K block (`nemotron_seed_gather_impl`'s DB).
+        var db: Bool = false
+        /// The B source's wide fill (`nemotron_seed_gather_impl`'s WF).
+        var wf: Bool = false
         var threads: Int { wm * wn * 32 }
+        var threadgroupBytes: Int { direct ? 0 : (db ? 2 : 1) * bn * (bk + 8) * 2 }
     }
 
     /// NEMOTRON_SEED_RETILE_PF=0 stops offering the PF rows (the K loop with
@@ -698,7 +1015,50 @@ enum NemotronSeedRetile {
     ] + (offerPF ? [
         Variant(name: "ws64x64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true),
         Variant(name: "d64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true),
-    ] : [])
+    ] : []) + (offerX ? extraVariants : []) + (offerDB ? stagedVariants : []) + (offerWF ? wideVariants : [])
+
+    /// NEMOTRON_SEED_RETILE_X=0 stops offering `extraVariants`.
+    static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_X"] != "0"
+    /// More threadgroup-staged rows through the same kernel text (template values only): the prefetching K loop
+    /// (pf) on the BK 128 and BN 128 geometries, and BN 128 with a 2 x 2 SIMD-group grid (each SIMD group 64
+    /// columns: four 16-column fragments, two mma pairs per 16-row fragment and 16-k chunk; 128 threads, KPT 64,
+    /// 18,432 B of threadgroup memory). Each keeps the run gather's fragment pairs (SN a multiple of 32 from the
+    /// tile's first column) and 16-row fragments (WM 1 or 2, so the 32-row body keeps SM a multiple of 16), and the
+    /// k chunks in order. Appended after the rows above.
+    static let extraVariants: [Variant] = [
+        Variant(name: "ws64x128w22pf", bn: 64, bk: 128, wm: 2, wn: 2, direct: false, pf: true),
+        Variant(name: "ws128x64w24pf", bn: 128, bk: 64, wm: 2, wn: 4, direct: false, pf: true),
+        Variant(name: "ws128x64w22", bn: 128, bk: 64, wm: 2, wn: 2, direct: false),
+    ]
+
+    /// NEMOTRON_SEED_RETILE_DB=0 stops offering `stagedVariants`.
+    static let offerDB = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_DB"] != "0"
+    /// The incumbent geometry with two threadgroup stages (db: block b in stage b & 1, block b + 1 written while
+    /// block b is read, one barrier per K block instead of two; 18,432 B), without and with the prefetching K loop
+    /// (block b + 2's loads issued before block b's mma). Every stage slot holds the per-row fill's value; the mma
+    /// sequence, accumulators and store are the single-stage path's. Appended.
+    static let stagedVariants: [Variant] = [
+        Variant(name: "ws64x64w22db", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, db: true),
+        Variant(name: "ws64x64w22dbpf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, db: true),
+    ]
+
+    /// NEMOTRON_SEED_RETILE_WF=0 stops offering `wideVariants`.
+    static let offerWF = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_WF"] != "0"
+    /// Threadgroup-staged rows whose blocks are written by the B source's wide fill (wf): the bank and the pair
+    /// dictionary read each thread's KPT codes as 32-bit words (KPT / 8 loads instead of KPT / 2 byte loads); the
+    /// fc2 decode copy gives each thread four consecutive outputs and CK consecutive k, as the incumbent fc2 copy
+    /// loader, so each 16-bit code word is read once for its four outputs (the per-row fill reads it once per
+    /// output). Every Ws slot gets the per-row fill's value (the same byte, scale and bias, the same dequantize
+    /// statements); the K blocks, mma sequence, accumulators and store are unchanged. On the incumbent geometry
+    /// alone, with pf, with db and with both, and with pf on the BK 128 and BN 128 geometries. Appended.
+    static let wideVariants: [Variant] = [
+        Variant(name: "ws64x64w22wf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, wf: true),
+        Variant(name: "ws64x64w22wfpf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, wf: true),
+        Variant(name: "ws64x64w22wfdb", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, db: true, wf: true),
+        Variant(name: "ws64x64w22wfdbpf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, db: true, wf: true),
+        Variant(name: "ws64x128w22wfpf", bn: 64, bk: 128, wm: 2, wn: 2, direct: false, pf: true, wf: true),
+        Variant(name: "ws128x64w24wfpf", bn: 128, bk: 64, wm: 2, wn: 4, direct: false, pf: true, wf: true),
+    ]
 
     enum Source: String, Sendable { case bank, dict, copy }
 
@@ -723,7 +1083,7 @@ enum NemotronSeedRetile {
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
         func call(_ bm: String) -> String {
             """
-                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF>(
+                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF, DB, WF>(
                         x, \(rows), b, tiles, y, N, K, Ws,
                         threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup,
@@ -731,7 +1091,7 @@ enum NemotronSeedRetile {
             """
         }
         return """
-                threadgroup T Ws[DIRECT_B ? 1 : BN * (BK + 16 / sizeof(T))];
+                threadgroup T Ws[DIRECT_B ? 1 : (DB ? 2 : 1) * BN * (BK + 16 / sizeof(T))];
                 \(make)
                 if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
             \(call("32"))
@@ -758,8 +1118,8 @@ enum NemotronSeedRetile {
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
                        rows: MLXArray?, tiles: NemotronHRunTiles) -> MLXArray? {
-        guard NemotronHPrefillX5.runGather, lin.mode == .affine, lin.bits == 4, lin.groupSize == 64,
-              x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
+        guard NemotronHPrefillX5.runGather, v.threadgroupBytes <= 32768, lin.mode == .affine, lin.bits == 4,
+              lin.groupSize == 64, x.ndim == 3, x.dim(1) == 1, x.dtype == .bfloat16,
               !role.relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype
         else { return nil }
         let ops = lin.nemotronGatherOperands(for: x.dtype)
@@ -803,7 +1163,8 @@ enum NemotronSeedRetile {
         return kernel(
             inputs,
             template: [("T", x.dtype), ("BM", tiles.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
-                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf)],
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf),
+                       ("DB", v.db), ("WF", v.wf)],
             grid: (((nOut + v.bn - 1) / v.bn) * v.threads, tiles.count, 1), threadGroup: (v.threads, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }
@@ -1487,6 +1848,7 @@ METAL_FUNC void nemotron_seed_dense_impl(
 /// faster in at least 75% of the cycles). Direct-B variants are left out:
 /// forced on every seed role they cost ~40 ms (331295a3).
 /// NEMOTRON_SEED_DENSE_RETILE=0 keeps the incumbents; NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out;
+/// NEMOTRON_SEED_DENSE_RETILE_X2=0 leaves `moreVariants` out;
 /// NEMOTRON_SEED_DENSE_RETILE_FORCE=<variant> adopts that variant wherever it
 /// qualifies.
 enum NemotronSeedDenseRetile {
@@ -1532,7 +1894,26 @@ enum NemotronSeedDenseRetile {
     ]
     /// NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out of this tune (the base rows only).
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X"] != "0"
-    static let variants: [Variant] = baseVariants + (offerX ? extraVariants : [])
+    /// More rows through the same kernel text (template values only), appended after the pf row so every earlier
+    /// row keeps its index: pf with two stages on the incumbent geometry (block b + 2's loads before block b's
+    /// mma); pf, alone and with two stages, on the 128-row 4 x 2 geometry; 128-row tiles on a 2 x 2 grid (each
+    /// SIMD group 64 rows: four 16-row fragments per 32-column pair; 128 threads); 256-row tiles on an 8 x 2 grid
+    /// (each dequantized B block shared by twice the rows of the 128-row tiles; 512 threads, KPT 8 for the
+    /// dictionary fill, CK 2 for the copy fill; a tile of at most 128 rows runs the 128-row body), alone and with
+    /// two stages. Each keeps SM a multiple of 16 in both bodies and SN 32 (the incumbents' 32-column pairs and
+    /// 16-row fragments from the tile's first row) and fits 32 KB. Each row adds a qualify and a timing pass over
+    /// every layer of the kind (the tune has no load cap).
+    static let moreVariants: [Variant] = [
+        Variant(64, 64, 64, wm: 2, wn: 2, db: true, pf: true),
+        Variant(128, 64, 64, wm: 4, wn: 2, pf: true),
+        Variant(128, 64, 64, wm: 4, wn: 2, db: true, pf: true),
+        Variant(128, 64, 64, wm: 2, wn: 2),
+        Variant(256, 64, 64, wm: 8, wn: 2),
+        Variant(256, 64, 64, wm: 8, wn: 2, db: true),
+    ]
+    /// NEMOTRON_SEED_DENSE_RETILE_X2=0 leaves `moreVariants` out of this tune.
+    static let offerX2 = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X2"] != "0"
+    static let variants: [Variant] = baseVariants + (offerX ? extraVariants : []) + (offerX2 ? moreVariants : [])
 
     enum Source: String, Sendable { case dict, copy }
 
@@ -1828,8 +2209,10 @@ enum NemotronSeedDenseRetile {
 /// (`NemotronPrefillDenseDict.apply`, `NemotronPrefillSharedDownCopy.apply`) launches the adopted candidate only
 /// where `stockRunsNAX` holds for the request's rows; the residency target groups then treat the kind as admitted.
 /// NEMOTRON_SEED_QMM_TUNE=0 keeps the stock projections; NEMOTRON_SEED_QMM_FORCE=<n> adopts variant n (1-based,
-/// `NemotronSeedQMMTune.variants`: `NemotronSeedDenseRetile`'s base rows, then 64x64x64w22pf) wherever it qualified,
-/// 0 keeps the stock projections. NEMOTRON_SEED_QMM_TUNE_X=0 leaves the pf row out.
+/// `NemotronSeedQMMTune.variants`: `NemotronSeedDenseRetile`'s base rows, then 64x64x64w22pf, then
+/// `NemotronSeedDenseRetile.moreVariants` of at most 128 rows per tile) wherever it qualified, 0 keeps the stock
+/// projections.
+/// NEMOTRON_SEED_QMM_TUNE_X=0 leaves the pf row out, NEMOTRON_SEED_QMM_TUNE_X2=0 the `moreVariants` rows.
 enum NemotronSeedQMMTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE"] != "0"
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_FORCE"] ?? "")
@@ -1841,10 +2224,17 @@ enum NemotronSeedQMMTune {
     /// `NemotronSeedDenseRetile`'s base rows, then the stock geometry's K-loop prefetch twin (64x64x64w22pf);
     /// NEMOTRON_SEED_QMM_TUNE_X=0 leaves the pf row out. FORCE indices 1 ... 7 name the base rows either way.
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE_X"] != "0"
+    /// Then `NemotronSeedDenseRetile.moreVariants` of at most 128 rows per tile (pf with two stages, the 128-row
+    /// pf rows, 128-row tiles on a 2 x 2 grid; the 256-row tiles leave these kinds' narrower products about two
+    /// threadgroups per core); NEMOTRON_SEED_QMM_TUNE_X2=0 leaves them out. Appended after the pf row: FORCE 8
+    /// names the pf row when it is offered, and the rows of this set follow it.
+    static let offerX2 = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE_X2"] != "0"
     static let variants: [Variant] = NemotronSeedDenseRetile.baseVariants
         + (offerX ? NemotronSeedDenseRetile.extraVariants : [])
+        + (offerX2 ? NemotronSeedDenseRetile.moreVariants.filter { $0.bm <= 128 } : [])
     /// Soft cap on the tune's own load time: no kind, variant or timing phase starts past it. 6 s for the base
-    /// rows, scaled by the candidate count so the base rows keep their share of it when the pf row is offered.
+    /// rows, scaled by the candidate count so the base rows keep their share of it when the pf row and the X2 rows
+    /// are offered.
     static let budgetSeconds = 6.0 * Double(variants.count) / Double(NemotronSeedDenseRetile.baseVariants.count)
 
     /// Adopted variant per kind ("out_proj", "up_proj", "shared_down"), set once at load before any request.
@@ -2168,10 +2558,11 @@ enum NemotronSeedQMMTune {
 /// - rows per threadgroup (`m2`: the state product's 64 rows as two threadgroups of 32 rows, four SIMD groups);
 /// - K staging: 64 k staged per barrier pair and consumed as two 32-k chunks in order (`sk64`), or two staging
 ///   buffers with one barrier per chunk (`dbuf`);
-/// - staging SIMD groups (`st8`: eight SIMD groups stage the scan's A tile; the incumbent's four run the
-///   multiply-accumulates and the store).
-/// Variants: state product 1 `m2dbuf`, 2 `m2sk64`, 3 `sk64`; scan decay (and its fresh form) 1 `sk64st8`,
-/// 2 `st8dbuf`, 3 `sk64` (3: NEMOTRON_SEED_SSM_TUNE_X != 0).
+/// - staging SIMD groups (`st8`, `st16`: eight or sixteen SIMD groups stage the scan's A tile; the incumbent's four
+///   run the multiply-accumulates and the store).
+/// Variants: state product 1 `m2dbuf`, 2 `m2sk64`, 3 `sk64`, 4 `dbuf`, 5 `m2`; scan decay (and its fresh form)
+/// 1 `sk64st8`, 2 `st8dbuf`, 3 `sk64`, 4 `dbuf`, 5 `st8`, 6 `sk64st16`, 7 `st16dbuf` (3: NEMOTRON_SEED_SSM_TUNE_X
+/// != 0; 4 and later: NEMOTRON_SEED_SSM_TUNE_X2 != 0, one lower without the X row).
 /// `tune` (load time, after the seed retiles) checks every variant bit for bit against the production launch on
 /// `qualify`'s kinds of seeded cases plus window lengths around the 32- and 64-k staging steps (33, 65 or 31, 96,
 /// 161), with specials (also at chunk boundaries inside the window), overflowing and denormal products, `passes`
@@ -2206,16 +2597,34 @@ enum NemotronSeedSSMTune {
     /// state product's 64 rows per threadgroup, the scan's four staging SIMD groups). Appended, so FORCE 1 and 2
     /// keep their rows.
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_SSM_TUNE_X"] != "0"
+    /// NEMOTRON_SEED_SSM_TUNE_X2=0 leaves out the rows after those: the state product's `dbuf` (two staging buffers
+    /// at the incumbent's 64 rows per threadgroup, 16,896 B) and `m2` (two threadgroups of 32 rows, the incumbent's
+    /// 32-k staging); the scan's `dbuf` (two staging buffers, the incumbent's four staging SIMD groups), `st8`
+    /// (eight staging SIMD groups, the incumbent's 32-k staging), `sk64st16` and `st16dbuf` (sixteen staging SIMD
+    /// groups, 512 threads, each staging two or four of a step's columns; the first four SIMD groups compute and
+    /// store). Appended after the X row, so FORCE 1 ... 3 keep their rows.
+    static let offerX2 = ProcessInfo.processInfo.environment["NEMOTRON_SEED_SSM_TUNE_X2"] != "0"
     static let stateVariants: [Variant] = [
         Variant(name: "m2dbuf", rows: 32, staging: .dbuf, stage: nil),
         Variant(name: "m2sk64", rows: 32, staging: .sk64, stage: nil),
     ] + (offerX ? [Variant(name: "sk64", rows: 64, staging: .sk64, stage: nil)] : [])
+        + (offerX2 ? [
+            Variant(name: "dbuf", rows: 64, staging: .dbuf, stage: nil),
+            Variant(name: "m2", rows: 32, staging: .sk32, stage: nil),
+        ] : [])
     static let scanVariants: [Variant] = [
         Variant(name: "sk64st8", rows: 64, staging: .sk64, stage: 8),
         Variant(name: "st8dbuf", rows: 64, staging: .dbuf, stage: 8),
     ] + (offerX ? [Variant(name: "sk64", rows: 64, staging: .sk64, stage: nil)] : [])
+        + (offerX2 ? [
+            Variant(name: "dbuf", rows: 64, staging: .dbuf, stage: nil),
+            Variant(name: "st8", rows: 64, staging: .sk32, stage: 8),
+            Variant(name: "sk64st16", rows: 64, staging: .sk64, stage: 16),
+            Variant(name: "st16dbuf", rows: 64, staging: .dbuf, stage: 16),
+        ] : [])
     /// Soft cap on the tune's own load time: no variant or timing phase starts past it. 1.5 s for the two base
-    /// rows per list, scaled by the candidate count so they keep their share of it when the third row is offered.
+    /// rows per list, scaled by the candidate count so they keep their share of it when the X and X2 rows are
+    /// offered.
     static let budgetSeconds = 1.5 * Double(stateVariants.count + scanVariants.count) / 4.0
 
     /// Adopted variants (nil: the incumbent), set once at load before any request.
