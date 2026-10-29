@@ -6226,9 +6226,10 @@ class NemotronHSwitchMLP: Module {
                 y = relu2(y)
             }
         }
+        let act = y
         if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
            let fromCopy = NemotronPrefillFC2Copy.apply(y, q, tiles: tiles) {
-            y = fromCopy
+            y = NemotronSeedPhaseProbe.pin(fromCopy, x.reshaped(tokens, 1, inputDims), act, orderK, tiles, fc1, q)
         } else if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
                   let retiled = NemotronSeedRetile.fc2Plain(y, q, tiles: tiles) {
             y = retiled
@@ -8582,7 +8583,7 @@ enum NemotronPrefillDenseDict {
     /// The admitted kinds: "in_proj", "out_proj" (Mamba mixers), "up_proj" (shared experts, with ReLU2).
     nonisolated(unsafe) static var kinds: Set<String> = []
 
-    private static let header: String? = {
+    static let header: String? = {
         var h = nemotronRunGatherHeader
         let edits: [(String, String)] = [
             ("// Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned\n",
@@ -9050,7 +9051,7 @@ const device T* xn = x;
 
     /// `header` with the pair-dictionary loader: the scales and biases operands
     /// become the fc1 bank's `NemotronSBDict` index and FP32 pair table.
-    private static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
+    static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
         var h = source
         func swap(_ old: String, _ new: String) -> Bool {
             guard h.components(separatedBy: old).count == 2 else { return false }
@@ -9289,10 +9290,10 @@ enum NemotronPrefillSharedUpGather {
 
     static func apply(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, up)
+        return NemotronSeedDenseRetile.sharedUp(x, up) ?? launch(x, up)
     }
 
-    private static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let q = up as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
               q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases = q.biases,
               x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
