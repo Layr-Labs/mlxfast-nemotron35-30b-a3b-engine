@@ -647,6 +647,106 @@ METAL_FUNC void nemotron_seed_gather_impl(
 }
 """#
 
+/// NEMOTRON_SEED_LEAN: lean twins of the seed retile kernels, offered as extra rows to `NemotronSeedRetile`,
+/// `NemotronSeedDenseRetile` and `NemotronSeedQMMTune` (each row passes its tuner's bit check and adoption rule
+/// like any other). Every text is derived from the record text by exact swaps; nil (no rows) when one misses.
+/// - B sources (`...Ln`): the record structs with each lane's code, scale, bias and pair-index element offsets in
+///   32-bit `uint` where the record forms `size_t` (every offset lies inside one bank, decode copy or projection:
+///   under 128 x 2688 x 1344 bytes, below 2^32).
+/// - The routed gather keeps one 32-bit row offset per fragment row (`routed_rows[r] * K`, below 2^32 for any
+///   seed) read from the `x` base, where the record keeps a 64-bit row pointer per fragment row.
+/// - The direct (non-prefetch) gather walks k with one counter (k = 0, 32, ..., K - 32, reloading the group's
+///   scale and bias at k % 64 == 0), where the record nests a group counter and a step counter: the same steps, the
+///   same loads and the same mma order.
+/// Every load reads the record's address and every product, mma, accumulator and store is the record's.
+/// NEMOTRON_SEED_LEAN=0 removes the rows.
+enum NemotronSeedLean {
+    static let offered = ProcessInfo.processInfo.environment["NEMOTRON_SEED_LEAN"] != "0"
+
+    /// `text` from `from` (inclusive) to `to` (exclusive, or the end); nil unless each occurs once.
+    static func slice(_ text: String, from: String, to: String?) -> String? {
+        guard text.components(separatedBy: from).count == 2, let a = text.range(of: from) else { return nil }
+        guard let to else { return String(text[a.lowerBound...]) }
+        guard text.components(separatedBy: to).count == 2, let b = text.range(of: to), a.lowerBound < b.lowerBound
+        else { return nil }
+        return String(text[a.lowerBound ..< b.lowerBound])
+    }
+
+    /// `text` through `swaps` (old, new, occurrences); nil unless each occurs exactly as often.
+    static func swapped(_ text: String, _ swaps: [(String, String, Int)]) -> String? {
+        var s = text
+        for (old, new, count) in swaps {
+            guard s.components(separatedBy: old).count == count + 1 else { return nil }
+            s = s.replacingOccurrences(of: old, with: new)
+        }
+        return s
+    }
+
+    /// The B-source structs `names` in `text` renamed `...Ln`, with 32-bit element offsets.
+    static func sources(_ text: String, _ names: [String]) -> String? {
+        guard var s = swapped(text, names.map { ("struct \($0) {", "struct \($0)Ln {", 1) }),
+              s.contains("size_t(") else { return nil }
+        s = s.replacingOccurrences(of: "const size_t ", with: "const uint ")
+            .replacingOccurrences(of: "size_t(", with: "uint(")
+        return s.contains("size_t") ? nil : s
+    }
+
+    /// Appended to the routed retile header: the lean B sources, A loads and gather (`nemotron_seed_gather_impl_ln`).
+    static let retileHeader: String? = {
+        let src = nemotronSeedRetileSource
+        guard let structs = slice(src, from: "template <typename T>\nstruct NemotronSeedBank {",
+                                  to: "// The direct fc1's row-indexed A load"),
+              let b = sources(structs, ["NemotronSeedBank", "NemotronSeedDict", "NemotronSeedCopy"]),
+              let loads = slice(src, from: "template <typename Tile, typename T>\nMETAL_FUNC void nemotron_seed_load_routed(",
+                                to: "// tiles[t] = (first sorted row"),
+              let a = swapped(loads, [
+                ("METAL_FUNC void nemotron_seed_load_routed(", "METAL_FUNC void nemotron_seed_load_routed_ln(", 1),
+                ("    thread Tile& tile, const device T* const thread* rows, const int offset,",
+                 "    thread Tile& tile, const device T* x, const thread uint* rows, const int offset,", 1),
+                ("const device T* source_row = rows[mr * Frag::kElemRows + i] + offset;",
+                 "const device T* source_row = x + (rows[mr * Frag::kElemRows + i] + uint(offset));", 1),
+                ("METAL_FUNC void nemotron_seed_load_a(", "METAL_FUNC void nemotron_seed_load_a_ln(", 1),
+                ("    const device T* const thread* routed,", "    const thread uint* routed,", 1),
+                ("nemotron_seed_load_routed(Atile, routed, k, sgp_sm);",
+                 "nemotron_seed_load_routed_ln(Atile, xn, routed, k, sgp_sm);", 1),
+              ]),
+              let impl = slice(src, from: "template <\n    typename T,\n    int BM,", to: nil),
+              let g = swapped(impl, [
+                ("METAL_FUNC void nemotron_seed_gather_impl(", "METAL_FUNC void nemotron_seed_gather_impl_ln(", 1),
+                ("  const device T* routed[TM * BaseNAXFrag::kElemRows];",
+                 "  uint routed[TM * BaseNAXFrag::kElemRows];", 1),
+                ("? x + size_t(routed_rows[row0 + tm + row]) * K : x;", "? routed_rows[row0 + tm + row] * uint(K) : 0u;", 1),
+                ("nemotron_seed_load_a<ROUTED, aligned_m, SK>(", "nemotron_seed_load_a_ln<ROUTED, aligned_m, SK>(", 3),
+                ("      for (int kg = 0; kg < K; kg += 64) {\n        float2 sbv[TN * 2];\n        STEEL_PRAGMA_UNROLL\n"
+                    + "        for (short nn = 0; nn < TN; ++nn) {\n          STEEL_PRAGMA_UNROLL\n"
+                    + "          for (short i = 0; i < 2; ++i) {\n"
+                    + "            const int n = y_col + tn + nn * 16 + bc.y + i * 8;\n"
+                    + "            sbv[nn * 2 + i] = (ALIGN_N || n < N) ? bsrc.sb(n, kg / 64) : float2(0.0f);\n"
+                    + "          }\n        }\n\n        STEEL_PRAGMA_NO_UNROLL\n"
+                    + "        for (int kk1 = 0; kk1 < 64; kk1 += SK) {\n",
+                 "      float2 sbv[TN * 2];\n      STEEL_PRAGMA_NO_UNROLL\n      for (int ks = 0; ks < K; ks += SK) {\n"
+                    + "        if (ks % 64 == 0) {\n        STEEL_PRAGMA_UNROLL\n"
+                    + "        for (short nn = 0; nn < TN; ++nn) {\n          STEEL_PRAGMA_UNROLL\n"
+                    + "          for (short i = 0; i < 2; ++i) {\n"
+                    + "            const int n = y_col + tn + nn * 16 + bc.y + i * 8;\n"
+                    + "            sbv[nn * 2 + i] = (ALIGN_N || n < N) ? bsrc.sb(n, ks / 64) : float2(0.0f);\n"
+                    + "          }\n        }\n        }\n\n        {\n", 1),
+                ("(Atile, xn, routed, kg + kk1, K, sgp_sm);", "(Atile, xn, routed, ks, K, sgp_sm);", 1),
+                ("const int k = kg + kk1 + kk * 16 + bc.x;", "const int k = ks + kk * 16 + bc.x;", 1),
+              ]),
+              !g.contains("kg + kk1"), !g.contains("routed_rows[row0 + tm + row]) * K")
+        else { return nil }
+        return b + a + g
+    }()
+
+    /// Appended to the dense retile header: `NemotronSeedDenseDictLn` and `NemotronSeedDenseCopyLn`.
+    static let denseHeader: String? = slice(
+        nemotronSeedDenseSource, from: "template <typename T>\nstruct NemotronSeedDenseDict {",
+        to: "template <\n    typename T,\n    int BM,").flatMap {
+            sources($0, ["NemotronSeedDenseDict", "NemotronSeedDenseCopy"])
+        }
+}
+
 /// Seed-only (request prefill, `NemotronHPrefillX5.active`) routed MoE fc1 and
 /// fc2 through a retiled run gather (`nemotron_seed_gather_impl`) chosen once at
 /// load. Every variant keeps each output's `BaseNAXFrag::mma` sequence over k
@@ -676,6 +776,8 @@ enum NemotronSeedRetile {
         let bn: Int, bk: Int, wm: Int, wn: Int
         let direct: Bool
         var pf: Bool = false
+        /// `NemotronSeedLean`'s twin of the geometry.
+        var lean: Bool = false
         var threads: Int { wm * wn * 32 }
     }
 
@@ -698,9 +800,24 @@ enum NemotronSeedRetile {
     ] + (offerPF ? [
         Variant(name: "ws64x64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true),
         Variant(name: "d64w22pf", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true),
+        // The prefetching K loop at the other base geometries.
+        Variant(name: "ws64x128w22pf", bn: 64, bk: 128, wm: 2, wn: 2, direct: false, pf: true),
+        Variant(name: "ws128x64w24pf", bn: 128, bk: 64, wm: 2, wn: 4, direct: false, pf: true),
+        Variant(name: "d128w14pf", bn: 128, bk: 64, wm: 1, wn: 4, direct: true, pf: true),
+        Variant(name: "d128w24pf", bn: 128, bk: 64, wm: 2, wn: 4, direct: true, pf: true),
+    ] : []) + (NemotronSeedLean.offered && NemotronSeedLean.retileHeader != nil ? [
+        Variant(name: "ws64x64w22ln", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, lean: true),
+        Variant(name: "d64w22ln", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, lean: true),
+        Variant(name: "ws64x64w22pfln", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, lean: true),
+        Variant(name: "d64w22pfln", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true, lean: true),
     ] : [])
 
     enum Source: String, Sendable { case bank, dict, copy }
+
+    /// The timing runs the four layers as one dependent chain (each layer's input a view of the previous layer's
+    /// output, where it is large enough), so a geometry's tail is timed as the seed meets it.
+    /// NEMOTRON_SEED_RETILE_CHAIN=0 keeps the independent launches on one input.
+    static let chainTiming = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_CHAIN"] != "0"
 
     /// The launch a role's incumbent uses at the seed.
     struct Role: Sendable, Equatable {
@@ -713,17 +830,18 @@ enum NemotronSeedRetile {
     nonisolated(unsafe) static var fc1Choice: (role: Role, variant: Variant)? = nil
     nonisolated(unsafe) static var fc2Choice: (role: Role, variant: Variant)? = nil
 
-    private static func body(routed: Bool, source: Source) -> String {
+    private static func body(routed: Bool, source: Source, lean: Bool = false) -> String {
         let make: String
+        let ln = lean ? "Ln" : ""
         switch source {
-        case .bank: make = "NemotronSeedBank<T> b{(const device uint8_t*)w, scales, biases, K};"
-        case .dict: make = "NemotronSeedDict<T> b{(const device uint8_t*)w, scales, biases, K};"
-        case .copy: make = "NemotronSeedCopy<T> b{w, scales, biases, K};"
+        case .bank: make = "NemotronSeedBank\(ln)<T> b{(const device uint8_t*)w, scales, biases, K};"
+        case .dict: make = "NemotronSeedDict\(ln)<T> b{(const device uint8_t*)w, scales, biases, K};"
+        case .copy: make = "NemotronSeedCopy\(ln)<T> b{w, scales, biases, K};"
         }
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
         func call(_ bm: String) -> String {
             """
-                    nemotron_seed_gather_impl<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF>(
+                    nemotron_seed_gather_impl\(lean ? "_ln" : "")<T, \(bm), BN, BK, WM, WN, DIRECT_B, ALIGN_N, RELU2, \(routed), PF>(
                         x, \(rows), b, tiles, y, N, K, Ws,
                         threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup,
@@ -741,19 +859,24 @@ enum NemotronSeedRetile {
             """
     }
 
-    private static func makeKernel(routed: Bool, source: Source) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(routed: Bool, source: Source, lean: Bool = false) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
-            name: "nemotron_seed_gather_\(routed ? "routed_" : "")\(source.rawValue)",
+            name: "nemotron_seed_gather_\(routed ? "routed_" : "")\(source.rawValue)" + (lean ? "_ln" : ""),
             inputNames: ["x", "w", "scales", "biases", "tiles"] + (routed ? ["routed_rows"] : []) + ["N", "K"],
             outputNames: ["y"],
-            source: body(routed: routed, source: source),
-            header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource)
+            source: body(routed: routed, source: source, lean: lean),
+            header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource
+                + (lean ? "\n" + (NemotronSeedLean.retileHeader ?? "") : ""))
     }
 
     private static let routedBank = makeKernel(routed: true, source: .bank)
     private static let routedDict = makeKernel(routed: true, source: .dict)
     private static let plainBank = makeKernel(routed: false, source: .bank)
     private static let plainCopy = makeKernel(routed: false, source: .copy)
+    private static let routedBankLn = makeKernel(routed: true, source: .bank, lean: true)
+    private static let routedDictLn = makeKernel(routed: true, source: .dict, lean: true)
+    private static let plainBankLn = makeKernel(routed: false, source: .bank, lean: true)
+    private static let plainCopyLn = makeKernel(routed: false, source: .copy, lean: true)
 
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
@@ -785,9 +908,10 @@ enum NemotronSeedRetile {
                 guard role.routed, let d = NemotronSBDict.dict(lin), d.index.shape == ops.scales.shape,
                       d.index.dtype == .uint16, d.table.dtype == .float32
                 else { return nil }
-                (kernel, operands) = (routedDict, [ops.weight, d.index, d.table])
+                (kernel, operands) = (v.lean ? routedDictLn : routedDict, [ops.weight, d.index, d.table])
             } else {
-                (kernel, operands) = (role.routed ? routedBank : plainBank, [ops.weight, ops.scales, biases])
+                (kernel, operands) = (role.routed ? (v.lean ? routedBankLn : routedBank) : (v.lean ? plainBankLn : plainBank),
+                                      [ops.weight, ops.scales, biases])
             }
         case .copy:
             guard !role.routed, !role.relu2, nOut % 128 == 0, let copy = NemotronZSkip.copy(for: lin), copy.dict,
@@ -795,7 +919,7 @@ enum NemotronSeedRetile {
                   copy.scales.shape == [experts, nOut / 128, k / 64, 128], copy.scales.dtype == .uint16,
                   copy.biases.dtype == .float32
             else { return nil }
-            (kernel, operands) = (plainCopy, [copy.codes, copy.scales, copy.biases])
+            (kernel, operands) = (v.lean ? plainCopyLn : plainCopy, [copy.codes, copy.scales, copy.biases])
         }
         var inputs: [any ScalarOrArray] = [x] + operands + [tiles.tiles]
         if role.routed, let rows { inputs.append(rows) }
@@ -971,6 +1095,8 @@ enum NemotronSeedRetile {
         // Time the incumbent and the survivors round robin on the 488-token
         // case, first four MoE layers per repetition; median ms per layer.
         let layers = Array(moes.prefix(4))
+        // 25 timed cycles, scaled by `nemotronTuneTimingScale` (even).
+        let timedCycles = max(25, Int((25 * nemotronTuneTimingScale).rounded()) / 2 * 2)
         var medians: [[(Variant?, Double)]] = [[], []]
         var verdicts: [NemotronTuneAdoption.Verdict?] = [nil, nil]
         var choice: [Variant?] = [nil, nil]
@@ -980,19 +1106,30 @@ enum NemotronSeedRetile {
             var samples = Array(repeating: [Double](), count: candidates.count)
             do {
                 try withError {
-                    for rep in 0 ..< 30 {
+                    for rep in 0 ..< 5 + timedCycles {
                         for i in NemotronTuneAdoption.order(candidates.count, cycle: max(0, rep - 5)) {
                             let candidate = candidates[i]
                             let start = DispatchTime.now().uptimeNanoseconds
-                            let outs = layers.compactMap { m -> MLXArray? in
+                            // `chainTiming`: each layer's input is a view of the previous layer's output (same
+                            // shape and dtype as `x`), so the launches run back to back as in the seed.
+                            var current = x
+                            var outs: [MLXArray] = []
+                            var chained = chainTiming
+                            for m in layers {
                                 let lin = linear(m, r)
-                                if let candidate {
-                                    return launch(candidate, role: roles[r], x: x, lin: lin, rows: rows,
-                                                  tiles: cases[0].tiles)
+                                let out = candidate.map {
+                                    launch($0, role: roles[r], x: current, lin: lin, rows: rows, tiles: cases[0].tiles)
+                                } ?? incumbent(roles[r], x: current, lin: lin, rows: rows, tiles: cases[0].tiles)
+                                guard let out else { break }
+                                outs.append(out)
+                                if chained, out.dtype == x.dtype, out.size >= x.size {
+                                    current = out.reshaped(-1)[0 ..< x.size].reshaped(x.shape)
+                                } else {
+                                    chained = false
                                 }
-                                return incumbent(roles[r], x: x, lin: lin, rows: rows, tiles: cases[0].tiles)
                             }
-                            eval(outs)
+                            // A chain is complete once its last launch is; otherwise every launch is evaluated.
+                            if chained, let last = outs.last { eval(last) } else { eval(outs) }
                             Stream.gpu.synchronize()
                             let elapsed = DispatchTime.now().uptimeNanoseconds - start
                             if rep >= 5, outs.count == layers.count {
@@ -1005,7 +1142,7 @@ enum NemotronSeedRetile {
                 dropped[r].append("timing error")
                 continue
             }
-            guard samples.allSatisfy({ $0.count == 25 }) else { continue }
+            guard samples.allSatisfy({ $0.count == timedCycles }) else { continue }
             let verdict = NemotronTuneAdoption.decide(samples)
             verdicts[r] = verdict
             medians[r] = Array(zip(candidates, verdict.medians))
@@ -1499,12 +1636,16 @@ enum NemotronSeedDenseRetile {
         let db: Bool
         /// K-loop prefetch: each block's B loads issued one block ahead (`nemotron_seed_dense_impl`'s PF).
         let pf: Bool
+        /// `NemotronSeedLean`'s B sources (`NemotronSeedDenseDictLn` / `NemotronSeedDenseCopyLn`).
+        let lean: Bool
         var threads: Int { wm * wn * 32 }
         var threadgroupBytes: Int { (db ? 2 : 1) * bn * (bk + 8) * 2 }
 
-        init(_ bm: Int, _ bn: Int, _ bk: Int, wm: Int, wn: Int, db: Bool = false, pf: Bool = false) {
+        init(_ bm: Int, _ bn: Int, _ bk: Int, wm: Int, wn: Int, db: Bool = false, pf: Bool = false,
+             lean: Bool = false) {
             (self.bm, self.bn, self.bk, self.wm, self.wn, self.db, self.pf) = (bm, bn, bk, wm, wn, db, pf)
-            name = "\(bm)x\(bn)x\(bk)w\(wm)\(wn)" + (db ? "db" : "") + (pf ? "pf" : "")
+            self.lean = lean
+            name = "\(bm)x\(bn)x\(bk)w\(wm)\(wn)" + (db ? "db" : "") + (pf ? "pf" : "") + (lean ? "ln" : "")
         }
     }
 
@@ -1529,20 +1670,36 @@ enum NemotronSeedDenseRetile {
     /// dense tune has no load-time cap, and each row adds a qualify and a timing pass over every layer.
     static let extraVariants: [Variant] = [
         Variant(64, 64, 64, wm: 2, wn: 2, pf: true),
+        // The other base geometries with the same K-loop prefetch (single stage; each fits 32 KB).
+        Variant(64, 128, 64, wm: 2, wn: 4, pf: true),
+        Variant(128, 64, 64, wm: 4, wn: 2, pf: true),
+        Variant(128, 128, 64, wm: 4, wn: 4, pf: true),
+        Variant(64, 64, 128, wm: 2, wn: 2, pf: true),
     ]
     /// NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out of this tune (the base rows only).
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X"] != "0"
     static let variants: [Variant] = baseVariants + (offerX ? extraVariants : [])
+        + leanVariants
+    /// The incumbent geometry and its prefetch twin through `NemotronSeedLean`'s B sources (this tune and
+    /// `NemotronSeedQMMTune`), appended last so every other row keeps its index; NEMOTRON_SEED_LEAN=0 leaves them out.
+    /// They are qualified and (chain-)timed like every other row.
+    static let leanVariants: [Variant] = NemotronSeedLean.offered && NemotronSeedLean.denseHeader != nil
+        ? [Variant(64, 64, 64, wm: 2, wn: 2, lean: true), Variant(64, 64, 64, wm: 2, wn: 2, pf: true, lean: true)] : []
+    /// The timing runs every layer's launch as one dependent chain (each reads its pair table, or the copy's biases,
+    /// from a view of the previous launch's output), so a geometry's tail is timed as the seed meets it, not hidden
+    /// by the next layer's independent launch. NEMOTRON_SEED_DENSE_CHAIN=0 keeps the independent launches.
+    static let chainTiming = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_CHAIN"] != "0"
 
     enum Source: String, Sendable { case dict, copy }
 
     /// Kinds: "in_proj", "out_proj", "up_proj" (pair dictionaries), "shared_down" (decode copy).
     nonisolated(unsafe) static var choice: [String: Variant] = [:]
 
-    private static func makeKernel(_ source: Source) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(_ source: Source, lean: Bool = false) -> MLXFast.MLXFastKernel {
+        let ln = lean ? "Ln" : ""
         let make = source == .dict
-            ? "NemotronSeedDenseDict<T> b{(const device uint8_t*)w, scales, biases, K};"
-            : "NemotronSeedDenseCopy<T> b{w, scales, biases, K};"
+            ? "NemotronSeedDenseDict\(ln)<T> b{(const device uint8_t*)w, scales, biases, K};"
+            : "NemotronSeedDenseCopy\(ln)<T> b{w, scales, biases, K};"
         func call(_ bm: String) -> String {
             """
                     nemotron_seed_dense_impl<T, \(bm), BN, BK, WM, WN, DB, PF, ALIGN_N, RELU2>(
@@ -1555,7 +1712,7 @@ enum NemotronSeedDenseRetile {
         // A tile of at most BM / 2 rows runs the BM / 2 body (for BM 64 the
         // incumbents' 32-row bound); either way rows keep their 16-row fragments.
         return MLXFast.metalKernel(
-            name: "nemotron_seed_dense_\(source.rawValue)",
+            name: "nemotron_seed_dense_\(source.rawValue)" + (lean ? "_ln" : ""),
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
@@ -1567,11 +1724,14 @@ enum NemotronSeedDenseRetile {
             \(call("BM"))
                 }
             """,
-            header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource + "\n" + nemotronSeedDenseSource)
+            header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource + "\n" + nemotronSeedDenseSource
+                + (lean ? "\n" + (NemotronSeedLean.denseHeader ?? "") : ""))
     }
 
     private static let dictKernel = makeKernel(.dict)
     private static let copyKernel = makeKernel(.copy)
+    private static let dictKernelLn = makeKernel(.dict, lean: true)
+    private static let copyKernelLn = makeKernel(.copy, lean: true)
 
     /// One retiled launch over the request's rows (`x`: [1, rows, K]) in tiles of
     /// `v.bm` rows (at least three descriptors, as the incumbents); nil wherever
@@ -1599,7 +1759,7 @@ enum NemotronSeedDenseRetile {
             else { return nil }
             let table = dep.map { NemotronSeedQMMTune.operandView($0, like: d.table) } ?? d.table
             guard let table else { return nil }
-            (kernel, operands) = (dictKernel, [q.weight, d.index, table])
+            (kernel, operands) = (v.lean ? dictKernelLn : dictKernel, [q.weight, d.index, table])
         case .copy:
             guard !relu2, nOut % 128 == 0, let copy = NemotronSharedDownZSkip.copyArrays(for: linear),
                   copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
@@ -1608,7 +1768,7 @@ enum NemotronSeedDenseRetile {
             else { return nil }
             let biases = dep.map { NemotronSeedQMMTune.operandView($0, like: copy.biases) } ?? copy.biases
             guard let biases else { return nil }
-            (kernel, operands) = (copyKernel, [copy.codes, copy.scales, biases])
+            (kernel, operands) = (v.lean ? copyKernelLn : copyKernel, [copy.codes, copy.scales, biases])
         }
         let used = (rows + v.bm - 1) / v.bm
         let count = max(used, 3)
@@ -1653,7 +1813,11 @@ enum NemotronSeedDenseRetile {
     /// robin on case 0, every layer per cycle: 1 warm-up and
     /// `NemotronTuneAdoption.minCycles` timed cycles (`NemotronTuneAdoption.order`),
     /// median ms per launch; `NemotronTuneAdoption.decide` picks.
-    private static func evaluate(cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?) -> Outcome {
+    /// `chain(v, layer, dep)` (when given): the case-0 launch of `layer` reading one operand from a view of `dep` (the
+    /// previous layer's output in the timing chain), so each timed launch waits for the one before it, as the seed's
+    /// projections run; nil `chain` keeps the independent per-layer launches.
+    private static func evaluate(cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?,
+                                 chain: ((Variant?, Int, MLXArray?) -> MLXArray?)? = nil) -> Outcome {
         var alive = variants.filter { $0.threadgroupBytes <= 32768 }
         var dropped: [String] = []
         caseLoop: for c in 0 ..< cases {
@@ -1688,14 +1852,32 @@ enum NemotronSeedDenseRetile {
         guard !alive.isEmpty else { return Outcome(alive: alive, dropped: dropped, medians: [], choice: nil) }
         let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
         var samples = Array(repeating: [Double](), count: candidates.count)
-        let timed = NemotronTuneAdoption.minCycles
+        let timed = max(NemotronTuneAdoption.minCycles,
+                        Int((Double(NemotronTuneAdoption.minCycles) * nemotronTuneTimingScale).rounded()) / 2 * 2)
         do {
             try withError {
                 for rep in 0 ..< 1 + timed {
                     for i in NemotronTuneAdoption.order(candidates.count, cycle: max(0, rep - 1)) {
                         let start = DispatchTime.now().uptimeNanoseconds
-                        let outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
-                        eval(outs)
+                        var outs: [MLXArray] = []
+                        if let chain {
+                            var previous: MLXArray? = nil
+                            for layer in 0 ..< layers {
+                                guard let out = chain(candidates[i], layer, previous) else { break }
+                                previous = out
+                                outs.append(out)
+                            }
+                            if outs.count == layers, let last = outs.last {
+                                eval(last)
+                            } else {
+                                // A link the chain cannot build: this sample times the independent launches.
+                                outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
+                                eval(outs)
+                            }
+                        } else {
+                            outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
+                            eval(outs)
+                        }
                         Stream.gpu.synchronize()
                         let elapsed = DispatchTime.now().uptimeNanoseconds - start
                         if rep >= 1, outs.count == layers {
@@ -1774,10 +1956,13 @@ enum NemotronSeedDenseRetile {
                 detail.append("\(kind) off (inputs)")
                 continue
             }
-            let o = evaluate(cases: xs.count, layers: all.count) { v, c, layer in
+            let o = evaluate(cases: xs.count, layers: all.count, run: { v, c, layer in
                 if let v { return launch(v, source: .dict, x: xs[c], linear: all[layer], relu2: relu2) }
                 return NemotronPrefillDenseDict.launch(xs[c], all[layer], relu2: relu2)
-            }
+            }, chain: chainTiming ? { v, layer, dep in
+                if let v { return launch(v, source: .dict, x: xs[0], linear: all[layer], relu2: relu2, dep: dep) }
+                return NemotronPrefillDenseDict.launch(xs[0], all[layer], relu2: relu2, dep: dep)
+            } : nil)
             if let pick = o.choice { choice[kind] = pick }
             note(kind, o)
         }
@@ -1786,10 +1971,13 @@ enum NemotronSeedDenseRetile {
             // The shared up's ReLU2 output, except the scaled case.
             let xs = inputs(first.weight.dim(1) * 8, seed: 0x5eed_de80, zeros: { $0 != 1 })
             if xs.count == rowCounts.count {
-                let o = evaluate(cases: xs.count, layers: downs.count) { v, c, layer in
+                let o = evaluate(cases: xs.count, layers: downs.count, run: { v, c, layer in
                     if let v { return launch(v, source: .copy, x: xs[c], linear: downs[layer], relu2: false) }
                     return NemotronPrefillSharedDownCopy.launch(xs[c], downs[layer])
-                }
+                }, chain: chainTiming ? { v, layer, dep in
+                    if let v { return launch(v, source: .copy, x: xs[0], linear: downs[layer], relu2: false, dep: dep) }
+                    return NemotronPrefillSharedDownCopy.launch(xs[0], downs[layer], dep: dep)
+                } : nil)
                 if let pick = o.choice { choice["shared_down"] = pick }
                 note("shared_down", o)
             } else {
@@ -1843,14 +2031,27 @@ enum NemotronSeedQMMTune {
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE_X"] != "0"
     static let variants: [Variant] = NemotronSeedDenseRetile.baseVariants
         + (offerX ? NemotronSeedDenseRetile.extraVariants : [])
+        + NemotronSeedDenseRetile.leanVariants
     /// Soft cap on the tune's own load time: no kind, variant or timing phase starts past it. 6 s for the base
     /// rows, scaled by the candidate count so the base rows keep their share of it when the pf row is offered.
-    static let budgetSeconds = 6.0 * Double(variants.count) / Double(NemotronSeedDenseRetile.baseVariants.count)
+    static let budgetSeconds = 6.0 * nemotronTuneBudgetScale * Double(variants.count)
+        / Double(NemotronSeedDenseRetile.baseVariants.count)
 
     /// Adopted variant per kind ("out_proj", "up_proj", "shared_down"), set once at load before any request.
     nonisolated(unsafe) private(set) static var choice: [String: Variant] = [:]
 
     static func adopted(_ kind: String) -> Bool { choice[kind] != nil }
+
+    /// Whether the seed's attention q_proj / o_proj join the tune (NEMOTRON_SEED_QMM_ATTN=0 leaves them stock).
+    static let attentionKinds = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_ATTN"] != "0"
+
+    /// The seed's attention projection `kind` ("q_proj", "o_proj") through the adopted launch, where the stock
+    /// product runs `qmm_nax` on the request's rows; nil otherwise (the caller runs its stock projection).
+    static func attention(_ x: MLXArray, _ linear: Linear, kind: String) -> MLXArray? {
+        guard attentionKinds, NemotronHPrefillX5.active, choice[kind] != nil, x.ndim == 3, x.dim(0) == 1,
+              x.dim(1) > 32, NemotronSBDict.dict(linear) != nil else { return nil }
+        return dense(x, linear, kind: kind, relu2: false)
+    }
 
     /// Whether MLX's quantized matmul runs `qmm_nax` for a BF16 [m, k] x [n, k]^T product (one batch, transposed,
     /// group size 64, NAX host): m at or above every `get_qmv_batch_limit` (at most 33) and `qmm_splitk`'s split
@@ -2133,6 +2334,20 @@ enum NemotronSeedQMMTune {
                                   source: .dict, relu2: kind == "up_proj", zeros: false))
             }
         }
+        // The seed's attention q_proj and o_proj (stock `linear(x)` on 488 rows, `qmm_nax`), reading the pair
+        // dictionaries `NemotronSBDict` builds for every 4-bit target projection; k_proj and v_proj run split K at
+        // 488 rows and stay stock. NEMOTRON_SEED_QMM_ATTN=0 leaves them out.
+        if attentionKinds {
+            let attentions = target.modules().compactMap { $0 as? NemotronHAttention }
+            for (kind, linears) in [("q_proj", attentions.map { $0.wq as Linear }),
+                                    ("o_proj", attentions.map { $0.wo as Linear })] where !linears.isEmpty {
+                if linears.allSatisfy({ ($0 as? QuantizedLinear).flatMap { NemotronSBDict.dict($0) } != nil }) {
+                    kinds.append(Kind(name: kind, linears: linears, source: .dict, relu2: false, zeros: false))
+                } else {
+                    parts.append("\(kind) off (no dictionary)")
+                }
+            }
+        }
         if NemotronPrefillSharedDownCopy.verified {
             parts.append("shared_down off (copy launch verified)")
         } else {
@@ -2216,7 +2431,7 @@ enum NemotronSeedSSMTune {
     ] + (offerX ? [Variant(name: "sk64", rows: 64, staging: .sk64, stage: nil)] : [])
     /// Soft cap on the tune's own load time: no variant or timing phase starts past it. 1.5 s for the two base
     /// rows per list, scaled by the candidate count so they keep their share of it when the third row is offered.
-    static let budgetSeconds = 1.5 * Double(stateVariants.count + scanVariants.count) / 4.0
+    static let budgetSeconds = 1.5 * nemotronTuneBudgetScale * Double(stateVariants.count + scanVariants.count) / 4.0
 
     /// Adopted variants (nil: the incumbent), set once at load before any request.
     nonisolated(unsafe) private(set) static var stateChoice: Variant? = nil
