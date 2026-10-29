@@ -4014,6 +4014,85 @@ enum NemotronZSkip {
 }
 
 //
+// Shared down only: delete full-row TG staging and its admission barrier.
+// The original narrow/wide sources, arithmetic and output stores remain references.
+// This factory is evaluated only by the official remote worker.
+private func nemotronSharedRegisterInputSource(_ original: String, wide: Bool) -> String? {
+    var s = original
+    let arrays = "  threadgroup T xsh[K];\n  threadgroup uchar cmask[chunks];\n"
+    guard s.components(separatedBy: arrays).count == 2 else { return nil }
+    s = s.replacingOccurrences(of: arrays, with: "")
+    let stage = """
+      for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+        const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+        uint m = 0, unsafe = 0;
+        for (int i = 0; i < 8; i++) {
+          const uint ab = uint(xb[i]) & 0x7fffu;
+          m |= ab != 0 ? (1u << i) : 0u;
+          unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+          xsh[8 * c + i] = xs[8 * c + i];
+        }
+        // A full-mask sentinel sends tiny/nonfinite chunks to the unchanged dense
+        // arithmetic, without a second shared array or per-output exponent tests.
+        cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    """ + "\n"
+    guard s.components(separatedBy: stage).count == 2 else { return nil }
+    s = s.replacingOccurrences(of: stage, with: "")
+    if wide {
+        let wideStage = """
+            for (int c = sg * 32 + lid; c < chunks; c += SGS * 32) {
+              const device uint16_t* xb = (const device uint16_t*)(xs + 8 * c);
+              uint m = 0, unsafe = 0;
+              for (int i = 0; i < 8; i++) {
+                const uint ab = uint(xb[i]) & 0x7fffu;
+                m |= ab != 0 ? (1u << i) : 0u;
+                unsafe |= ab != 0 && (ab < 0x0880u || ab >= 0x7f80u) ? 1u : 0u;
+                xsh[8 * c + i] = xs[8 * c + i];
+              }
+              cmask[c] = unsafe != 0 ? uchar(255) : uchar(m);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        """ + "\n"
+        guard s.components(separatedBy: wideStage).count == 2 else { return nil }
+        s = s.replacingOccurrences(of: wideStage, with: "")
+    }
+    let paths = wide ? 2 : 1
+    let mask = "const uint m = cmask[c];"
+    guard s.components(separatedBy: mask).count == paths + 1 else { return nil }
+    // Eight lanes read one raw BF16 each, at the original addresses. All 32
+    // lanes reconstruct the same mask/sentinel and receive exact raw words.
+    let load = """
+const uint nms_bits = lid < 8 ? uint(((const device ushort*)xs)[8 * c + lid]) : 0u;
+      const uint nms_ab = nms_bits & 0x7fffu;
+      const uint nms_mask = simd_sum(lid < 8 && nms_ab != 0 ? (1u << uint(lid)) : 0u);
+      const bool nms_unsafe = simd_any(lid < 8 && nms_ab != 0 && (nms_ab < 0x0880u || nms_ab >= 0x7f80u));
+      const uint m = nms_unsafe ? 255u : nms_mask;
+      auto nms_at = [&](int j) -> T {
+        return as_type<T>(ushort(simd_broadcast(nms_bits, ushort(j))));
+      };
+"""
+    s = s.replacingOccurrences(of: mask, with: load)
+    for j in ["j1", "j2", "j3"] {
+        let old = "xsh[8 * c + \(j)]"
+        let expected = j == "j1" ? 3 * paths : (j == "j2" ? 2 * paths : paths)
+        guard s.components(separatedBy: old).count == expected + 1 else { return nil }
+        s = s.replacingOccurrences(of: old, with: "nms_at(\(j))")
+    }
+    let dense = "const threadgroup T* xv = xsh + 8 * c;"
+    guard s.components(separatedBy: dense).count == paths + 1 else { return nil }
+    s = s.replacingOccurrences(of: dense, with: """
+thread T nms_values[8];
+      for (int i = 0; i < 8; i++) nms_values[i] = nms_at(i);
+      const thread T* xv = nms_values;
+""")
+    guard !s.contains("xsh"), !s.contains("cmask"),
+          s.components(separatedBy: "threadgroup float part[32 * PS];").count == 2
+    else { return nil }
+    return s
+}
+
 enum NemotronSharedDownZSkip {
     static let enabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_SHARED_DOWN_ZSKIP"] != "0"
@@ -4118,6 +4197,145 @@ enum NemotronSharedDownZSkip {
         lock.withLock { copies[ObjectIdentifier(down)].map { ($0.codes, $0.scales, $0.biases) } }
     }
 
+    private static let registerInputRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_SHARED_INPUT_REGS"] != "0"
+    nonisolated(unsafe) private static var registerInputForms: [ObjectIdentifier: Set<String>] = [:]
+
+    private static func registerInputKernel(_ copy: Copy) -> MLXFast.MLXFastKernel? {
+        switch (copy.wide, NemotronZSkip.vstore) {
+        case (false, false): return registerNarrowKernel
+        case (false, true): return registerNarrowVSKernel
+        case (true, false): return registerWideKernel
+        case (true, true): return registerWideVSKernel
+        }
+    }
+    private static func registerInputTag(_ copy: Copy) -> String {
+        "\(copy.wide ? "w" : "n")_\(NemotronZSkip.vstore ? "vs" : "lane0")"
+    }
+    private static func makeRegisterInputKernel(wide: Bool, vstore: Bool) -> MLXFast.MLXFastKernel? {
+        guard registerInputRequested,
+              let original = wide ? wideSource : source,
+              let registerSource = nemotronSharedRegisterInputSource(original, wide: wide)
+        else { return nil }
+        let finalSource: String
+        if vstore {
+            guard let vector = nemotronZSkipVectorStoreSource(registerSource) else { return nil }
+            finalSource = vector
+        } else {
+            finalSource = registerSource
+        }
+        return MLXFast.metalKernel(
+            name: "nemotron_shared_down_reg_input_\(wide ? "wide" : "narrow")_\(vstore ? "vs" : "lane0")",
+            inputNames: ["wk", "sk", "bk", "x", "inds"], outputNames: ["shared_y"],
+            source: finalSource,
+            header: nemotronMoELeaderHeader + nemotronMoELeaderStore + nemotronZSkipHeader,
+            ensureRowContiguous: true)
+    }
+    private static let registerNarrowKernel = makeRegisterInputKernel(wide: false, vstore: false)
+    private static let registerNarrowVSKernel = makeRegisterInputKernel(wide: false, vstore: true)
+    private static let registerWideKernel = makeRegisterInputKernel(wide: true, vstore: false)
+    private static let registerWideVSKernel = makeRegisterInputKernel(wide: true, vstore: true)
+
+    // Also used for the reference in admission: never index empty compiler output.
+    private static func registerInputCheckDispatch(_ x: MLXArray, _ copy: Copy, _ inds: MLXArray,
+                                                  _ kernel: MLXFast.MLXFastKernel) -> MLXArray? {
+        let sgs = NemotronZSkip.sgs
+        let tiles = copy.wide ? n / 256 + 1 : n / 128
+        let outputs = kernel(
+            [copy.decodeCodes, copy.scales, copy.biases, x, inds],
+            template: [("T", DType.bfloat16), ("K", k), ("N", n), ("SGS", sgs)],
+            grid: (32 * sgs * tiles, 3, 1), threadGroup: (32 * sgs, 1, 1),
+            outputShapes: [[1, 3, n]], outputDTypes: [.bfloat16])
+        guard outputs.count == 1, outputs[0].shape == [1, 3, n], outputs[0].dtype == .bfloat16
+        else { return nil }
+        return outputs[0]
+    }
+
+    // Each row includes all 256 masks over the 464 chunks. Rotation changes
+    // their position relative to scale groups, SIMD ownership and the tail.
+    private static func registerInputMaskRows(_ phase: Int) -> MLXArray {
+        var words = Array(repeating: UInt16(0), count: 3 * k)
+        let values: [UInt16] = [0x3f00, 0x3fc0, 0xbf80, 0x4080, 0x3a80, 0x4100, 0xbc00, 0x3f80]
+        for row in 0 ..< 3 {
+            for chunk in 0 ..< k / 8 {
+                let mask = (chunk + row * 73 + phase) % 256
+                for i in 0 ..< 8 {
+                    words[row * k + chunk * 8 + i] = mask & (1 << i) != 0
+                        ? values[(i + row) % 8] : ((i + row + chunk) % 2 == 0 ? 0 : 0x8000)
+                }
+            }
+        }
+        return MLXArray(words, [3, k]).view(dtype: .bfloat16)
+    }
+    private static func registerInputSpecialRows() -> MLXArray {
+        var words = Array(repeating: UInt16(0), count: 3 * k)
+        let special: [UInt16] = [0x0001, 0x8001, 0x7f80, 0xff80, 0x7fc1, 0x087f, 0x0880, 0x7f7f, 0xff7f]
+        for row in 0 ..< 3 {
+            for (j, word) in special.enumerated() {
+                let chunk = [0, k / 16, k / 8 - 1][j % 3]
+                words[row * k + chunk * 8 + (j + row) % 8] = word
+            }
+        }
+        return MLXArray(words, [3, k]).view(dtype: .bfloat16)
+    }
+
+    /// After the original shared/co-launch admission settled its actual copy
+    /// form, before graph tracing. Only the separate shared-down run changes;
+    /// the alternative non-early combined co-launch remains the original path.
+    static func qualifyRegisterInputs(_ model: Module) {
+        lock.withLock { registerInputForms = [:] }
+        guard registerInputRequested, Device.defaultDevice().deviceType == .gpu,
+              StreamOrDevice.default == .gpu else { return }
+        let snapshot = lock.withLock { (copies, inds) }
+        let expected = Set(model.modules().compactMap { module -> ObjectIdentifier? in
+            guard let moe = module as? NemotronHMoE,
+                  let down = moe.sharedExperts?.downProj as? QuantizedLinear, admissible(down)
+            else { return nil }
+            return ObjectIdentifier(down)
+        })
+        guard !expected.isEmpty, expected == Set(snapshot.0.keys), let zeros = snapshot.1 else { return }
+        var admitted: [ObjectIdentifier: Set<String>] = [:]
+        var cases = 0
+        var passed = false
+        do {
+            passed = try withError { () -> Bool in
+                for (owner, actualCopy) in snapshot.0 {
+                    // The actual wide form and its existing tile-major fallback
+                    // are checked independently on every real backing bank.
+                    let forms = actualCopy.wide ? [tileMajor(actualCopy), actualCopy] : [actualCopy]
+                    for copy in forms {
+                        guard let record = kernel(for: copy), let twin = registerInputKernel(copy)
+                        else { return false }
+                        let inputs = seededRows(seed: admitted.count) + realisticRows(seed: admitted.count)
+                            + [registerInputMaskRows(0), registerInputMaskRows(113), registerInputMaskRows(255),
+                               registerInputSpecialRows()]
+                        guard inputs.count == 12 else { return false }
+                        var same = MLXArray(true)
+                        var checked = 0
+                        for input in inputs {
+                            guard let a = registerInputCheckDispatch(input, copy, zeros, record),
+                                  let b = registerInputCheckDispatch(input, copy, zeros, twin)
+                            else { return false }
+                            same = logicalAnd(same, (a.view(dtype: .uint16) .== b.view(dtype: .uint16)).all())
+                            eval(same, a, b)
+                            checked += 1
+                        }
+                        guard checked == 12, same.item(Bool.self) else { return false }
+                        admitted[owner, default: []].insert(registerInputTag(copy))
+                        cases += checked
+                    }
+                }
+                return admitted.count == snapshot.0.count && !admitted.isEmpty
+            }
+        } catch {
+            passed = false
+        }
+        lock.withLock { registerInputForms = passed ? admitted : [:] }
+        FileHandle.standardError.write(Data((passed
+            ? "nemotron shared input registers: on (\(admitted.count) real banks, \(cases) cases, exact current stores)\n"
+            : "nemotron shared input registers: off (missing case, mismatch or error)\n").utf8))
+    }
+
     private static func admissible(_ q: QuantizedLinear) -> Bool {
         type(of: q) == QuantizedLinear.self && q.mode == .affine && q.bits == 4
             && q.groupSize == 64 && q.bias == nil
@@ -4174,11 +4392,18 @@ enum NemotronSharedDownZSkip {
 
     static func run(_ x: MLXArray, owner: Linear) -> MLXArray? {
         guard enabled, kernel != nil, x.shape == [3, k], x.dtype == .bfloat16 else { return nil }
-        let found = lock.withLock { () -> (Copy, MLXArray)? in
-            guard let copy = copies[ObjectIdentifier(owner)], let inds else { return nil }
-            return (copy, inds)
+        let found = lock.withLock { () -> (Copy, MLXArray, Bool)? in
+            let key = ObjectIdentifier(owner)
+            guard let copy = copies[key], let inds else { return nil }
+            let admitted = registerInputForms[key]?.contains(registerInputTag(copy)) == true
+            return (copy, inds, admitted)
         }
-        guard let found, let kernel = kernel(for: found.0) else { return nil }
+        guard let found else { return nil }
+        if found.2, let kernel = registerInputKernel(found.0),
+           let output = registerInputCheckDispatch(x, found.0, found.1, kernel) {
+            return output
+        }
+        guard let kernel = kernel(for: found.0) else { return nil }
         return dispatch(x, found.0, found.1, kernel)
     }
 
@@ -4188,6 +4413,7 @@ enum NemotronSharedDownZSkip {
     }
 
     static func prepare(_ model: Module) {
+        lock.withLock { registerInputForms = [:] }
         guard enabled, kernel != nil, NemotronMoELeader.enabled,
               Device.defaultDevice().deviceType == .gpu else { return }
         let zeros = MLXArray.zeros([3], dtype: .uint32)
