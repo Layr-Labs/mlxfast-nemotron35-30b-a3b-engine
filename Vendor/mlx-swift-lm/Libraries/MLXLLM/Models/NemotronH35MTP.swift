@@ -157,9 +157,11 @@ private final class NemotronMTPDraftHead {
         // upper 8, keep 16 per 1024 rows); the default 2-bit records read 16 /
         // 6 groups and keep 12 rows per 512-row chunk for the exact rescore.
         let bits = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_BITS"] ?? "") ?? 2
-        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? (bits == 2 ? 16 : 12)
+        // e-man07: the 2-bit screen reads 12 column groups (the 6 most important aligned pairs) and keeps 8 rows per
+        // 512-row chunk; NEMOTRON_MTP_HEAD_SCREEN_GROUPS=16 and NEMOTRON_MTP_HEAD_SCREEN_KEEP=12 restore the previous.
+        let groupCount = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_GROUPS"] ?? "") ?? 12
         let chunk = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_CHUNK"] ?? "") ?? (bits == 2 ? 512 : 1024)
-        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 12 : 16)
+        let keep = Int(environment["NEMOTRON_MTP_HEAD_SCREEN_KEEP"] ?? "") ?? (bits == 2 ? 8 : 16)
         let k = NemotronHeadScreen.width, rows = NemotronHeadScreen.rows
         guard (2...16).contains(groupCount), groupCount % 2 == 0,
               [512, 1024, 2048].contains(chunk), keep % 4 == 0, (4...min(chunk / 8, 64)).contains(keep),

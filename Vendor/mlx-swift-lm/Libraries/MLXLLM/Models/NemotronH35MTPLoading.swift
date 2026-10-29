@@ -100,6 +100,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPRouterRowsSelect.qualifyDraft(assistant.module)
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
+        NemotronMambaInProjConvDt.qualifyTSL(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
@@ -815,3 +816,5 @@ final class NemotronCPUWarm: @unchecked Sendable {
 // Measurement entry 1 of this tree.
 
 // Measurement entry 1 of this tree.
+// e-man07: composition c85 (first measurement).
+// e-man07: measurement 2 of this composition.
