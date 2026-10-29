@@ -5869,6 +5869,82 @@ enum NemotronHeadScreen {
             outputDTypes: [.int32, .float32, .float32, .int32])
     }
 
+    /// Greedy callers use only chunk bests. Retain the original partial task geometry and native B1 body;
+    /// omit its two diagnostic candidate output buffers/stores, never its global partial score dependency.
+    /// Built from the B1 select and from its 32-bit twin (`selectB1Offset32Source`); `runBestOnly` launches the
+    /// one `selectB1` would launch.
+    private static func bestOnlySelectSource(_ source: String?) -> String? {
+        guard var s = source else { return nil }
+        for store in ["      cand_ids[chunk * C + s2] = id;\n", "      cand_vals[chunk * C + s2] = v;\n"] {
+            guard s.components(separatedBy: store).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: store, with: "")
+        }
+        guard !s.contains("cand_ids["), !s.contains("cand_vals[") else { return nil }
+        return s
+    }
+    private static let bestOnlySelectKernel = bestOnlySelectSource(selectB1Source).map {
+        MLXFast.metalKernel(name: "nemotron_head_screen_b1_bests_only",
+            inputNames: ["scores", "w", "scales", "biases", "x"],
+            outputNames: ["best_val", "best_id"], source: $0, header: nemotronMultiRowQMVHeader)
+    }
+    private static let bestOnlySelectOffset32Kernel = bestOnlySelectSource(selectB1Offset32Source).map {
+        MLXFast.metalKernel(name: "nemotron_head_screen_b1_o32_bests_only",
+            inputNames: ["scores", "w", "scales", "biases", "x"],
+            outputNames: ["best_val", "best_id"], source: $0, header: nemotronMultiRowQMVHeader)
+    }
+    static let bestOnlyRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_BESTS_ONLY"] != "0"
+    struct BestOnlyPick {
+        let id: MLXArray, scores: MLXArray, bestValues: MLXArray, bestIds: MLXArray
+    }
+    /// `run`'s ticket-free B1 screen (`b1`, `noTicket`) on a 2-bit record plan without the kept-row outputs: the same
+    /// partial pass (`run`'s kernel choice, template and grid: the paired pass, its 32-bit twin where
+    /// `partialOffset32` applies, the `NemotronDraftTune` geometry when `tunedPartial`), then the select `selectB1`
+    /// launches (its 32-bit twin where that applies) minus its two candidate stores, then `pick`. nil outside the
+    /// served plan or when the needed bests-only select is missing.
+    static func runBestOnly(_ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+                            records2: MLXArray, groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
+                            upperGroups: MLXArray?, upperGroupCount: Int, paired: Bool,
+                            rowsPerSimdgroup: Int = 8, simdgroups: Int = 2,
+                            tunedPartial: Bool = false) -> BestOnlyPick? {
+        guard bestOnlyRequested, hidden.shape == [1, 1, width], hidden.dtype == .bfloat16,
+              chunk == 512, keep == 12, selectHalfDecodeForm == 0,
+              groupCount >= 2, groupCount <= 16, groupCount % 2 == 0,
+              upperGroups == nil || (upperGroupCount >= 2 && upperGroupCount <= 16 && upperGroupCount % 2 == 0)
+        else { return nil }
+        let twin = selectOffset32Enabled && selectOffset32Verified && chunk <= 1024
+            && weight.dtype == .uint32 && weight.size * 2 <= Int(UInt32.max) && scales.size <= Int(UInt32.max)
+            && biases.size <= Int(UInt32.max)
+        guard let selector = twin ? bestOnlySelectOffset32Kernel : bestOnlySelectKernel else { return nil }
+        let rows = upperGroups == nil ? Self.rows : headRows
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup), ("NSG", simdgroups),
+            ("LO", Self.rows), ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
+        let pairedPass = paired
+            && pairable(groupCount: groupCount, upperGroupCount: upperGroups == nil ? nil : upperGroupCount,
+                        rowsPerSimdgroup: rowsPerSimdgroup)
+        let pairedTwin = pairedPass
+            && partialOffset32(fullHead: upperGroups != nil, records2: records2, offset32: nil)
+        let producer = pairedPass
+            ? (pairedTwin ? record2PairedOffset32Kernel : nil) ?? record2PairedKernel ?? record2PartialKernel
+            : record2PartialKernel
+        let tunedScores: MLXArray? = tunedPartial && paired
+            ? record2Scores(hidden, records2: records2, groups: groups, groupCount: groupCount,
+                            upperGroups: upperGroups, upperGroupCount: upperGroupCount, rps: rowsPerSimdgroup,
+                            nsg: simdgroups, dep: hidden, offset32: nil)
+            : nil
+        let scores = tunedScores ?? producer([records2, hidden, groups, upperGroups ?? groups], template: template,
+            grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+            outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        let chunks = rows / chunk
+        let selected = selector([scores, weight, scales, biases, hidden],
+            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", 8)],
+            grid: (32, 8 * chunks, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[chunks], [chunks]], outputDTypes: [.float32, .int32])
+        return BestOnlyPick(id: pick(values: selected[0], ids: selected[1]), scores: scores,
+                            bestValues: selected[0], bestIds: selected[1])
+    }
+
     /// Load time, right after the plan's ticket-free check (`prepareScreen`): the 32-bit select twin against the B1
     /// select, all four outputs bit for bit (kept ids, kept values as bits, chunk best values as bits, chunk best
     /// ids), on the plan's head arrays, chunk and keep, for each row count the plan screens. Partial scores of ten
@@ -7118,4 +7194,58 @@ extension NemotronHeadPreparedActivation {
             grid: (32, n / g.rps, 1), threadGroup: (32, g.nsg, 1),
             outputShapes: [[3, n]], outputDTypes: [.bfloat16])[0]
     }
+}
+
+// Worker-only qualification resides here to respect the unchanged per-file source-byte cap.
+extension NemotronHResidualRMSNorm {
+    /// Official-worker load only, after the incumbent draft colaunch admission: exact output words against
+    /// the original two-output primitive for dense/products and both product input orders on real norms.
+    static func qualifyDraftFinalOnly(_ head: Module) {
+        admitDraftFinalOnly(false)
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron draft final only: \(text)\n".utf8))
+        }
+        guard draftFinalOnlyRequested, !NemotronMoELeader.selfTest,
+              let block = head.modules().compactMap({ $0 as? NemotronH35MTPExpertBlock }).first else {
+            return report("off (setting or no eligible final norm)")
+        }
+        var cases = 0
+        do {
+            let equal = try withError { () -> Bool in
+                var comparisons: [MLXArray] = []
+                for i in 0 ..< 12 {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xfda0 + i)), into: 3)
+                    var lhs = (MLXRandom.normal([1, 1, 2688], key: keys[0]) * Float(1 + i % 3)).asType(.bfloat16)
+                    var shared = MLXRandom.normal([1, 1, 2688], scale: 0.1, key: keys[1]).asType(.bfloat16)
+                    var products = MLXRandom.normal([6 * 2688], scale: 0.05, key: keys[2])
+                    if i == 6 { lhs = MLXArray.zeros(lhs.shape, dtype: .bfloat16); products = MLXArray.zeros(products.shape) }
+                    if i == 7 { shared = MLXArray([Float](repeating: -0.0, count: 2688)).asType(.bfloat16).reshaped(1, 1, 2688) }
+                    if i == 8 {
+                        let padded = concatenated([MLXArray.zeros([1], dtype: .bfloat16), lhs.reshaped(2688)], axis: 0)
+                        lhs = padded[1 ..< 2689].reshaped(1, 1, 2688)
+                    }
+                    if i >= 9 {
+                        var special = [Float](repeating: 0, count: 6 * 2688)
+                        special[223 * i] = i == 9 ? Float.infinity : (i == 10 ? -Float.infinity : Float.nan)
+                        products = MLXArray(special)
+                    }
+                    let dense = NemotronZSkip.reduceProducts(products, rows: 1)
+                    for (rhs, first) in [(dense, false), (products, false), (products, true)] {
+                        guard let old = applySum(lhs, rhs, shared: shared, norm: block.finalNorm, sharedFirst: first),
+                              let new = runFinalOnly(lhs, rhs, shared: shared, norm: block.finalNorm, sharedFirst: first)
+                        else { return false }
+                        comparisons.append((old.1.view(dtype: .uint16) .== new.view(dtype: .uint16)).all())
+                        cases += 1
+                    }
+                }
+                eval(comparisons)
+                return !comparisons.isEmpty && comparisons.allSatisfy { $0.item(Bool.self) }
+            }
+            admitDraftFinalOnly(equal)
+            report(equal ? "on (\(cases) normalized outputs bitwise equal; dead residual omitted)" : "off (differs)")
+        } catch {
+            report("off (\(error))")
+        }
+    }
+
 }
