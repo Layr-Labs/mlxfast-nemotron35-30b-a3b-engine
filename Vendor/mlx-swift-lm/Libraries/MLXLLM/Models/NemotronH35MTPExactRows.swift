@@ -4672,6 +4672,12 @@ enum NemotronTargetQKV {
         else { return nil }
         let activations = NemotronHeadPreparedActivation.compatible(packed, rows: 3, k: 2688)
             ?? NemotronHeadPreparedActivation.pack(x.reshaped(3, 2688))
+        // `NemotronDraftTune` (vqkv): the geometry adopted at load for this launch (unread `dep`: the activations).
+        if let g = NemotronDraftTune.adopted[.vqkv], !NemotronMoELeader.selfTest,
+           let tuned = verifyTuneLaunch(g, weights: q + k + v, packed: activations, kCache: kCache, vCache: vCache,
+                                        position: MLXArray([Int32(offset), Int32(capacity)]), dep: activations) {
+            return (tuned[0], tuned[1], tuned[2])
+        }
         var outputs = preparedWritingKVKernel(
             q + k + v + [activations, NemotronMultiRowQMV.scalarPair(2688, 4096).0,
                          kCache, vCache, MLXArray([Int32(offset), Int32(capacity)])],
@@ -6331,13 +6337,14 @@ enum NemotronDraftTune {
     }()
     /// Soft cap on the tune's own load time: no family, variant (its first launch JITs its pipeline) or timing phase
     /// starts past it; what has not started keeps its incumbent. A forced run checks every family.
-    static let budgetSeconds = forced.all != nil || !forced.families.isEmpty ? 60.0 : 3.0
+    static let budgetSeconds = forced.all != nil || !forced.families.isEmpty ? 60.0 : 3.0 * nemotronTuneBudgetScale
     /// Wall time of one family's timed cycles (graph building included), sized from the warm-up cycle.
     static let timedMilliseconds = 100.0
 
-    /// In tune order (sdpa: `tuneSDPA`, after the draft attention's checks).
+    /// In tune order (sdpa: `tuneSDPA`, after the draft attention's checks; vqkv: `tuneVerifyQKV`, the target's
+    /// R = 3 cache-writing Q/K/V launch of the captured verify, tuned on its own clock).
     enum Family: String, CaseIterable, Sendable {
-        case fc1, screen, qkv, up, wo, down, ehp, eh, sdpa
+        case fc1, screen, qkv, up, wo, down, ehp, eh, sdpa, vqkv
     }
 
     struct Geometry: Hashable, Sendable, CustomStringConvertible {
@@ -6411,6 +6418,12 @@ enum NemotronDraftTune {
         case .sdpa:
             return [v(1, 32, unroll: 8, keys: 2, packed: true), v(1, 32, unroll: 8, keys: 2),
                     v(1, 32, unroll: 8, keys: 1), v(1, 32, unroll: 4, keys: 2), v(1, 32, unroll: 4, keys: 1)]
+        case .vqkv:
+            // Outputs per SIMD group x SIMD groups per tile (256 % (rps * nsg) == 0), then the prepared QMV's
+            // main-loop load forms (1 W32, 2 W32 + hoist, 3 + next-block prefetch) and the unroll pragma.
+            return [v(1, 2), v(1, 4), v(2, 1), v(2, 4), v(2, 8), v(4, 1), v(4, 2), v(4, 4), v(8, 1),
+                    v(2, 2, load: 1), v(2, 2, load: 2), v(2, 2, load: 3), v(2, 4, load: 2), v(4, 2, load: 2),
+                    v(1, 4, load: 2), v(2, 2, unroll: 2)]
         }
     }
 
@@ -6630,7 +6643,7 @@ enum NemotronDraftTune {
         guard enabled else { return report("all", "off (setting)") }
         guard !NemotronMoELeader.selfTest, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu
         else { return report("all", "off (not applicable)") }
-        for family in Family.allCases where family != .sdpa {
+        for family in Family.allCases where family != .sdpa && family != .vqkv {
             guard elapsed() < budgetSeconds else {
                 report(family.rawValue, "skipped (load budget), incumbent kept")
                 continue
@@ -6642,7 +6655,7 @@ enum NemotronDraftTune {
             case .wo, .up, .down, .eh: message = tuneQMV(family, head, elapsed: elapsed)
             case .qkv: message = tuneQKV(head, elapsed: elapsed)
             case .ehp: message = tuneEhp(head, elapsed: elapsed)
-            case .sdpa: continue
+            case .sdpa, .vqkv: continue
             }
             report(family.rawValue, message)
         }
@@ -7007,6 +7020,178 @@ func nemotronUnrollSource(_ source: String, loop: String, count: Int, unroll: In
     guard source.components(separatedBy: loop).count == count + 1 else { return nil }
     guard unroll > 1 else { return source }
     return source.replacingOccurrences(of: loop, with: "#pragma clang loop unroll_count(\(unroll))\n" + loop)
+}
+
+extension NemotronTargetQKV {
+    /// `NemotronDraftTune` (vqkv): the captured verify's R = 3 cache-writing Q/K/V launch
+    /// (`preparedWritingKVKernel`) rebuilt at geometry `g`: the tile prefix with NSG SIMD groups per tile, the crown
+    /// prepared body through the main-loop load form `g.load` and the NSG template (`nemotronPreparedVariantSource`'s
+    /// counted swaps), the record's cache store, the vector-store closing loop when `g.vs` (the incumbent's,
+    /// `vstoreVerified`) and the unroll pragma on the main K loop; one unread input `dep` last. Every output keeps the
+    /// record's lane split, block order, decode, products, affine close, `simd_sum`, rounding and store addresses;
+    /// only the output -> SIMD-group / threadgroup map and the load issue form move. nil when it cannot be built.
+    static func verifyTuneKernel(_ g: NemotronDraftTune.Geometry) -> MLXFast.MLXFastKernel? {
+        let key = "nemotron_vqkv_tune_l\(g.load)_u\(g.unroll)" + (g.vs ? "_vs" : "")
+        return NemotronDraftTune.cached(key) {
+            guard [0, 1, 2, 3].contains(g.load),
+                  let prefix = nemotronCountedSwaps(tilePrefix, [("(2 * RPS)", "(NSG * RPS)", 2)]),
+                  let loaded = nemotronCountedSwaps(
+                      nemotronHeadPreparedQMVSource,
+                      (g.load == 1 ? nemotronPreparedW32Swaps : g.load == 2 ? nemotronPreparedHoistSwaps
+                          : g.load == 3 ? nemotronPreparedPrefetchSwaps : []) + nemotronPreparedNSGSwaps),
+                  let stored = nemotronCountedSwaps(loaded, [(storeLine, storeAndCache, 1)])
+            else { return nil }
+            var source: String? = kvPreload + prefix + stored + "\n}"
+            if g.vs { source = source.flatMap(nemotronQMVVectorStoreSource) }
+            source = source.flatMap { nemotronUnrollSource($0, loop: NemotronU2.qmvLoop, count: 1, unroll: g.unroll) }
+            return source.map {
+                MLXFast.metalKernel(
+                    name: key,
+                    inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "prepared", "K",
+                                 "kcache", "vcache", "kvpos", "dep"],
+                    outputNames: ["qy", "ky", "vy"], source: $0,
+                    header: NemotronHeadPreparedActivation.variantHeader(half: false, load: g.load),
+                    mutableInputs: ["kcache", "vcache"])
+            }
+        }
+    }
+
+    /// One launch of `verifyTuneKernel(g)`: `weights` the Q, K and V (codes, scales, biases) triples, `packed` the
+    /// three rows' prepared activations, the caches [1, 2, capacity, 128] written at tokens offset ..< offset + 3,
+    /// `dep` unread. nil when it cannot run.
+    static func verifyTuneLaunch(_ g: NemotronDraftTune.Geometry, weights: [MLXArray], packed: MLXArray,
+                                 kCache: MLXArray, vCache: MLXArray, position: MLXArray, dep: MLXArray)
+        -> [MLXArray]? {
+        guard weights.count == 9, g.rps >= 1, g.nsg >= 1, 256 % (g.rps * g.nsg) == 0, 3 * g.rps <= 32,
+              32 * g.nsg <= 1024, let kernel = verifyTuneKernel(g) else { return nil }
+        return kernel(
+            weights + [packed, NemotronMultiRowQMV.scalarPair(2688, 4096).0, kCache, vCache, position, dep],
+            template: [("T", DType.bfloat16), ("R", 3), ("FAST", false), ("RELU2", false), ("RPS", g.rps),
+                       ("NSG", g.nsg)],
+            grid: (32, 4608 / g.rps, 1), threadGroup: (32, g.nsg, 1),
+            outputShapes: [[1, 3, 4096], [1, 3, 256], [1, 3, 256]],
+            outputDTypes: [.bfloat16, .bfloat16, .bfloat16])
+    }
+
+    /// The target attention layers with their Q, K and V buffers (nine arrays), for `NemotronDraftTune.tuneVerifyQKV`.
+    static func verifyWeightSets(_ target: Module) -> [(attention: NemotronHAttention, weights: [MLXArray])] {
+        target.modules().compactMap { $0 as? NemotronHAttention }.compactMap { a in
+            guard let q = buffers(a.wq, rows: 4096), let k = buffers(a.wk, rows: 256),
+                  let v = buffers(a.wv, rows: 256) else { return nil }
+            return (a, q + k + v)
+        }
+    }
+
+    /// Whether the captured verify takes the cache-writing launch at all (the guards `applyWritingKV` holds).
+    static var writingKVInUse: Bool {
+        CBv2CriticalPathCuts.kvInPlaceAppend && NemotronMTPExecution.batchedM1 && NemotronMultiRowQMV.enabled
+            && preparedEnabled && resultsPerSimdgroup(rows: 3) == 2
+    }
+}
+
+extension NemotronDraftTune {
+    /// Load time, after `NemotronTargetQKV.qualifyVectorStore` and the draft tune, before any verify graph is traced or
+    /// warmed: geometry choice of the captured verify's R = 3 cache-writing Q/K/V launch (six per round, ~7 MB of
+    /// weights each, fixed at 2 outputs x 2 SIMD groups with the crown loads until now). Every variant
+    /// (`variants(.vqkv, ...)`) and V0's twin (the incumbent's geometry through the tune's pipeline) is checked bit
+    /// for bit against the production launch (`applyWritingKV`) on every target attention layer's real weights: q, k,
+    /// v and every element of both caches, four row sets (Gaussian at two scales, sparse with -0 and a one-hot row,
+    /// tiny and large rows), rows written at two offsets. V0's twin and the survivors are timed round robin as chains
+    /// in which each launch binds the previous launch's q rows as `dep`, cycling cold copies of every layer's
+    /// weights (~96 MB per pass), and the fastest is adopted only through the shared rule. Own load cap (3 s).
+    /// One stderr line; NEMOTRON_VQKV_TUNE=0 keeps the record launch; NEMOTRON_DRAFT_FORCE=vqkv:<n> forces variant n.
+    static func tuneVerifyQKV(_ target: Module) {
+        adopted[.vqkv] = nil
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        func elapsed() -> Double { Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e9 }
+        func report(_ message: String) {
+            FileHandle.standardError.write(Data(
+                "nemotron verify qkv tune: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
+        }
+        guard enabled, ProcessInfo.processInfo.environment["NEMOTRON_VQKV_TUNE"] != "0" else {
+            return report("off (setting)")
+        }
+        guard !NemotronMoELeader.selfTest, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              NemotronTargetQKV.writingKVInUse
+        else { return report("off (the cache-writing Q/K/V launch is not used)") }
+        let layers = NemotronTargetQKV.verifyWeightSets(target)
+        guard !layers.isEmpty else { return report("off (no prepared Q/K/V weights)") }
+        let sets = layers.map(\.weights)
+        let attentions = layers.map(\.attention)
+
+        // Check cases: every layer x four row sets, rows written at offset 0 or 13 of a 16-slot cache.
+        let keys = MLXRandom.split(key: MLXRandom.key(0x5651_4B56), into: 4)
+        let bf16 = { (v: Float) in MLXArray(v).asType(.bfloat16) }
+        let row = MLXArray((0 ..< 3).map(Int32.init)).reshaped(1, 3, 1)
+        let column = MLXArray((0 ..< 2688).map(Int32.init)).reshaped(1, 1, 2688)
+        let gaussian = MLXRandom.normal([1, 3, 2688], key: keys[0]).asType(.bfloat16)
+        let wide = (MLXRandom.normal([1, 3, 2688], key: keys[1]) * 4).asType(.bfloat16)
+        let u = MLXRandom.uniform(Float(0) ..< 1, [1, 3, 2688], key: keys[2])
+        let small = (MLXRandom.normal([1, 3, 2688], key: keys[3]) * 0.01).asType(.bfloat16)
+        let sparse = which(row .== MLXArray(Int32(0)),
+                           which(u .< MLXArray(Float(0.3)), small, which(u .< MLXArray(Float(0.6)), bf16(-0.0), bf16(0))),
+                           which(row .== MLXArray(Int32(1)), bf16(0),
+                                 which(column .== MLXArray(Int32(1337)), bf16(1.5), bf16(0))))
+        let edges = which(row .== MLXArray(Int32(0)), (gaussian.asType(.float32) * 1e-30).asType(.bfloat16),
+                          which(row .== MLXArray(Int32(1)), (small.asType(.float32) * 3e6).asType(.bfloat16),
+                                which(u .< MLXArray(Float(0.1)), bf16(-0.0),
+                                      which(u .< MLXArray(Float(0.2)), bf16(0), gaussian))))
+        let rows = [gaussian, wide, sparse, edges]
+        let packs = rows.map { NemotronHeadPreparedActivation.pack($0.reshaped(3, 2688)) }
+        let initial = (0 ..< 2).map {
+            MLXRandom.normal([1, 2, 16, 128], key: MLXRandom.key(UInt64(0x5652_0000 + $0))).asType(.bfloat16)
+        }
+        eval(rows + packs + initial)
+        struct Case { let layer: Int; let rows: Int; let offset: Int }
+        var cases: [Case] = []
+        for l in sets.indices {
+            for r in rows.indices { cases.append(Case(layer: l, rows: r, offset: (l + r) % 2 == 0 ? 0 : 13)) }
+        }
+        // A fresh copy of the two caches per launch (the launches write them in place).
+        func freshCaches() -> (MLXArray, MLXArray) {
+            let a = initial[0] * bf16(1), b = initial[1] * bf16(1)
+            eval(a, b)
+            return (a, b)
+        }
+
+        // Timing copies: every layer's weights, cycled to about 96 MB per pass.
+        let bytes = sets[0].map(\.nbytes).reduce(0, +)
+        let c = max(sets.count, copyCount(bytes))
+        let copies = (0 ..< c).map { j in sets[j % sets.count].map { copy($0) } }
+        let timedCaches = (0 ..< c).map { _ in freshCaches() }
+        eval(copies.flatMap { $0 } + timedCaches.flatMap { [$0.0, $0.1] })
+        let timedPosition = MLXArray([Int32(5), Int32(16)])
+        eval(timedPosition)
+        let inputsReady = elapsed()
+        let incumbent = Geometry(rps: 2, nsg: 2, unroll: 1, load: 0, vs: NemotronTargetQKV.vstoreVerified)
+        let message = run(
+            .vqkv, incumbent: incumbent, cases: cases.count, links: max(16, c),
+            reference: { i in
+                let cs = cases[i]
+                let a = attentions[cs.layer]
+                let (kc, vc) = freshCaches()
+                guard let out = NemotronTargetQKV.applyWritingKV(
+                    rows[cs.rows], query: a.wq, key: a.wk, value: a.wv, prepared: packs[cs.rows],
+                    kCache: kc, vCache: vc, offset: cs.offset, capacity: 16) else { return nil }
+                let outs = [out.0, out.1, out.2]
+                return outs + depends(inputs: [kc, vc], dependencies: outs)
+            },
+            launch: { g, i in
+                let cs = cases[i]
+                let (kc, vc) = freshCaches()
+                guard let outs = NemotronTargetQKV.verifyTuneLaunch(
+                    g, weights: sets[cs.layer], packed: packs[cs.rows], kCache: kc, vCache: vc,
+                    position: MLXArray([Int32(cs.offset), Int32(16)]), dep: packs[cs.rows]) else { return nil }
+                return outs + depends(inputs: [kc, vc], dependencies: outs)
+            },
+            link: { g, previous, j in
+                let t = timedCaches[j % c]
+                return NemotronTargetQKV.verifyTuneLaunch(
+                    g, weights: copies[j % c], packed: packs[0], kCache: t.0, vCache: t.1, position: timedPosition,
+                    dep: previous ?? packs[0])?[0]
+            }, elapsed: elapsed, timed: 400)
+        report("inputs by \(String(format: "%.2f", inputsReady)) s, " + message)
+    }
 }
 
 extension NemotronTargetQKV {

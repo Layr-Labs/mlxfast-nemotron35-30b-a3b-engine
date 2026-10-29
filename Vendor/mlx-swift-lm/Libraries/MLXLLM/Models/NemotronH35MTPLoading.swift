@@ -103,6 +103,7 @@ extension NemotronH35MTPAssistant {
         NemotronMambaInProjConvDt.qualifyRegs(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
+        NemotronDraftTune.tuneVerifyQKV(target)
         NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
