@@ -7035,12 +7035,11 @@ enum NemotronQMVTune {
 // least 3% faster by median and faster in at least 75% of the cycles). `tuneDraft` does the same for the
 // draft head's copy at R = 1 (rows at 45% with the special values, 8.75%, 20%, 70% and full; timed at 45%, the
 // draft tail's density). Plain BF16 copies keep the incumbent.
-// NEMOTRON_FC2_TUNE=0 / NEMOTRON_DFC2_TUNE=0 keep the incumbents; NEMOTRON_FC2_FORCE=<n> / NEMOTRON_DFC2_FORCE=<n>
 // adopt variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
 enum NemotronFC2Tune {
-    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC2_TUNE"] != "0"
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC2_TUNE"] == "1"
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC2_FORCE"] ?? "")
-    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] != "0"
+    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] == "1"
     static let draftForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_DFC2_FORCE"] ?? "")
     /// Wall time of one tune's timed rounds (graph building included), sized from the last warm-up round.
     static let timedMilliseconds = 150.0

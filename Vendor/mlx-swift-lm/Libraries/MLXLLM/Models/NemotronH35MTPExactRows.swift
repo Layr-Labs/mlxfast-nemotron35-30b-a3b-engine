@@ -3837,12 +3837,11 @@ enum NemotronMTPVerifySDPA {
         }
     }
 
-    /// NEMOTRON_SDPA_TUNE=0 keeps the launch selected above (one threadgroup per query head once `qualifyFast`
     /// passed). Otherwise `tune` times that launch and the per-row prepared launch it was checked against
     /// (`mergedPrepared`: 32 x 3 threadgroups, the aggregation selected above) and adopts the per-row launch only
     /// when `NemotronTuneAdoption.decide` admits it (at least 3% faster by median and faster in at least 75% of the
     /// cycles). NEMOTRON_SDPA_FORCE=1 adopts the per-row launch, 0 keeps the per-head launch.
-    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] != "0"
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] == "1"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SDPA_FORCE"] ?? "")
     nonisolated(unsafe) private static var perRowAdopted = false
 
@@ -6851,10 +6850,9 @@ enum NemotronScreenPicks {
 // 75% of the cycles, paired within each cycle).
 // The chains read cold data as the round does: fc1 cycles 16 routes through the bank, the other families cycle copies
 // of their weights (an integer add of zero, about 96 MB per pass). Load cap 3 s.
-// NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; NEMOTRON_DRAFT_FORCE=<n> adopts variant n (1-based, `variants`) of
 // every family that qualified it, <family>:<n>[,<family>:<n>] of the named families; 0 keeps the incumbent.
 enum NemotronDraftTune {
-    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_TUNE"] != "0"
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_TUNE"] == "1"
     static let forced: (all: Int?, families: [Family: Int]) = {
         let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FORCE"] ?? ""
         if let n = Int(value) { return (n, [:]) }
