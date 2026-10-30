@@ -123,6 +123,13 @@ extension NemotronH35Model: CBv2CompleteCheckpointKVTypeProviding {
 
 // MARK: - Seed retile (R4)
 
+/// `NemotronHPrefillX5.runGather`'s device condition: NAX, or the local-only
+/// diagnostic NEMOTRON_FORCE_RUNGATHER=1, which runs the NAX run gather and the
+/// seed kernels built on it on a GPU without NAX (bit checks; unset by default,
+/// which changes nothing).
+let nemotronNAXOrForced = GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    || ProcessInfo.processInfo.environment["NEMOTRON_FORCE_RUNGATHER"] == "1"
+
 /// The run gather with free tiling, appended to `nemotronRunGatherHeader`. For
 /// every output fragment pair the same `BaseNAXFrag::mma` (matmul2d(16, 32, 16),
 /// multiply_accumulate) runs over k chunks 0, 16, ..., K - 16 in order, on A
@@ -209,7 +216,46 @@ METAL_FUNC void nemotron_seed_word_store(
   }
 }
 
-// RING (nemotron_seed_gather_impl's register ring): the word fill in three
+// tile_matmad_nax (A not transposed, TN even: its fragment-pair branch), except
+// that a 16-row fragment after the first is skipped when none of its rows is
+// below valid_rows (uniform across the SIMD group). A skipped fragment is never
+// stored; every other fragment gets tile_matmad_nax's mma sequence. (Here, ahead
+// of the B sources, so the lean texts derived below do not repeat it.)
+template <class CTile, class ATile, class BTile, bool transpose_b>
+METAL_FUNC void nemotron_seed_matmad_rows(
+    thread CTile& C,
+    thread ATile& A,
+    thread BTile& B,
+    metal::bool_constant<transpose_b>,
+    const short valid_rows) {
+  constexpr short TM = CTile::kTileRows;
+  constexpr short TN = CTile::kTileCols;
+  constexpr short TK = transpose_b ? BTile::kTileCols : BTile::kTileRows;
+  static_assert(ATile::kTileRows == TM && ATile::kTileCols == TK, "A tile");
+  static_assert((transpose_b ? BTile::kTileRows : BTile::kTileCols) == TN && TN % 2 == 0, "B tile");
+  constexpr auto tb = metal::bool_constant<transpose_b>{};
+  STEEL_PRAGMA_UNROLL
+  for (short mm = 0; mm < TM; ++mm) {
+    if (mm == 0 || mm * CTile::kFragRows < valid_rows) {
+      STEEL_PRAGMA_UNROLL
+      for (short nn = 0; nn < TN; nn += 2) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          CTile::NAXFrag_t::mma(
+              C.frag_at(mm, nn),
+              C.frag_at(mm, nn + 1),
+              A.frag_at(mm, kk),
+              metal::bool_constant<false>{},
+              B.frag_at(kk, nn, tb),
+              B.frag_at(kk, nn + 1, tb),
+              metal::bool_constant<transpose_b>{});
+        }
+      }
+    }
+  }
+}
+
+// RING (nemotron_seed_gather_impl's SP producer ring): the word fill in three
 // steps. `rload` issues the loads `load` issues (the KPT / 8 code words, and
 // the source's key: the BF16 scale and bias `sb` reads, or the pair index)
 // into a ring slot under `load`'s predicate, and nothing that waits on them;
@@ -292,6 +338,11 @@ struct NemotronSeedBank {
   METAL_FUNC uint8_t byte(const int n, const int k) const thread {
     return w[size_t(n) * size_t(K / 2) + size_t(k >> 1)];
   }
+  // HB: byte(n, k) | byte(n, k + 2) << 8 as one 16-bit load (k % 4 == 0 and
+  // K / 2 even, so the address is 2-byte aligned).
+  METAL_FUNC uint16_t code16(const int n, const int k) const thread {
+    return *(const device uint16_t*)(w + size_t(n) * size_t(K / 2) + size_t(k >> 1));
+  }
 
   // WF: the word fill (nemotron_seed_word_load / _store). `words`: the
   // address `byte` reads for k (a multiple of 8), as 32-bit code words.
@@ -366,6 +417,9 @@ struct NemotronSeedDict {
   }
   METAL_FUNC uint8_t byte(const int n, const int k) const thread {
     return w[size_t(n) * size_t(K / 2) + size_t(k >> 1)];
+  }
+  METAL_FUNC uint16_t code16(const int n, const int k) const thread {
+    return *(const device uint16_t*)(w + size_t(n) * size_t(K / 2) + size_t(k >> 1));
   }
 
   // WF: the word fill (nemotron_seed_word_load / _store). `words`: the
@@ -444,6 +498,10 @@ struct NemotronSeedCopy {
     const uint lo = (uint(c[0]) >> (4 * o)) & 0xfu;
     const uint hi = (uint(c[32]) >> (4 * o)) & 0xfu;
     return uint8_t(lo | (hi << 4));
+  }
+  // CN: the code word of n ... n + 3 at k (n % 4 == 0): nibble j is n + j's code.
+  METAL_FUNC uint16_t word(const int n, const int k) const thread {
+    return codes[(size_t(n / 128) * size_t(K) + size_t(k)) * 32 + size_t((n % 128) / 4)];
   }
 
   // WF: thread t of NT holds four consecutive outputs n ... n + 3 (one code
@@ -651,8 +709,11 @@ template <
     bool PF,
     bool DB,
     bool WF,
+    bool HB,
+    bool CN,
+    int SP,
+    bool AP,
     int RING,
-    bool APF,
     class BSrc>
 METAL_FUNC void nemotron_seed_gather_impl(
     const device T* x,
@@ -683,7 +744,13 @@ METAL_FUNC void nemotron_seed_gather_impl(
   constexpr short TN = SN / 16;
   constexpr short TK = SK / 16;
   static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
-  static_assert(BK % 64 == 0, "B blocks start on a quantization group");
+  // B blocks start on a quantization group, or (SP, AP: the staged wide
+  // fill) BK 32 blocks lie inside one: kb is a multiple of 32, so a thread's
+  // k run (kb + lk ...) stays in group (kb + lk) / 64.
+  static_assert(BK % 64 == 0 || (BK == 32 && WF && (SP > 0 || AP)), "B blocks and quantization groups");
+  static_assert(!AP || (DB && PF), "AP reorders the two-stage prefetching loop");
+  static_assert(SP == 0 || (WF && !DB && !PF && !AP && !DIRECT_B && !CN), "SP: its own staged wide-fill loop");
+  static_assert(RING == 0 || (RING == 2 && SP > 0), "RING: the SP producers' two-slot register ring");
 
   const int y_col = tid.x * BN;
   const short tgp_bm = short(min(BM, tile_rows));
@@ -722,15 +789,113 @@ METAL_FUNC void nemotron_seed_gather_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     constexpr bool aligned_m = decltype(kAlignedM)::value;
-    if constexpr (DIRECT_B && PF) {
+    if constexpr (CN) {
+      // CN (decode copy source): B enters the mma as K x N (transpose_b
+      // false), so lane (fn, fm) = get_coord() holds k = 16-chunk + fm + 8 i
+      // and n = 16-column block + fn + j, j = 0 ... 3: nibble j of one copy
+      // word (word(n, k) for n = block + fn). Every k a lane holds has fm's
+      // parity, so the lane applies one of the copy loader's two statements
+      // to the same FP32 operands: s * lo + b (even k) or
+      // (s / 16) * (hi << 4) + b (odd k). Same mma pairs and k order as the
+      // other paths, rows guarded as HB. PF: step k + 32's words (and, at a
+      // group start, its scales and biases) are loaded after step k's B
+      // fragments are dequantized and before step k's mma.
+      static_assert(ALIGN_N && BN % 4 == 0, "copy words cover four columns");
+      const short2 bc = BaseNAXFrag::get_coord();
+      const uint sh = uint(bc.y & 1) * 4;
+      const uint msk = 0xfu << sh;
+      float scv[TN * 4];
+      float bsv[TN * 4];
+      uint16_t raw[TN * TK * 2];
+      auto load_sb = [&](const int kg) {
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < TN; ++nn) {
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < 4; ++j) {
+            const float2 p = bsrc.sb(y_col + tn + nn * 16 + bc.x + j, kg / 64);
+            scv[nn * 4 + j] = sh != 0 ? p.x / 16.0f : p.x;
+            bsv[nn * 4 + j] = p.y;
+          }
+        }
+      };
+      auto load_raw = [&](const int ks) {
+        STEEL_PRAGMA_UNROLL
+        for (short kk = 0; kk < TK; ++kk) {
+          STEEL_PRAGMA_UNROLL
+          for (short nn = 0; nn < TN; ++nn) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < 2; ++i) {
+              raw[(kk * TN + nn) * 2 + i] =
+                  bsrc.word(y_col + tn + nn * 16 + bc.x, ks + kk * 16 + bc.y + i * 8);
+            }
+          }
+        }
+      };
+      if constexpr (PF) {
+        if (sg_active) {
+          load_sb(0);
+          load_raw(0);
+        }
+      }
+      STEEL_PRAGMA_NO_UNROLL
+      for (int ks = 0; ks < K; ks += SK) {
+        if (sg_active) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TK, TN> Btile;
+
+          volatile int compiler_barrier;
+
+          if constexpr (!PF) {
+            if (ks % 64 == 0) {
+              load_sb(ks);
+            }
+            load_raw(ks);
+          }
+
+          nemotron_seed_load_a<ROUTED, aligned_m, SK>(Atile, xn, routed, ks, K, sgp_sm);
+
+          STEEL_PRAGMA_UNROLL
+          for (short kk = 0; kk < TK; ++kk) {
+            STEEL_PRAGMA_UNROLL
+            for (short nn = 0; nn < TN; ++nn) {
+              thread typename NAXTile<T, TK, TN>::frag_type& frag = Btile.frag_at(kk, nn);
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < 2; ++i) {
+                const uint w = uint(raw[(kk * TN + nn) * 2 + i]) << sh;
+                STEEL_PRAGMA_UNROLL
+                for (short j = 0; j < 4; ++j) {
+                  frag[i * 4 + j] = static_cast<T>(
+                      scv[nn * 4 + j] * float((w >> (4 * j)) & msk) + bsv[nn * 4 + j]);
+                }
+              }
+            }
+          }
+
+          if constexpr (PF) {
+            const int kn = ks + SK;
+            if (kn < K) {
+              if (kn % 64 == 0) {
+                load_sb(kn);
+              }
+              load_raw(kn);
+            }
+          }
+
+          nemotron_seed_matmad_rows(Dtile, Atile, Btile, metal::bool_constant<false>{}, sgp_sm);
+
+          (void)compiler_barrier;
+        }
+      }
+    } else if constexpr (DIRECT_B && PF) {
       // PF: the direct path's per-step loop over k = 0, 32, ... with step
       // k + 32's code bytes (and, at a group start, its scales and biases)
       // loaded into registers after step k's B fragments are dequantized and
       // before step k's mma. Same bytes, same dequantize statements, same mma
-      // order as the loop below; only the loads move.
+      // order as the loop below; only the loads move. HB: as there.
       const short2 bc = BaseNAXFrag::get_coord();
       float2 sbv[TN * 2];
-      uint8_t raw[TN * TK * 2 * 2];
+      uint8_t raw[HB ? 1 : TN * TK * 2 * 2];
+      uint16_t raw16[HB ? TN * TK * 2 : 1];
       auto load_sb = [&](const int kg) {
         STEEL_PRAGMA_UNROLL
         for (short nn = 0; nn < TN; ++nn) {
@@ -752,8 +917,12 @@ METAL_FUNC void nemotron_seed_gather_impl(
               const int k = ks + kk * 16 + bc.x;
               const short q = ((nn * TK + kk) * 2 + i) * 2;
               if (ALIGN_N || n < N) {
-                raw[q] = bsrc.byte(n, k);
-                raw[q + 1] = bsrc.byte(n, k + 2);
+                if constexpr (HB) {
+                  raw16[q / 2] = bsrc.code16(n, k);
+                } else {
+                  raw[q] = bsrc.byte(n, k);
+                  raw[q + 1] = bsrc.byte(n, k + 2);
+                }
               }
             }
           }
@@ -785,8 +954,14 @@ METAL_FUNC void nemotron_seed_gather_impl(
                 T v0 = T(0), v1 = T(0), v2 = T(0), v3 = T(0);
                 if (ALIGN_N || n < N) {
                   const float2 p = sbv[nn * 2 + i];
-                  nemotron_seed_deq2(raw[q], p.x, p.y, v0, v1);
-                  nemotron_seed_deq2(raw[q + 1], p.x, p.y, v2, v3);
+                  if constexpr (HB) {
+                    const uint16_t h = raw16[q / 2];
+                    nemotron_seed_deq2(uint8_t(h & 0xff), p.x, p.y, v0, v1);
+                    nemotron_seed_deq2(uint8_t(h >> 8), p.x, p.y, v2, v3);
+                  } else {
+                    nemotron_seed_deq2(raw[q], p.x, p.y, v0, v1);
+                    nemotron_seed_deq2(raw[q + 1], p.x, p.y, v2, v3);
+                  }
                 }
                 frag[i * 4 + 0] = v0;
                 frag[i * 4 + 1] = v1;
@@ -804,12 +979,16 @@ METAL_FUNC void nemotron_seed_gather_impl(
             load_raw(kn);
           }
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<false>{},
-              Btile,
-              metal::bool_constant<transpose>{});
+          if constexpr (HB) {
+            nemotron_seed_matmad_rows(Dtile, Atile, Btile, metal::bool_constant<transpose>{}, sgp_sm);
+          } else {
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+          }
 
           (void)compiler_barrier;
         }
@@ -817,7 +996,10 @@ METAL_FUNC void nemotron_seed_gather_impl(
     } else if constexpr (DIRECT_B) {
       // Each thread dequantizes its own B fragment elements: rows n =
       // tn + 16 nn + coord.y + 8 i, k = 16-chunk + coord.x + j (the
-      // positions BaseNAXFrag::load reads from Ws).
+      // positions BaseNAXFrag::load reads from Ws). HB: the two code bytes
+      // of a quad (k and k + 2) come from one 16-bit load and feed the same
+      // dequantize statements; the mma skips 16-row fragments without a
+      // valid row (nemotron_seed_matmad_rows).
       const short2 bc = BaseNAXFrag::get_coord();
       for (int kg = 0; kg < K; kg += 64) {
         float2 sbv[TN * 2];
@@ -852,8 +1034,14 @@ METAL_FUNC void nemotron_seed_gather_impl(
                   T v0 = T(0), v1 = T(0), v2 = T(0), v3 = T(0);
                   if (ALIGN_N || n < N) {
                     const float2 p = sbv[nn * 2 + i];
-                    nemotron_seed_deq2(bsrc.byte(n, k), p.x, p.y, v0, v1);
-                    nemotron_seed_deq2(bsrc.byte(n, k + 2), p.x, p.y, v2, v3);
+                    if constexpr (HB) {
+                      const uint16_t h = bsrc.code16(n, k);
+                      nemotron_seed_deq2(uint8_t(h & 0xff), p.x, p.y, v0, v1);
+                      nemotron_seed_deq2(uint8_t(h >> 8), p.x, p.y, v2, v3);
+                    } else {
+                      nemotron_seed_deq2(bsrc.byte(n, k), p.x, p.y, v0, v1);
+                      nemotron_seed_deq2(bsrc.byte(n, k + 2), p.x, p.y, v2, v3);
+                    }
                   }
                   frag[i * 4 + 0] = v0;
                   frag[i * 4 + 1] = v1;
@@ -863,185 +1051,20 @@ METAL_FUNC void nemotron_seed_gather_impl(
               }
             }
 
-            tile_matmad_nax(
-                Dtile,
-                Atile,
-                metal::bool_constant<false>{},
-                Btile,
-                metal::bool_constant<transpose>{});
-
-            (void)compiler_barrier;
-          }
-        }
-      }
-    } else if constexpr (RING > 1 || APF) {
-      // RING / APF: the threadgroup-staged path with the B source's wide fill
-      // and one stage: blocks b = 0, 1, ... of BK k, each written to Ws between
-      // two barriers (every Ws slot the compute reads holds the per-row fill's
-      // value) and computed by the single-stage path's statements.
-      // RING = D: block b's loads go to register slot b % D (a compile-time
-      // index: the block loop is unrolled by D), D blocks ahead: blocks 0 ...
-      // D - 1 before the loop, block b + D right after the barrier that
-      // follows block b's Ws write. A slot holds only loaded values (`rload`:
-      // the code words and the raw key); block b + 1's (scale, bias) is
-      // resolved (`resolve`) after block b's Ws write, before block b's mma,
-      // and `rstore` writes block b with the wide fill's `store`.
-      // APF: two A tiles alternate over the 32-k steps (every block has an even
-      // number: BK % 64 == 0, K % 64 == 0); step s + 1's A fragments (the next
-      // block's first step after a block's last) are loaded before step s's
-      // mma. Same A and B values, same mma sequence over k.
-      static_assert(!(RING > 1 || APF) || (WF && (RING == 0 || (RING >= 2 && RING <= 4)) && BK % (2 * SK) == 0),
-                    "ring split");
-      constexpr int NT = WM * WN * 32;
-      const int t = int(simd_group_id) * 32 + int(simd_lane_id);
-      const int nb = (K + BK - 1) / BK;
-      typename BSrc::template Regs<BN, BK, NT> wregs;
-      NAXTile<T, TM, TK> A0;
-      NAXTile<T, TM, TK> A1;
-      auto compute = [&](const int b) {
-        const int kb = b * BK;
-        const int klim = min(BK, K - kb);
-        if constexpr (APF) {
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < klim; kk1 += 2 * SK) {
-            if (sg_active) {
-              NAXTile<T, TN, TK> Btile;
-
-              volatile int compiler_barrier;
-
-              nemotron_seed_load_a<ROUTED, aligned_m, SK>(A1, xn, routed, kb + kk1 + SK, K, sgp_sm);
-
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-              tile_matmad_nax(
-                  Dtile,
-                  A0,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
-            }
-            if (sg_active) {
-              NAXTile<T, TN, TK> Btile;
-
-              volatile int compiler_barrier;
-
-              if (kb + kk1 + 2 * SK < K) {
-                nemotron_seed_load_a<ROUTED, aligned_m, SK>(A0, xn, routed, kb + kk1 + 2 * SK, K, sgp_sm);
-              }
-
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1 + SK);
-
-              tile_matmad_nax(
-                  Dtile,
-                  A1,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
-            }
-          }
-        } else {
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < klim; kk1 += SK) {
-            if (sg_active) {
-              NAXTile<T, TM, TK> Atile;
-              NAXTile<T, TN, TK> Btile;
-
-              volatile int compiler_barrier;
-
-              nemotron_seed_load_a<ROUTED, aligned_m, SK>(Atile, xn, routed, kb + kk1, K, sgp_sm);
-
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
+            if constexpr (HB) {
+              nemotron_seed_matmad_rows(Dtile, Atile, Btile, metal::bool_constant<transpose>{}, sgp_sm);
+            } else {
               tile_matmad_nax(
                   Dtile,
                   Atile,
                   metal::bool_constant<false>{},
                   Btile,
                   metal::bool_constant<transpose>{});
+            }
 
-              (void)compiler_barrier;
-            }
+            (void)compiler_barrier;
           }
         }
-      };
-      if constexpr (RING > 1) {
-        using Raw = typename BSrc::template Raw<BN, BK, NT>;
-        Raw ring[RING];
-        auto rload = [&](thread Raw& r, const int b) {
-          bsrc.template rload<BN, BK, NT, ALIGN_N>(r, t, y_col, N, b * BK, min(BK, K - b * BK));
-        };
-        auto resolve = [&](thread const Raw& r, const int b) {
-          bsrc.template resolve<BN, BK, NT, ALIGN_N>(wregs, r, t, y_col, N, min(BK, K - b * BK));
-        };
-        rload(ring[0], 0);
-        if (1 < nb) {
-          rload(ring[1], 1);
-        }
-        if constexpr (RING > 2) {
-          if (2 < nb) {
-            rload(ring[2], 2);
-          }
-        }
-        if constexpr (RING > 3) {
-          if (3 < nb) {
-            rload(ring[3], 3);
-          }
-        }
-        if constexpr (APF) {
-          if (sg_active) {
-            nemotron_seed_load_a<ROUTED, aligned_m, SK>(A0, xn, routed, 0, K, sgp_sm);
-          }
-        }
-        resolve(ring[0], 0);
-        // Block b from slot S (= b % D).
-        auto step = [&](auto S, const int b) {
-          constexpr int s = decltype(S)::value;
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          bsrc.template rstore<BN, BK, NT, ALIGN_N>(Ws, wregs, ring[s], t, y_col, N, min(BK, K - b * BK));
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (b + RING < nb) {
-            rload(ring[s], b + RING);
-          }
-          if (b + 1 < nb) {
-            resolve(ring[(s + 1) % RING], b + 1);
-          }
-          compute(b);
-        };
-        for (int b = 0; b < nb; b += RING) {
-          step(Int<0>{}, b);
-          if (b + 1 < nb) {
-            step(Int<1>{}, b + 1);
-          }
-          if constexpr (RING > 2) {
-            if (b + 2 < nb) {
-              step(Int<2>{}, b + 2);
-            }
-          }
-          if constexpr (RING > 3) {
-            if (b + 3 < nb) {
-              step(Int<3>{}, b + 3);
-            }
-          }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      } else {
-        // APF alone: the wide fill of each block between the barriers, as the
-        // single-stage WF path.
-        if (sg_active) {
-          nemotron_seed_load_a<ROUTED, aligned_m, SK>(A0, xn, routed, 0, K, sgp_sm);
-        }
-        for (int b = 0; b < nb; b++) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          bsrc.template load<BN, BK, NT, ALIGN_N>(wregs, t, y_col, N, b * BK, min(BK, K - b * BK));
-          bsrc.template store<BN, BK, NT, ALIGN_N>(Ws, wregs, t, y_col, N, min(BK, K - b * BK));
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          compute(b);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
       }
     } else if constexpr (DB || WF) {
       // The threadgroup-staged path below over blocks b = 0, 1, ... of BK k
@@ -1135,7 +1158,96 @@ METAL_FUNC void nemotron_seed_gather_impl(
           }
         }
       };
-      if constexpr (DB && PF) {
+      if constexpr (SP > 0) {
+        constexpr int NTP = SP * 32;
+        static_assert((BN * BK) % NTP == 0 && (BN * BK / NTP) % 8 == 0 && BK % (BN * BK / NTP) == 0
+                      && NTP % (BN / 4) == 0, "producer fill split");
+        const bool producer = int(simd_group_id) >= WM * WN;
+        const int tp = (int(simd_group_id) - WM * WN) * 32 + int(simd_lane_id);
+        typename BSrc::template Regs<BN, BK, NTP> pregs;
+        auto pf_load_p = [&](const int b) {
+          const int kb = b * BK;
+          const int klim = min(BK, K - kb);
+          bsrc.template load<BN, BK, NTP, ALIGN_N>(pregs, tp, y_col, N, kb, klim);
+        };
+        auto pf_store_p = [&](threadgroup T* ws, const int b) {
+          const int klim = min(BK, K - b * BK);
+          bsrc.template store<BN, BK, NTP, ALIGN_N>(ws, pregs, tp, y_col, N, klim);
+        };
+        if constexpr (RING == 2) {
+          using Raw = typename BSrc::template Raw<BN, BK, NTP>;
+          Raw ring[2];
+          auto rload = [&](thread Raw& r, const int b) {
+            bsrc.template rload<BN, BK, NTP, ALIGN_N>(r, tp, y_col, N, b * BK, min(BK, K - b * BK));
+          };
+          auto resolve = [&](thread const Raw& r, const int b) {
+            bsrc.template resolve<BN, BK, NTP, ALIGN_N>(pregs, r, tp, y_col, N, min(BK, K - b * BK));
+          };
+          auto rstore = [&](threadgroup T* ws, thread const Raw& r, const int b) {
+            bsrc.template rstore<BN, BK, NTP, ALIGN_N>(ws, pregs, r, tp, y_col, N, min(BK, K - b * BK));
+          };
+          if (producer) {
+            rload(ring[0], 0);
+            if (1 < nb) {
+              rload(ring[1], 1);
+            }
+            resolve(ring[0], 0);
+            rstore(Ws, ring[0], 0);
+            if (2 < nb) {
+              rload(ring[0], 2);
+            }
+            if (1 < nb) {
+              resolve(ring[1], 1);
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          auto step = [&](auto S, const int b) {
+            constexpr int s = decltype(S)::value;
+            if (producer) {
+              if (b + 1 < nb) {
+                rstore(Ws + ((b + 1) & 1) * STAGE, ring[s], b + 1);
+                if (b + 3 < nb) {
+                  rload(ring[s], b + 3);
+                }
+                if (b + 2 < nb) {
+                  resolve(ring[1 - s], b + 2);
+                }
+              }
+            } else {
+              compute(Ws + (b & 1) * STAGE, b);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          };
+          for (int b = 0; b < nb; b += 2) {
+            step(Int<1>{}, b);
+            if (b + 1 < nb) {
+              step(Int<0>{}, b + 1);
+            }
+          }
+        } else {
+          if (producer) {
+            pf_load_p(0);
+            pf_store_p(Ws, 0);
+            if (1 < nb) {
+              pf_load_p(1);
+            }
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          for (int b = 0; b < nb; b++) {
+            if (producer) {
+              if (b + 1 < nb) {
+                pf_store_p(Ws + ((b + 1) & 1) * STAGE, b + 1);
+                if (b + 2 < nb) {
+                  pf_load_p(b + 2);
+                }
+              }
+            } else {
+              compute(Ws + (b & 1) * STAGE, b);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+          }
+        }
+      } else if constexpr (DB && PF) {
         pf_load(0);
         pf_store(Ws, 0);
         if (1 < nb) {
@@ -1143,13 +1255,18 @@ METAL_FUNC void nemotron_seed_gather_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int b = 0; b < nb; b++) {
+          if constexpr (AP) {
+            compute(Ws + (b & 1) * STAGE, b);
+          }
           if (b + 1 < nb) {
             pf_store(Ws + ((b + 1) & 1) * STAGE, b + 1);
             if (b + 2 < nb) {
               pf_load(b + 2);
             }
           }
-          compute(Ws + (b & 1) * STAGE, b);
+          if constexpr (!AP) {
+            compute(Ws + (b & 1) * STAGE, b);
+          }
           threadgroup_barrier(mem_flags::mem_threadgroup);
         }
       } else if constexpr (DB) {
@@ -1315,6 +1432,240 @@ METAL_FUNC void nemotron_seed_gather_impl(
 }
 """#
 
+/// The four request-prefill (seed) tunes (`NemotronSeedRetile`, `NemotronSeedDenseRetile`, `NemotronSeedQMMTune`,
+/// `NemotronSeedSSMTune`) adopt a bit-identical candidate whose median is at most this fraction of the incumbent's
+/// (0.5% faster) and which is faster than the incumbent in at least `NemotronTuneAdoption.winBar` (75%) of the
+/// cycles. Being a tune's own bar, it keeps that single-tier rule: the two-tier rule (`strongBar` /
+/// `narrowWinBar`) applies only to tunes on the seed rule's shared bar (`NemotronTuneAdoption.seedMedianBar`, 0.99
+/// by default), and only while this value differs from it. These tunes decide on the seed rule (`seed: true`): the
+/// candidate adopted is the lowest median among those passing both tests, and timed cycles are scaled by
+/// `nemotronTuneTimingScale`. NEMOTRON_SEED_TUNE_BAR sets it.
+let nemotronSeedTuneMedianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_SEED_TUNE_BAR"] ?? "") ?? 0.995
+
+/// `NemotronSeedRetile`'s two-stage rows (db2), appended after `nemotronSeedRetileSource` for their kernels only (the
+/// record text is untouched). The threadgroup-B path of `nemotron_seed_gather_impl` with two Ws stages: block b + 1
+/// is dequantized into one stage while block b's mma reads the other, one barrier per block. The setup, `fill`
+/// (`fill_pf`, `prefetch`), the per-block mma loop and the store are the record path's statements; only the stage
+/// pointer, the block order of fill and mma, and the barriers move. Each output's mma sequence (32-k chunks
+/// 0, 32, ..., K - 32 in order into the same accumulator) is the record's for any BK, so BK may be 32.
+let nemotronSeedRetileDB2Source = #"""
+// tiles[t] = (first sorted row, rows <= BM, expert), as the run gather.
+template <
+    typename T,
+    int BM,
+    int BN,
+    int BK,
+    int WM,
+    int WN,
+    bool ALIGN_N,
+    bool RELU2,
+    bool ROUTED,
+    bool PF,
+    class BSrc>
+METAL_FUNC void nemotron_seed_gather_db2_impl(
+    const device T* x,
+    const device uint32_t* routed_rows,
+    BSrc bsrc,
+    const device int* tiles,
+    device T* y,
+    const int N,
+    const int K,
+    threadgroup T* Ws,
+    uint3 tid,
+    uint simd_group_id,
+    uint simd_lane_id) {
+  const int tile_rows = tiles[tid.y * 3 + 1];
+  if (tile_rows <= 0) {
+    return;
+  }
+  const int row0 = tiles[tid.y * 3 + 0];
+  const uint32_t index = uint32_t(tiles[tid.y * 3 + 2]);
+  bsrc.expert(index, N);
+
+  constexpr bool transpose = true;
+  constexpr int BK_padded = (BK + 16 / sizeof(T));
+  constexpr int STAGE = BN * BK_padded;
+  constexpr short SM = BM / WM;
+  constexpr short SN = BN / WN;
+  constexpr short SK = 32;
+  constexpr short TM = SM / 16;
+  constexpr short TN = SN / 16;
+  constexpr short TK = SK / 16;
+  static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
+  // A block is whole 32-k steps; with BK % KPT == 0 and 64 % KPT == 0 below,
+  // no thread's KPT run crosses a quantization group.
+  static_assert(BK % SK == 0 && (BK % 64 == 0 || 64 % BK == 0), "B blocks are whole 32-k steps");
+
+  const int y_col = tid.x * BN;
+  const short tgp_bm = short(min(BM, tile_rows));
+  const short tgp_bn = ALIGN_N ? BN : short(min(BN, N - y_col));
+  y += size_t(row0) * N + size_t(y_col);
+
+  const short tm = SM * (simd_group_id / WN);
+  const short tn = SN * (simd_group_id % WN);
+  const short sgp_sm = min(SM, short(max(0, int(tgp_bm) - tm)));
+  const short sgp_sn = ALIGN_N ? SN : min(SN, short(max(0, (N - (y_col + tn)))));
+  const bool is_unaligned_sm = (sgp_sm != SM);
+  const bool is_unaligned_bn = ALIGN_N ? false : (tgp_bn != BN);
+
+  const short m_lo_lim = 0;
+  const short m_hi_lim = min(int(sgp_sm), max(0, int(tgp_bm) - tm));
+  const bool sg_active = m_hi_lim > m_lo_lim;
+
+  NAXTile<float, TM, TN> Dtile;
+  Dtile.clear();
+
+  const device T* xn = ROUTED ? x : x + (size_t(row0) + size_t(tm)) * size_t(K);
+  const device T* routed[TM * BaseNAXFrag::kElemRows];
+  if constexpr (ROUTED) {
+    const short2 row_coord = BaseNAXFrag::get_coord();
+    STEEL_PRAGMA_UNROLL
+    for (short mr = 0; mr < TM; ++mr) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < BaseNAXFrag::kElemRows; ++i) {
+        const short row = mr * BaseNAXFrag::kFragRows + row_coord.y
+            + i * BaseNAXFrag::kElemRowsJump;
+        routed[mr * BaseNAXFrag::kElemRows + i] = row < sgp_sm
+            ? x + size_t(routed_rows[row0 + tm + row]) * K : x;
+      }
+    }
+  }
+
+  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
+    constexpr bool aligned_m = decltype(kAlignedM)::value;
+    constexpr int NT = WM * WN * 32;
+    constexpr int KPT = BN * BK / NT;
+    static_assert(KPT % 4 == 0 && KPT <= 64 && 64 % KPT == 0 && BK % KPT == 0, "loader split");
+    const int t = int(simd_group_id) * 32 + int(simd_lane_id);
+    const short lr = short(t / (BK / KPT));
+    const short lk = short((t % (BK / KPT)) * KPT);
+    const int ln = y_col + lr;
+    auto fill = [&](threadgroup T* ws, const int kb, const int klim) {
+      threadgroup T* wdst = ws + lr * BK_padded + lk;
+      if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
+        const float2 p = bsrc.sb(ln, (kb + lk) / 64);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < KPT; j += 2) {
+          T v0, v1;
+          nemotron_seed_deq2(bsrc.byte(ln, kb + lk + j), p.x, p.y, v0, v1);
+          wdst[j] = v0;
+          wdst[j + 1] = v1;
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < KPT; ++j) {
+          wdst[j] = T(0);
+        }
+      }
+    };
+    // PF: block b + 2's code bytes, scale and bias are loaded into registers
+    // after block b + 1's stage write, before block b's mma; the next stage
+    // write dequantizes them with fill's statements.
+    uint8_t pf_bytes[PF ? KPT / 2 : 1];
+    float2 pf_sb = float2(0.0f);
+    auto prefetch = [&](const int kb, const int klim) {
+      if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
+        pf_sb = bsrc.sb(ln, (kb + lk) / 64);
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < KPT; j += 2) {
+          pf_bytes[j / 2] = bsrc.byte(ln, kb + lk + j);
+        }
+      }
+    };
+    auto fill_pf = [&](threadgroup T* ws, const int klim) {
+      threadgroup T* wdst = ws + lr * BK_padded + lk;
+      if ((ALIGN_N || lr < tgp_bn) && lk < klim) {
+        const float2 p = pf_sb;
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < KPT; j += 2) {
+          T v0, v1;
+          nemotron_seed_deq2(pf_bytes[j / 2], p.x, p.y, v0, v1);
+          wdst[j] = v0;
+          wdst[j + 1] = v1;
+        }
+      } else {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < KPT; ++j) {
+          wdst[j] = T(0);
+        }
+      }
+    };
+    auto compute = [&](threadgroup T* ws, const int kb, const int klim) {
+      STEEL_PRAGMA_NO_UNROLL
+      for (int kk1 = 0; kk1 < klim; kk1 += SK) {
+        if (sg_active) {
+          NAXTile<T, TM, TK> Atile;
+          NAXTile<T, TN, TK> Btile;
+
+          volatile int compiler_barrier;
+
+          nemotron_seed_load_a<ROUTED, aligned_m, SK>(Atile, xn, routed, kb + kk1, K, sgp_sm);
+
+          Btile.template load<T, BK_padded, 1>(ws + tn * BK_padded + kk1);
+
+          tile_matmad_nax(
+              Dtile,
+              Atile,
+              metal::bool_constant<false>{},
+              Btile,
+              metal::bool_constant<transpose>{});
+
+          (void)compiler_barrier;
+        }
+      }
+    };
+    // K % 64 == 0: every block is whole groups or a whole half group.
+    const int nb = (K + BK - 1) / BK;
+    // Stage b & 1 holds block b. Block b + 1 is written while block b is read;
+    // the barrier closing iteration b - 1 orders both (its stage was last read
+    // in iteration b - 1, and block b was written there).
+    if constexpr (PF) {
+      prefetch(0, min(BK, K));
+      fill_pf(Ws, min(BK, K));
+      if (1 < nb) {
+        prefetch(BK, min(BK, K - BK));
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int b = 0; b < nb; b++) {
+        if (b + 1 < nb) {
+          fill_pf(Ws + ((b + 1) & 1) * STAGE, min(BK, K - (b + 1) * BK));
+          if (b + 2 < nb) {
+            prefetch((b + 2) * BK, min(BK, K - (b + 2) * BK));
+          }
+        }
+        compute(Ws + (b & 1) * STAGE, b * BK, min(BK, K - b * BK));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    } else {
+      fill(Ws, 0, min(BK, K));
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (int b = 0; b < nb; b++) {
+        if (b + 1 < nb) {
+          fill(Ws + ((b + 1) & 1) * STAGE, (b + 1) * BK, min(BK, K - (b + 1) * BK));
+        }
+        compute(Ws + (b & 1) * STAGE, b * BK, min(BK, K - b * BK));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+    }
+  });
+
+  if (ALIGN_N || !is_unaligned_bn) {
+    if (m_lo_lim == 0 && m_hi_lim == SM) {
+      Dtile.template store<RELU2>(y + tm * N + tn, N);
+    } else {
+      Dtile.template store_slice<RELU2>(
+          y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
+    }
+  } else {
+    Dtile.template store_slice<RELU2>(
+        y + tm * N + tn,
+        N,
+        short2(0, m_lo_lim),
+        short2(sgp_sn, m_hi_lim));
+  }
+}
+"""#
+
 /// NEMOTRON_SEED_LEAN: lean twins of the seed retile kernels, offered as extra rows to `NemotronSeedRetile`,
 /// `NemotronSeedDenseRetile` and `NemotronSeedQMMTune` (each row passes its tuner's bit check and adoption rule
 /// like any other). Every text is derived from the record text by exact swaps; nil (no rows) when one misses.
@@ -1326,9 +1677,10 @@ METAL_FUNC void nemotron_seed_gather_impl(
 /// - The direct (non-prefetch) gather walks k with one counter (k = 0, 32, ..., K - 32, reloading the group's
 ///   scale and bias at k % 64 == 0), where the record nests a group counter and a step counter: the same steps, the
 ///   same loads and the same mma order.
-/// - The staged paths' template switches (PF, DB, WF, RING, APF) come with the gather text, so a lean row can take
-///   them; the wide fill reads its code words through the lean B source's `words` (32-bit offsets, like `byte`), and
-///   the ring's `rload` / `key` through the lean sources' offsets too.
+/// - The staged paths' template switches (PF, DB, WF) come with the gather text, so a lean row can take them; the
+///   wide fill reads its code words through the lean B source's `words` (32-bit offsets, like `byte`). The direct
+///   paths' HB and CN switches come with it too (the A-load swap counts the CN path's call: 5 calls); no lean row
+///   takes them.
 /// Every load reads the record's address and every product, mma, accumulator and store is the record's.
 /// NEMOTRON_SEED_LEAN=0 removes the rows.
 enum NemotronSeedLean {
@@ -1387,7 +1739,7 @@ enum NemotronSeedLean {
                 ("  const device T* routed[TM * BaseNAXFrag::kElemRows];",
                  "  uint routed[TM * BaseNAXFrag::kElemRows];", 1),
                 ("? x + size_t(routed_rows[row0 + tm + row]) * K : x;", "? routed_rows[row0 + tm + row] * uint(K) : 0u;", 1),
-                ("nemotron_seed_load_a<ROUTED, aligned_m, SK>(", "nemotron_seed_load_a_ln<ROUTED, aligned_m, SK>(", 9),
+                ("nemotron_seed_load_a<ROUTED, aligned_m, SK>(", "nemotron_seed_load_a_ln<ROUTED, aligned_m, SK>(", 5),
                 ("      for (int kg = 0; kg < K; kg += 64) {\n        float2 sbv[TN * 2];\n        STEEL_PRAGMA_UNROLL\n"
                     + "        for (short nn = 0; nn < TN; ++nn) {\n          STEEL_PRAGMA_UNROLL\n"
                     + "          for (short i = 0; i < 2; ++i) {\n"
@@ -1416,415 +1768,6 @@ enum NemotronSeedLean {
         to: "template <\n    typename T,\n    int BM,").flatMap {
             sources($0, ["NemotronSeedDenseDict", "NemotronSeedDenseCopy"])
         }
-}
-
-/// NEMOTRON_SEED_WSPEC: the routed retile's staged gather with specialized SIMD groups, offered as one extra row
-/// to `NemotronSeedRetile` (`wspecVariants`) and admitted only by its bit check and adoption rule.
-/// - Consumers (SIMD groups 0 ... WM x WN - 1, the incumbent's 2 x 2 grid): the lean gather's output fragments,
-///   A loads (32-bit row offsets), B fragment loads from the threadgroup block, mma sequence over k and store.
-/// - Producers (the PSG SIMD groups after them): no fragments; they write both threadgroup stages with the lean B
-///   source's wide fill (`load` then `store` over NT = PSG x 32 threads), block b + 1 into stage (b + 1) & 1 while
-///   the consumers read block b, with block b + 2's loads issued before the barrier (the DB + PF schedule of
-///   `nemotron_seed_gather_impl`, split by role).
-/// One barrier per K block, reached by both roles; every stage slot gets the wide fill's value (the same words,
-/// scale and bias, and the same `store` statements), so each output keeps the single-stage path's values, mma
-/// order, FP32 accumulators and typed store. Needs `NemotronSeedLean.retileHeader` (no row when it is nil).
-/// NEMOTRON_SEED_WSPEC=0 removes the row and the occupancy-shaped row (`occSource`).
-enum NemotronSeedWSpec {
-    static let offered = ProcessInfo.processInfo.environment["NEMOTRON_SEED_WSPEC"] != "0"
-    /// NEMOTRON_SEED_WSPEC_OCC=0 removes only the occupancy-shaped row (`occSource`).
-    static let occOffered = offered && ProcessInfo.processInfo.environment["NEMOTRON_SEED_WSPEC_OCC"] != "0"
-
-    /// Appended after `NemotronSeedLean.retileHeader`: `nemotron_seed_gather_ws`.
-    static let source = #"""
-// NEMOTRON_SEED_WSPEC: tiles[t] = (first sorted row, rows <= BM, expert), as
-// the run gather. A producer's tm is at least BM, so its sgp_sm is 0: it sets
-// no routed row, runs no mma and stores nothing.
-template <
-    typename T,
-    int BM,
-    int BN,
-    int BK,
-    int WM,
-    int WN,
-    int PSG,
-    bool ALIGN_N,
-    bool RELU2,
-    bool ROUTED,
-    class BSrc>
-METAL_FUNC void nemotron_seed_gather_ws(
-    const device T* x,
-    const device uint32_t* routed_rows,
-    BSrc bsrc,
-    const device int* tiles,
-    device T* y,
-    const int N,
-    const int K,
-    threadgroup T* Ws,
-    uint3 tid,
-    uint simd_group_id,
-    uint simd_lane_id) {
-  const int tile_rows = tiles[tid.y * 3 + 1];
-  if (tile_rows <= 0) {
-    return;
-  }
-  const int row0 = tiles[tid.y * 3 + 0];
-  const uint32_t index = uint32_t(tiles[tid.y * 3 + 2]);
-  bsrc.expert(index, N);
-
-  constexpr bool transpose = true;
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  constexpr short SM = BM / WM;
-  constexpr short SN = BN / WN;
-  constexpr short SK = 32;
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
-  constexpr short TK = SK / 16;
-  constexpr int STAGE = BN * BK_padded;
-  constexpr int NT = PSG * 32;
-  static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
-  static_assert(BK % 64 == 0 && PSG > 0, "B blocks start on a quantization group");
-
-  const bool producer = simd_group_id >= uint(WM * WN);
-  const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, tile_rows));
-  const short tgp_bn = ALIGN_N ? BN : short(min(BN, N - y_col));
-  y += size_t(row0) * N + size_t(y_col);
-
-  const short tm = SM * (simd_group_id / WN);
-  const short tn = SN * (simd_group_id % WN);
-  const short sgp_sm = min(SM, short(max(0, int(tgp_bm) - tm)));
-  const short sgp_sn = ALIGN_N ? SN : min(SN, short(max(0, (N - (y_col + tn)))));
-  const bool is_unaligned_sm = (sgp_sm != SM);
-  const bool is_unaligned_bn = ALIGN_N ? false : (tgp_bn != BN);
-
-  const short m_lo_lim = 0;
-  const short m_hi_lim = min(int(sgp_sm), max(0, int(tgp_bm) - tm));
-  const bool sg_active = !producer && m_hi_lim > m_lo_lim;
-
-  NAXTile<float, TM, TN> Dtile;
-  Dtile.clear();
-
-  const device T* xn = ROUTED ? x : x + (size_t(row0) + size_t(tm)) * size_t(K);
-  uint routed[TM * BaseNAXFrag::kElemRows];
-  if constexpr (ROUTED) {
-    const short2 row_coord = BaseNAXFrag::get_coord();
-    STEEL_PRAGMA_UNROLL
-    for (short mr = 0; mr < TM; ++mr) {
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < BaseNAXFrag::kElemRows; ++i) {
-        const short row = mr * BaseNAXFrag::kFragRows + row_coord.y
-            + i * BaseNAXFrag::kElemRowsJump;
-        routed[mr * BaseNAXFrag::kElemRows + i] = row < sgp_sm
-            ? routed_rows[row0 + tm + row] * uint(K) : 0u;
-      }
-    }
-  }
-
-  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
-    constexpr bool aligned_m = decltype(kAlignedM)::value;
-    // Producer thread t of NT (unused by the consumers).
-    const int t = (int(simd_group_id) - WM * WN) * 32 + int(simd_lane_id);
-    const int nb = (K + BK - 1) / BK;
-    typename BSrc::template Regs<BN, BK, NT> wregs;
-    auto pf_load = [&](const int b) {
-      bsrc.template load<BN, BK, NT, ALIGN_N>(wregs, t, y_col, N, b * BK, min(BK, K - b * BK));
-    };
-    auto pf_store = [&](threadgroup T* ws, const int b) {
-      bsrc.template store<BN, BK, NT, ALIGN_N>(ws, wregs, t, y_col, N, min(BK, K - b * BK));
-    };
-    auto compute = [&](threadgroup T* ws, const int b) {
-      const int kb = b * BK;
-      const int klim = min(BK, K - kb);
-      STEEL_PRAGMA_NO_UNROLL
-      for (int kk1 = 0; kk1 < klim; kk1 += SK) {
-        if (sg_active) {
-          NAXTile<T, TM, TK> Atile;
-          NAXTile<T, TN, TK> Btile;
-
-          volatile int compiler_barrier;
-
-          nemotron_seed_load_a_ln<ROUTED, aligned_m, SK>(Atile, xn, routed, kb + kk1, K, sgp_sm);
-
-          Btile.template load<T, BK_padded, 1>(ws + tn * BK_padded + kk1);
-
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<false>{},
-              Btile,
-              metal::bool_constant<transpose>{});
-
-          (void)compiler_barrier;
-        }
-      }
-    };
-    if (producer) {
-      pf_load(0);
-      pf_store(Ws, 0);
-      if (1 < nb) {
-        pf_load(1);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int b = 0; b < nb; b++) {
-      if (producer) {
-        if (b + 1 < nb) {
-          pf_store(Ws + ((b + 1) & 1) * STAGE, b + 1);
-          if (b + 2 < nb) {
-            pf_load(b + 2);
-          }
-        }
-      } else {
-        compute(Ws + (b & 1) * STAGE, b);
-      }
-      if (b + 1 < nb) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-    }
-  });
-
-  if (producer) {
-    return;
-  }
-  if (ALIGN_N || !is_unaligned_bn) {
-    if (m_lo_lim == 0 && m_hi_lim == SM) {
-      Dtile.template store<RELU2>(y + tm * N + tn, N);
-    } else {
-      Dtile.template store_slice<RELU2>(
-          y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
-    }
-  } else {
-    Dtile.template store_slice<RELU2>(
-        y + tm * N + tn,
-        N,
-        short2(0, m_lo_lim),
-        short2(sgp_sn, m_hi_lim));
-  }
-}
-"""#
-
-    /// Appended after `NemotronSeedLean.retileHeader`: `nemotron_seed_gather_wso`, the occupancy-shaped row's
-    /// gather (`NemotronSeedRetile.wspecVariants` after sp2): `nemotron_seed_gather_ws`'s consumers and lean wide
-    /// fill with one producer SIMD group (160 threads) over the incumbent's single BN x BK stage (9,216 B), so a
-    /// threadgroup asks for no more threadgroup memory than the incumbent's and 32 threads more. The kernel
-    /// also takes whole-block handoffs (HALF false), but no row offers them (slower in the M4 tune).
-    static let occSource = #"""
-// NEMOTRON_SEED_WSPEC_OCC: nemotron_seed_gather_ws with the incumbent's one
-// threadgroup stage (BN x BK, BK 64) and PSG producer SIMD groups. Whole
-// blocks (HALF false): the producers write block b + 1 between two barriers
-// (after the consumers' last read of block b), then issue block b + 2's
-// loads. HALF: the stage is a two-slot ring of 32-k halves (columns 0 ... 31
-// and 32 ... 63 of each row, where the incumbent's two 32-k steps read them);
-// half b + 1 goes into the other slot while the consumers read half b, with
-// half b + 2's loads issued before the barrier, one barrier per half. The
-// fill is the lean B source's wide fill at NT 64 (whole blocks, sp2's split)
-// or NT 128 (halves: 32 k of one row, or 4 outputs x 8 k, per fill thread);
-// each producer thread runs 64 / (32 PSG) fill threads per block or half.
-template <
-    typename T,
-    int BM,
-    int BN,
-    int BK,
-    int WM,
-    int WN,
-    int PSG,
-    bool HALF,
-    bool ALIGN_N,
-    bool RELU2,
-    bool ROUTED,
-    class BSrc>
-METAL_FUNC void nemotron_seed_gather_wso(
-    const device T* x,
-    const device uint32_t* routed_rows,
-    BSrc bsrc,
-    const device int* tiles,
-    device T* y,
-    const int N,
-    const int K,
-    threadgroup T* Ws,
-    uint3 tid,
-    uint simd_group_id,
-    uint simd_lane_id) {
-  const int tile_rows = tiles[tid.y * 3 + 1];
-  if (tile_rows <= 0) {
-    return;
-  }
-  const int row0 = tiles[tid.y * 3 + 0];
-  const uint32_t index = uint32_t(tiles[tid.y * 3 + 2]);
-  bsrc.expert(index, N);
-
-  constexpr bool transpose = true;
-  constexpr int BK_padded = (BK + 16 / sizeof(T));
-  constexpr short SM = BM / WM;
-  constexpr short SN = BN / WN;
-  constexpr short SK = 32;
-  constexpr short TM = SM / 16;
-  constexpr short TN = SN / 16;
-  constexpr short TK = SK / 16;
-  constexpr int NP = PSG * 32;
-  constexpr int FNT = HALF ? 128 : 64;
-  constexpr int V = 64 / NP;
-  constexpr bool WORD = metal::is_same_v<
-      typename BSrc::template Regs<BN, BK, FNT>, NemotronSeedWordRegs<BN, BK, FNT>>;
-  constexpr bool COPY =
-      metal::is_same_v<BSrc, NemotronSeedCopyLn<T>> || metal::is_same_v<BSrc, NemotronSeedCopy<T>>;
-  static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
-  static_assert(BN == 64 && BK == 64 && PSG > 0 && 64 % NP == 0, "the incumbent's stage, 64 fill threads per step");
-  static_assert(WORD != COPY, "the word fill or the decode copy fill");
-
-  const bool producer = simd_group_id >= uint(WM * WN);
-  const int y_col = tid.x * BN;
-  const short tgp_bm = short(min(BM, tile_rows));
-  const short tgp_bn = ALIGN_N ? BN : short(min(BN, N - y_col));
-  y += size_t(row0) * N + size_t(y_col);
-
-  const short tm = SM * (simd_group_id / WN);
-  const short tn = SN * (simd_group_id % WN);
-  const short sgp_sm = min(SM, short(max(0, int(tgp_bm) - tm)));
-  const short sgp_sn = ALIGN_N ? SN : min(SN, short(max(0, (N - (y_col + tn)))));
-  const bool is_unaligned_sm = (sgp_sm != SM);
-  const bool is_unaligned_bn = ALIGN_N ? false : (tgp_bn != BN);
-
-  const short m_lo_lim = 0;
-  const short m_hi_lim = min(int(sgp_sm), max(0, int(tgp_bm) - tm));
-  const bool sg_active = !producer && m_hi_lim > m_lo_lim;
-
-  NAXTile<float, TM, TN> Dtile;
-  Dtile.clear();
-
-  const device T* xn = ROUTED ? x : x + (size_t(row0) + size_t(tm)) * size_t(K);
-  uint routed[TM * BaseNAXFrag::kElemRows];
-  if constexpr (ROUTED) {
-    const short2 row_coord = BaseNAXFrag::get_coord();
-    STEEL_PRAGMA_UNROLL
-    for (short mr = 0; mr < TM; ++mr) {
-      STEEL_PRAGMA_UNROLL
-      for (short i = 0; i < BaseNAXFrag::kElemRows; ++i) {
-        const short row = mr * BaseNAXFrag::kFragRows + row_coord.y
-            + i * BaseNAXFrag::kElemRowsJump;
-        routed[mr * BaseNAXFrag::kElemRows + i] = row < sgp_sm
-            ? routed_rows[row0 + tm + row] * uint(K) : 0u;
-      }
-    }
-  }
-
-  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
-    constexpr bool aligned_m = decltype(kAlignedM)::value;
-    // Producer thread p of NP (unused by the consumers).
-    const int p = (int(simd_group_id) - WM * WN) * 32 + int(simd_lane_id);
-    // Steps: K blocks, or (HALF) 32-k halves; K is a multiple of 64.
-    const int nb = HALF ? (K + SK - 1) / SK : (K + BK - 1) / BK;
-    typename BSrc::template Regs<BN, BK, FNT> wregs[V];
-    // Fill thread j of this producer thread at step b: whole blocks, q; half h
-    // of a block, the NT 128 fill threads writing columns 32h ... 32h + 31
-    // (word fill: row q's k 32h ... 32h + 31; copy: q's 4 outputs x 8 k).
-    auto fill_thread = [&](const int b, const short j) {
-      const int q = int(j) * NP + p;
-      return !HALF ? q : WORD ? 2 * q + (b & 1) : 64 * (b & 1) + q;
-    };
-    auto pf_load = [&](const int b) {
-      const int kb = HALF ? (b >> 1) * BK : b * BK;
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < V; ++j) {
-        bsrc.template load<BN, BK, FNT, ALIGN_N>(wregs[j], fill_thread(b, j), y_col, N, kb, min(BK, K - kb));
-      }
-    };
-    auto pf_store = [&](const int b) {
-      const int kb = HALF ? (b >> 1) * BK : b * BK;
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < V; ++j) {
-        bsrc.template store<BN, BK, FNT, ALIGN_N>(Ws, wregs[j], fill_thread(b, j), y_col, N, min(BK, K - kb));
-      }
-    };
-    // The 32-k step at k: the lean gather's A loads, the B fragments at the
-    // stage column the incumbent's step at k reads (k % BK), the mma.
-    auto step = [&](const int k) {
-      if (sg_active) {
-        NAXTile<T, TM, TK> Atile;
-        NAXTile<T, TN, TK> Btile;
-
-        volatile int compiler_barrier;
-
-        nemotron_seed_load_a_ln<ROUTED, aligned_m, SK>(Atile, xn, routed, k, K, sgp_sm);
-
-        Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + k % BK);
-
-        tile_matmad_nax(
-            Dtile,
-            Atile,
-            metal::bool_constant<false>{},
-            Btile,
-            metal::bool_constant<transpose>{});
-
-        (void)compiler_barrier;
-      }
-    };
-    if (producer) {
-      pf_load(0);
-      pf_store(0);
-      if (1 < nb) {
-        pf_load(1);
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int b = 0; b < nb; b++) {
-      if constexpr (HALF) {
-        if (producer) {
-          if (b + 1 < nb) {
-            pf_store(b + 1);
-            if (b + 2 < nb) {
-              pf_load(b + 2);
-            }
-          }
-        } else {
-          step(b * SK);
-        }
-        if (b + 1 < nb) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-      } else {
-        if (!producer) {
-          const int kb = b * BK;
-          const int klim = min(BK, K - kb);
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < klim; kk1 += SK) {
-            step(kb + kk1);
-          }
-        }
-        if (b + 1 < nb) {
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (producer) {
-            pf_store(b + 1);
-            if (b + 2 < nb) {
-              pf_load(b + 2);
-            }
-          }
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-      }
-    }
-  });
-
-  if (producer) {
-    return;
-  }
-  if (ALIGN_N || !is_unaligned_bn) {
-    if (m_lo_lim == 0 && m_hi_lim == SM) {
-      Dtile.template store<RELU2>(y + tm * N + tn, N);
-    } else {
-      Dtile.template store_slice<RELU2>(
-          y + tm * N + tn, N, short2(0, m_lo_lim), short2(SN, m_hi_lim));
-    }
-  } else {
-    Dtile.template store_slice<RELU2>(
-        y + tm * N + tn,
-        N,
-        short2(0, m_lo_lim),
-        short2(sgp_sn, m_hi_lim));
-  }
-}
-"""#
 }
 
 /// Seed only (request prefill, `NemotronHPrefillX5.requestPrefill`): the target's last block is MoE, and of its
@@ -2042,11 +1985,10 @@ enum NemotronSeedTailMoE {
 /// NEMOTRON_SEED_RETILE_DB=0 `stagedVariants` (two threadgroup stages);
 /// NEMOTRON_SEED_RETILE_WF=0 `wideVariants` (the B source's wide fill); each also
 /// removes its rows' lean twins (`stagedWideLeanVariants`, NEMOTRON_SEED_LEAN).
-/// NEMOTRON_SEED_RETILE_RING=0 leaves out `ringVariants` (a register ring of B
-/// loads several blocks ahead, A fragments one step ahead).
-/// NEMOTRON_SEED_WSPEC=0 leaves out `wspecVariants` (producer and consumer
-/// SIMD groups, `NemotronSeedWSpec`); NEMOTRON_SEED_WSPEC_OCC=0 only its
-/// occupancy-shaped row (one producer SIMD group, the incumbent's stage).
+/// NEMOTRON_SEED_RETILE_HB=0 leaves out `halfVariants` (direct B, one 16-bit
+/// code load per quad, row-guarded mma; bank and dictionary roles) and
+/// NEMOTRON_SEED_RETILE_CN=0 `copyNativeVariants` (direct B from the decode
+/// copy's words; copy role), both appended after every other row.
 enum NemotronSeedRetile {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE"] != "0"
     static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_FORCE"]
@@ -2062,18 +2004,32 @@ enum NemotronSeedRetile {
         var db: Bool = false
         /// The B source's wide fill (`nemotron_seed_gather_impl`'s WF).
         var wf: Bool = false
-        /// Blocks of B loads in flight in the register ring (`nemotron_seed_gather_impl`'s RING; 0: no ring).
-        var ring: Int = 0
-        /// A fragments loaded one 32-k step ahead (`nemotron_seed_gather_impl`'s APF).
-        var apf: Bool = false
-        /// Producer SIMD groups after the WM x WN consumers (`NemotronSeedWSpec`; 0: every SIMD group does both).
-        var producers: Int = 0
-        /// With `producers`: `NemotronSeedWSpec.occSource`'s gather over the incumbent's single stage.
-        var occ: Bool = false
-        /// `occ`: the stage handed over in 32-k halves (a two-slot ring), else in whole K blocks.
+        /// HB: each pair of code bytes (k, k + 2) of a direct B quad comes from
+        /// one 16-bit load, and the mma skips 16-row fragments without a valid
+        /// row (`nemotron_seed_matmad_rows`). Bank and dictionary sources.
         var half: Bool = false
-        var threads: Int { (wm * wn + producers) * 32 }
-        var threadgroupBytes: Int { direct ? 0 : (db ? 2 : 1) * bn * (bk + 8) * 2 }
+        /// CN: B read from the decode copy's words straight into K x N
+        /// fragments (transpose_b false). Copy source only; not bit-exact by
+        /// construction (the mma's other operand layout), so only the bitwise
+        /// qualify admits it.
+        var cn: Bool = false
+        /// SP: this many producer SIMD groups write two Ws stages with the B source's wide fill while the wm x wn
+        /// SIMD groups run the mma (`nemotron_seed_gather_impl`'s SP; wf rows without db, pf or ap).
+        var sp: Int = 0
+        /// AP: in the two-stage prefetching loop (`DB && PF`), block b's mma is
+        /// issued before block b + 1's stage write and block b + 2's loads.
+        var ap: Bool = false
+        /// RING (sp rows): the producers keep two blocks of B loads in flight in a two-slot register ring
+        /// (`nemotron_seed_gather_impl`'s RING).
+        var ring: Int = 0
+        /// Two Ws stages (`nemotron_seed_gather_db2_impl`).
+        var db2: Bool = false
+        /// `NemotronSeedIncumbentDB2`'s two-stage twin of the role's incumbent (BK `bk`).
+        var inc: Bool = false
+        /// The twin's order (0 write-first, 1 mma-first, 2 register prefetch, 3 lean dequant).
+        var incOrder: Int = 0
+        var threads: Int { (wm * wn + sp) * 32 }
+        var threadgroupBytes: Int { direct ? 0 : (db || sp > 0 || db2 || (inc && incOrder < 3) ? 2 : 1) * bn * (bk + 8) * 2 }
     }
 
     /// NEMOTRON_SEED_RETILE_PF=0 stops offering the PF rows (the K loop with
@@ -2106,9 +2062,55 @@ enum NemotronSeedRetile {
         Variant(name: "ws64x64w22pfln", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, lean: true),
         Variant(name: "d64w22pfln", bn: 64, bk: 64, wm: 2, wn: 2, direct: true, pf: true, lean: true),
     ] : []) + (offerX ? extraVariants : []) + (offerDB ? stagedVariants : []) + (offerWF ? wideVariants : [])
-        + stagedWideLeanVariants
-        + (offerRing ? ringVariants : [])
-        + wspecVariants
+        + stagedWideLeanVariants + (offerDB2 ? db2Variants : []) + incVariants + computeFirstVariants + producerVariants
+
+    /// NEMOTRON_SEED_RETILE_AP=0 stops offering `computeFirstVariants`.
+    static let offerAP = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_AP"] != "0"
+    static let computeFirstVariants: [Variant] = offerAP && offerPF && offerDB && offerWF ? [
+        Variant(name: "ws64x32w22wfap", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, pf: true, db: true, wf: true, ap: true),
+        Variant(name: "ws64x64w22wfap", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, db: true, wf: true, ap: true),
+    ] + (NemotronSeedLean.offered && NemotronSeedLean.retileHeader != nil ? [
+        Variant(name: "ws64x32w22wfapln", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, pf: true, lean: true, db: true, wf: true, ap: true),
+        Variant(name: "ws64x64w22wfapln", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, lean: true, db: true, wf: true, ap: true),
+    ] : []) : []
+
+    /// NEMOTRON_SEED_RETILE_SP=0 stops offering `producerVariants`.
+    static let offerSP = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_SP"] != "0"
+    static let producerVariants: [Variant] = offerSP && offerWF ? [
+        Variant(name: "ws64x32w22wfsp2", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, wf: true, sp: 2),
+        Variant(name: "ws64x32w22wfsp4", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, wf: true, sp: 4),
+        Variant(name: "ws64x64w22wfsp2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, wf: true, sp: 2),
+        Variant(name: "ws64x32w22wfsp2r2", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, wf: true, sp: 2, ring: 2),
+    ] + (NemotronSeedLean.offered && NemotronSeedLean.retileHeader != nil ? [
+        Variant(name: "ws64x32w22wfsp2ln", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, lean: true, wf: true, sp: 2),
+        Variant(name: "ws64x64w22wfsp2ln", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, lean: true, wf: true, sp: 2),
+    ] : []) : []
+
+    /// NEMOTRON_SEED_RETILE_DB2=0 stops offering the db2 rows.
+    static let offerDB2 = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_DB2"] != "0"
+    static let db2Variants: [Variant] = [
+        Variant(name: "ws64x32w22db2", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, db2: true),
+        Variant(name: "ws64x32w22db2pf", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, pf: true, db2: true),
+        Variant(name: "ws64x32w12db2pf", bn: 64, bk: 32, wm: 1, wn: 2, direct: false, pf: true, db2: true),
+    ]
+    /// `NemotronSeedIncumbentDB2`'s rows (the incumbents' 64 columns, two Ws stages of BK 64 or 32), appended
+    /// after `db2Variants`; NEMOTRON_SEED_RETILE_INC_DB2=0 leaves them out.
+    static let incVariants: [Variant] = (NemotronSeedIncumbentDB2.available ? [
+        Variant(name: "inc64x64db2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, inc: true),
+        Variant(name: "inc64x32db2", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, inc: true),
+    ] + (NemotronSeedIncumbentDB2.availableB ? [
+        Variant(name: "incm64x32db2", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, inc: true, incOrder: 1),
+        Variant(name: "incm64x64db2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, inc: true, incOrder: 1),
+        Variant(name: "incp64x32db2", bn: 64, bk: 32, wm: 2, wn: 2, direct: false, inc: true, incOrder: 2),
+    ] : []) : []) + (NemotronSeedLeanDequant.available ? [
+        Variant(name: "lq64x64", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, inc: true, incOrder: 3),
+    ] : [])
+    /// The default row: with no NEMOTRON_SEED_RETILE_FORCE, a role adopts `ws64x32w22db2pf` whenever that row
+    /// passed the role's bit-for-bit qualification (every case, every layer the tune checks), without the timing
+    /// pass; a role where it did not pass is tuned as before. In this tree the default is off: NEMOTRON_SEED_RETILE_DB2_DEFAULT=1 turns it on, otherwise the
+    /// timing decision for both roles.
+    static let defaultRow: Variant? = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_DB2_DEFAULT"] == "1"
+        ? variants.first(where: { $0.name == "ws64x32w22db2pf" }) : nil
 
     /// NEMOTRON_SEED_RETILE_X=0 stops offering `extraVariants`.
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_X"] != "0"
@@ -2161,42 +2163,50 @@ enum NemotronSeedRetile {
                     lean: true, db: $0.db, wf: $0.wf)
         } : []
 
-    /// NEMOTRON_SEED_RETILE_RING=0 stops offering the ring rows (`ringVariants`).
-    static let offerRing = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_RING"] != "0"
-    /// The incumbent geometry with the B source's wide fill and one threadgroup stage, with deeper load overlap
-    /// (`nemotron_seed_gather_impl`'s RING and APF), appended after every row above so FORCE names keep their rows:
-    /// - pfD (RING = D): block b's B loads (the code words and the raw scale and bias, or the pair index) go to
-    ///   register slot b % D, D blocks ahead (the wf pf row keeps one block ahead), and block b + 1's (scale, bias)
-    ///   is widened or read from the pair table before block b's mma; the block loop is unrolled by D so each slot
-    ///   index is a compile-time constant. A slot is 5 registers for the bank and the dictionary (four code words
-    ///   and the key) and 6 for the fc2 decode copy (eight code words and four pair indices).
-    /// - apf (APF): two A tiles alternate, so step s + 1's A fragments (the next block's first step after a block's
-    ///   last) are loaded before step s's mma.
-    /// Every Ws slot gets the wide fill's value (the same words, scale and bias, and its `store` statements), and
-    /// the K blocks, mma sequence, accumulators and store are the single-stage path's. One stage (9,216 B). The
-    /// kernel takes RING with APF too, but no row offers both: the two together pass the register budget of the
-    /// 64 x 64 tile (the 32-row A tiles, the 32 x 32 FP32 accumulators and the slots).
-    static let ringVariants: [Variant] = [
-        Variant(name: "ws64x64w22wfpf2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, wf: true, ring: 2),
-        Variant(name: "ws64x64w22wfpf3", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, wf: true, ring: 3),
-        Variant(name: "ws64x64w22wfapf", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, wf: true, apf: true),
+    /// NEMOTRON_SEED_RETILE_HB=0 stops offering `halfVariants`.
+    static let offerHalf = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_HB"] != "0"
+    /// NEMOTRON_SEED_RETILE_CN=0 stops offering `copyNativeVariants`.
+    static let offerCopyNative = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_CN"] != "0"
+
+    /// h: direct B with HB (name ...h), one SIMD group across M (WM 1: no B value is dequantized twice) and BN a
+    /// divisor of 1856 and 2688 (ALIGN_N); pf: the prefetching K loop. The plain direct path (no DB, WF or lean
+    /// text). Offered to the bank and dictionary roles, after every row above.
+    static let halfVariants: [Variant] = offerHalf ? [
+        Variant(name: "d64w12h", bn: 64, bk: 64, wm: 1, wn: 2, direct: true, half: true),
+        Variant(name: "d32w11h", bn: 32, bk: 64, wm: 1, wn: 1, direct: true, half: true),
+    ] + (offerPF ? [
+        Variant(name: "d64w12hpf", bn: 64, bk: 64, wm: 1, wn: 2, direct: true, pf: true, half: true),
+        Variant(name: "d32w11hpf", bn: 32, bk: 64, wm: 1, wn: 1, direct: true, pf: true, half: true),
+    ] : []) : []
+
+    /// cn: CN with WM 1, BN 64 (copy source; rows guarded as HB); pf: the prefetching K loop. Offered to the copy
+    /// role, after every row above.
+    static let copyNativeVariants: [Variant] = offerCopyNative ? [
+        Variant(name: "cn64w12h", bn: 64, bk: 64, wm: 1, wn: 2, direct: true, cn: true),
+    ] + (offerPF ? [
+        Variant(name: "cn64w12hpf", bn: 64, bk: 64, wm: 1, wn: 2, direct: true, pf: true, cn: true),
+    ] : []) : []
+
+    static let fastFC1Names: Set<String> = [
+        "ws64x64w22", "ws64x128w22", "d64w22ln",
+        "ws64x64w22wfln", "ws64x128w22wfpf", "ws64x128w22wfpfln",
+        "lq64x64", "ws64x64w22wfap", "ws64x64w22wfapln",
+        "ws64x64w22wfsp2", "ws64x64w22wfsp2ln",
+    ]
+    static let fastFC2Names: Set<String> = [
+        "lq64x64", "ws64x64w22wfsp2", "ws64x64w22wfsp2ln", "incm64x64db2",
     ]
 
-    /// `NemotronSeedWSpec`'s row, appended last: the incumbent geometry's four consumer SIMD groups plus two
-    /// producers (192 threads) over two lean wide-fill stages (18,432 B), one barrier per K block.
-    static let wspecVariants: [Variant] = NemotronSeedWSpec.offered && NemotronSeedLean.retileHeader != nil ? [
-        Variant(name: "ws64x64w22sp2", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, lean: true, db: true,
-                wf: true, producers: 2),
-    ] + (NemotronSeedWSpec.occOffered ? occVariants : []) : []
-
-    /// `NemotronSeedWSpec.occSource`'s row, after sp2: the incumbent geometry's four consumer SIMD groups plus one
-    /// producer (160 threads) over the incumbent's single stage (9,216 B), handed over in 32-k halves (a two-slot
-    /// ring inside it: the producer fills one half while the consumers run the mma on the other, one barrier per
-    /// half, the incumbent's barrier count). NEMOTRON_SEED_WSPEC_OCC=0 leaves it out.
-    static let occVariants: [Variant] = [
-        Variant(name: "ws64x64w22sp1h", bn: 64, bk: 64, wm: 2, wn: 2, direct: false, pf: true, lean: true,
-                wf: true, producers: 1, occ: true, half: true),
-    ]
+    /// The rows a role is offered: every row above, then the h rows (bank and dictionary sources: they read the
+    /// bank's code bytes) or the cn rows (the decode copy's words).
+    static func offered(_ role: Role) -> [Variant] {
+        let all = variants + (role.source == .copy ? copyNativeVariants : halfVariants)
+        if forced != nil || ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_ALL"] == "1" {
+            return all
+        }
+        let keep = role.relu2 ? fastFC1Names : fastFC2Names
+        return all.filter { keep.contains($0.name) }
+    }
 
     enum Source: String, Sendable { case bank, dict, copy }
 
@@ -2216,10 +2226,7 @@ enum NemotronSeedRetile {
     nonisolated(unsafe) static var fc1Choice: (role: Role, variant: Variant)? = nil
     nonisolated(unsafe) static var fc2Choice: (role: Role, variant: Variant)? = nil
 
-    /// `wspec`: `NemotronSeedWSpec`'s gather (lean B sources; DB sizes its two stages); `occ`: its
-    /// `occSource` gather (lean B sources, one stage).
-    private static func body(routed: Bool, source: Source, lean: Bool = false, wspec: Bool = false,
-                             occ: Bool = false) -> String {
+    private static func body(routed: Bool, source: Source, lean: Bool = false, db2: Bool = false) -> String {
         let make: String
         let ln = lean ? "Ln" : ""
         switch source {
@@ -2228,13 +2235,10 @@ enum NemotronSeedRetile {
         case .copy: make = "NemotronSeedCopy\(ln)<T> b{w, scales, biases, K};"
         }
         let rows = routed ? "routed_rows" : "(const device uint32_t*)tiles"
-        let gather = occ ? "nemotron_seed_gather_wso"
-            : wspec ? "nemotron_seed_gather_ws" : "nemotron_seed_gather_impl" + (lean ? "_ln" : "")
-        let switches = occ ? "PSG, HALF, ALIGN_N, RELU2, \(routed)" : wspec ? "PSG, ALIGN_N, RELU2, \(routed)"
-            : "DIRECT_B, ALIGN_N, RELU2, \(routed), PF, DB, WF, RING, APF"
+        let tail = db2 ? "PF" : "PF, DB, WF, HB, CN, SP, AP, RING"
         func call(_ bm: String) -> String {
             """
-                    \(gather)<T, \(bm), BN, BK, WM, WN, \(switches)>(
+                    nemotron_seed_gather_\(db2 ? "db2_" : "")impl\(lean ? "_ln" : "")<T, \(bm), BN, BK, WM, WN, \(db2 ? "" : "DIRECT_B, ")ALIGN_N, RELU2, \(routed), \(tail)>(
                         x, \(rows), b, tiles, y, N, K, Ws,
                         threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup,
@@ -2242,7 +2246,7 @@ enum NemotronSeedRetile {
             """
         }
         return """
-                threadgroup T Ws[DIRECT_B ? 1 : (DB ? 2 : 1) * BN * (BK + 16 / sizeof(T))];
+                threadgroup T Ws[\(db2 ? "2 * " : "DIRECT_B ? 1 : (DB || SP > 0 ? 2 : 1) * ")BN * (BK + 16 / sizeof(T))];
                 \(make)
                 if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
             \(call("32"))
@@ -2252,20 +2256,17 @@ enum NemotronSeedRetile {
             """
     }
 
-    private static func makeKernel(routed: Bool, source: Source, lean: Bool = false, wspec: Bool = false,
-                                   occ: Bool = false)
-        -> MLXFast.MLXFastKernel
-    {
+    private static func makeKernel(routed: Bool, source: Source, lean: Bool = false,
+                                   db2: Bool = false) -> MLXFast.MLXFastKernel {
         MLXFast.metalKernel(
             name: "nemotron_seed_gather_\(routed ? "routed_" : "")\(source.rawValue)" + (lean ? "_ln" : "")
-                + (wspec ? "_ws" : "") + (occ ? "_wso" : ""),
+                + (db2 ? "_db2" : ""),
             inputNames: ["x", "w", "scales", "biases", "tiles"] + (routed ? ["routed_rows"] : []) + ["N", "K"],
             outputNames: ["y"],
-            source: body(routed: routed, source: source, lean: lean, wspec: wspec, occ: occ),
+            source: body(routed: routed, source: source, lean: lean, db2: db2),
             header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource
                 + (lean ? "\n" + (NemotronSeedLean.retileHeader ?? "") : "")
-                + (wspec ? "\n" + NemotronSeedWSpec.source : "")
-                + (occ ? "\n" + NemotronSeedWSpec.occSource : ""))
+                + (db2 ? "\n" + nemotronSeedRetileDB2Source : ""))
     }
 
     private static let routedBank = makeKernel(routed: true, source: .bank)
@@ -2276,14 +2277,10 @@ enum NemotronSeedRetile {
     private static let routedDictLn = makeKernel(routed: true, source: .dict, lean: true)
     private static let plainBankLn = makeKernel(routed: false, source: .bank, lean: true)
     private static let plainCopyLn = makeKernel(routed: false, source: .copy, lean: true)
-    private static let routedBankWs = makeKernel(routed: true, source: .bank, lean: true, wspec: true)
-    private static let routedDictWs = makeKernel(routed: true, source: .dict, lean: true, wspec: true)
-    private static let plainBankWs = makeKernel(routed: false, source: .bank, lean: true, wspec: true)
-    private static let plainCopyWs = makeKernel(routed: false, source: .copy, lean: true, wspec: true)
-    private static let routedBankWso = makeKernel(routed: true, source: .bank, lean: true, occ: true)
-    private static let routedDictWso = makeKernel(routed: true, source: .dict, lean: true, occ: true)
-    private static let plainBankWso = makeKernel(routed: false, source: .bank, lean: true, occ: true)
-    private static let plainCopyWso = makeKernel(routed: false, source: .copy, lean: true, occ: true)
+    private static let routedBankDB2 = makeKernel(routed: true, source: .bank, db2: true)
+    private static let routedDictDB2 = makeKernel(routed: true, source: .dict, db2: true)
+    private static let plainBankDB2 = makeKernel(routed: false, source: .bank, db2: true)
+    private static let plainCopyDB2 = makeKernel(routed: false, source: .copy, db2: true)
 
     /// One retiled launch; nil wherever the incumbent's guards would not admit it.
     static func launch(_ v: Variant, role: Role, x: MLXArray, lin: QuantizedSwitchLinear,
@@ -2303,11 +2300,15 @@ enum NemotronSeedRetile {
         } else {
             guard x.dim(0) == n else { return nil }
         }
+        if v.inc {
+            return NemotronSeedIncumbentDB2.launch(bk: v.bk, role: role, x: x, lin: lin, rows: rows, tiles: tiles,
+                                                   order: v.incOrder)
+        }
         let kernel: MLXFast.MLXFastKernel
         let operands: [MLXArray]
         switch role.source {
         case .bank, .dict:
-            guard !ops.hasLinearBias, let biases = ops.biases, ops.scales.dtype == x.dtype,
+            guard !v.cn, !ops.hasLinearBias, let biases = ops.biases, ops.scales.dtype == x.dtype,
                   biases.dtype == x.dtype, ops.scales.shape == [experts, nOut, k / 64],
                   biases.shape == ops.scales.shape
             else { return nil }
@@ -2315,39 +2316,31 @@ enum NemotronSeedRetile {
                 guard role.routed, let d = NemotronSBDict.dict(lin), d.index.shape == ops.scales.shape,
                       d.index.dtype == .uint16, d.table.dtype == .float32
                 else { return nil }
-                (kernel, operands) = (v.occ ? routedDictWso : v.producers > 0 ? routedDictWs
-                                      : v.lean ? routedDictLn : routedDict,
+                (kernel, operands) = (v.db2 ? routedDictDB2 : v.lean ? routedDictLn : routedDict,
                                       [ops.weight, d.index, d.table])
-            } else if v.occ {
-                (kernel, operands) = (role.routed ? routedBankWso : plainBankWso, [ops.weight, ops.scales, biases])
-            } else if v.producers > 0 {
-                (kernel, operands) = (role.routed ? routedBankWs : plainBankWs, [ops.weight, ops.scales, biases])
             } else {
-                (kernel, operands) = (role.routed ? (v.lean ? routedBankLn : routedBank) : (v.lean ? plainBankLn : plainBank),
+                (kernel, operands) = (role.routed ? (v.db2 ? routedBankDB2 : v.lean ? routedBankLn : routedBank)
+                                          : (v.db2 ? plainBankDB2 : v.lean ? plainBankLn : plainBank),
                                       [ops.weight, ops.scales, biases])
             }
         case .copy:
-            guard !role.routed, !role.relu2, nOut % 128 == 0, let copy = NemotronZSkip.copy(for: lin), copy.dict,
+            guard !v.half, !role.routed, !role.relu2, nOut % 128 == 0, let copy = NemotronZSkip.copy(for: lin), copy.dict,
                   copy.codes.shape == [experts, nOut / 128, k, 32], copy.codes.dtype == .uint16,
                   copy.scales.shape == [experts, nOut / 128, k / 64, 128], copy.scales.dtype == .uint16,
                   copy.biases.dtype == .float32
             else { return nil }
-            (kernel, operands) = (v.occ ? plainCopyWso : v.producers > 0 ? plainCopyWs
-                                  : v.lean ? plainCopyLn : plainCopy,
+            (kernel, operands) = (v.db2 ? plainCopyDB2 : v.lean ? plainCopyLn : plainCopy,
                                   [copy.codes, copy.scales, copy.biases])
         }
         var inputs: [any ScalarOrArray] = [x] + operands + [tiles.tiles]
         if role.routed, let rows { inputs.append(rows) }
         inputs += [nOut, k]
-        var template: [(String, any KernelTemplateArg)] = [
-            ("T", x.dtype), ("BM", tiles.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
-            ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf),
-            ("DB", v.db), ("WF", v.wf), ("RING", v.ring), ("APF", v.apf)]
-        if v.producers > 0 { template.append(("PSG", v.producers)) }
-        if v.occ { template.append(("HALF", v.half)) }
         return kernel(
             inputs,
-            template: template,
+            template: [("T", x.dtype), ("BM", tiles.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
+                       ("DIRECT_B", v.direct), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", role.relu2), ("PF", v.pf),
+                       ("DB", v.db), ("WF", v.wf), ("HB", v.half), ("CN", v.cn),
+                       ("SP", v.sp), ("AP", v.ap), ("RING", v.ring)],
             grid: (((nOut + v.bn - 1) / v.bn) * v.threads, tiles.count, 1), threadGroup: (v.threads, 1, 1),
             outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
     }
@@ -2469,11 +2462,13 @@ enum NemotronSeedRetile {
         guard cases.count == 5 else { return report("off (counting sort unavailable)") }
 
         // Qualify: bit for bit against the incumbent; any mismatch or error drops a variant.
-        var alive: [[Variant]] = [variants, variants]
+        let offers = roles.map { offered($0) }
+        var alive: [[Variant]] = offers
         var dropped: [[String]] = [[], []]
+        let edgeMoes = moes.count > 1 ? [moe, moes.last!] : [moe]
         for r in 0 ..< 2 {
             caseLoop: for (ci, c) in cases.enumerated() {
-                for m in (ci == 0 ? moes : [moe]) {
+                for m in (ci == 0 ? edgeMoes : [moe]) {
                     let lin = linear(m, r)
                     let (x, rows) = input(r, c)
                     let reference: MLXArray?
@@ -2515,12 +2510,18 @@ enum NemotronSeedRetile {
         // Time the incumbent and the survivors round robin on the 488-token
         // case, first four MoE layers per repetition; median ms per layer.
         let layers = Array(moes.prefix(4))
-        // 25 timed cycles, scaled by `nemotronTuneTimingScale` (even).
-        let timedCycles = max(25, Int((25 * nemotronTuneTimingScale).rounded()) / 2 * 2)
+        // 24 timed cycles (even).
+        let timedCycles = 24
         var medians: [[(Variant?, Double)]] = [[], []]
         var verdicts: [NemotronTuneAdoption.Verdict?] = [nil, nil]
         var choice: [Variant?] = [nil, nil]
+        var defaulted = [false, false]
         for r in 0 ..< 2 where !alive[r].isEmpty {
+            if forced == nil, let d = defaultRow, alive[r].contains(d) {
+                choice[r] = d
+                defaulted[r] = true
+                continue
+            }
             let candidates: [Variant?] = [nil] + alive[r].map { Optional($0) }
             let (x, rows) = input(r, cases[0])
             var samples = Array(repeating: [Double](), count: candidates.count)
@@ -2563,7 +2564,7 @@ enum NemotronSeedRetile {
                 continue
             }
             guard samples.allSatisfy({ $0.count == timedCycles }) else { continue }
-            let verdict = NemotronTuneAdoption.decide(samples, seed: true)
+            let verdict = NemotronTuneAdoption.decide(samples, medianBar: nemotronSeedTuneMedianBar, seed: true)
             verdicts[r] = verdict
             medians[r] = Array(zip(candidates, verdict.medians))
             if let forced, let f = alive[r].first(where: { $0.name == forced }) {
@@ -2583,15 +2584,781 @@ enum NemotronSeedRetile {
             let times = medians[r].indices.dropFirst().map {
                 "\(medians[r][$0].0!.name) \(String(format: "%.2f", medians[r][$0].1)) \(verdicts[r]?.won($0) ?? "n/a")"
             }
-            return "\(roles[r].label) \(alive[r].count)/\(variants.count) bitwise"
+            return "\(roles[r].label) \(alive[r].count)/\(offers[r].count) bitwise"
+                + (defaulted[r] ? ", default \(choice[r]?.name ?? "") bitwise, timing skipped" : "")
                 + (verdicts[r].map { v in ", " + v.rule({ medians[r][$0].0?.name ?? "V0" }) } ?? "")
                 + (times.isEmpty ? "" : " [" + times.joined(separator: ", ") + "]")
-                + (dropped[r].isEmpty ? "" : " dropped: " + dropped[r].prefix(8).joined(separator: ", "))
+                + (dropped[r].isEmpty ? "" : " dropped: " + dropped[r].prefix(16).joined(separator: ", "))
         }
         report("\(choice[0]?.name ?? "V0")/\(choice[1]?.name ?? "V0") fc1 \(ms(0, choice[0])) ms fc2 \(ms(1, choice[1])) ms"
             + " vs V0 fc1 \(ms(0, nil)) ms fc2 \(ms(1, nil)) ms (per layer, 488 tokens, median of 25;"
             + " fc1 \(detail(0)); fc2 \(detail(1)))"
             + String(format: " tune %.2f s", Double(DispatchTime.now().uptimeNanoseconds - tuneStart) / 1e9))
+    }
+}
+
+// MARK: - Seed incumbent two-stage twins
+
+/// Two-stage (ping-pong Ws) twins of the seed's incumbent routed launches, offered to `NemotronSeedRetile` as its
+/// `inc` rows: the direct-input fc1 through the pair dictionary (`NemotronPrefillDirectFC1.dictHeader`'s
+/// `nemotron_gather_qmm_runs_direct_dict_impl`) and the fc2 decode-copy gather (`NemotronPrefillFC2Copy.header`'s
+/// `nemotron_gather_qmm_runs_copy_impl`). Each twin is the incumbent impl's text through counted swaps (nil, so no
+/// rows, when one misses): block k + 1 is written into one threadgroup stage while block k's mma reads the other
+/// (stage k & 1), one barrier per block, where the incumbent writes and reads one stage between two barriers. The B
+/// block writes are the incumbent's statements (its loader, or its copy load at the block's codes, pair index and
+/// stage), the A loads, `tile_matmad_nax` calls, accumulators and store are the incumbent's, and every output's mma
+/// runs over 32-k chunks 0, 32, ..., K - 32 in order, so a twin's output is its incumbent's. BK is the incumbent's
+/// 64 (two stages of 9 KB) or 32 (two stages of 5 KB; a block lies inside one quantization group, the loader steps
+/// its group every two blocks and the copy load takes the block's group). A twin needs K % BK == 0 (asserted).
+/// NEMOTRON_SEED_RETILE_INC_DB2=0 leaves the rows out.
+enum NemotronSeedIncumbentDB2 {
+    static let offered = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_INC_DB2"] != "0"
+
+    /// The K loop's swaps shared by both twins.
+    private static func loop(_ text: String, head: (String, String), tail: (String, String)) -> String? {
+        NemotronSeedLean.swapped(text, [
+            (head.0, head.1, 1),
+            (tail.0, tail.1, 1),
+            ("      if (!align_K) {\n",
+             "      static_assert(align_K, \"two-stage twin: whole K blocks\");\n      if (!align_K) {\n", 1),
+        ])
+    }
+
+    private static func load(_ l: String, _ pad: String) -> String {
+        "\(pad)if constexpr (kAlignedN.value) {\n\(pad)  \(l).load_unsafe();\n\(pad)} else {\n"
+            + "\(pad)  \(l).load_safe(short2(BK, tgp_bn));\n\(pad)}\n"
+    }
+
+    /// `nemotron_gather_qmm_runs_direct_dict_impl` as `nemotron_gather_qmm_runs_direct_dict_db2_impl`: a second
+    /// loader (stage 1, one block on) writes the odd blocks; each loader steps two blocks between its loads.
+    static let dictSource: String? = NemotronPrefillDirectFC1.dictHeader.flatMap { h -> String? in
+        guard let impl = NemotronSeedLean.slice(h, from: "// to expert runs. tiles[t] = (first sorted row", to: nil),
+              let named = NemotronSeedLean.swapped(impl, [
+                  ("METAL_FUNC void nemotron_gather_qmm_runs_direct_dict_impl(",
+                   "METAL_FUNC void nemotron_gather_qmm_runs_direct_dict_db2_impl(", 1),
+                  ("      simd_group_id,\n      simd_lane_id);\n\n  dispatch_bool(",
+                   "      simd_group_id,\n      simd_lane_id);\n"
+                    + "  thread loader_w_t loader_w1 = loader_w;\n  loader_w1.dst += BN * BK_padded;\n"
+                    + "  loader_w1.next();\n\n  dispatch_bool(", 1),
+              ])
+        else { return nil }
+        return loop(named, head: (
+            "      for (int k = 0; k < K_it; k++) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                + "        if constexpr (kAlignedN.value) {\n          loader_w.load_unsafe();\n        } else {\n"
+                + "          loader_w.load_safe(short2(BK, tgp_bn));\n        }\n\n"
+                + "        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+            "      threadgroup T* const Ws0 = Ws;\n" + load("loader_w", "      ")
+                + "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                + "      for (int k = 0; k < K_it; k++) {\n"
+                + "        threadgroup T* const Ws = Ws0 + (k & 1) * (BN * BK_padded);\n"
+                + "        if (k + 1 < K_it) {\n"
+                + "          if ((k & 1) == 1) {\n"
+                + "            loader_w.next();\n            loader_w.next();\n" + load("loader_w", "            ")
+                + "          } else {\n"
+                + "            if (k > 0) {\n              loader_w1.next();\n              loader_w1.next();\n            }\n"
+                + load("loader_w1", "            ")
+                + "          }\n        }\n"),
+            tail: ("        xn += BK;\n        loader_w.next();\n      }\n",
+                   "        xn += BK;\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"))
+    }
+
+    /// `nemotron_gather_qmm_runs_copy_impl` as `nemotron_gather_qmm_runs_copy_db2_impl`: the copy load takes the
+    /// block index (its codes, its group's pair index, its stage).
+    static let copySource: String? = {
+        guard let impl = NemotronSeedLean.slice(NemotronPrefillFC2Copy.header,
+                                                from: "// Nemotron: the run gather reading the routed fc2", to: nil),
+              let named = NemotronSeedLean.swapped(impl, [
+                  ("METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(",
+                   "METAL_FUNC void nemotron_gather_qmm_runs_copy_db2_impl(", 1),
+                  ("  auto cl_load = [&]() {\n",
+                   "  auto cl_load = [&](const int cl_b) {\n"
+                    + "    const device uint16_t* cl_codes_b = cl_codes + size_t(cl_b) * size_t(BK) * 32;\n"
+                    + "    const device uint16_t* cl_idx_b = cl_idx + size_t((cl_b * BK) / group_size) * 128;\n"
+                    + "    threadgroup T* cl_dst_b = cl_dst + (cl_b & 1) * (BN * BK_padded);\n", 1),
+                  ("const uint pair = uint(cl_idx[o]);", "const uint pair = uint(cl_idx_b[o]);", 1),
+                  ("const uint lo = (uint(cl_codes[j * 32])", "const uint lo = (uint(cl_codes_b[j * 32])", 1),
+                  ("const uint hi = (uint(cl_codes[(j + 1) * 32])", "const uint hi = (uint(cl_codes_b[(j + 1) * 32])", 1),
+                  ("cl_dst[o * BK_padded + j] =", "cl_dst_b[o * BK_padded + j] =", 1),
+                  ("cl_dst[o * BK_padded + j + 1] =", "cl_dst_b[o * BK_padded + j + 1] =", 1),
+              ]),
+              let looped = loop(named, head: (
+                  "      for (int k = 0; k < K_it; k++) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                      + "        cl_load();\n\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+                  "      threadgroup T* const Ws0 = Ws;\n      cl_load(0);\n"
+                      + "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+                      + "      for (int k = 0; k < K_it; k++) {\n"
+                      + "        threadgroup T* const Ws = Ws0 + (k & 1) * (BN * BK_padded);\n"
+                      + "        if (k + 1 < K_it) {\n          cl_load(k + 1);\n        }\n"),
+                  tail: ("        xn += BK;\n        cl_codes += BK * 32;\n        cl_idx += 128;\n      }\n",
+                         "        xn += BK;\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"))
+        else { return nil }
+        // The K tail (compiled, never taken: align_K is asserted) loads block K_it.
+        return NemotronSeedLean.swapped(looped, [("        cl_load();\n", "        cl_load(K_it);\n", 1)])
+    }()
+
+    private static func body(_ impl: String, args: String) -> String {
+        func call(_ bm: String) -> String {
+            """
+                    \(impl)<T, GS, BITS, \(bm), BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        \(args), Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+            """
+        }
+        return """
+                threadgroup T Ws[2 * BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+            \(call("32"))
+                } else {
+            \(call("BM"))
+                }
+            """
+    }
+
+    private static let dictKernel: MLXFast.MLXFastKernel? = dictSource.flatMap { twin in
+        NemotronPrefillDirectFC1.dictHeader.map { h in
+            MLXFast.metalKernel(
+                name: "nemotron_gather_qmm_runs_direct_input_dict_db2",
+                inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+                outputNames: ["y"],
+                source: body("nemotron_gather_qmm_runs_direct_dict_db2_impl",
+                             args: "x, w, scales, biases, tiles, routed_rows, y, N, K"),
+                header: h + "\n" + twin)
+        }
+    }
+
+    private static let copyKernel: MLXFast.MLXFastKernel? = copySource.map { twin in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_fc2_copy_db2",
+            inputNames: ["x", "wk", "sidx", "table", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: body("nemotron_gather_qmm_runs_copy_db2_impl", args: "x, wk, sidx, table, tiles, y, N, K"),
+            header: NemotronPrefillFC2Copy.header + "\n" + twin)
+    }
+
+    /// Whether both twins were derived (the rows are offered only then).
+    static var available: Bool { offered && dictSource != nil && copySource != nil }
+
+    /// The twin of the role's incumbent at `bk`; nil for any other role or wherever the incumbent's guards would
+    /// not admit the launch (`NemotronPrefillDirectFC1.launch` with its dictionary, `NemotronPrefillFC2Copy.launch`).
+    static func launch(bk: Int, role: NemotronSeedRetile.Role, x: MLXArray, lin: QuantizedSwitchLinear,
+                       rows: MLXArray?, tiles: NemotronHRunTiles, order: Int = 0) -> MLXArray? {
+        let ops = lin.nemotronGatherOperands(for: x.dtype)
+        let n = tiles.rows, k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
+        guard k % bk == 0, k % 64 == 0 else { return nil }
+        if role.routed, role.source == .dict, role.relu2 {
+            guard let dictKernel = order == 0 ? dictKernel : orderedDict(order), let rows, !ops.hasLinearBias, let biases = ops.biases,
+                  ops.scales.dtype == x.dtype, biases.dtype == x.dtype,
+                  ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape,
+                  let d = NemotronSBDict.dict(lin), d.index.shape == ops.scales.shape,
+                  d.index.dtype == .uint16, d.table.dtype == .float32
+            else { return nil }
+            return dictKernel(
+                [x, ops.weight, d.index, d.table, tiles.tiles, rows, nOut, k],
+                template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", 64), ("BK", bk),
+                           ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", true), ("RELU2", true)],
+                grid: (((nOut + 63) / 64) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+        }
+        if !role.routed, role.source == .copy, !role.relu2 {
+            let bn = NemotronPrefillFC2Copy.columns
+            guard let copyKernel = order == 0 ? copyKernel : orderedCopy(order), x.dim(0) == n, nOut % 128 == 0, let copy = NemotronZSkip.copy(for: lin), copy.dict,
+                  copy.codes.shape == [experts, nOut / 128, k, 32], copy.codes.dtype == .uint16,
+                  copy.scales.shape == [experts, nOut / 128, k / 64, 128], copy.scales.dtype == .uint16,
+                  copy.biases.dtype == .float32
+            else { return nil }
+            return copyKernel(
+                [x, copy.codes, copy.scales, copy.biases, tiles.tiles, nOut, k],
+                template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", tiles.bm), ("BN", bn), ("BK", bk),
+                           ("ALIGN_N", true), ("ALIGN_K", true), ("RELU2", false)],
+                grid: (((nOut + bn - 1) / bn) * 128, tiles.count, 1), threadGroup: (128, 1, 1),
+                outputShapes: [[n, 1, nOut]], outputDTypes: [x.dtype])[0]
+        }
+        return nil
+    }
+}
+
+/// More orders of `NemotronSeedIncumbentDB2`'s two-stage twins (order 1 and 2; order 0 is the twins above), offered
+/// as further `inc` rows: 1, mma-first, issues block k's mma before block k + 1's B write (the same write, after the
+/// mma, before the block's barrier); 2, register prefetch, reads block k + 1's code bytes and (scale, bias) into
+/// registers before block k's mma and writes the stage after it with the incumbent's dequantize statements on those
+/// registers (the dictionary loader's `dequantize<T, 2, 4>` per byte; the copy load's per-output statements). Stage,
+/// barrier and mma structure are order 0's, so every value and every output's mma order are the incumbent's.
+/// NEMOTRON_SEED_RETILE_INC_DB2B=0 leaves these rows out.
+extension NemotronSeedIncumbentDB2 {
+    static let offeredB = ProcessInfo.processInfo.environment["NEMOTRON_SEED_RETILE_INC_DB2B"] != "0"
+
+    private static func suffix(_ order: Int) -> String { order == 1 ? "db2m" : "db2p" }
+
+    private static func loadB(_ l: String, _ pad: String) -> String {
+        "\(pad)if constexpr (kAlignedN.value) {\n\(pad)  \(l).load_unsafe();\n\(pad)} else {\n"
+            + "\(pad)  \(l).load_safe(short2(BK, tgp_bn));\n\(pad)}\n"
+    }
+
+    private static func twinLoop(_ text: String, head: (String, String), tail: (String, String)) -> String? {
+        NemotronSeedLean.swapped(text, [
+            (head.0, head.1, 1),
+            (tail.0, tail.1, 1),
+            ("      if (!align_K) {\n",
+             "      static_assert(align_K, \"two-stage twin: whole K blocks\");\n      if (!align_K) {\n", 1),
+        ])
+    }
+
+    /// The dictionary fc1 twin in `order` (1 or 2).
+    static func dictTwin(_ order: Int) -> String? {
+        guard let h = NemotronPrefillDirectFC1.dictHeader,
+              let impl = NemotronSeedLean.slice(h, from: "// to expert runs. tiles[t] = (first sorted row", to: nil)
+        else { return nil }
+        let pf = order == 2 ? """
+              static_assert(bits == 4, "register prefetch: 4-bit codes");
+              uint8_t pf_w[loader_w_t::n_reads * bytes_per_pack];
+              T pf_scale = T(0);
+              T pf_bias = T(0);
+              auto pf_fetch = [&](thread loader_w_t& l) {
+                const uint pair = uint(*l.scales);
+                pf_scale = static_cast<T>(l.biases[2 * pair]);
+                pf_bias = static_cast<T>(l.biases[2 * pair + 1]);
+                for (int i = 0; i < loader_w_t::n_reads * bytes_per_pack; i++) {
+                  pf_w[i] = l.src[i];
+                }
+              };
+              auto pf_store = [&](thread loader_w_t& l) {
+                const float s = float(pf_scale);
+                const float b = float(pf_bias);
+                float sc[2] = {s, s / 16.0f};
+                for (int i = 0; i < loader_w_t::n_reads; i++) {
+                  for (int j = 0; j < (pack_factor / 2); j++) {
+                    const uint8_t wb = pf_w[i * bytes_per_pack + j];
+                    l.dst[i * pack_factor + 2 * j] = static_cast<T>(sc[0] * (wb & 0x0f) + b);
+                    l.dst[i * pack_factor + 2 * j + 1] = static_cast<T>(sc[1] * (wb & 0xf0) + b);
+                  }
+                }
+              };
+
+            """ : ""
+        guard let named = NemotronSeedLean.swapped(impl, [
+            ("METAL_FUNC void nemotron_gather_qmm_runs_direct_dict_impl(",
+             "METAL_FUNC void nemotron_gather_qmm_runs_direct_dict_\(suffix(order))_impl(", 1),
+            ("      simd_group_id,\n      simd_lane_id);\n\n  dispatch_bool(",
+             "      simd_group_id,\n      simd_lane_id);\n"
+                + "  thread loader_w_t loader_w1 = loader_w;\n  loader_w1.dst += BN * BK_padded;\n"
+                + "  loader_w1.next();\n" + pf + "\n  dispatch_bool(", 1),
+        ]) else { return nil }
+        let oldHead = "      for (int k = 0; k < K_it; k++) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "        if constexpr (kAlignedN.value) {\n          loader_w.load_unsafe();\n        } else {\n"
+            + "          loader_w.load_safe(short2(BK, tgp_bn));\n        }\n\n"
+            + "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        let start = "      threadgroup T* const Ws0 = Ws;\n" + loadB("loader_w", "      ")
+            + "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "      for (int k = 0; k < K_it; k++) {\n"
+            + "        threadgroup T* const Ws = Ws0 + (k & 1) * (BN * BK_padded);\n"
+            + "        thread loader_w_t& ln = (k & 1) == 1 ? loader_w : loader_w1;\n"
+        let step = "          if (k > 0) {\n            ln.next();\n            ln.next();\n          }\n"
+        let oldTail = "        xn += BK;\n        loader_w.next();\n      }\n"
+        if order == 1 {
+            return twinLoop(named, head: (oldHead, start), tail: (oldTail,
+                "        xn += BK;\n        if (k + 1 < K_it) {\n" + step + loadB("ln", "          ") + "        }\n"
+                    + "        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"))
+        }
+        return twinLoop(named, head: (oldHead, start + "        if (k + 1 < K_it) {\n" + step
+                + "          if constexpr (kAlignedN.value) {\n            pf_fetch(ln);\n          }\n        }\n"),
+            tail: (oldTail,
+                "        xn += BK;\n        if (k + 1 < K_it) {\n          if constexpr (kAlignedN.value) {\n"
+                    + "            pf_store(ln);\n          } else {\n            ln.load_safe(short2(BK, tgp_bn));\n"
+                    + "          }\n        }\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"))
+    }
+
+    /// The fc2 copy twin in `order` (1 or 2).
+    static func copyTwin(_ order: Int) -> String? {
+        guard let impl = NemotronSeedLean.slice(NemotronPrefillFC2Copy.header,
+                                                from: "// Nemotron: the run gather reading the routed fc2", to: nil)
+        else { return nil }
+        let pf = order == 2 ? """
+              uint16_t clr_c[CL_KPT];
+              float clr_s[4];
+              float clr_b[4];
+              auto cl_fetch = [&](const int cl_b) {
+                const device uint16_t* cl_codes_b = cl_codes + size_t(cl_b) * size_t(BK) * 32;
+                const device uint16_t* cl_idx_b = cl_idx + size_t((cl_b * BK) / group_size) * 128;
+                STEEL_PRAGMA_UNROLL
+                for (short o = 0; o < 4; o++) {
+                  const uint pair = uint(cl_idx_b[o]);
+                  clr_s[o] = table[2 * pair];
+                  clr_b[o] = table[2 * pair + 1];
+                }
+                STEEL_PRAGMA_UNROLL
+                for (short j = 0; j < CL_KPT; j++) {
+                  clr_c[j] = cl_codes_b[j * 32];
+                }
+              };
+              auto cl_store = [&](const int cl_b) {
+                threadgroup T* cl_dst_b = cl_dst + (cl_b & 1) * (BN * BK_padded);
+                STEEL_PRAGMA_UNROLL
+                for (short o = 0; o < 4; o++) {
+                  const float s = clr_s[o];
+                  const float b = clr_b[o];
+                  float sc[2] = {s, s / 16.0f};
+                  STEEL_PRAGMA_UNROLL
+                  for (short j = 0; j < CL_KPT; j += 2) {
+                    const uint lo = (uint(clr_c[j]) >> (4 * o)) & 0xfu;
+                    const uint hi = (uint(clr_c[j + 1]) >> (4 * o)) & 0xfu;
+                    const uint8_t byte = uint8_t(lo | (hi << 4));
+                    cl_dst_b[o * BK_padded + j] = static_cast<T>(sc[0] * (byte & 0x0f) + b);
+                    cl_dst_b[o * BK_padded + j + 1] = static_cast<T>(sc[1] * (byte & 0xf0) + b);
+                  }
+                }
+              };
+
+            """ : ""
+        guard let named = NemotronSeedLean.swapped(impl, [
+            ("METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(",
+             "METAL_FUNC void nemotron_gather_qmm_runs_copy_\(suffix(order))_impl(", 1),
+            ("  auto cl_load = [&]() {\n",
+             "  auto cl_load = [&](const int cl_b) {\n"
+                + "    const device uint16_t* cl_codes_b = cl_codes + size_t(cl_b) * size_t(BK) * 32;\n"
+                + "    const device uint16_t* cl_idx_b = cl_idx + size_t((cl_b * BK) / group_size) * 128;\n"
+                + "    threadgroup T* cl_dst_b = cl_dst + (cl_b & 1) * (BN * BK_padded);\n", 1),
+            ("const uint pair = uint(cl_idx[o]);", "const uint pair = uint(cl_idx_b[o]);", 1),
+            ("const uint lo = (uint(cl_codes[j * 32])", "const uint lo = (uint(cl_codes_b[j * 32])", 1),
+            ("const uint hi = (uint(cl_codes[(j + 1) * 32])", "const uint hi = (uint(cl_codes_b[(j + 1) * 32])", 1),
+            ("cl_dst[o * BK_padded + j] =", "cl_dst_b[o * BK_padded + j] =", 1),
+            ("cl_dst[o * BK_padded + j + 1] =", "cl_dst_b[o * BK_padded + j + 1] =", 1),
+            ("  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {\n",
+             pf + "  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {\n", 1),
+        ]) else { return nil }
+        let oldHead = "      for (int k = 0; k < K_it; k++) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "        cl_load();\n\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        let start = "      threadgroup T* const Ws0 = Ws;\n      cl_load(0);\n"
+            + "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "      for (int k = 0; k < K_it; k++) {\n"
+            + "        threadgroup T* const Ws = Ws0 + (k & 1) * (BN * BK_padded);\n"
+        let oldTail = "        xn += BK;\n        cl_codes += BK * 32;\n        cl_idx += 128;\n      }\n"
+        let looped = order == 1
+            ? twinLoop(named, head: (oldHead, start), tail: (oldTail,
+                "        xn += BK;\n        if (k + 1 < K_it) {\n          cl_load(k + 1);\n        }\n"
+                    + "        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"))
+            : twinLoop(named, head: (oldHead, start + "        if (k + 1 < K_it) {\n          cl_fetch(k + 1);\n        }\n"),
+                       tail: (oldTail,
+                "        xn += BK;\n        if (k + 1 < K_it) {\n          cl_store(k + 1);\n        }\n"
+                    + "        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"))
+        return looped.flatMap { NemotronSeedLean.swapped($0, [("        cl_load();\n", "        cl_load(K_it);\n", 1)]) }
+    }
+
+    private static func bodyB(_ impl: String, args: String) -> String {
+        func call(_ bm: String) -> String {
+            """
+                    \(impl)<T, GS, BITS, \(bm), BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        \(args), Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+            """
+        }
+        return """
+                threadgroup T Ws[2 * BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+            \(call("32"))
+                } else {
+            \(call("BM"))
+                }
+            """
+    }
+
+    private static func makeDict(_ order: Int) -> MLXFast.MLXFastKernel? {
+        guard let h = NemotronPrefillDirectFC1.dictHeader, let twin = dictTwin(order) else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_direct_input_dict_\(suffix(order))",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+            outputNames: ["y"],
+            source: bodyB("nemotron_gather_qmm_runs_direct_dict_\(suffix(order))_impl",
+                          args: "x, w, scales, biases, tiles, routed_rows, y, N, K"),
+            header: h + "\n" + twin)
+    }
+
+    private static func makeCopy(_ order: Int) -> MLXFast.MLXFastKernel? {
+        guard let twin = copyTwin(order) else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_fc2_copy_\(suffix(order))",
+            inputNames: ["x", "wk", "sidx", "table", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: bodyB("nemotron_gather_qmm_runs_copy_\(suffix(order))_impl", args: "x, wk, sidx, table, tiles, y, N, K"),
+            header: NemotronPrefillFC2Copy.header + "\n" + twin)
+    }
+
+    private static let dictM = makeDict(1)
+    private static let dictP = makeDict(2)
+    private static let copyM = makeCopy(1)
+    private static let copyP = makeCopy(2)
+
+    static func orderedDict(_ order: Int) -> MLXFast.MLXFastKernel? { order == 1 ? dictM : order == 2 ? dictP : order == 3 ? NemotronSeedLeanDequant.routedDict : nil }
+    static func orderedCopy(_ order: Int) -> MLXFast.MLXFastKernel? { order == 1 ? copyM : order == 2 ? copyP : order == 3 ? NemotronSeedLeanDequant.copy : nil }
+
+    /// Whether every order-1 and order-2 twin was derived (their rows are offered only then).
+    static var availableB: Bool {
+        available && offeredB && [1, 2].allSatisfy { dictTwin($0) != nil && copyTwin($0) != nil }
+    }
+}
+
+/// Two-stage twins of the seed's incumbent dense launches, offered to `NemotronSeedDenseRetile` as its `inc` rows:
+/// the dense dictionary gather (`NemotronPrefillDenseDict.header`'s `nemotron_gather_qmm_runs_dict_impl`: in_proj,
+/// out_proj and an admitted up_proj) and the shared up's run gather (`nemotronRunGatherHeader`'s
+/// `nemotron_gather_qmm_runs_impl` with the bank loader: the "up_gather" kind). Each twin is the incumbent impl's
+/// text through the counted swaps of the routed twins (order 0 write-first, 1 mma-first, 2 register prefetch; nil,
+/// so no rows, when one misses), at the incumbent's 64 x 64 tile and BK 32 (two stages of 5 KB): every threadgroup
+/// value is the incumbent loader's (the bank loader's (scale, bias) read for the bank, the pair dictionary's for the
+/// dictionary), and every output's mma runs over 32-k chunks 0, 32, ..., K - 32 in order.
+/// NEMOTRON_SEED_DENSE_INC=0 leaves the rows out.
+extension NemotronSeedIncumbentDB2 {
+    static let offeredDense = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_INC"] != "0"
+
+    /// The loader run-gather impl `base`_impl in `header` as `base`_<db2|db2m|db2p>_impl.
+    static func loaderTwin(_ header: String?, base: String, order: Int, dict: Bool) -> String? {
+        guard let header,
+              let impl = NemotronSeedLean.slice(header, from: "// to expert runs. tiles[t] = (first sorted row", to: nil)
+        else { return nil }
+        let sfx = ["db2", "db2m", "db2p"][order]
+        let sb = dict
+            ? "    const uint pair = uint(*l.scales);\n    pf_scale = static_cast<T>(l.biases[2 * pair]);\n"
+                + "    pf_bias = static_cast<T>(l.biases[2 * pair + 1]);\n"
+            : "    pf_scale = *l.scales;\n    pf_bias = *l.biases;\n"
+        let pf = order != 2 ? "" : "  static_assert(bits == 4, \"register prefetch: 4-bit codes\");\n"
+            + "  uint8_t pf_w[loader_w_t::n_reads * bytes_per_pack];\n  T pf_scale = T(0);\n  T pf_bias = T(0);\n"
+            + "  auto pf_fetch = [&](thread loader_w_t& l) {\n" + sb
+            + "    for (int i = 0; i < loader_w_t::n_reads * bytes_per_pack; i++) {\n      pf_w[i] = l.src[i];\n    }\n  };\n"
+            + "  auto pf_store = [&](thread loader_w_t& l) {\n    const float s = float(pf_scale);\n"
+            + "    const float b = float(pf_bias);\n    float sc[2] = {s, s / 16.0f};\n"
+            + "    for (int i = 0; i < loader_w_t::n_reads; i++) {\n      for (int j = 0; j < (pack_factor / 2); j++) {\n"
+            + "        const uint8_t wb = pf_w[i * bytes_per_pack + j];\n"
+            + "        l.dst[i * pack_factor + 2 * j] = static_cast<T>(sc[0] * (wb & 0x0f) + b);\n"
+            + "        l.dst[i * pack_factor + 2 * j + 1] = static_cast<T>(sc[1] * (wb & 0xf0) + b);\n"
+            + "      }\n    }\n  };\n"
+        guard let named = NemotronSeedLean.swapped(impl, [
+            ("METAL_FUNC void \(base)_impl(", "METAL_FUNC void \(base)_\(sfx)_impl(", 1),
+            ("      simd_group_id,\n      simd_lane_id);\n\n  dispatch_bool(",
+             "      simd_group_id,\n      simd_lane_id);\n"
+                + "  thread loader_w_t loader_w1 = loader_w;\n  loader_w1.dst += BN * BK_padded;\n"
+                + "  loader_w1.next();\n" + pf + "\n  dispatch_bool(", 1),
+        ]) else { return nil }
+        func load(_ l: String, _ pad: String) -> String {
+            "\(pad)if constexpr (kAlignedN.value) {\n\(pad)  \(l).load_unsafe();\n\(pad)} else {\n"
+                + "\(pad)  \(l).load_safe(short2(BK, tgp_bn));\n\(pad)}\n"
+        }
+        let oldHead = "      for (int k = 0; k < K_it; k++) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "        if constexpr (kAlignedN.value) {\n          loader_w.load_unsafe();\n        } else {\n"
+            + "          loader_w.load_safe(short2(BK, tgp_bn));\n        }\n\n"
+            + "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        let oldTail = "        xn += BK;\n        loader_w.next();\n      }\n"
+        let start = "      threadgroup T* const Ws0 = Ws;\n" + load("loader_w", "      ")
+            + "      threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+            + "      for (int k = 0; k < K_it; k++) {\n"
+            + "        threadgroup T* const Ws = Ws0 + (k & 1) * (BN * BK_padded);\n"
+            + "        thread loader_w_t& ln = (k & 1) == 1 ? loader_w : loader_w1;\n"
+        let step = "          if (k > 0) {\n            ln.next();\n            ln.next();\n          }\n"
+        let close = "        threadgroup_barrier(mem_flags::mem_threadgroup);\n      }\n"
+        let head: String, tail: String
+        switch order {
+        case 0:
+            head = start + "        if (k + 1 < K_it) {\n" + step + load("ln", "          ") + "        }\n"
+            tail = "        xn += BK;\n" + close
+        case 1:
+            head = start
+            tail = "        xn += BK;\n        if (k + 1 < K_it) {\n" + step + load("ln", "          ") + "        }\n" + close
+        default:
+            head = start + "        if (k + 1 < K_it) {\n" + step
+                + "          if constexpr (kAlignedN.value) {\n            pf_fetch(ln);\n          }\n        }\n"
+            tail = "        xn += BK;\n        if (k + 1 < K_it) {\n          if constexpr (kAlignedN.value) {\n"
+                + "            pf_store(ln);\n          } else {\n            ln.load_safe(short2(BK, tgp_bn));\n"
+                + "          }\n        }\n" + close
+        }
+        return NemotronSeedLean.swapped(named, [
+            (oldHead, head, 1),
+            (oldTail, tail, 1),
+            ("      if (!align_K) {\n",
+             "      static_assert(align_K, \"two-stage twin: whole K blocks\");\n      if (!align_K) {\n", 1),
+        ])
+    }
+
+    private static func denseKernel(_ order: Int, dict: Bool) -> MLXFast.MLXFastKernel? {
+        let sfx = ["db2", "db2m", "db2p"][order]
+        let header = dict ? NemotronPrefillDenseDict.header : nemotronRunGatherHeader
+        let base = dict ? "nemotron_gather_qmm_runs_dict" : "nemotron_gather_qmm_runs"
+        guard let header, let twin = loaderTwin(header, base: base, order: order, dict: dict) else { return nil }
+        func call(_ bm: String) -> String {
+            """
+                    \(base)_\(sfx)_impl<T, GS, BITS, \(bm), BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        x, w, scales, biases, tiles, y, N, K, Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+            """
+        }
+        // The dictionary gather runs the BM body only; the run gather splits at 32 rows (its incumbents' bodies).
+        let source = dict
+            ? "        threadgroup T Ws[2 * BN * (BK + 16 / sizeof(T))];\n" + call("BM") + "\n"
+            : """
+                threadgroup T Ws[2 * BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+            \(call("32"))
+                } else {
+            \(call("BM"))
+                }
+            """
+        return MLXFast.metalKernel(
+            name: (dict ? "nemotron_gather_qmm_runs_dense_dict_" : "nemotron_gather_qmm_runs_adaptive_tiles_") + sfx,
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: source,
+            header: header + "\n" + twin)
+    }
+
+    private static let denseDictKernels: [MLXFast.MLXFastKernel?] = (0 ..< 3).map { denseKernel($0, dict: true) }
+    private static let denseBankKernels: [MLXFast.MLXFastKernel?] = (0 ..< 3).map { denseKernel($0, dict: false) }
+
+    /// Whether every dense twin was derived (the rows are offered only then).
+    static var availableDense: Bool {
+        offeredDense && (0 ..< 3).allSatisfy {
+            loaderTwin(NemotronPrefillDenseDict.header, base: "nemotron_gather_qmm_runs_dict", order: $0, dict: true) != nil
+                && loaderTwin(nemotronRunGatherHeader, base: "nemotron_gather_qmm_runs", order: $0, dict: false) != nil
+        }
+    }
+
+    /// The dense twin over the request's rows (`x`: [1, rows, K]) in 64-row tiles (at least three descriptors), as
+    /// the incumbent: `dict` the dense dictionary gather (`NemotronPrefillDenseDict.launch`), else the shared up's
+    /// bank run gather (`NemotronPrefillSharedUpGather.launch`, typed ReLU2); nil wherever its guards would not admit.
+    static func dense(order: Int, bk: Int, dict: Bool, x: MLXArray, linear: Linear, relu2: Bool,
+                      dep: MLXArray? = nil) -> MLXArray? {
+        guard (0 ..< 4).contains(order), let kernel = order == 3
+                ? (dict ? NemotronSeedLeanDequant.denseDict : NemotronSeedLeanDequant.denseBank)
+                : (dict ? denseDictKernels : denseBankKernels)[order],
+              NemotronHPrefillX5.runGather, let q = linear as? QuantizedLinear, type(of: linear) == QuantizedLinear.self,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, x.ndim == 3, x.dim(0) == 1,
+              x.dim(1) > 8, x.dtype == .bfloat16, !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
+              q.weight.dtype == .uint32, q.weight.ndim == 2
+        else { return nil }
+        let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, k % bk == 0, q.scales.shape == [nOut, k / 64] else { return nil }
+        let operands: [MLXArray]
+        if dict {
+            guard let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
+                  d.table.dtype == .float32,
+                  let table = dep.map({ NemotronSeedQMMTune.operandView($0, like: d.table) }) ?? d.table
+            else { return nil }
+            operands = [q.weight.expandedDimensions(axis: 0), d.index.expandedDimensions(axis: 0), table]
+        } else {
+            guard relu2, let biases = q.biases, q.scales.dtype == x.dtype, biases.dtype == x.dtype,
+                  biases.shape == q.scales.shape,
+                  let b = dep.map({ NemotronSeedQMMTune.operandView($0, like: biases) }) ?? biases
+            else { return nil }
+            operands = [q.weight.expandedDimensions(axis: 0), q.scales.expandedDimensions(axis: 0),
+                        b.expandedDimensions(axis: 0)]
+        }
+        let used = (rows + 63) / 64
+        let count = max(used, 3)
+        var desc = [Int32]()
+        desc.reserveCapacity(count * 3)
+        for t in 0 ..< count {
+            desc += t < used ? [Int32(t * 64), Int32(min(64, rows - t * 64)), 0] : [0, 0, 0]
+        }
+        let tiles = MLXArray(desc).reshaped(count, 3)
+        let y = kernel(
+            [x.reshaped(rows, 1, k)] + operands + [tiles, nOut, k],
+            template: [("T", x.dtype), ("GS", 64), ("BITS", 4), ("BM", 64), ("BN", 64), ("BK", bk),
+                       ("ALIGN_N", nOut % 64 == 0), ("ALIGN_K", true), ("RELU2", relu2)],
+            grid: (((nOut + 63) / 64) * 128, count, 1), threadGroup: (128, 1, 1),
+            outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
+        return y.reshaped(1, rows, nOut)
+    }
+}
+
+// MARK: - Seed incumbent lean-dequant twins
+
+/// Lean-producer twins of the seed's incumbent gathers (single stage, the incumbents' tile, BK 64), offered as timed
+/// rows (`NemotronSeedIncumbentDB2` order 3): the routed direct-input dictionary fc1 and fc2 decode-copy gathers
+/// (`NemotronSeedRetile` row lq64x64), the dense dictionary gather and the shared up's bank run gather
+/// (`NemotronSeedDenseRetile` row inc64x64x64lq). Each is the incumbent impl's text through counted swaps (nil, so no
+/// rows, when one misses). Only the B-tile producer and, for the routed fc1, the A rows' addressing change:
+/// - loader gathers: the block's code bytes are read as 32-bit words (each word's four bytes in order) where the
+///   loader reads them one by one, and each byte's two values are written as one two-element store; the (scale,
+///   bias) read and the dequantize expressions (`s * (byte & 0x0f) + b`, `(s / 16) * (byte & 0xf0) + b`, cast to T)
+///   are `QuantizedBlockLoader(Dict)::load_unsafe`'s;
+/// - the fc2 copy load reads each code word once per block where the incumbent reads it once per output, and writes
+///   each pair as one two-element store; nibble values and expressions are the incumbent's;
+/// - the routed fc1 keeps 32-bit row offsets from `x` where the incumbent keeps 64-bit row pointers (every offset
+///   is below 2^32 for any seed).
+/// Every threadgroup value, A operand, mma, accumulator and store is the incumbent's. NEMOTRON_SEED_LQ=0 leaves the
+/// rows out.
+enum NemotronSeedLeanDequant {
+    static let offered = ProcessInfo.processInfo.environment["NEMOTRON_SEED_LQ"] != "0"
+
+    static let helpers = #"""
+// Seed lean-dequant producers: QuantizedBlockLoader(Dict)::load_unsafe with the codes read as 32-bit words and each
+// byte's two values written by one two-element store.
+template <typename T, typename L>
+METAL_FUNC void nemotron_lq_store(thread const L& l, const T scale, const T bias) {
+  static_assert(L::n_reads % 4 == 0 && L::pack_factor == 2 && L::bytes_per_pack == 1, "lean load: 4-bit words");
+  const float s = float(scale);
+  const float b = float(bias);
+  float sc[2] = {s, s / 16.0f};
+  const device uint* w = (const device uint*)l.src;
+  STEEL_PRAGMA_UNROLL
+  for (short q = 0; q < L::n_reads / 4; q++) {
+    const uint word = w[q];
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < 4; j++) {
+      const int bt = int((word >> (8 * j)) & 0xffu);
+      vec<T, 2> v;
+      v[0] = static_cast<T>(sc[0] * (bt & 0x0f) + b);
+      v[1] = static_cast<T>(sc[1] * (bt & 0xf0) + b);
+      *((threadgroup vec<T, 2>*)(l.dst + (4 * q + j) * L::pack_factor)) = v;
+    }
+  }
+}
+
+template <typename T, typename L>
+METAL_FUNC void nemotron_lq_load_dict(thread const L& l) {
+  const uint pair = uint(*l.scales);
+  T scale = static_cast<T>(l.biases[2 * pair]);
+  T bias = static_cast<T>(l.biases[2 * pair + 1]);
+  nemotron_lq_store<T>(l, scale, bias);
+}
+
+template <typename T, typename L>
+METAL_FUNC void nemotron_lq_load_bank(thread const L& l) {
+  T scale = *l.scales;
+  T bias = *l.biases;
+  nemotron_lq_store<T>(l, scale, bias);
+}
+"""#
+
+    private static func impl(_ header: String?, from: String) -> String? {
+        header.flatMap { NemotronSeedLean.slice($0, from: from, to: nil) }
+    }
+
+    /// A loader gather's impl `base`_impl as `base`_lq_impl with the lean load in its K loop.
+    static func loaderTwin(_ header: String?, base: String, dict: Bool, routed: Bool) -> String? {
+        guard let text = impl(header, from: "// to expert runs. tiles[t] = (first sorted row") else { return nil }
+        var swaps: [(String, String, Int)] = [
+            ("METAL_FUNC void \(base)_impl(", "METAL_FUNC void \(base)_lq_impl(", 1),
+            ("          loader_w.load_unsafe();\n",
+             "          nemotron_lq_load_\(dict ? "dict" : "bank")<T>(loader_w);\n", 1),
+        ]
+        if routed {
+            swaps += [
+                ("  const device T* routed[TM * BaseNAXFrag::kElemRows];", "  uint routed[TM * BaseNAXFrag::kElemRows];", 1),
+                ("          ? x + size_t(routed_rows[row0 + tm + row]) * K : x;",
+                 "          ? routed_rows[row0 + tm + row] * uint(K) : 0u;", 1),
+                ("nemotron_load_routed(Atile, routed, int(xn - x) + kk1, sgp_sm);",
+                 "nemotron_load_routed_lq(Atile, x, routed, int(xn - x) + kk1, sgp_sm);", 3),
+            ]
+        }
+        return NemotronSeedLean.swapped(text, swaps)
+    }
+
+    /// `nemotron_load_routed` as `nemotron_load_routed_lq`: 32-bit row offsets from `x`.
+    static let routedLoad: String? = NemotronPrefillDirectFC1.dictHeader.flatMap {
+        NemotronSeedLean.slice($0, from: "template <typename Tile, typename T>\nMETAL_FUNC void nemotron_load_routed(",
+                               to: "// Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned")
+    }.flatMap {
+        NemotronSeedLean.swapped($0, [
+            ("METAL_FUNC void nemotron_load_routed(", "METAL_FUNC void nemotron_load_routed_lq(", 1),
+            ("    thread Tile& tile, const device T* const thread* rows, const int offset,",
+             "    thread Tile& tile, const device T* x, const thread uint* rows, const int offset,", 1),
+            ("const device T* source_row = rows[mr * Frag::kElemRows + i] + offset;",
+             "const device T* source_row = x + (rows[mr * Frag::kElemRows + i] + uint(offset));", 1),
+        ])
+    }
+
+    /// The fc2 copy impl as `nemotron_gather_qmm_runs_copy_lq_impl`.
+    static let copyTwin: String? = impl(NemotronPrefillFC2Copy.header,
+                                        from: "// Nemotron: the run gather reading the routed fc2").flatMap {
+        NemotronSeedLean.swapped($0, [
+            ("METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(", "METAL_FUNC void nemotron_gather_qmm_runs_copy_lq_impl(", 1),
+            ("  auto cl_load = [&]() {\n    STEEL_PRAGMA_UNROLL\n    for (short o = 0; o < 4; o++) {\n",
+             "  auto cl_load = [&]() {\n    uint cw[CL_KPT];\n    STEEL_PRAGMA_UNROLL\n"
+                + "    for (short j = 0; j < CL_KPT; j++) {\n      cw[j] = uint(cl_codes[j * 32]);\n    }\n"
+                + "    STEEL_PRAGMA_UNROLL\n    for (short o = 0; o < 4; o++) {\n", 1),
+            ("        const uint lo = (uint(cl_codes[j * 32]) >> (4 * o)) & 0xfu;\n"
+                + "        const uint hi = (uint(cl_codes[(j + 1) * 32]) >> (4 * o)) & 0xfu;\n"
+                + "        const uint8_t byte = uint8_t(lo | (hi << 4));\n"
+                + "        cl_dst[o * BK_padded + j] = static_cast<T>(sc[0] * (byte & 0x0f) + b);\n"
+                + "        cl_dst[o * BK_padded + j + 1] = static_cast<T>(sc[1] * (byte & 0xf0) + b);\n",
+             "        const int lo = int((cw[j] >> (4 * o)) & 0xfu);\n"
+                + "        const int hi = int(((cw[j + 1] >> (4 * o)) << 4) & 0xf0u);\n"
+                + "        vec<T, 2> v;\n"
+                + "        v[0] = static_cast<T>(sc[0] * lo + b);\n"
+                + "        v[1] = static_cast<T>(sc[1] * hi + b);\n"
+                + "        *((threadgroup vec<T, 2>*)(cl_dst + o * BK_padded + j)) = v;\n", 1),
+        ])
+    }
+
+    private static func source(_ impl: String, args: String, split: Bool) -> String {
+        func call(_ bm: String) -> String {
+            """
+                    \(impl)<T, GS, BITS, \(bm), BN, BK, 2, 2, ALIGN_N, ALIGN_K, RELU2>(
+                        \(args), Ws,
+                        threadgroup_position_in_grid,
+                        simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
+            """
+        }
+        guard split else { return "        threadgroup T Ws[BN * (BK + 16 / sizeof(T))];\n" + call("BM") + "\n" }
+        return """
+                threadgroup T Ws[BN * (BK + 16 / sizeof(T))];
+                if (BM == 64 && tiles[threadgroup_position_in_grid.y * 3 + 1] <= 32) {
+            \(call("32"))
+                } else {
+            \(call("BM"))
+                }
+            """
+    }
+
+    static let routedDict: MLXFast.MLXFastKernel? = {
+        guard let h = NemotronPrefillDirectFC1.dictHeader, let a = routedLoad,
+              let twin = loaderTwin(h, base: "nemotron_gather_qmm_runs_direct_dict", dict: true, routed: true)
+        else { return nil }
+        return MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_direct_input_dict_lq",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "routed_rows", "N", "K"],
+            outputNames: ["y"],
+            source: source("nemotron_gather_qmm_runs_direct_dict_lq_impl",
+                           args: "x, w, scales, biases, tiles, routed_rows, y, N, K", split: true),
+            header: h + "\n" + helpers + "\n" + a + "\n" + twin)
+    }()
+
+    static let copy: MLXFast.MLXFastKernel? = copyTwin.map { twin in
+        MLXFast.metalKernel(
+            name: "nemotron_gather_qmm_runs_fc2_copy_lq",
+            inputNames: ["x", "wk", "sidx", "table", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: source("nemotron_gather_qmm_runs_copy_lq_impl", args: "x, wk, sidx, table, tiles, y, N, K",
+                           split: true),
+            header: NemotronPrefillFC2Copy.header + "\n" + twin)
+    }
+
+    private static func denseKernel(dict: Bool) -> MLXFast.MLXFastKernel? {
+        let header = dict ? NemotronPrefillDenseDict.header : nemotronRunGatherHeader
+        let base = dict ? "nemotron_gather_qmm_runs_dict" : "nemotron_gather_qmm_runs"
+        guard let header, let twin = loaderTwin(header, base: base, dict: dict, routed: false) else { return nil }
+        return MLXFast.metalKernel(
+            name: dict ? "nemotron_gather_qmm_runs_dense_dict_lq" : "nemotron_gather_qmm_runs_adaptive_tiles_lq",
+            inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
+            outputNames: ["y"],
+            source: source("\(base)_lq_impl", args: "x, w, scales, biases, tiles, y, N, K", split: !dict),
+            header: header + "\n" + helpers + "\n" + twin)
+    }
+
+    static let denseDict = denseKernel(dict: true)
+    static let denseBank = denseKernel(dict: false)
+
+    /// Whether every lean twin was derived (the rows are offered only then).
+    static var available: Bool {
+        offered && routedLoad != nil && copyTwin != nil
+            && loaderTwin(NemotronPrefillDirectFC1.dictHeader, base: "nemotron_gather_qmm_runs_direct_dict", dict: true,
+                          routed: true) != nil
+            && loaderTwin(NemotronPrefillDenseDict.header, base: "nemotron_gather_qmm_runs_dict", dict: true,
+                          routed: false) != nil
+            && loaderTwin(nemotronRunGatherHeader, base: "nemotron_gather_qmm_runs", dict: false, routed: false) != nil
     }
 }
 
@@ -2602,13 +3369,13 @@ enum NemotronSeedRetile {
 /// `nemotronRunGatherHeader` and `nemotronSeedRetileSource`. For every output
 /// fragment pair the same `BaseNAXFrag::mma` (matmul2d(16, 32, 16),
 /// multiply_accumulate) runs over k chunks 0, 16, ..., K - 16 in order, on A
-/// fragments loaded by the incumbents' statements and B fragments read from a
-/// threadgroup block holding the incumbents' BF16 dequantized value at each
-/// (n, k); the typed store is the incumbents'. Free: BM, BN, BK, the SIMD-group
-/// grid WM x WN (SM, SN multiples of 16 and 32, so rows keep their 16-row
-/// fragments from the tile's first row and each mma pairs columns 32c ...
-/// 32c + 31), which thread dequantizes which B value, and DB: two threadgroup
-/// stages with one barrier per K block instead of one stage with two.
+/// fragments loaded by the incumbents' statements and B fragments holding the
+/// incumbents' BF16 dequantized value at each (n, k), from a threadgroup block
+/// or (HB) dequantized straight into the registers; the typed store is the
+/// incumbents'. Free: BM, BN, BK, the SIMD-group grid WM x WN (SM, SN multiples
+/// of 16 and 32, so rows keep their 16-row fragments from the tile's first row
+/// and each mma pairs columns 32c ... 32c + 31), which thread dequantizes which
+/// B value, DB (two threadgroup stages, one barrier per K block) and HB.
 let nemotronSeedDenseSource = #"""
 // B source: the bank's codes with (scale, bias) through the pair dictionary,
 // as QuantizedBlockLoaderDict (the FP32 table holds exact BF16 widenings, so
@@ -2718,56 +3485,18 @@ struct NemotronSeedDenseDict {
     }
   }
 
-  // RING: `load` in two steps. `rload` reads the block's code words and its
-  // pair index into a ring slot under `load`'s predicate; `resolve` reads the
-  // (scale, bias) from the pair table as `load` does; `rstore` runs `store`
-  // (the same function) on the slot's code words and the pair.
-  template <int BN, int BK, int NT>
-  struct Raw {
-    uint word[(BN * BK / NT) / 8];
-    uint16_t pair;
-  };
-
-  template <int BN, int BK, int NT, bool ALIGN_N>
-  METAL_FUNC void rload(thread Raw<BN, BK, NT>& r, const int t, const int y_col, const int N,
-                        const int kb, const int klim) const thread {
-    constexpr int KPT = BN * BK / NT;
-    const int lr = t / (BK / KPT);
-    const int lk = (t % (BK / KPT)) * KPT;
-    const int n = y_col + lr;
-    if ((ALIGN_N || n < N) && lk < klim) {
-      r.pair = sidx[size_t(n) * size_t(K / 64) + size_t((kb + lk) / 64)];
-      const device uint32_t* src =
-          (const device uint32_t*)(w + size_t(n) * size_t(K / 2) + size_t((kb + lk) / 2));
-      STEEL_PRAGMA_UNROLL
-      for (short q = 0; q < KPT / 8; ++q) {
-        r.word[q] = src[q];
-      }
-    }
+  // HB: fill's reads for one output n. sb: the (scale, bias) of group g, from
+  // fill's pair index and table entries. code16: byte(n, k) | byte(n, k + 2) << 8
+  // (the bytes fill takes from its code words) as one 16-bit load (k % 4 == 0
+  // and K / 2 even, so the address is 2-byte aligned).
+  METAL_FUNC float2 sb(const int n, const int g) const thread {
+    const uint pair = uint(sidx[size_t(n) * size_t(K / 64) + size_t(g)]);
+    const float s = table[2 * pair];
+    const float b = table[2 * pair + 1];
+    return float2(s, b);
   }
-
-  template <int BN, int BK, int NT, bool ALIGN_N>
-  METAL_FUNC void resolve(thread Regs<BN, BK, NT>& rg, thread const Raw<BN, BK, NT>& r, const int t,
-                          const int y_col, const int N, const int klim) const thread {
-    constexpr int KPT = BN * BK / NT;
-    const int lr = t / (BK / KPT);
-    const int lk = (t % (BK / KPT)) * KPT;
-    const int n = y_col + lr;
-    if ((ALIGN_N || n < N) && lk < klim) {
-      const uint pair = uint(r.pair);
-      rg.s = table[2 * pair];
-      rg.b = table[2 * pair + 1];
-    }
-  }
-
-  template <int BN, int BK, int NT, bool ALIGN_N>
-  METAL_FUNC void rstore(threadgroup T* ws, thread Regs<BN, BK, NT>& rg, thread const Raw<BN, BK, NT>& r,
-                         const int t, const int y_col, const int N, const int klim) const thread {
-    STEEL_PRAGMA_UNROLL
-    for (short q = 0; q < (BN * BK / NT) / 8; ++q) {
-      rg.word[q] = r.word[q];
-    }
-    store<BN, BK, NT, ALIGN_N>(ws, rg, t, y_col, N, klim);
+  METAL_FUNC uint16_t code16(const int n, const int k) const thread {
+    return *(const device uint16_t*)(w + size_t(n) * size_t(K / 2) + size_t(k >> 1));
   }
 };
 
@@ -2892,67 +3621,6 @@ struct NemotronSeedDenseCopy {
       }
     }
   }
-
-  // RING: `load` in two steps. `rload` reads the block's CK code words and
-  // the four outputs' BF16 scales and biases into a ring slot under `load`'s
-  // predicate; `resolve` widens them to float as `load` does; `rstore` runs
-  // `store` (the same function) on the slot's code words and the widened pairs.
-  template <int BN, int BK, int NT>
-  struct Raw {
-    uint16_t c[BK * (BN / 4) / NT];
-    T s[4];
-    T b[4];
-  };
-
-  template <int BN, int BK, int NT, bool ALIGN_N>
-  METAL_FUNC void rload(thread Raw<BN, BK, NT>& r, const int t, const int y_col, const int N,
-                        const int kb, const int klim) const thread {
-    constexpr int CK = BK * (BN / 4) / NT;
-    const int cm = t % (BN / 4);
-    const int cc = t / (BN / 4);
-    const int n = y_col + 4 * cm;
-    const int k0 = kb + cc * CK;
-    if ((ALIGN_N || n < N) && cc * CK < klim) {
-      const device uint16_t* c =
-          codes + (size_t(n / 128) * size_t(K) + size_t(k0)) * 32 + size_t((n % 128) / 4);
-      const size_t g = (size_t(n / 128) * size_t(K / 64) + size_t(k0 / 64)) * 128 + size_t(n % 128);
-      STEEL_PRAGMA_UNROLL
-      for (short o = 0; o < 4; o++) {
-        r.s[o] = sk[g + o];
-        r.b[o] = bk[g + o];
-      }
-      STEEL_PRAGMA_UNROLL
-      for (short j = 0; j < CK; ++j) {
-        r.c[j] = c[j * 32];
-      }
-    }
-  }
-
-  template <int BN, int BK, int NT, bool ALIGN_N>
-  METAL_FUNC void resolve(thread Regs<BN, BK, NT>& w, thread const Raw<BN, BK, NT>& r, const int t,
-                          const int y_col, const int N, const int klim) const thread {
-    constexpr int CK = BK * (BN / 4) / NT;
-    const int cm = t % (BN / 4);
-    const int cc = t / (BN / 4);
-    const int n = y_col + 4 * cm;
-    if ((ALIGN_N || n < N) && cc * CK < klim) {
-      STEEL_PRAGMA_UNROLL
-      for (short o = 0; o < 4; o++) {
-        w.s[o] = float(r.s[o]);
-        w.b[o] = float(r.b[o]);
-      }
-    }
-  }
-
-  template <int BN, int BK, int NT, bool ALIGN_N>
-  METAL_FUNC void rstore(threadgroup T* ws, thread Regs<BN, BK, NT>& w, thread const Raw<BN, BK, NT>& r,
-                         const int t, const int y_col, const int N, const int klim) const thread {
-    STEEL_PRAGMA_UNROLL
-    for (short j = 0; j < BK * (BN / 4) / NT; ++j) {
-      w.c[j] = r.c[j];
-    }
-    store<BN, BK, NT, ALIGN_N>(ws, w, t, y_col, N, klim);
-  }
 };
 
 template <
@@ -2966,8 +3634,9 @@ template <
     bool PF,
     bool ALIGN_N,
     bool RELU2,
-    int RING,
-    bool APF,
+    bool HB,
+    bool AP,
+    int SP,
     class BSrc>
 METAL_FUNC void nemotron_seed_dense_impl(
     const device T* x,
@@ -2998,6 +3667,7 @@ METAL_FUNC void nemotron_seed_dense_impl(
   constexpr short TK = SK / 16;
   static_assert(SM % 16 == 0 && TN % 2 == 0, "the run gather's fragment pairs");
   static_assert(BK % 64 == 0, "B blocks start on a quantization group");
+  static_assert(SP == 0 || (!HB && !DB && !PF && !AP), "SP: its own two-stage loop");
 
   const int y_col = tid.x * BN;
   const short tgp_bm = short(min(BM, tile_rows));
@@ -3025,251 +3695,243 @@ METAL_FUNC void nemotron_seed_dense_impl(
 
   dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
     constexpr bool aligned_m = decltype(kAlignedM)::value;
-    auto fill = [&](threadgroup T* ws, const int b) {
-      bsrc.template fill<BN, BK, NT, ALIGN_N>(ws, t, y_col, N, b * BK, min(BK, K - b * BK));
-    };
-    auto compute = [&](threadgroup T* ws, const int b) {
-      const int kb = b * BK;
-      const int klim = min(BK, K - kb);
+    if constexpr (HB) {
+      // HB: no threadgroup stage and no barrier. Each thread dequantizes its
+      // own B fragment elements at the positions BaseNAXFrag::load reads from
+      // the stage (n = y_col + tn + 16 nn + coord.y + 8 i, k = 32-k step +
+      // 16 kk + coord.x + j): the code bytes of k and k + 2 come from one
+      // 16-bit load (code16) and feed fill's dequantize statements with
+      // fill's (scale, bias) (sb). The A loads, the mma pairs and their k
+      // order are compute's; a 16-row fragment without a valid row skips its
+      // mma (nemotron_seed_matmad_rows; it is never stored). PF: step k + 32's
+      // code bytes (and, at a group start, its scales and biases) are loaded
+      // after step k's B fragments are dequantized and before step k's mma.
+      static_assert(ALIGN_N, "HB: whole column tiles");
+      const short2 bc = BaseNAXFrag::get_coord();
+      float2 sbv[TN * 2];
+      uint16_t raw[TN * TK * 2];
+      auto load_sb = [&](const int kg) {
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < TN; ++nn) {
+          STEEL_PRAGMA_UNROLL
+          for (short i = 0; i < 2; ++i) {
+            sbv[nn * 2 + i] = bsrc.sb(y_col + tn + nn * 16 + bc.y + i * 8, kg / 64);
+          }
+        }
+      };
+      auto load_raw = [&](const int ks) {
+        STEEL_PRAGMA_UNROLL
+        for (short nn = 0; nn < TN; ++nn) {
+          STEEL_PRAGMA_UNROLL
+          for (short kk = 0; kk < TK; ++kk) {
+            STEEL_PRAGMA_UNROLL
+            for (short i = 0; i < 2; ++i) {
+              raw[(nn * TK + kk) * 2 + i] =
+                  bsrc.code16(y_col + tn + nn * 16 + bc.y + i * 8, ks + kk * 16 + bc.x);
+            }
+          }
+        }
+      };
+      if constexpr (PF) {
+        if (sg_active) {
+          load_sb(0);
+          load_raw(0);
+        }
+      }
       STEEL_PRAGMA_NO_UNROLL
-      for (int kk1 = 0; kk1 < klim; kk1 += SK) {
+      for (int ks = 0; ks < K; ks += SK) {
         if (sg_active) {
           NAXTile<T, TM, TK> Atile;
           NAXTile<T, TN, TK> Btile;
 
           volatile int compiler_barrier;
 
-          if constexpr (aligned_m) {
-            Atile.load(xn + kb + kk1, K);
-          } else {
-            Atile.load_safe(xn + kb + kk1, K, short2(SK, sgp_sm));
+          if constexpr (!PF) {
+            if (ks % 64 == 0) {
+              load_sb(ks);
+            }
+            load_raw(ks);
           }
 
-          Btile.template load<T, BK_padded, 1>(ws + tn * BK_padded + kk1);
+          if constexpr (aligned_m) {
+            Atile.load(xn + ks, K);
+          } else {
+            Atile.load_safe(xn + ks, K, short2(SK, sgp_sm));
+          }
 
-          tile_matmad_nax(
-              Dtile,
-              Atile,
-              metal::bool_constant<false>{},
-              Btile,
-              metal::bool_constant<transpose>{});
+          STEEL_PRAGMA_UNROLL
+          for (short nn = 0; nn < TN; ++nn) {
+            STEEL_PRAGMA_UNROLL
+            for (short kk = 0; kk < TK; ++kk) {
+              thread typename NAXTile<T, TN, TK>::frag_type& frag = Btile.frag_at(nn, kk);
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < 2; ++i) {
+                const uint16_t h = raw[(nn * TK + kk) * 2 + i];
+                const float2 p = sbv[nn * 2 + i];
+                T v0, v1, v2, v3;
+                nemotron_seed_deq2(uint8_t(h & 0xff), p.x, p.y, v0, v1);
+                nemotron_seed_deq2(uint8_t(h >> 8), p.x, p.y, v2, v3);
+                frag[i * 4 + 0] = v0;
+                frag[i * 4 + 1] = v1;
+                frag[i * 4 + 2] = v2;
+                frag[i * 4 + 3] = v3;
+              }
+            }
+          }
+
+          if constexpr (PF) {
+            const int kn = ks + SK;
+            if (kn < K) {
+              if (kn % 64 == 0) {
+                load_sb(kn);
+              }
+              load_raw(kn);
+            }
+          }
+
+          nemotron_seed_matmad_rows(Dtile, Atile, Btile, metal::bool_constant<transpose>{}, sgp_sm);
 
           (void)compiler_barrier;
         }
       }
-    };
-    // PF: each block's B loads are issued into registers (`load`) one block
-    // ahead, before the current block's mma, and `store` writes fill's values
-    // from them; the stages, barriers and compute are the non-PF form's.
-    typename BSrc::template Regs<BN, BK, NT> pf_regs;
-    auto pf_load = [&](const int b) {
-      bsrc.template load<BN, BK, NT, ALIGN_N>(pf_regs, t, y_col, N, b * BK, min(BK, K - b * BK));
-    };
-    auto pf_store = [&](threadgroup T* ws, const int b) {
-      bsrc.template store<BN, BK, NT, ALIGN_N>(ws, pf_regs, t, y_col, N, min(BK, K - b * BK));
-    };
-    if constexpr (RING > 1 || APF) {
-      // RING / APF, one stage (as the single-stage form below: each block
-      // written to Ws between two barriers, then computed by its statements).
-      // RING = D: block b's loads go to register slot b % D (a compile-time
-      // index: the block loop is unrolled by D), D blocks ahead: blocks 0 ...
-      // D - 1 before the loop, block b + D right after the barrier that follows
-      // block b's Ws write. A slot holds only loaded values (`rload`: the code
-      // words and the pair index, or the BF16 scales and biases); block b + 1's
-      // (scale, bias) is read from the pair table or widened (`resolve`) after
-      // block b's Ws write, before block b's mma, and `rstore` writes block b
-      // with `store`. APF: two A tiles alternate over the 32-k steps (every
-      // block has an even number: BK % 64 == 0, K % 64 == 0); step s + 1's A
-      // fragments (the next block's first step after a block's last) are loaded
-      // before step s's mma. Same A and B values, same mma sequence over k.
-      static_assert(!(RING > 1 || APF) || ((RING == 0 || (RING >= 2 && RING <= 4)) && BK % (2 * SK) == 0),
-                    "ring split");
-      NAXTile<T, TM, TK> A0;
-      NAXTile<T, TM, TK> A1;
-      auto load_a = [&](thread NAXTile<T, TM, TK>& a, const int k) {
-        if constexpr (aligned_m) {
-          a.load(xn + k, K);
-        } else {
-          a.load_safe(xn + k, K, short2(SK, sgp_sm));
-        }
+    } else {
+      auto fill = [&](threadgroup T* ws, const int b) {
+        bsrc.template fill<BN, BK, NT, ALIGN_N>(ws, t, y_col, N, b * BK, min(BK, K - b * BK));
       };
-      auto compute_r = [&](const int b) {
-        if constexpr (APF) {
-          const int kb = b * BK;
-          const int klim = min(BK, K - kb);
-          STEEL_PRAGMA_NO_UNROLL
-          for (int kk1 = 0; kk1 < klim; kk1 += 2 * SK) {
-            if (sg_active) {
-              NAXTile<T, TN, TK> Btile;
-
-              volatile int compiler_barrier;
-
-              load_a(A1, kb + kk1 + SK);
-
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-
-              tile_matmad_nax(
-                  Dtile,
-                  A0,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
-            }
-            if (sg_active) {
-              NAXTile<T, TN, TK> Btile;
-
-              volatile int compiler_barrier;
-
-              if (kb + kk1 + 2 * SK < K) {
-                load_a(A0, kb + kk1 + 2 * SK);
-              }
-
-              Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1 + SK);
-
-              tile_matmad_nax(
-                  Dtile,
-                  A1,
-                  metal::bool_constant<false>{},
-                  Btile,
-                  metal::bool_constant<transpose>{});
-
-              (void)compiler_barrier;
-            }
-          }
-        } else {
-          compute(Ws, b);
-        }
-      };
-      if constexpr (RING > 1) {
-        using Raw = typename BSrc::template Raw<BN, BK, NT>;
-        Raw ring[RING];
-        auto rload = [&](thread Raw& r, const int b) {
-          bsrc.template rload<BN, BK, NT, ALIGN_N>(r, t, y_col, N, b * BK, min(BK, K - b * BK));
-        };
-        auto resolve = [&](thread const Raw& r, const int b) {
-          bsrc.template resolve<BN, BK, NT, ALIGN_N>(pf_regs, r, t, y_col, N, min(BK, K - b * BK));
-        };
-        rload(ring[0], 0);
-        if (1 < nb) {
-          rload(ring[1], 1);
-        }
-        if constexpr (RING > 2) {
-          if (2 < nb) {
-            rload(ring[2], 2);
-          }
-        }
-        if constexpr (RING > 3) {
-          if (3 < nb) {
-            rload(ring[3], 3);
-          }
-        }
-        if constexpr (APF) {
+      auto compute = [&](threadgroup T* ws, const int b) {
+        const int kb = b * BK;
+        const int klim = min(BK, K - kb);
+        STEEL_PRAGMA_NO_UNROLL
+        for (int kk1 = 0; kk1 < klim; kk1 += SK) {
           if (sg_active) {
-            load_a(A0, 0);
+            NAXTile<T, TM, TK> Atile;
+            NAXTile<T, TN, TK> Btile;
+
+            volatile int compiler_barrier;
+
+            if constexpr (aligned_m) {
+              Atile.load(xn + kb + kk1, K);
+            } else {
+              Atile.load_safe(xn + kb + kk1, K, short2(SK, sgp_sm));
+            }
+
+            Btile.template load<T, BK_padded, 1>(ws + tn * BK_padded + kk1);
+
+            tile_matmad_nax(
+                Dtile,
+                Atile,
+                metal::bool_constant<false>{},
+                Btile,
+                metal::bool_constant<transpose>{});
+
+            (void)compiler_barrier;
           }
         }
-        resolve(ring[0], 0);
-        // Block b from slot S (= b % D).
-        auto step = [&](auto S, const int b) {
-          constexpr int s = decltype(S)::value;
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          bsrc.template rstore<BN, BK, NT, ALIGN_N>(Ws, pf_regs, ring[s], t, y_col, N, min(BK, K - b * BK));
-          threadgroup_barrier(mem_flags::mem_threadgroup);
-          if (b + RING < nb) {
-            rload(ring[s], b + RING);
-          }
-          if (b + 1 < nb) {
-            resolve(ring[(s + 1) % RING], b + 1);
-          }
-          compute_r(b);
+      };
+      // PF: each block's B loads are issued into registers (`load`) one block
+      // ahead, before the current block's mma, and `store` writes fill's values
+      // from them; the stages, barriers and compute are the non-PF form's.
+      typename BSrc::template Regs<BN, BK, NT> pf_regs;
+      auto pf_load = [&](const int b) {
+        bsrc.template load<BN, BK, NT, ALIGN_N>(pf_regs, t, y_col, N, b * BK, min(BK, K - b * BK));
+      };
+      auto pf_store = [&](threadgroup T* ws, const int b) {
+        bsrc.template store<BN, BK, NT, ALIGN_N>(ws, pf_regs, t, y_col, N, min(BK, K - b * BK));
+      };
+      if constexpr (SP > 0) {
+        constexpr int NTP = SP * 32;
+        static_assert((BN * BK) % NTP == 0 && (BN * BK / NTP) % 8 == 0 && BK % (BN * BK / NTP) == 0
+                      && NTP % (BN / 4) == 0, "producer fill split");
+        const bool producer = int(simd_group_id) >= WM * WN;
+        const int tp = (int(simd_group_id) - WM * WN) * 32 + int(simd_lane_id);
+        typename BSrc::template Regs<BN, BK, NTP> pregs;
+        auto pf_load_p = [&](const int b) {
+          bsrc.template load<BN, BK, NTP, ALIGN_N>(pregs, tp, y_col, N, b * BK, min(BK, K - b * BK));
         };
-        for (int b = 0; b < nb; b += RING) {
-          step(Int<0>{}, b);
-          if (b + 1 < nb) {
-            step(Int<1>{}, b + 1);
-          }
-          if constexpr (RING > 2) {
-            if (b + 2 < nb) {
-              step(Int<2>{}, b + 2);
-            }
-          }
-          if constexpr (RING > 3) {
-            if (b + 3 < nb) {
-              step(Int<3>{}, b + 3);
-            }
+        auto pf_store_p = [&](threadgroup T* ws, const int b) {
+          bsrc.template store<BN, BK, NTP, ALIGN_N>(ws, pregs, tp, y_col, N, min(BK, K - b * BK));
+        };
+        if (producer) {
+          pf_load_p(0);
+          pf_store_p(Ws, 0);
+          if (1 < nb) {
+            pf_load_p(1);
           }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-      } else {
-        // APF alone: the fill of each block between the barriers, as the
-        // single-stage form below.
-        if (sg_active) {
-          load_a(A0, 0);
+        for (int b = 0; b < nb; b++) {
+          if (producer) {
+            if (b + 1 < nb) {
+              pf_store_p(Ws + ((b + 1) & 1) * STAGE, b + 1);
+              if (b + 2 < nb) {
+                pf_load_p(b + 2);
+              }
+            }
+          } else {
+            compute(Ws + (b & 1) * STAGE, b);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+      } else if constexpr (DB && PF) {
+        // As the DB form below, with block b + 2's loads issued after block
+        // b + 1's stage write and before block b's mma.
+        pf_load(0);
+        pf_store(Ws, 0);
+        if (1 < nb) {
+          pf_load(1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int b = 0; b < nb; b++) {
+          if constexpr (AP) {
+            compute(Ws + (b & 1) * STAGE, b);
+          }
+          if (b + 1 < nb) {
+            pf_store(Ws + ((b + 1) & 1) * STAGE, b + 1);
+            if (b + 2 < nb) {
+              pf_load(b + 2);
+            }
+          }
+          if constexpr (!AP) {
+            compute(Ws + (b & 1) * STAGE, b);
+          }
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      } else if constexpr (PF) {
+        // As the single-stage form below, with block b + 1's loads issued after
+        // block b's stage write and barrier, before block b's mma.
+        pf_load(0);
+        for (int b = 0; b < nb; b++) {
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          pf_store(Ws, b);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+          if (b + 1 < nb) {
+            pf_load(b + 1);
+          }
+          compute(Ws, b);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      } else if constexpr (DB) {
+        // Stage b & 1 holds block b. Block b + 1 is written while block b is
+        // read; the barrier closing iteration b - 1 orders both (its stage was
+        // last read in iteration b - 1, and block b was written there).
+        fill(Ws, 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int b = 0; b < nb; b++) {
+          if (b + 1 < nb) {
+            fill(Ws + ((b + 1) & 1) * STAGE, b + 1);
+          }
+          compute(Ws + (b & 1) * STAGE, b);
+          threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+      } else {
         for (int b = 0; b < nb; b++) {
           threadgroup_barrier(mem_flags::mem_threadgroup);
           fill(Ws, b);
           threadgroup_barrier(mem_flags::mem_threadgroup);
-          compute_r(b);
+          compute(Ws, b);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
       }
-    } else if constexpr (DB && PF) {
-      // As the DB form below, with block b + 2's loads issued after block
-      // b + 1's stage write and before block b's mma.
-      pf_load(0);
-      pf_store(Ws, 0);
-      if (1 < nb) {
-        pf_load(1);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (int b = 0; b < nb; b++) {
-        if (b + 1 < nb) {
-          pf_store(Ws + ((b + 1) & 1) * STAGE, b + 1);
-          if (b + 2 < nb) {
-            pf_load(b + 2);
-          }
-        }
-        compute(Ws + (b & 1) * STAGE, b);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-    } else if constexpr (PF) {
-      // As the single-stage form below, with block b + 1's loads issued after
-      // block b's stage write and barrier, before block b's mma.
-      pf_load(0);
-      for (int b = 0; b < nb; b++) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        pf_store(Ws, b);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (b + 1 < nb) {
-          pf_load(b + 1);
-        }
-        compute(Ws, b);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-    } else if constexpr (DB) {
-      // Stage b & 1 holds block b. Block b + 1 is written while block b is
-      // read; the barrier closing iteration b - 1 orders both (its stage was
-      // last read in iteration b - 1, and block b was written there).
-      fill(Ws, 0);
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (int b = 0; b < nb; b++) {
-        if (b + 1 < nb) {
-          fill(Ws + ((b + 1) & 1) * STAGE, b + 1);
-        }
-        compute(Ws + (b & 1) * STAGE, b);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-      }
-    } else {
-      for (int b = 0; b < nb; b++) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        fill(Ws, b);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        compute(Ws, b);
-      }
-      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   });
 
@@ -3304,11 +3966,11 @@ METAL_FUNC void nemotron_seed_dense_impl(
 /// every layer of the kind per cycle (1 warm-up and 16 timed cycles,
 /// `NemotronTuneAdoption.order`, median), and adopts the fastest only when
 /// `NemotronTuneAdoption.decide` admits it (at least 3% faster by median and
-/// faster in at least 75% of the cycles). Direct-B variants are left out:
-/// forced on every seed role they cost ~40 ms (331295a3).
+/// faster in at least 75% of the cycles). The direct-B rows with two byte loads
+/// per code pair are left out: forced on every seed role they cost ~40 ms
+/// (331295a3); the h rows (`halfVariants`) are offered to the pair-dictionary kinds.
 /// NEMOTRON_SEED_DENSE_RETILE=0 keeps the incumbents; NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out;
-/// NEMOTRON_SEED_DENSE_RETILE_X2=0 leaves `moreVariants` out; NEMOTRON_SEED_DENSE_RING=0 leaves `ringVariants`
-/// out;
+/// NEMOTRON_SEED_DENSE_RETILE_X2=0 leaves `moreVariants` out; NEMOTRON_SEED_DENSE_HB=0 the h rows (both tunes);
 /// NEMOTRON_SEED_DENSE_RETILE_FORCE=<variant> adopts that variant wherever it
 /// qualifies.
 enum NemotronSeedDenseRetile {
@@ -3323,20 +3985,29 @@ enum NemotronSeedDenseRetile {
         let pf: Bool
         /// `NemotronSeedLean`'s B sources (`NemotronSeedDenseDictLn` / `NemotronSeedDenseCopyLn`).
         let lean: Bool
-        /// Blocks of B loads in flight in the register ring (`nemotron_seed_dense_impl`'s RING; 0: no ring).
-        let ring: Int
-        /// A fragments loaded one 32-k step ahead (`nemotron_seed_dense_impl`'s APF).
-        let apf: Bool
-        var threads: Int { wm * wn * 32 }
-        var threadgroupBytes: Int { (db ? 2 : 1) * bn * (bk + 8) * 2 }
+        /// HB: B dequantized straight into the fragment registers (`nemotron_seed_dense_impl`'s HB; no threadgroup
+        /// stage); pair dictionary source only.
+        let half: Bool
+        /// AP: in the two-stage prefetching loop (`DB && PF`), block b's mma is issued before block b + 1's stage
+        /// write and block b + 2's loads.
+        let ap: Bool
+        /// SP: this many producer SIMD groups write two Ws stages with the B source's fill halves while the wm x wn
+        /// SIMD groups run the mma (`nemotron_seed_dense_impl`'s SP; rows without db, pf, h or ap).
+        let sp: Int
+        /// `NemotronSeedIncumbentDB2`'s two-stage twin of the kind's incumbent in this order (0 write-first,
+        /// 1 mma-first, 2 register prefetch, 3 lean dequant); -1 for the retile rows.
+        let incOrder: Int
+        var threads: Int { (wm * wn + sp) * 32 }
+        var threadgroupBytes: Int { half ? 0 : (db || sp > 0 ? 2 : 1) * bn * (bk + 8) * 2 }
 
         init(_ bm: Int, _ bn: Int, _ bk: Int, wm: Int, wn: Int, db: Bool = false, pf: Bool = false,
-             lean: Bool = false, ring: Int = 0, apf: Bool = false) {
+             lean: Bool = false, half: Bool = false, ap: Bool = false, sp: Int = 0, inc: Int? = nil) {
             (self.bm, self.bn, self.bk, self.wm, self.wn, self.db, self.pf) = (bm, bn, bk, wm, wn, db, pf)
-            self.lean = lean
-            (self.ring, self.apf) = (ring, apf)
-            name = "\(bm)x\(bn)x\(bk)w\(wm)\(wn)" + (db ? "db" : "") + (pf ? "pf" : "")
-                + (ring > 1 ? "pf\(ring)" : "") + (apf ? "apf" : "") + (lean ? "ln" : "")
+            (self.lean, self.half, self.ap, self.sp) = (lean, half, ap, sp)
+            incOrder = inc ?? -1
+            name = inc.map { "inc\(bm)x\(bn)x\(bk)" + ["db2", "db2m", "db2p", "lq"][$0] }
+                ?? "\(bm)x\(bn)x\(bk)w\(wm)\(wn)" + (db ? "db" : "") + (half ? "h" : "") + (pf ? "pf" : "")
+                + (ap ? "ap" : "") + (sp > 0 ? "sp\(sp)" : "") + (lean ? "ln" : "")
         }
     }
 
@@ -3370,8 +4041,54 @@ enum NemotronSeedDenseRetile {
     /// NEMOTRON_SEED_DENSE_RETILE_X=0 leaves the pf row out of this tune (the base rows only).
     static let offerX = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X"] != "0"
     static let variants: [Variant] = baseVariants + (offerX ? extraVariants : [])
-        + leanVariants + (offerX2 ? moreVariants : [])
-        + (offerRing ? ringVariants : [])
+        + leanVariants + (offerX2 ? moreVariants : []) + halfVariants + k32Variants + incVariants + computeFirstVariants
+        + producerVariants
+    /// NEMOTRON_SEED_DENSE_AP=0 leaves `computeFirstVariants` out of this tune and `NemotronSeedQMMTune`.
+    static let offerAP = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_AP"] != "0"
+    static let computeFirstVariants: [Variant] = offerAP && k32Source != nil ? [
+        Variant(64, 64, 32, wm: 2, wn: 2, db: true, pf: true, ap: true),
+        Variant(64, 64, 64, wm: 2, wn: 2, db: true, pf: true, ap: true),
+        Variant(128, 64, 64, wm: 4, wn: 2, db: true, pf: true, ap: true),
+    ] : []
+    /// NEMOTRON_SEED_DENSE_SP=0 stops offering `producerVariants` (both tunes).
+    static let offerSP = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_SP"] != "0"
+    static let producerVariants: [Variant] = offerSP && k32Source != nil ? [
+        Variant(64, 64, 32, wm: 2, wn: 2, sp: 2),
+        Variant(64, 64, 32, wm: 2, wn: 2, sp: 4),
+        Variant(64, 64, 64, wm: 2, wn: 2, sp: 2),
+    ] : []
+    /// `NemotronSeedIncumbentDB2`'s dense twins (the incumbents' 64 x 64 tile, two stages of BK 32, orders 0, 1, 2),
+    /// appended last (this tune only); NEMOTRON_SEED_DENSE_INC=0 leaves them out.
+    static let incVariants: [Variant] = (NemotronSeedIncumbentDB2.availableDense
+        ? (0 ..< 3).map { Variant(64, 64, 32, wm: 2, wn: 2, db: true, inc: $0) } : [])
+        + (NemotronSeedLeanDequant.available ? [Variant(64, 64, 64, wm: 2, wn: 2, inc: 3)] : [])
+    /// Two-stage rows at BK 32 (`nemotron_seed_dense_k32_impl`): 10 KB of stages, where the 64-k two-stage rows
+    /// need 18 KB. The K32 kernel is the record impl's text with its name and its BK assertion swapped (a 32-k block
+    /// lies inside one quantization group and is one 32-k step, and every B source's per-thread run divides 64), so
+    /// each slot holds the record's value and each output's mma sequence over k chunks 0, 16, ..., K - 16 is the
+    /// record's. Appended (this tune and `NemotronSeedQMMTune`), so every earlier row keeps its index;
+    /// NEMOTRON_SEED_DENSE_DB2=0 leaves them out.
+    static let k32Variants: [Variant] = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_DB2"] != "0"
+        && k32Source != nil ? [
+            Variant(64, 64, 32, wm: 2, wn: 2, db: true),
+            Variant(64, 64, 32, wm: 2, wn: 2, db: true, pf: true),
+            Variant(128, 64, 32, wm: 4, wn: 2, db: true),
+        ] : []
+    /// The default row: with no FORCE setting, a kind adopts 64x64x32w22dbpf wherever that row passed the kind's
+    /// bit-for-bit qualification (this tune and `NemotronSeedQMMTune`), without the timing pass; elsewhere the
+    /// tune decides as before. In this tree the default is off: NEMOTRON_SEED_DENSE_DB2_DEFAULT=1 turns it on.
+    static let defaultRow: Variant? = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_DB2_DEFAULT"] == "1"
+        ? k32Variants.first(where: { $0.name == "64x64x32w22dbpf" }) : nil
+    /// `nemotron_seed_dense_impl` renamed `nemotron_seed_dense_k32_impl`, admitting BK 32; nil unless each swap
+    /// matches once.
+    static let k32Source: String? = NemotronSeedLean.slice(
+        nemotronSeedDenseSource, from: "template <\n    typename T,\n    int BM,", to: nil).flatMap {
+            NemotronSeedLean.swapped($0, [
+                ("METAL_FUNC void nemotron_seed_dense_impl(", "METAL_FUNC void nemotron_seed_dense_k32_impl(", 1),
+                ("  static_assert(BK % 64 == 0, \"B blocks start on a quantization group\");",
+                 "  static_assert(BK % 32 == 0 && (BK % 64 == 0 || 64 % BK == 0), \"B blocks are whole 32-k steps\");", 1),
+            ])
+        }
     /// The incumbent geometry and its prefetch twin through `NemotronSeedLean`'s B sources (this tune and
     /// `NemotronSeedQMMTune`), appended after the pf rows so every earlier row keeps its index (`moreVariants`
     /// follow them); NEMOTRON_SEED_LEAN=0 leaves them out.
@@ -3396,21 +4113,38 @@ enum NemotronSeedDenseRetile {
     ]
     /// NEMOTRON_SEED_DENSE_RETILE_X2=0 leaves `moreVariants` out of this tune.
     static let offerX2 = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_X2"] != "0"
-    /// The incumbent geometry (one stage) with deeper load overlap (`nemotron_seed_dense_impl`'s RING and APF),
-    /// appended after `moreVariants` so every earlier row keeps its index and name: pf2 and pf3 (block b's B loads,
-    /// the code words and the pair index or the BF16 scales and biases, in register slot b % D, D blocks ahead;
-    /// block b + 1's (scale, bias) read from the pair table or widened before block b's mma; the pf row keeps one
-    /// block ahead) and apf (two A tiles alternate: step s + 1's A fragments loaded before step s's mma). Every Ws
-    /// slot gets `store`'s value from the same words and pairs, and the K blocks, mma sequence, accumulators and
-    /// store are the single-stage form's. (The kernel takes RING with APF too; no row offers both: the two together
-    /// pass the register budget of the 64 x 64 tile.)
-    static let ringVariants: [Variant] = [
-        Variant(64, 64, 64, wm: 2, wn: 2, ring: 2),
-        Variant(64, 64, 64, wm: 2, wn: 2, ring: 3),
-        Variant(64, 64, 64, wm: 2, wn: 2, apf: true),
+    /// h (HB): no threadgroup stage and no barrier; each thread dequantizes its own B fragment elements, the code
+    /// bytes of k and k + 2 from one 16-bit load, with the pair dictionary fill's statements, scale and bias, and a
+    /// 16-row fragment without a valid row skips its mma (never stored). The A loads, the mma pairs and their k
+    /// order, the accumulators and the store are the base rows'. BM 64 with one SIMD group across M (WM 1: no B
+    /// value dequantized twice) at BN 64 and 32, the incumbent grid (WM 2), and the WM 1 rows' K-loop prefetch twins
+    /// (pf: the next 32-k step's code bytes, and at a group start its scales and biases, loaded before this step's
+    /// mma). Pair dictionary kinds only. Appended after every other row (here and in `NemotronSeedQMMTune`), so
+    /// those keep their names and indices. NEMOTRON_SEED_DENSE_HB=0 leaves them out of both tunes.
+    static let offerHB = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_HB"] != "0"
+    static let halfVariants: [Variant] = offerHB ? [
+        Variant(64, 64, 64, wm: 1, wn: 2, half: true),
+        Variant(64, 32, 64, wm: 1, wn: 1, half: true),
+        Variant(64, 64, 64, wm: 2, wn: 2, half: true),
+        Variant(64, 64, 64, wm: 1, wn: 2, pf: true, half: true),
+        Variant(64, 32, 64, wm: 1, wn: 1, pf: true, half: true),
+    ] : []
+
+    static let fastNames: Set<String> = [
+        "64x64x64w22", "64x64x64w22db", "128x64x64w42db",
+        "64x64x64w22pf", "64x64x64w22dbpf", "64x64x64w22sp2",
     ]
-    /// NEMOTRON_SEED_DENSE_RING=0 leaves `ringVariants` out of this tune.
-    static let offerRing = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RING"] != "0"
+
+    /// The rows a source is offered: the h and inc rows read the pair dictionary or bank, so the copy source skips
+    /// them (they trail every list, so every other row keeps its index).
+    static func offered(_ all: [Variant], _ source: Source) -> [Variant] {
+        let base = source == .dict ? all : all.filter { !$0.half && $0.incOrder < 0 }
+        if forced != nil || NemotronSeedQMMTune.forced != nil
+            || ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_ALL"] == "1" {
+            return base
+        }
+        return base.filter { fastNames.contains($0.name) }
+    }
     /// The timing runs every layer's launch as one dependent chain (each reads its pair table, or the copy's biases,
     /// from a view of the previous launch's output), so a geometry's tail is timed as the seed meets it, not hidden
     /// by the next layer's independent launch. NEMOTRON_SEED_DENSE_CHAIN=0 keeps the independent launches.
@@ -3418,17 +4152,20 @@ enum NemotronSeedDenseRetile {
 
     enum Source: String, Sendable { case dict, copy }
 
-    /// Kinds: "in_proj", "out_proj", "up_proj" (pair dictionaries), "shared_down" (decode copy).
+    /// Kinds: "in_proj", "out_proj", "up_proj" (pair dictionaries), "shared_down" (decode copy), "up_gather" (the
+    /// shared up through its pair dictionary where the seed runs `NemotronPrefillSharedUpGather`).
     nonisolated(unsafe) static var choice: [String: Variant] = [:]
+    /// NEMOTRON_SEED_DENSE_UP_GATHER=0 leaves the shared up gather to its single launch (no "up_gather" kind).
+    static let offerUpGather = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_UP_GATHER"] != "0"
 
-    private static func makeKernel(_ source: Source, lean: Bool = false) -> MLXFast.MLXFastKernel {
+    private static func makeKernel(_ source: Source, lean: Bool = false, k32: Bool = false) -> MLXFast.MLXFastKernel {
         let ln = lean ? "Ln" : ""
         let make = source == .dict
             ? "NemotronSeedDenseDict\(ln)<T> b{(const device uint8_t*)w, scales, biases, K};"
             : "NemotronSeedDenseCopy\(ln)<T> b{w, scales, biases, K};"
         func call(_ bm: String) -> String {
             """
-                    nemotron_seed_dense_impl<T, \(bm), BN, BK, WM, WN, DB, PF, ALIGN_N, RELU2, RING, APF>(
+                    nemotron_seed_dense_\(k32 ? "k32_" : "")impl<T, \(bm), BN, BK, WM, WN, DB, PF, ALIGN_N, RELU2, HB, AP, SP>(
                         x, b, tiles, y, N, K, Ws,
                         threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup,
@@ -3438,11 +4175,11 @@ enum NemotronSeedDenseRetile {
         // A tile of at most BM / 2 rows runs the BM / 2 body (for BM 64 the
         // incumbents' 32-row bound); either way rows keep their 16-row fragments.
         return MLXFast.metalKernel(
-            name: "nemotron_seed_dense_\(source.rawValue)" + (lean ? "_ln" : ""),
+            name: "nemotron_seed_dense_\(source.rawValue)" + (lean ? "_ln" : "") + (k32 ? "_k32" : ""),
             inputNames: ["x", "w", "scales", "biases", "tiles", "N", "K"],
             outputNames: ["y"],
             source: """
-                threadgroup T Ws[(DB ? 2 : 1) * BN * (BK + 16 / sizeof(T))];
+                threadgroup T Ws[HB ? 1 : (DB || SP > 0 ? 2 : 1) * BN * (BK + 16 / sizeof(T))];
                 \(make)
                 if (tiles[threadgroup_position_in_grid.y * 3 + 1] <= BM / 2) {
             \(call("BM / 2"))
@@ -3451,13 +4188,16 @@ enum NemotronSeedDenseRetile {
                 }
             """,
             header: nemotronRunGatherHeader + "\n" + nemotronSeedRetileSource + "\n" + nemotronSeedDenseSource
-                + (lean ? "\n" + (NemotronSeedLean.denseHeader ?? "") : ""))
+                + (lean ? "\n" + (NemotronSeedLean.denseHeader ?? "") : "")
+                + (k32 ? "\n" + (k32Source ?? "") : ""))
     }
 
     private static let dictKernel = makeKernel(.dict)
     private static let copyKernel = makeKernel(.copy)
     private static let dictKernelLn = makeKernel(.dict, lean: true)
     private static let copyKernelLn = makeKernel(.copy, lean: true)
+    private static let dictKernelK32 = makeKernel(.dict, k32: true)
+    private static let copyKernelK32 = makeKernel(.copy, k32: true)
 
     /// One retiled launch over the request's rows (`x`: [1, rows, K]) in tiles of
     /// `v.bm` rows (at least three descriptors, as the incumbents); nil wherever
@@ -3468,33 +4208,40 @@ enum NemotronSeedDenseRetile {
     /// launch waits for `dep`'s producer.
     static func launch(_ v: Variant, source: Source, x: MLXArray, linear: Linear, relu2: Bool,
                        dep: MLXArray? = nil) -> MLXArray? {
+        if v.incOrder >= 0 {
+            guard source == .dict else { return nil }
+            return NemotronSeedIncumbentDB2.dense(order: v.incOrder, bk: v.bk, dict: true, x: x, linear: linear,
+                                                  relu2: relu2, dep: dep)
+        }
         guard NemotronHPrefillX5.runGather, v.threadgroupBytes <= 32768, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16
         else { return nil }
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
-        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 32 == 0 else { return nil }
+        guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 32 == 0, !v.half || nOut % v.bn == 0 else { return nil }
         let kernel: MLXFast.MLXFastKernel
         let operands: [MLXArray]
         switch source {
         case .dict:
             guard !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
-                  q.weight.dtype == .uint32, q.weight.ndim == 2, q.scales.shape == [nOut, k / 64],
+                   q.weight.dtype == .uint32, q.weight.ndim == 2, q.scales.shape == [nOut, k / 64],
                   let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
                   d.table.dtype == .float32
             else { return nil }
             let table = dep.map { NemotronSeedQMMTune.operandView($0, like: d.table) } ?? d.table
             guard let table else { return nil }
-            (kernel, operands) = (v.lean ? dictKernelLn : dictKernel, [q.weight, d.index, table])
+            (kernel, operands) = (v.bk % 64 != 0 ? dictKernelK32 : v.lean ? dictKernelLn : dictKernel,
+                                  [q.weight, d.index, table])
         case .copy:
-            guard !relu2, nOut % 128 == 0, let copy = NemotronSharedDownZSkip.copyArrays(for: linear),
+            guard !v.half, !relu2, nOut % 128 == 0, let copy = NemotronSharedDownZSkip.copyArrays(for: linear),
                   copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
                   copy.scales.shape == [1, nOut / 128, k / 64, 128], copy.scales.dtype == x.dtype,
                   copy.biases.shape == copy.scales.shape, copy.biases.dtype == x.dtype
             else { return nil }
             let biases = dep.map { NemotronSeedQMMTune.operandView($0, like: copy.biases) } ?? copy.biases
             guard let biases else { return nil }
-            (kernel, operands) = (v.lean ? copyKernelLn : copyKernel, [copy.codes, copy.scales, biases])
+            (kernel, operands) = (v.bk % 64 != 0 ? copyKernelK32 : v.lean ? copyKernelLn : copyKernel,
+                                  [copy.codes, copy.scales, biases])
         }
         let used = (rows + v.bm - 1) / v.bm
         let count = max(used, 3)
@@ -3508,7 +4255,7 @@ enum NemotronSeedDenseRetile {
             [x.reshaped(rows, 1, k)] + operands + [tiles, nOut, k],
             template: [("T", x.dtype), ("BM", v.bm), ("BN", v.bn), ("BK", v.bk), ("WM", v.wm), ("WN", v.wn),
                        ("DB", v.db), ("PF", v.pf), ("ALIGN_N", nOut % v.bn == 0), ("RELU2", relu2),
-                       ("RING", v.ring), ("APF", v.apf)],
+                       ("HB", v.half), ("AP", v.ap), ("SP", v.sp)],
             grid: (((nOut + v.bn - 1) / v.bn) * v.threads, count, 1), threadGroup: (v.threads, 1, 1),
             outputShapes: [[rows, 1, nOut]], outputDTypes: [x.dtype])[0]
         return y.reshaped(1, rows, nOut)
@@ -3520,6 +4267,16 @@ enum NemotronSeedDenseRetile {
         return launch(v, source: .dict, x: x, linear: linear, relu2: relu2)
     }
 
+    /// From `NemotronPrefillSharedUpGather.apply` (request prefill, verified only): kind "up_gather".
+    static func sharedUp(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+        guard let v = choice["up_gather"] else { return nil }
+        if v.incOrder >= 0 {
+            return NemotronSeedIncumbentDB2.dense(order: v.incOrder, bk: v.bk, dict: false, x: x, linear: up,
+                                                  relu2: true)
+        }
+        return launch(v, source: .dict, x: x, linear: up, relu2: true)
+    }
+
     /// From `NemotronPrefillSharedDownCopy.apply` (request prefill, verified only).
     static func sharedDown(_ x: MLXArray, _ down: Linear) -> MLXArray? {
         guard let v = choice["shared_down"] else { return nil }
@@ -3527,14 +4284,16 @@ enum NemotronSeedDenseRetile {
     }
 
     private struct Outcome {
+        let offered: Int
         let alive: [Variant]
         let dropped: [String]
         let medians: [(Variant?, Double)]
         let choice: Variant?
         var verdict: NemotronTuneAdoption.Verdict? = nil
+        var defaulted = false
     }
 
-    /// Qualifies `variants` against the incumbent (`run(nil, case, layer)`) bit for
+    /// Qualifies the variants `source` is offered against the incumbent (`run(nil, case, layer)`) bit for
     /// bit (every layer in case 0, the first layer in the others; any mismatch or
     /// error drops a variant), then times the incumbent and the survivors round
     /// robin on case 0, every layer per cycle: 1 warm-up and
@@ -3543,12 +4302,14 @@ enum NemotronSeedDenseRetile {
     /// `chain(v, layer, dep)` (when given): the case-0 launch of `layer` reading one operand from a view of `dep` (the
     /// previous layer's output in the timing chain), so each timed launch waits for the one before it, as the seed's
     /// projections run; nil `chain` keeps the independent per-layer launches.
-    private static func evaluate(cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?,
+    private static func evaluate(_ source: Source, cases: Int, layers: Int, run: (Variant?, Int, Int) -> MLXArray?,
                                  chain: ((Variant?, Int, MLXArray?) -> MLXArray?)? = nil) -> Outcome {
-        var alive = variants.filter { $0.threadgroupBytes <= 32768 }
+        let offers = offered(variants, source)
+        var alive = offers.filter { $0.threadgroupBytes <= 32768 }
         var dropped: [String] = []
         caseLoop: for c in 0 ..< cases {
-            for layer in 0 ..< (c == 0 ? layers : 1) {
+            let checkLayers = c == 0 && layers > 1 ? [0, layers - 1] : [0]
+            for layer in checkLayers {
                 let reference = try? withError { () -> MLXArray? in
                     guard let out = run(nil, c, layer) else { return nil }
                     eval(out)
@@ -3576,11 +4337,17 @@ enum NemotronSeedDenseRetile {
                 if alive.isEmpty { break caseLoop }
             }
         }
-        guard !alive.isEmpty else { return Outcome(alive: alive, dropped: dropped, medians: [], choice: nil) }
+        guard !alive.isEmpty else {
+            return Outcome(offered: offers.count, alive: alive, dropped: dropped, medians: [], choice: nil)
+        }
+        if forced == nil, let d = defaultRow, alive.contains(d) {
+            return Outcome(offered: offers.count, alive: alive, dropped: dropped, medians: [], choice: d,
+                           defaulted: true)
+        }
         let candidates: [Variant?] = [nil] + alive.map { Optional($0) }
         var samples = Array(repeating: [Double](), count: candidates.count)
-        let timed = max(NemotronTuneAdoption.minCycles,
-                        Int((Double(NemotronTuneAdoption.minCycles) * nemotronTuneTimingScale).rounded()) / 2 * 2)
+        let timed = NemotronTuneAdoption.minCycles
+        let timedLayers = min(layers, 8)
         do {
             try withError {
                 for rep in 0 ..< 1 + timed {
@@ -3589,26 +4356,26 @@ enum NemotronSeedDenseRetile {
                         var outs: [MLXArray] = []
                         if let chain {
                             var previous: MLXArray? = nil
-                            for layer in 0 ..< layers {
+                            for layer in 0 ..< timedLayers {
                                 guard let out = chain(candidates[i], layer, previous) else { break }
                                 previous = out
                                 outs.append(out)
                             }
-                            if outs.count == layers, let last = outs.last {
+                            if outs.count == timedLayers, let last = outs.last {
                                 eval(last)
                             } else {
                                 // A link the chain cannot build: this sample times the independent launches.
-                                outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
+                                outs = (0 ..< timedLayers).compactMap { run(candidates[i], 0, $0) }
                                 eval(outs)
                             }
                         } else {
-                            outs = (0 ..< layers).compactMap { run(candidates[i], 0, $0) }
+                            outs = (0 ..< timedLayers).compactMap { run(candidates[i], 0, $0) }
                             eval(outs)
                         }
                         Stream.gpu.synchronize()
                         let elapsed = DispatchTime.now().uptimeNanoseconds - start
-                        if rep >= 1, outs.count == layers {
-                            samples[i].append(Double(elapsed) / 1e6 / Double(layers))
+                        if rep >= 1, outs.count == timedLayers {
+                            samples[i].append(Double(elapsed) / 1e6 / Double(timedLayers))
                         }
                     }
                 }
@@ -3617,9 +4384,9 @@ enum NemotronSeedDenseRetile {
             dropped.append("timing error")
         }
         guard samples.allSatisfy({ $0.count == timed }) else {
-            return Outcome(alive: alive, dropped: dropped, medians: [], choice: nil)
+            return Outcome(offered: offers.count, alive: alive, dropped: dropped, medians: [], choice: nil)
         }
-        let verdict = NemotronTuneAdoption.decide(samples, seed: true)
+        let verdict = NemotronTuneAdoption.decide(samples, medianBar: nemotronSeedTuneMedianBar, seed: true)
         let medians = Array(zip(candidates, verdict.medians))
         var pick: Variant? = nil
         if let forced, let f = alive.first(where: { $0.name == forced }) {
@@ -3627,7 +4394,8 @@ enum NemotronSeedDenseRetile {
         } else if let best = verdict.adopted {
             pick = candidates[best]
         }
-        return Outcome(alive: alive, dropped: dropped, medians: medians, choice: pick, verdict: verdict)
+        return Outcome(offered: offers.count, alive: alive, dropped: dropped, medians: medians, choice: pick,
+                       verdict: verdict)
     }
 
     static func tune(_ target: Module) {
@@ -3649,10 +4417,11 @@ enum NemotronSeedDenseRetile {
             let times = o.medians.indices.dropFirst().map {
                 "\(o.medians[$0].0!.name) \(String(format: "%.3f", o.medians[$0].1)) \(o.verdict?.won($0) ?? "n/a")"
             }
-            detail.append("\(kind) \(o.alive.count)/\(variants.count) bitwise"
+            detail.append("\(kind) \(o.alive.count)/\(o.offered) bitwise"
+                + (o.defaulted ? ", default \(o.choice?.name ?? "") bitwise, timing skipped" : "")
                 + (o.verdict.map { v in ", " + v.rule({ o.medians[$0].0?.name ?? "V0" }) } ?? "")
                 + (times.isEmpty ? "" : " [" + times.joined(separator: ", ") + "]")
-                + (o.dropped.isEmpty ? "" : " dropped: " + o.dropped.prefix(6).joined(separator: ", ")))
+                + (o.dropped.isEmpty ? "" : " dropped: " + o.dropped.prefix(16).joined(separator: ", ")))
         }
         // Rows: 488, 488 x 40, 300, 97, 17; `zeros(case)`: ReLU2-like rows, mostly exact zeros.
         let rowCounts = [488, 488, 300, 97, 17]
@@ -3683,7 +4452,7 @@ enum NemotronSeedDenseRetile {
                 detail.append("\(kind) off (inputs)")
                 continue
             }
-            let o = evaluate(cases: xs.count, layers: all.count, run: { v, c, layer in
+            let o = evaluate(.dict, cases: xs.count, layers: all.count, run: { v, c, layer in
                 if let v { return launch(v, source: .dict, x: xs[c], linear: all[layer], relu2: relu2) }
                 return NemotronPrefillDenseDict.launch(xs[c], all[layer], relu2: relu2)
             }, chain: chainTiming ? { v, layer, dep in
@@ -3693,12 +4462,35 @@ enum NemotronSeedDenseRetile {
             if let pick = o.choice { choice[kind] = pick }
             note(kind, o)
         }
+        // The shared up's one-launch gather (`NemotronPrefillSharedUpGather`, bank scales and biases, typed ReLU2
+        // store), which the seed runs when the dictionary launch did not admit up_proj: the same rows through the
+        // pair dictionary, checked bit for bit against that gather (kind "up_gather").
+        if offerUpGather, NemotronPrefillSharedUpGather.verified, !NemotronPrefillDenseDict.kinds.contains("up_proj"),
+           case let ups = NemotronPrefillDenseDict.linears(target, kind: "up_proj"), let first = ups.first {
+            let xs = inputs(first.weight.dim(1) * 8, seed: 0x5eed_dec0, zeros: { $0 == 3 })
+            if xs.count == rowCounts.count {
+                let o = evaluate(.dict, cases: xs.count, layers: ups.count, run: { v, c, layer in
+                    if let v, v.incOrder >= 0 {
+                        return NemotronSeedIncumbentDB2.dense(order: v.incOrder, bk: v.bk, dict: false, x: xs[c],
+                                                              linear: ups[layer], relu2: true)
+                    }
+                    if let v { return launch(v, source: .dict, x: xs[c], linear: ups[layer], relu2: true) }
+                    return NemotronPrefillSharedUpGather.launch(xs[c], ups[layer])
+                })
+                if let pick = o.choice { choice["up_gather"] = pick }
+                note("up_gather", o)
+            } else {
+                detail.append("up_gather off (inputs)")
+            }
+        } else {
+            detail.append("up_gather off (" + (offerUpGather ? "gather not in use" : "setting") + ")")
+        }
         let downs = target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }
         if NemotronPrefillSharedDownCopy.verified, let first = downs.first {
             // The shared up's ReLU2 output, except the scaled case.
             let xs = inputs(first.weight.dim(1) * 8, seed: 0x5eed_de80, zeros: { $0 != 1 })
             if xs.count == rowCounts.count {
-                let o = evaluate(cases: xs.count, layers: downs.count, run: { v, c, layer in
+                let o = evaluate(.copy, cases: xs.count, layers: downs.count, run: { v, c, layer in
                     if let v { return launch(v, source: .copy, x: xs[c], linear: downs[layer], relu2: false) }
                     return NemotronPrefillSharedDownCopy.launch(xs[c], downs[layer])
                 }, chain: chainTiming ? { v, layer, dep in
@@ -3779,10 +4571,10 @@ extension NemotronHMLP {
 /// where `stockRunsNAX` holds for the request's rows; the residency target groups then treat the kind as admitted.
 /// NEMOTRON_SEED_QMM_TUNE=0 keeps the stock projections; NEMOTRON_SEED_QMM_FORCE=<n> adopts variant n (1-based,
 /// `NemotronSeedQMMTune.variants`: `NemotronSeedDenseRetile`'s base rows, then its pf rows, then its lean rows,
-/// then `NemotronSeedDenseRetile.moreVariants` of at most 128 rows per tile, then its `ringVariants`) wherever it
-/// qualified, 0 keeps the stock projections.
+/// then `NemotronSeedDenseRetile.moreVariants` of at most 128 rows per tile, then its h rows, offered to the pair
+/// dictionary kinds) wherever it qualified, 0 keeps the stock projections.
 /// NEMOTRON_SEED_QMM_TUNE_X=0 leaves the pf rows out, NEMOTRON_SEED_QMM_TUNE_X2=0 the `moreVariants` rows,
-/// NEMOTRON_SEED_QMM_RING=0 the ring rows.
+/// NEMOTRON_SEED_DENSE_HB=0 the h rows.
 enum NemotronSeedQMMTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE"] != "0"
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_FORCE"] ?? "")
@@ -3799,18 +4591,19 @@ enum NemotronSeedQMMTune {
     /// narrower products about two threadgroups per core); NEMOTRON_SEED_QMM_TUNE_X2=0 leaves them out. Appended
     /// after the pf and lean rows, so every earlier row keeps its FORCE index (15 ... 17 with every set offered).
     static let offerX2 = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE_X2"] != "0"
+    /// Last `NemotronSeedDenseRetile.halfVariants` (h: direct B, one 16-bit code load per quad, row-guarded mma;
+    /// pair dictionary kinds only; NEMOTRON_SEED_DENSE_HB=0 leaves them out), after every other row so each keeps
+    /// its FORCE index (the h rows are 18 ... 22 with every set offered).
     static let variants: [Variant] = NemotronSeedDenseRetile.baseVariants
         + (offerX ? NemotronSeedDenseRetile.extraVariants : [])
         + NemotronSeedDenseRetile.leanVariants
         + (offerX2 ? NemotronSeedDenseRetile.moreVariants.filter { $0.bm <= 128 } : [])
-        + (offerRing ? NemotronSeedDenseRetile.ringVariants : [])
-    /// `NemotronSeedDenseRetile.ringVariants` (the stock geometry with the register ring of B loads 2 or 3 blocks
-    /// ahead, or with A fragments one step ahead), appended after the X2 rows so every earlier row keeps its FORCE
-    /// index (18 ... 20 with every set offered); NEMOTRON_SEED_QMM_RING=0 leaves them out. The soft load cap scales
-    /// with them (`budgetSeconds`).
-    static let offerRing = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_RING"] != "0"
+        + NemotronSeedDenseRetile.halfVariants
+        + NemotronSeedDenseRetile.k32Variants
+        + NemotronSeedDenseRetile.computeFirstVariants
+        + NemotronSeedDenseRetile.producerVariants
     /// Soft cap on the tune's own load time: no kind, variant or timing phase starts past it. 6 s for the base
-    /// rows, scaled by the candidate count so the base rows keep their share of it when the pf, lean and X2 rows
+    /// rows, scaled by the candidate count so the base rows keep their share of it when the pf, lean, X2 and h rows
     /// are offered.
     static let budgetSeconds = 6.0 * nemotronTuneBudgetScale * Double(variants.count)
         / Double(NemotronSeedDenseRetile.baseVariants.count)
@@ -3904,7 +4697,7 @@ enum NemotronSeedQMMTune {
     /// Check, time and pick for one kind; returns the pick and a report fragment.
     private static func evaluate(_ kind: Kind, seed: UInt64, specials: MLXArray, elapsed: () -> Double)
         -> (Variant?, String) {
-        let variants = Self.variants
+        let variants = NemotronSeedDenseRetile.offered(Self.variants, kind.source)
         guard let first = kind.linears.first as? QuantizedLinear, let last = kind.linears.last,
               kind.linears.allSatisfy({ ($0 as? QuantizedLinear)?.weight.shape == first.weight.shape })
         else { return (nil, "off (no quantized layers)") }
@@ -3938,7 +4731,7 @@ enum NemotronSeedQMMTune {
         }
         guard inputs.count == rowCounts.count else { return (nil, "off (inputs)") }
         let edges: [Linear] = kind.linears.count > 1 ? [first, last] : [first]
-        func layers(_ c: Int) -> [Linear] { c == 0 ? kind.linears : edges }
+        func layers(_ c: Int) -> [Linear] { edges }
         func candidate(_ v: Variant, _ x: MLXArray, _ linear: Linear, dep: MLXArray?) -> MLXArray? {
             NemotronSeedDenseRetile.launch(v, source: kind.source, x: x, linear: linear, relu2: kind.relu2, dep: dep)
         }
@@ -3971,9 +4764,8 @@ enum NemotronSeedQMMTune {
                 continue
             }
             do {
-                // Three passes over every case and layer: a race would have to repeat to pass.
                 let same = try withError { () -> Bool in
-                    for _ in 0 ..< 3 {
+                    for _ in 0 ..< 1 {
                         for (c, x) in inputs.enumerated() {
                             var ok = MLXArray(true)
                             for (i, linear) in layers(c).enumerated() {
@@ -4009,7 +4801,11 @@ enum NemotronSeedQMMTune {
         var samples: [[Double]] = []
         var verdict: NemotronTuneAdoption.Verdict? = nil
         var reps = 0
-        if !alive.isEmpty, elapsed() >= budgetSeconds {
+        // The dense default row (`NemotronSeedDenseRetile.defaultRow`) where it qualified: no timing pass.
+        let defaulted = forced == nil ? NemotronSeedDenseRetile.defaultRow.flatMap { alive.contains($0) ? $0 : nil } : nil
+        if defaulted != nil {
+            dropped.append("timing skipped (default row)")
+        } else if !alive.isEmpty, elapsed() >= budgetSeconds {
             dropped.append("timing skipped (load budget)")
         } else if !alive.isEmpty {
             samples = Array(repeating: [Double](), count: candidates.count)
@@ -4027,9 +4823,8 @@ enum NemotronSeedQMMTune {
                         return previous
                     }
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
@@ -4051,7 +4846,7 @@ enum NemotronSeedQMMTune {
                     }
                 }
                 if samples.allSatisfy({ $0.count == reps }) {
-                    verdict = NemotronTuneAdoption.decide(samples, seed: true)
+                    verdict = NemotronTuneAdoption.decide(samples, medianBar: nemotronSeedTuneMedianBar, seed: true)
                     medians = verdict?.medians ?? []
                 } else {
                     dropped.append("timing incomplete")
@@ -4069,6 +4864,9 @@ enum NemotronSeedQMMTune {
             } else {
                 why = f == 0 ? "forced stock" : "forced \(f) not qualified, kept"
             }
+        } else if let d = defaulted {
+            picked = d
+            why = "default"
         } else if !medians.isEmpty, let best = verdict?.adopted {
             picked = candidates[best]
             why = "adopted"
@@ -4087,7 +4885,7 @@ enum NemotronSeedQMMTune {
             + " median of \(reps), chains of \(chain.count); \(alive.count)/\(variants.count) bitwise over"
             + " \(rowCounts.count) cases x 3, smallest \(boundary) rows\(below)"
             + (times.isEmpty ? "" : "; [" + times.joined(separator: ", ") + "]")
-            + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(6).joined(separator: ", ")) + ")")
+            + (dropped.isEmpty ? "" : "; dropped: " + dropped.prefix(16).joined(separator: ", ")) + ")")
     }
 
     /// Load time, after the seed retiles; NAX hosts only (`NemotronHPrefillX5.runGather`).
@@ -4128,10 +4926,12 @@ enum NemotronSeedQMMTune {
         }
         if NemotronPrefillSharedDownCopy.verified {
             parts.append("shared_down off (copy launch verified)")
-        } else {
+        } else if ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_SHARED_DOWN"] == "1" {
             kinds.append(Kind(name: "shared_down",
                               linears: target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj },
                               source: .copy, relu2: false, zeros: true))
+        } else {
+            parts.append("shared_down off (preserve target down_proj mlock)")
         }
         let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
                                  Float(bitPattern: 0x8001_0000), 3e38])
@@ -4228,7 +5028,7 @@ enum NemotronSeedSSMTune {
     /// Soft cap on the tune's own load time: no variant or timing phase starts past it. 1.5 s for the two base
     /// rows per list, scaled by the candidate count so they keep their share of it when the X and X2 rows are
     /// offered.
-    static let budgetSeconds = 1.5 * nemotronTuneBudgetScale * Double(stateVariants.count + scanVariants.count) / 4.0
+    static let budgetSeconds = 3.0 * nemotronTuneBudgetScale * Double(stateVariants.count + scanVariants.count) / 4.0
 
     /// Adopted variants (nil: the incumbent), set once at load before any request.
     nonisolated(unsafe) private(set) static var stateChoice: Variant? = nil
@@ -4568,7 +5368,8 @@ enum NemotronSeedSSMTune {
                     }
                 }
                 verdict = NemotronTuneAdoption.decide(
-                    samples, eligible: { candidates[$0].map(alive.contains) ?? false }, seed: true)
+                    samples, eligible: { candidates[$0].map(alive.contains) ?? false },
+                    medianBar: nemotronSeedTuneMedianBar, seed: true)
                 medians = verdict?.medians ?? []
             } else {
                 if !alive.isEmpty { dropped.append("timing incomplete") }

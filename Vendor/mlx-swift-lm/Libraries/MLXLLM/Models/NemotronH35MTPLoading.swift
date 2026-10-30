@@ -109,11 +109,12 @@ extension NemotronH35MTPAssistant {
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
         NemotronDraftTune.tuneVerifyQKV(target)
-        NemotronMTPSSMAnchor.tune(target)
         NemotronSSMTail32.qualify(target)
         NemotronSSMTailTC.qualify(target)
+        NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronHResidualRMSNorm.qualifyDraftFinalOnly(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
@@ -295,6 +296,9 @@ extension NemotronH35MTPAssistant {
             CBv2MTPCommittedTargetObservation(tokens: prompt, hidden: prefill.lastHidden),
             requestState: draftState)
         var carry = prefill.lastHidden[0..., (promptLength - 1)..<promptLength, 0...]
+        let primeWarm = draftStep(tokens: seed, hidden: carry, shortlist: nil, requestState: draftState)
+        eval([primeWarm.tokens, primeWarm.hidden] + evaluationTargets(for: draftState))
+        discardRound(requestState: draftState)
 
         // Plain one-token target step (non-captured decode shape).
         let stepEvaluation = try recurrent.bind()
@@ -539,7 +543,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 dense = [("up_proj", up)]
             }
             for (kind, linear) in dense
-            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind) {
+            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind)
+                || (kind == "up_proj" && NemotronSeedDenseRetile.choice["up_gather"] != nil) {
                 guard let q = linear as? QuantizedLinear, let d = NemotronSBDict.dict(q), let b = q.biases else { continue }
                 denseDicts[n, default: []] += [d.index, d.table]
                 denseMetadata.formUnion([ObjectIdentifier(q.scales), ObjectIdentifier(b)])
