@@ -5812,14 +5812,13 @@ extension NemotronU2 {
 // (activations with infinities, NaNs, -0, tiny and large values on routes with
 // experts in three, two and one rows and with all eighteen distinct, experts 0
 // and 127) against the production launch on every bank, and dropped on a miss.
-// NEMOTRON_FC1_TUNE=0 keeps the incumbent; NEMOTRON_FC1_FORCE=<n> adopts
 // variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
 // NEMOTRON_FC1_LEAN_ROWS=0 leaves the lean rows out (the 18 record-text rows).
 enum NemotronFC1Tune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE"] != "0"
     /// An adopted variant's median is at most this fraction of the incumbent's.
     static let medianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE_BAR"] ?? "") ?? 0.995
-    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "")
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "20")
     /// Wall time of the timed rounds (graph building included), sized from the warm-up round.
     static let timedMilliseconds = 600.0
 
@@ -6351,7 +6350,6 @@ enum NemotronFC1Tune {
 // incumbent). Only
 // the verify's dictionary launches read the choice (`preparedLaunch`, `inProjLaunch`), under the production
 // context it was measured in (ReLU2 and unroll state); plain launches, the draft head, the prompt prefill and
-// explicit record calls keep their kernels. NEMOTRON_QMV_TUNE=0 keeps every incumbent;
 // NEMOTRON_QMV_FORCE=<family>:<n>[,<family>:<n>] (families inproj, head, outproj, sharedup) adopts variant n
 // (1-based, `variants`) of that family when it qualified, 0 keeps its incumbent. The shared up runs beside the
 // router in one barrier stage, where a geometry timed alone does not carry over, so its family keeps the incumbent
@@ -6367,7 +6365,8 @@ enum NemotronQMVTune {
     static let sharedUpTuned = ProcessInfo.processInfo.environment["NEMOTRON_QMV_TUNE_SHAREDUP"] == "1"
     static let forced: [Family: Int] = {
         var out: [Family: Int] = [:]
-        for item in (ProcessInfo.processInfo.environment["NEMOTRON_QMV_FORCE"] ?? "").split(separator: ",") {
+        for item in (ProcessInfo.processInfo.environment["NEMOTRON_QMV_FORCE"] ?? "inproj:16,head:13,outproj:0")
+            .split(separator: ",") {
             let parts = item.split(separator: ":")
             guard parts.count == 2, let f = Family(rawValue: String(parts[0])), let n = Int(parts[1]) else { continue }
             out[f] = n
@@ -7035,12 +7034,11 @@ enum NemotronQMVTune {
 // least 3% faster by median and faster in at least 75% of the cycles). `tuneDraft` does the same for the
 // draft head's copy at R = 1 (rows at 45% with the special values, 8.75%, 20%, 70% and full; timed at 45%, the
 // draft tail's density). Plain BF16 copies keep the incumbent.
-// NEMOTRON_FC2_TUNE=0 / NEMOTRON_DFC2_TUNE=0 keep the incumbents; NEMOTRON_FC2_FORCE=<n> / NEMOTRON_DFC2_FORCE=<n>
 // adopt variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
 enum NemotronFC2Tune {
-    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC2_TUNE"] != "0"
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC2_TUNE"] == "1"
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC2_FORCE"] ?? "")
-    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] != "0"
+    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] == "1"
     static let draftForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_DFC2_FORCE"] ?? "")
     /// Wall time of one tune's timed rounds (graph building included), sized from the last warm-up round.
     static let timedMilliseconds = 150.0
