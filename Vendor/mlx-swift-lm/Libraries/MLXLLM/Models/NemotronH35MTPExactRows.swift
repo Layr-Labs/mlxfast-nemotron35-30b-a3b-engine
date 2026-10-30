@@ -3837,12 +3837,14 @@ enum NemotronMTPVerifySDPA {
         }
     }
 
-    /// NEMOTRON_SDPA_TUNE=0 keeps the launch selected above (one threadgroup per query head once `qualifyFast`
+    /// The tune is off by default (NEMOTRON_SDPA_TUNE=1 runs it): it keeps the launch selected above (one threadgroup
+    /// per query head once `qualifyFast`
     /// passed). Otherwise `tune` times that launch and the per-row prepared launch it was checked against
     /// (`mergedPrepared`: 32 x 3 threadgroups, the aggregation selected above) and adopts the per-row launch only
     /// when `NemotronTuneAdoption.decide` admits it (at least 3% faster by median and faster in at least 75% of the
     /// cycles). NEMOTRON_SDPA_FORCE=1 adopts the per-row launch, 0 keeps the per-head launch.
-    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] != "0"
+    /// Off by default (the verify SDPA keeps its incumbent form); NEMOTRON_SDPA_TUNE=1 runs the tune.
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] == "1"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SDPA_FORCE"] ?? "")
     nonisolated(unsafe) private static var perRowAdopted = false
 
@@ -6851,12 +6853,18 @@ enum NemotronScreenPicks {
 // 75% of the cycles, paired within each cycle).
 // The chains read cold data as the round does: fc1 cycles 16 routes through the bank, the other families cycle copies
 // of their weights (an integer add of zero, about 96 MB per pass). Load cap 3 s.
-// NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; NEMOTRON_DRAFT_FORCE=<n> adopts variant n (1-based, `variants`) of
+// NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; by default the draft-chain families take fixed rows (the FORCE
+// default below: fc1 `r4n2u4`, screen `r8n1u1`, qkv and down `r4n2u2`, ehp `r2n2u2` in the incumbent's store form,
+// eh `r2n2u1`; up and wo keep their incumbents), each adopted only where it passed its bit-for-bit check, and only
+// the draft SDPA is decided by the rule; NEMOTRON_DRAFT_FORCE=<n> adopts
+// variant n (1-based, `variants`) of
 // every family that qualified it, <family>:<n>[,<family>:<n>] of the named families; 0 keeps the incumbent.
 enum NemotronDraftTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_TUNE"] != "0"
     static let forced: (all: Int?, families: [Family: Int]) = {
-        let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FORCE"] ?? ""
+        // Default: fixed rows of the draft-chain families (`variants` order); the draft SDPA decides by the rule.
+        let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FORCE"]
+            ?? "fc1:9,screen:3,qkv:6,up:0,wo:0,down:6,ehp:6,eh:1"
         if let n = Int(value) { return (n, [:]) }
         var out: [Family: Int] = [:]
         for item in value.split(whereSeparator: { $0 == "," || $0 == "+" }) {

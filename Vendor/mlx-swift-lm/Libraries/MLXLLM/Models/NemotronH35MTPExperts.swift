@@ -623,6 +623,179 @@ private func nmlFC1LeanSource(_ source: String) -> String? {
     return s
 }
 
+/// Register-input twins of the record's routed FC1 qdot helpers, for `nmlFC1PrefetchSource`: `nml_qdot_word`,
+/// `nml_qdot_pair_word` and `nml_qdot_triple_word` (with `nml_qdot_half_word` and `nml_qdot_pair_half_word`) are
+/// the text of `nml_qdot`, `nml_qdot_pair`, `nml_qdot_triple`, `nml_qdot_half` and `nml_qdot_pair_half`, cut from
+/// the record headers with only the code word's source swapped: the lane's block codes (values_per_thread 8: one
+/// 4-byte word, the word the record helper reads as `ws2[0]` and as its halfwords `ws[0]`, `ws[1]`) arrive as
+/// `word`, and the helper's two device views of it become thread arrays holding the same values (`ws2[i / 2]` is
+/// `ws2[0]` for i < 2; `ws[i]` is halfword i, little endian). Every decode, product, term order, accumulation and
+/// affine close is the record text. `nml_prepared_fetch` / `nml_prepared_regs` split `nml_prepared_vector` into
+/// its nine loads into registers and the hand-out of those values. nil when a record helper's text moved.
+private let nmlFC1PrefetchHeader: String? = {
+    let record = nemotronMoELeaderHeader + "\n" + nemotronMoETripleDecodeHeader + "\n"
+    var s = ""
+    for name in ["nml_qdot_half", "nml_qdot_pair_half", "nml_qdot", "nml_qdot_pair", "nml_qdot_triple"] {
+        guard record.components(separatedBy: " \(name)(\n").count == 2,
+              let open = record.range(of: " \(name)(\n"),
+              let start = record.range(of: "template <", options: .backwards,
+                                       range: record.startIndex ..< open.lowerBound),
+              let close = record.range(of: "\n}\n", range: open.upperBound ..< record.endIndex)
+        else { return nil }
+        s += String(record[start.lowerBound ..< close.upperBound]) + "\n"
+    }
+    for (old, new, count) in [
+        (" nml_qdot_half(\n", " nml_qdot_half_word(\n", 1),
+        (" nml_qdot_pair_half(\n", " nml_qdot_pair_half_word(\n", 1),
+        (" nml_qdot(\n", " nml_qdot_word(\n", 1),
+        (" nml_qdot_pair(\n", " nml_qdot_pair_word(\n", 1),
+        (" nml_qdot_triple(\n", " nml_qdot_triple_word(\n", 1),
+        ("nml_qdot_half<U, values_per_thread>(w, ", "nml_qdot_half_word<U, values_per_thread>(word, ", 1),
+        ("nml_qdot_pair_half<U, values_per_thread>(\n        w, ",
+         "nml_qdot_pair_half_word<U, values_per_thread>(\n        word, ", 1),
+        ("const device uint8_t* w,", "const uint word,", 5),
+        ("const device uint16_t* ws = (const device uint16_t*)w;",
+         "const uint16_t ws[2] = {uint16_t(word), uint16_t(word >> 16)};", 5),
+        ("const device uint* ws2 = (const device uint*)w;", "const uint ws2[1] = {word};", 3),
+    ] {
+        guard s.components(separatedBy: old).count == count + 1 else { return nil }
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    guard !s.contains("device"), !s.contains("(w,"), !s.contains(" w,"), !s.contains(")w;") else { return nil }
+    return s + """
+        template <typename U, int values_per_thread>
+        inline void nml_prepared_fetch(const device float* p, thread U* v) {
+          for (int i = 0; i <= values_per_thread; i++) {
+            v[i] = p[i * 32];
+          }
+        }
+
+        template <typename U, int values_per_thread>
+        inline U nml_prepared_regs(const thread U* v, thread U* x_thread) {
+          for (int i = 0; i < values_per_thread; i++) {
+            x_thread[i] = v[i];
+          }
+          return v[values_per_thread];
+        }
+
+        """
+}()
+
+/// The lean triple FC1 (`nmlFC1LeanSource`'s text, plain or pair-dictionary form) with each main K loop's
+/// per-row code word and pair index (plain: BF16 scale and bias) loaded `distance` blocks ahead into registers:
+/// the text of `NemotronFC1Tune`'s prefetch rows. Ahead of each main loop the lane loads block 0's (and at
+/// distance 2 block 1's) words into a register set; at the top of the step for block k it loads the block that
+/// is `distance` blocks ahead, then runs block k from the set loaded earlier (`nml_qdot_word`,
+/// `nml_qdot_pair_word`, `nml_qdot_triple_word`: the record helpers' text on the same word; the dictionary pair
+/// `sbt[...]` and the BF16 widening read the same index or value), then steps the sets. With `activations` the
+/// next block's nine prepared activation floats per row are loaded ahead the same way. A step loads ahead only
+/// while that block is itself a main-loop block (k + (distance + 1) x block_size < K, so every lane's 8 values,
+/// its 4 code bytes and its group lie inside the row); otherwise it reloads its own block (in bounds, never
+/// used), so no lane reads the tail block or past a row; the tail keeps its own loads. Every load reads a
+/// record address, and every value, product, term order, accumulation, affine close, closing simd_sum and
+/// store is the record's. nil unless every replaced statement occurs as expected.
+private func nmlFC1PrefetchSource(_ source: String, distance: Int = 1, activations: Bool = false) -> String? {
+    guard distance == 1 || distance == 2, !activations || distance == 1,
+          source.components(separatedBy: "  uint nlw = ").count == 2 else { return nil }
+    let dict = source.contains("  const device uint16_t* sc = scales;\n  const device uint16_t* bs = scales;\n")
+    guard dict || source.contains("  const device T* sc = scales;\n  const device T* bs = biases;\n") else {
+        return nil
+    }
+    // A register set: code words, and the pair indices (dictionary) or the BF16 scales and biases.
+    let streams = dict ? [("w", "uint"), ("i", "uint16_t")] : [("w", "uint"), ("s", "T"), ("b", "T")]
+    func declare(_ set: String, _ indent: String) -> String {
+        streams.map { "\(indent)\($0.1) \(set)\($0.0)[results_per_simdgroup];\n" }.joined()
+    }
+    func fetch(_ set: String, _ offset: String, _ indent: String) -> String {
+        let g = "(\(offset) >> 5) + uint(r * in_vec_size_g)"
+        return "\(indent)for (int r = 0; r < results_per_simdgroup; r++) {\n"
+            + "\(indent)  \(set)w[r] = *((const device uint*)(ws + (\(offset) + uint(r * in_vec_size_w))));\n"
+            + (dict ? "\(indent)  \(set)i[r] = sc[\(g)];\n"
+                : "\(indent)  \(set)s[r] = sc[\(g)];\n\(indent)  \(set)b[r] = bs[\(g)];\n")
+            + "\(indent)}\n"
+    }
+    let loop = "    for (; k < K - block_size; k += block_size) {\n"
+    let end = "    }\n    const int remaining = clamp("
+    var parts = source.components(separatedBy: "    int k = 0;\n")
+    guard parts.count == 4 else { return nil }
+    for p in 1 ..< 4 {
+        let part = parts[p]
+        guard let h = part.range(of: loop), let e = part.range(of: end, range: h.upperBound ..< part.endIndex)
+        else { return nil }
+        let lead = String(part[..<h.lowerBound])
+        guard lead.isEmpty || (lead.hasPrefix("    #pragma clang loop unroll_count(")
+                                   && lead.components(separatedBy: "\n").count == 2) else { return nil }
+        var body = String(part[h.upperBound ..< e.lowerBound])
+        let xs = ["x0", "x1", "x2"].filter {
+            body.components(separatedBy: "nml_prepared_vector<U, values_per_thread>(\($0) + nl\($0), ").count == 2
+        }
+        func swap(_ old: String, _ new: String) -> Int {
+            let n = body.components(separatedBy: old).count - 1
+            body = body.replacingOccurrences(of: old, with: new)
+            return n
+        }
+        let wl = "        auto wl = (const device uint8_t*)(ws + (nlw + uint(r * in_vec_size_w)));\n"
+        let heads = dict
+            ? swap(wl + "        const device uint16_t* sl = sc + ((nlw >> 5) + uint(r * in_vec_size_g));\n"
+                   + "        const device uint16_t* bl = bs + ((nlw >> 5) + uint(r * in_vec_size_g));\n"
+                   + "        const float2 sbp = sbt[sl[0]];\n",
+                   "        const float2 sbp = sbt[nlpi[r]];\n")
+            : swap(wl + "        const device T* sl = sc + ((nlw >> 5) + uint(r * in_vec_size_g));\n"
+                   + "        const device T* bl = bs + ((nlw >> 5) + uint(r * in_vec_size_g));\n"
+                   + "        U s = sl[0];\n        U b = bl[0];\n",
+                   "        U s = nlps[r];\n        U b = nlpb[r];\n")
+        let calls = swap("nml_qdot<U, values_per_thread, R == 3>(wl, ",
+                         "nml_qdot_word<U, values_per_thread, R == 3>(nlpw[r], ")
+            + swap("nml_qdot_pair<U, values_per_thread, R == 3>(\n            wl, ",
+                   "nml_qdot_pair_word<U, values_per_thread, R == 3>(\n            nlpw[r], ")
+            + swap("nml_qdot_triple<U, values_per_thread, R == 3>(\n            wl, ",
+                   "nml_qdot_triple_word<U, values_per_thread, R == 3>(\n            nlpw[r], ")
+        let reads = activations ? xs.map {
+            swap("nml_prepared_vector<U, values_per_thread>(\($0) + nl\($0), ",
+                 "nml_prepared_regs<U, values_per_thread>(nlp\($0), ")
+        }.reduce(0, +) : xs.count
+        // The step's load-ahead offset (its own block once the block ahead is not a main-loop block) and the
+        // register sets' step: block k + 1's set becomes the current one (distance 2: k + 1's and k + 2's).
+        let ahead = distance == 1 ? "k + 2 * block_size < K ? block_size / 2 : 0"
+            : "k + 3 * block_size < K ? block_size : 0"
+        let step: (String) -> String = distance == 1 ? { "        nlp\($0)[r] = nln\($0)[r];\n" }
+            : { "        nlp\($0)[r] = nlq\($0)[r];\n        nlq\($0)[r] = nln\($0)[r];\n" }
+        var top = "      const uint nlo = nlw + uint(\(ahead));\n" + declare("nln", "      ")
+            + fetch("nln", "nlo", "      ")
+        var rotate = "      for (int r = 0; r < results_per_simdgroup; r++) {\n"
+            + streams.map { step($0.0) }.joined() + "      }\n"
+        var pre = "    static_assert(values_per_thread == 8, \"a lane's block codes are one 32-bit word\");\n"
+            + declare("nlp", "    ") + (distance == 2 ? declare("nlq", "    ") : "")
+        var preload = fetch("nlp", "nlw", "      ")
+        if distance == 2 {
+            preload += "      const uint nlo = nlw + uint(2 * block_size < K ? block_size / 2 : 0);\n"
+                + fetch("nlq", "nlo", "      ")
+        }
+        if activations {
+            top += "      const uint nlxo = uint(k + 2 * block_size < K ? PSTRIDE : 0);\n"
+            rotate += "      for (int i = 0; i <= values_per_thread; i++) {\n"
+            for x in xs {
+                pre += "    U nlp\(x)[values_per_thread + 1];\n"
+                preload += "      nml_prepared_fetch<U, values_per_thread>(\(x) + nl\(x), nlp\(x));\n"
+                top += "      U nln\(x)[values_per_thread + 1];\n"
+                    + "      nml_prepared_fetch<U, values_per_thread>(\(x) + (nl\(x) + nlxo), nln\(x));\n"
+                rotate += "        nlp\(x)[i] = nln\(x)[i];\n"
+            }
+            rotate += "      }\n"
+        }
+        let advance = "      nlw += block_size / 2;\n"
+        guard heads == 1, calls == 1, reads == xs.count, !xs.isEmpty, swap(advance, rotate + advance) == 1,
+              !body.contains("wl"), !body.contains("sl[0]"), !body.contains("bl[0]")
+        else { return nil }
+        parts[p] = "    int k = 0;\n" + pre + "    if (k < K - block_size) {\n" + preload + "    }\n" + lead + loop
+            + top + body + String(part[e.lowerBound...])
+    }
+    let s = parts.joined()
+    guard s.components(separatedBy: "(nlpw[r], ").count == 2,
+          s.components(separatedBy: "\n            nlpw[r], ").count == 3 else { return nil }
+    return s
+}
+
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
 /// (`NemotronSBDict`). `scales` carries one uint16 pair index per group and
 /// `biases` the tensor's pair table as FP32 (scale, bias), each entry the exact
@@ -5789,12 +5962,21 @@ extension NemotronU2 {
 //   no pragma, the record loops; 4: four blocks per unrolled step);
 // - lean (the rows appended last): the text through `nmlFC1LeanSource`, each
 //   lane reading through the arrays' base pointers plus 32-bit element offsets
-//   (the record's addresses) instead of six stepped 64-bit pointers.
+//   (the record's addresses) instead of six stepped 64-bit pointers;
+// - prefetch (the `pf` rows, after the lean rows; lean text): the lean text
+//   through `nmlFC1PrefetchSource`, each main K loop loading a later block's
+//   per-row code words and pair indices (plain: BF16 scales and biases) into
+//   registers before running the current block from the set loaded one step
+//   earlier (`pf`: one block ahead, `pf2`: two; `pfx` also the next block's
+//   prepared activations), so a lane has the next block's weight loads in
+//   flight while it computes. The loads read the record's addresses (never the
+//   tail block, never past a row), and the qdot is the record helper's text
+//   (`nmlFC1PrefetchHeader`) on the same 32-bit word the helper reads.
 // None of these touches the lane split, the K order, a term, a rounding point
 // or the cross-lane reduction tree. Every tune kernel carries an unread `dep`
 // input (FP32): production binds the launch's own prepared activation there.
-// The lean rows are candidates like any other: production launches a lean
-// kernel only when the tune adopted (or a FORCE picked) a lean row.
+// The lean and prefetch rows are candidates like any other: production
+// launches one only when the tune adopted (or a FORCE picked) it.
 // `tune` (load time, untimed) still checks every variant bit for bit against
 // the launch production makes today on seeded inputs and routes over the real
 // routed FC1 banks (every case on every MoE layer), drops any mismatch or Metal
@@ -5808,18 +5990,22 @@ extension NemotronU2 {
 // and faster in at least 75% of the cycles). NEMOTRON_FC1_TUNE_BAR sets the median bar (0.97 is the shared one).
 // The pair-dictionary form and the plain form are adopted separately: the
 // plain form only when some bank without a dictionary took part in the check.
-// A lean row that passed is also checked on the lean load check's inputs
+// A lean row (the prefetch rows are lean rows) that passed is also checked on
+// the lean load check's inputs
 // (activations with infinities, NaNs, -0, tiny and large values on routes with
 // experts in three, two and one rows and with all eighteen distinct, experts 0
 // and 127) against the production launch on every bank, and dropped on a miss.
-// NEMOTRON_FC1_TUNE=0 keeps the incumbent; NEMOTRON_FC1_FORCE=<n> adopts
+// NEMOTRON_FC1_TUNE=0 keeps the incumbent; the tune adopts row 25 (`r2n2xlnpf2`) by default; NEMOTRON_FC1_FORCE=<n> adopts
 // variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
-// NEMOTRON_FC1_LEAN_ROWS=0 leaves the lean rows out (the 18 record-text rows).
+// NEMOTRON_FC1_LEAN_ROWS=0 leaves the lean and prefetch rows out (the 18 record-text rows).
 enum NemotronFC1Tune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE"] != "0"
     /// An adopted variant's median is at most this fraction of the incumbent's.
     static let medianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE_BAR"] ?? "") ?? 0.995
-    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "")
+    /// Defaults to 25 (`r2n2xlnpf2`, the prefetch twin of row 20 `r2n2xln` two blocks ahead, adopted wherever it
+    /// qualified); NEMOTRON_FC1_FORCE=20 restores `r2n2xln`, another <n> picks another row, 0 the
+    /// incumbent, an empty value lets the tune's rule decide.
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "25")
     /// Wall time of the timed rounds (graph building included), sized from the warm-up round.
     static let timedMilliseconds = 600.0
 
@@ -5838,13 +6024,21 @@ enum NemotronFC1Tune {
         let unroll: Int
         /// The text through `nmlFC1LeanSource` (base pointers plus 32-bit lane offsets), last in the pipeline.
         var lean = false
+        /// Lean text only: blocks the main K loops load ahead into registers (`nmlFC1PrefetchSource`, after the
+        /// lean transform); 0 none.
+        var pf = 0
+        /// With `pf` 1: the next block's prepared activations are loaded ahead too.
+        var pfx = false
     }
 
-    /// The lean rows (NEMOTRON_FC1_LEAN_ROWS=0 leaves them out).
+    /// The lean and prefetch rows (NEMOTRON_FC1_LEAN_ROWS=0 leaves them out).
     static let leanRows = ProcessInfo.processInfo.environment["NEMOTRON_FC1_LEAN_ROWS"] != "0"
 
     /// The incumbent is r2n1 (two outputs, one SIMD group, slot on z). The lean rows come last (the record rows
-    /// keep their FORCE indices): the incumbent's geometry and the slot-on-x geometries, with the lean text.
+    /// keep their FORCE indices): the incumbent's geometry and the slot-on-x geometries, with the lean text. The
+    /// prefetch rows follow them (the lean rows keep theirs, 19-21): the lean text of `r2n2xln` and `r2n4xln` with
+    /// the next block's code words and pair indices loaded ahead (22 `r2n2xlnpf`, 23 `r2n4xlnpf`), with the next
+    /// block's activations too (24 `r2n2xlnpfx`), and two blocks ahead (25 `r2n2xlnpf2`).
     static let variants: [Variant] = [
         Variant(name: "r2n2", rps: 2, nsg: 2, slotX: false, w32: false, unroll: 0),
         Variant(name: "r2n4", rps: 2, nsg: 4, slotX: false, w32: false, unroll: 0),
@@ -5868,12 +6062,17 @@ enum NemotronFC1Tune {
         Variant(name: "r2n1ln", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 0, lean: true),
         Variant(name: "r2n2xln", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0, lean: true),
         Variant(name: "r2n4xln", rps: 2, nsg: 4, slotX: true, w32: false, unroll: 0, lean: true),
+        Variant(name: "r2n2xlnpf", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0, lean: true, pf: 1),
+        Variant(name: "r2n4xlnpf", rps: 2, nsg: 4, slotX: true, w32: false, unroll: 0, lean: true, pf: 1),
+        Variant(name: "r2n2xlnpfx", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0, lean: true, pf: 1,
+                pfx: true),
+        Variant(name: "r2n2xlnpf2", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0, lean: true, pf: 2),
     ] : [])
 
     /// The same launch geometry and text (name aside).
     static func sameGeometry(_ a: Variant, _ b: Variant) -> Bool {
         a.rps == b.rps && a.nsg == b.nsg && a.slotX == b.slotX && a.w32 == b.w32 && unrollCount(a) == unrollCount(b)
-            && a.lean == b.lean
+            && a.lean == b.lean && a.pf == b.pf && a.pfx == b.pfx
     }
 
     /// The incumbent's geometry through the tune's pipeline (the timing twin of the production launch).
@@ -5899,8 +6098,8 @@ enum NemotronFC1Tune {
 
     /// The incumbent's source pipeline (`NemotronMoELeaderPreparedKernels`:
     /// unroll, then tail-8, prepared pointers and pair dictionary) with the
-    /// variant's slot axis, and for a lean row `nmlFC1LeanSource` last; nil
-    /// when the record text moved.
+    /// variant's slot axis, for a lean row `nmlFC1LeanSource`, and for a
+    /// prefetch row `nmlFC1PrefetchSource` last; nil when the record text moved.
     static func source(_ v: Variant, tail8: Bool, dict: Bool) -> String? {
         var s = nemotronMoETripleGateUpSource.replacingOccurrences(
             of: "x2 += block_size;", with: "x2 += PSTRIDE;")
@@ -5935,6 +6134,10 @@ enum NemotronFC1Tune {
             guard let l = nmlFC1LeanSource(p) else { return nil }
             p = l
         }
+        if v.pf > 0 {
+            guard v.lean, let f = nmlFC1PrefetchSource(p, distance: v.pf, activations: v.pfx) else { return nil }
+            p = f
+        }
         return p
     }
 
@@ -5957,14 +6160,17 @@ enum NemotronFC1Tune {
 
     static func kernel(_ v: Variant, tail8: Bool, dict: Bool) -> MLXFast.MLXFastKernel? {
         let key = "\(v.name)_u\(unrollCount(v))_\(tail8 ? "t8" : "tr")_\(dict ? "sbd" : "bf")" + (v.lean ? "_ln" : "")
+            + (v.pf > 0 ? "_pf\(v.pf)" + (v.pfx ? "x" : "") : "")
         return lock.withLock { () -> MLXFast.MLXFastKernel? in
             if let made = kernels[key] { return made }
             var made: MLXFast.MLXFastKernel? = nil
-            if let body = source(v, tail8: tail8, dict: dict), let header = header(w32: v.w32) {
+            // A prefetch row's register-input qdot twins follow the (unswapped) incumbent header.
+            let twins = v.pf > 0 ? nmlFC1PrefetchHeader.map { "\n" + $0 } : ""
+            if let body = source(v, tail8: tail8, dict: dict), let base = header(w32: v.w32), let twins {
                 made = MLXFast.metalKernel(
                     name: "nemotron_fc1_tune_" + key,
                     inputNames: ["w", "scales", "biases", "prepared", "inds", "dep"],
-                    outputNames: ["y"], source: body, header: header)
+                    outputNames: ["y"], source: body, header: base + twins)
             }
             kernels[key] = made
             return made
@@ -6351,7 +6557,8 @@ enum NemotronFC1Tune {
 // incumbent). Only
 // the verify's dictionary launches read the choice (`preparedLaunch`, `inProjLaunch`), under the production
 // context it was measured in (ReLU2 and unroll state); plain launches, the draft head, the prompt prefill and
-// explicit record calls keep their kernels. NEMOTRON_QMV_TUNE=0 keeps every incumbent;
+// explicit record calls keep their kernels. NEMOTRON_QMV_TUNE=0 keeps every incumbent; by default the tune adopts
+// in_proj row 16, the head's row 13, out_proj's row 16 and the shared up's row 10 (NEMOTRON_QMV_FORCE below);
 // NEMOTRON_QMV_FORCE=<family>:<n>[,<family>:<n>] (families inproj, head, outproj, sharedup) adopts variant n
 // (1-based, `variants`) of that family when it qualified, 0 keeps its incumbent. The shared up runs beside the
 // router in one barrier stage, where a geometry timed alone does not carry over, so its family keeps the incumbent
@@ -6367,7 +6574,10 @@ enum NemotronQMVTune {
     static let sharedUpTuned = ProcessInfo.processInfo.environment["NEMOTRON_QMV_TUNE_SHAREDUP"] == "1"
     static let forced: [Family: Int] = {
         var out: [Family: Int] = [:]
-        for item in (ProcessInfo.processInfo.environment["NEMOTRON_QMV_FORCE"] ?? "").split(separator: ",") {
+        // Default: in_proj row 16 (`r2n2l2ln`), the head row 13 (`r2n16ln`), out_proj row 16 (`r2n2l0ln`) and
+        // shared-up row 10 (`r2n2l1ln`).
+        for item in (ProcessInfo.processInfo.environment["NEMOTRON_QMV_FORCE"] ?? "inproj:16,head:13,outproj:16,sharedup:10")
+            .split(separator: ",") {
             let parts = item.split(separator: ":")
             guard parts.count == 2, let f = Family(rawValue: String(parts[0])), let n = Int(parts[1]) else { continue }
             out[f] = n
@@ -7035,12 +7245,17 @@ enum NemotronQMVTune {
 // least 3% faster by median and faster in at least 75% of the cycles). `tuneDraft` does the same for the
 // draft head's copy at R = 1 (rows at 45% with the special values, 8.75%, 20%, 70% and full; timed at 45%, the
 // draft tail's density). Plain BF16 copies keep the incumbent.
-// NEMOTRON_FC2_TUNE=0 / NEMOTRON_DFC2_TUNE=0 keep the incumbents; NEMOTRON_FC2_FORCE=<n> / NEMOTRON_DFC2_FORCE=<n>
+// The verify tune adopts row 3 (`x16`) by default (NEMOTRON_FC2_TUNE=0 keeps the incumbent); the draft tune is off by
+// default (NEMOTRON_DFC2_TUNE=1 runs it);
+// NEMOTRON_FC2_FORCE=<n> / NEMOTRON_DFC2_FORCE=<n>
 // adopt variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
 enum NemotronFC2Tune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC2_TUNE"] != "0"
-    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC2_FORCE"] ?? "")
-    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] != "0"
+    /// Defaults to 3 (`x16`, adopted wherever it qualified); NEMOTRON_FC2_FORCE=<n> picks another row, 0 the
+    /// incumbent, an empty value lets the tune's rule decide.
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC2_FORCE"] ?? "3")
+    /// Off by default (the draft FC2 slot kernels keep their geometry); NEMOTRON_DFC2_TUNE=1 runs the tune.
+    static let draftEnabled = ProcessInfo.processInfo.environment["NEMOTRON_DFC2_TUNE"] == "1"
     static let draftForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_DFC2_FORCE"] ?? "")
     /// Wall time of one tune's timed rounds (graph building included), sized from the last warm-up round.
     static let timedMilliseconds = 150.0
@@ -7574,13 +7789,13 @@ extension NemotronMoELeader {
 /// Multiplier on the seed tunes' timed cycles (`NemotronTuneAdoption.cycles(seed: true)`, the seed retiles' fixed
 /// counts). NEMOTRON_TUNE_TIMING_SCALE=1 restores the earlier counts.
 let nemotronTuneTimingScale: Double = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_TIMING_SCALE"] ?? "")
-    .map { min(max($0, 0.5), 8) } ?? 2.0
+    .map { min(max($0, 0.5), 8) } ?? 6.0
 /// Multiplier on the seed tunes' soft load caps (seed QMM and seed scan-window tunes). The caps only bound the
 /// untimed load: each variant's first launch JITs its pipeline, so a cap sized on a warm cache can stop a tune before
 /// its later kinds, variants or timing phase start on a fresh ranked load. NEMOTRON_TUNE_BUDGET_SCALE=1 restores the
 /// earlier caps.
 let nemotronTuneBudgetScale: Double = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_BUDGET_SCALE"] ?? "")
-    .map { min(max($0, 0.25), 20) } ?? 3.0
+    .map { min(max($0, 0.25), 20) } ?? 9.0
 /// NEMOTRON_WINDOW_TUNE_RULE=two-tier: the decode-round tunes (FC1, QMV, verify and draft FC2, the draft families and
 /// draft SDPA, verify SDPA, SSM anchor) take the seed rule as well (the two-tier shared bar, both scales). Otherwise
 /// they keep the single-tier rule, unscaled cycles and unscaled load caps.
