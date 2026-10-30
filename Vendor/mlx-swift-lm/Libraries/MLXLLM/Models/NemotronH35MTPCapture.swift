@@ -467,10 +467,17 @@ enum NemotronMTPSSMAnchor {
                         record11 = (a.2, nil)
                     } else {
                         let grown = extend(record11.tape, w, keep)
-                        record11 = grown.steps <= NemotronMTPPendingSSM.strictSteps
-                            ? (record11.anchor, grown) : (replay(grown, record11.anchor), nil)
+                        if grown.steps <= NemotronMTPPendingSSM.strictSteps {
+                            record11 = (record11.anchor, grown)
+                        } else {
+                            record11 = (replay(grown, record11.anchor), nil)
+                        }
                     }
-                    skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, extend(skip.tape, w, keep))
+                    if writes {
+                        skip = (b.2!, extend(nil, w, keep))
+                    } else {
+                        skip = (skip.anchor, extend(skip.tape, w, keep))
+                    }
                     same = same && (skip.tape?.steps ?? 0) <= top
                         && bits(replay(record11.tape, record11.anchor), replay(skip.tape, skip.anchor))
                     cases += 1
@@ -586,7 +593,11 @@ enum NemotronMTPSSMAnchor {
                         guard let r = launch(w, runs[g].anchor, runs[g].tape, writes ? .anchor : .none, g == 1),
                               !writes || r.2 != nil else { failure = "sequence launch unavailable"; break sequence }
                         outputs.append(r)
-                        runs[g] = writes ? (r.2!, extend(nil, w, keep)) : (runs[g].anchor, extend(runs[g].tape, w, keep))
+                        if writes {
+                            runs[g] = (r.2!, extend(nil, w, keep))
+                        } else {
+                            runs[g] = (runs[g].anchor, extend(runs[g].tape, w, keep))
+                        }
                     }
                     cases += 1
                     guard same(outputs[0], outputs[1]), (runs[1].tape?.steps ?? 0) <= top,
@@ -678,11 +689,10 @@ enum NemotronMTPSSMAnchor {
                         return
                     }
                     compared = chain
-                    // A round: both geometries' chains built first, then evaluated back to back in `order`.
+                    // A round: each geometry's chain built and evaluated back to back in `order`.
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { run($0 == 1) }
-                        return chains.map { outs -> Double? in
-                            guard let outs else { return nil }
+                        order.map { idx -> Double? in
+                            guard let outs = run(idx == 1) else { return nil }
                             let begin = DispatchTime.now().uptimeNanoseconds
                             eval(outs)
                             Stream.gpu.synchronize()

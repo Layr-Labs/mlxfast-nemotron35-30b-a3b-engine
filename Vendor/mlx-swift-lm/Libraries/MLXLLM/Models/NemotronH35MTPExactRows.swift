@@ -461,7 +461,7 @@ func nemotronQMVLeanSource(_ source: String?) -> String? {
 /// the Mamba in_proj's dictionary launches (record or 32-bit epilogue, record or unrolled loop), and the rows
 /// `NemotronQMVTune` builds from them. Off by default (the record bodies); NEMOTRON_QMV_LEAN=1 admits the lean bodies.
 enum NemotronQMVLean {
-    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_QMV_LEAN"] == "1"
+    static let requested = ProcessInfo.processInfo.environment["NEMOTRON_QMV_LEAN"] != "0"
     nonisolated(unsafe) private(set) static var verified = false
     static var active: Bool { requested && verified }
 
@@ -6406,6 +6406,82 @@ enum NemotronHeadScreen {
             outputDTypes: [.int32, .float32, .float32, .int32])
     }
 
+    /// Greedy callers use only chunk bests. Retain the original partial task geometry and native B1 body;
+    /// omit its two diagnostic candidate output buffers/stores, never its global partial score dependency.
+    /// Built from the B1 select and from its 32-bit twin (`selectB1Offset32Source`); `runBestOnly` launches the
+    /// one `selectB1` would launch.
+    private static func bestOnlySelectSource(_ source: String?) -> String? {
+        guard var s = source else { return nil }
+        for store in ["      cand_ids[chunk * C + s2] = id;\n", "      cand_vals[chunk * C + s2] = v;\n"] {
+            guard s.components(separatedBy: store).count == 2 else { return nil }
+            s = s.replacingOccurrences(of: store, with: "")
+        }
+        guard !s.contains("cand_ids["), !s.contains("cand_vals[") else { return nil }
+        return s
+    }
+    private static let bestOnlySelectKernel = bestOnlySelectSource(selectB1Source).map {
+        MLXFast.metalKernel(name: "nemotron_head_screen_b1_bests_only",
+            inputNames: ["scores", "w", "scales", "biases", "x"],
+            outputNames: ["best_val", "best_id"], source: $0, header: nemotronMultiRowQMVHeader)
+    }
+    private static let bestOnlySelectOffset32Kernel = bestOnlySelectSource(selectB1Offset32Source).map {
+        MLXFast.metalKernel(name: "nemotron_head_screen_b1_o32_bests_only",
+            inputNames: ["scores", "w", "scales", "biases", "x"],
+            outputNames: ["best_val", "best_id"], source: $0, header: nemotronMultiRowQMVHeader)
+    }
+    static let bestOnlyRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_SCREEN_BESTS_ONLY"] != "0"
+    struct BestOnlyPick {
+        let id: MLXArray, scores: MLXArray, bestValues: MLXArray, bestIds: MLXArray
+    }
+    /// `run`'s ticket-free B1 screen (`b1`, `noTicket`) on a 2-bit record plan without the kept-row outputs: the same
+    /// partial pass (`run`'s kernel choice, template and grid: the paired pass, its 32-bit twin where
+    /// `partialOffset32` applies, the `NemotronDraftTune` geometry when `tunedPartial`), then the select `selectB1`
+    /// launches (its 32-bit twin where that applies) minus its two candidate stores, then `pick`. nil outside the
+    /// served plan or when the needed bests-only select is missing.
+    static func runBestOnly(_ hidden: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray,
+                            records2: MLXArray, groups: MLXArray, groupCount: Int, chunk: Int, keep: Int,
+                            upperGroups: MLXArray?, upperGroupCount: Int, paired: Bool,
+                            rowsPerSimdgroup: Int = 8, simdgroups: Int = 2,
+                            tunedPartial: Bool = false) -> BestOnlyPick? {
+        guard bestOnlyRequested, hidden.shape == [1, 1, width], hidden.dtype == .bfloat16,
+              chunk == 512, keep == 12, selectHalfDecodeForm == 0,
+              groupCount >= 2, groupCount <= 16, groupCount % 2 == 0,
+              upperGroups == nil || (upperGroupCount >= 2 && upperGroupCount <= 16 && upperGroupCount % 2 == 0)
+        else { return nil }
+        let twin = selectOffset32Enabled && selectOffset32Verified && chunk <= 1024
+            && weight.dtype == .uint32 && weight.size * 2 <= Int(UInt32.max) && scales.size <= Int(UInt32.max)
+            && biases.size <= Int(UInt32.max)
+        guard let selector = twin ? bestOnlySelectOffset32Kernel : bestOnlySelectKernel else { return nil }
+        let rows = upperGroups == nil ? Self.rows : headRows
+        let template: [(String, any KernelTemplateArg)] = [
+            ("T", hidden.dtype), ("S", groupCount), ("RPS", rowsPerSimdgroup), ("NSG", simdgroups),
+            ("LO", Self.rows), ("S2", upperGroups == nil ? groupCount : upperGroupCount)]
+        let pairedPass = paired
+            && pairable(groupCount: groupCount, upperGroupCount: upperGroups == nil ? nil : upperGroupCount,
+                        rowsPerSimdgroup: rowsPerSimdgroup)
+        let pairedTwin = pairedPass
+            && partialOffset32(fullHead: upperGroups != nil, records2: records2, offset32: nil)
+        let producer = pairedPass
+            ? (pairedTwin ? record2PairedOffset32Kernel : nil) ?? record2PairedKernel ?? record2PartialKernel
+            : record2PartialKernel
+        let tunedScores: MLXArray? = tunedPartial && paired
+            ? record2Scores(hidden, records2: records2, groups: groups, groupCount: groupCount,
+                            upperGroups: upperGroups, upperGroupCount: upperGroupCount, rps: rowsPerSimdgroup,
+                            nsg: simdgroups, dep: hidden, offset32: nil)
+            : nil
+        let scores = tunedScores ?? producer([records2, hidden, groups, upperGroups ?? groups], template: template,
+            grid: (32, rows / rowsPerSimdgroup, 1), threadGroup: (32, simdgroups, 1),
+            outputShapes: [[rows]], outputDTypes: [.float32])[0]
+        let chunks = rows / chunk
+        let selected = selector([scores, weight, scales, biases, hidden],
+            template: [("T", hidden.dtype), ("CH", chunk), ("C", keep), ("NSG", 8)],
+            grid: (32, 8 * chunks, 1), threadGroup: (32, 8, 1),
+            outputShapes: [[chunks], [chunks]], outputDTypes: [.float32, .int32])
+        return BestOnlyPick(id: pick(values: selected[0], ids: selected[1]), scores: scores,
+                            bestValues: selected[0], bestIds: selected[1])
+    }
+
     /// Load time, right after the plan's ticket-free check (`prepareScreen`): the 32-bit select twin against the B1
     /// select, all four outputs bit for bit (kept ids, kept values as bits, chunk best values as bits, chunk best
     /// ids), on the plan's head arrays, chunk and keep, for each row count the plan screens. Partial scores of ten
@@ -6937,25 +7013,29 @@ enum NemotronDraftTune {
                              packed: packed, vs: inc.vs)
             return (g.description, g)
         }
+        let isForced = forced.all != nil || forced.families[f] != nil
         switch f {
         case .fc1:
-            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 1), v(8, 2), v(4, 2, slotX: true),
-                    v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4)]
+            return isForced
+                ? [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 1), v(8, 2), v(4, 2, slotX: true),
+                   v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4)]
+                : [v(4, 1), v(8, 2), v(4, 2, slotX: true),
+                   v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4)]
         case .screen:
-            return [v(4, 2), v(16, 2), v(8, 1), v(8, 4), v(16, 1), v(32, 1), v(4, 4), v(16, 4)]
+            return isForced
+                ? [v(4, 2), v(16, 2), v(8, 1), v(8, 4), v(16, 1), v(32, 1), v(4, 4), v(16, 4)]
+                : [v(8, 1), v(8, 4), v(16, 1), v(4, 4)]
         case .wo, .up, .down, .eh, .qkv:
-            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2)]
+            return [v(2, 2), v(4, 1), v(4, 2, unroll: 2)]
         case .ehp:
-            return [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2)]
+            return isForced
+                ? [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2)]
+                : [v(2, 1), v(2, 2, unroll: 2), v(2, 2, load: 2)]
         case .sdpa:
             return [v(1, 32, unroll: 8, keys: 2, packed: true), v(1, 32, unroll: 8, keys: 2),
                     v(1, 32, unroll: 8, keys: 1), v(1, 32, unroll: 4, keys: 2), v(1, 32, unroll: 4, keys: 1)]
         case .vqkv:
-            // Outputs per SIMD group x SIMD groups per tile (256 % (rps * nsg) == 0), then the prepared QMV's
-            // main-loop load forms (1 W32, 2 W32 + hoist, 3 + next-block prefetch) and the unroll pragma.
-            return [v(1, 2), v(1, 4), v(2, 1), v(2, 4), v(2, 8), v(4, 1), v(4, 2), v(4, 4), v(8, 1),
-                    v(2, 2, load: 1), v(2, 2, load: 2), v(2, 2, load: 3), v(2, 4, load: 2), v(4, 2, load: 2),
-                    v(1, 4, load: 2), v(2, 2, unroll: 2)]
+            return [v(2, 2, load: 1), v(2, 2, unroll: 2), v(2, 2, unroll: 2, load: 1), v(2, 2, unroll: 2, load: 2)]
         }
     }
 
@@ -7104,9 +7184,8 @@ enum NemotronDraftTune {
                         return previous
                     }
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
@@ -7640,7 +7719,7 @@ extension NemotronDraftTune {
             FileHandle.standardError.write(Data(
                 "nemotron verify qkv tune: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
         }
-        guard enabled, ProcessInfo.processInfo.environment["NEMOTRON_VQKV_TUNE"] == "1" else {
+        guard enabled, ProcessInfo.processInfo.environment["NEMOTRON_VQKV_TUNE"] != "0" else {
             return report("off (setting)")
         }
         guard !NemotronMoELeader.selfTest, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -7686,9 +7765,8 @@ extension NemotronDraftTune {
             return (a, b)
         }
 
-        // Timing copies: every layer's weights, cycled to about 96 MB per pass.
-        let bytes = sets[0].map(\.nbytes).reduce(0, +)
-        let c = max(sets.count, copyCount(bytes))
+        // Timing copies: every layer's weights, cycled 2x across the 6 attention layers.
+        let c = sets.count * 2
         let copies = (0 ..< c).map { j in sets[j % sets.count].map { copy($0) } }
         let timedCaches = (0 ..< c).map { _ in freshCaches() }
         eval(copies.flatMap { $0 } + timedCaches.flatMap { [$0.0, $0.1] })
@@ -7697,7 +7775,7 @@ extension NemotronDraftTune {
         let inputsReady = elapsed()
         let incumbent = Geometry(rps: 2, nsg: 2, unroll: 1, load: 0, vs: NemotronTargetQKV.vstoreVerified)
         let message = run(
-            .vqkv, incumbent: incumbent, cases: cases.count, links: max(16, c),
+            .vqkv, incumbent: incumbent, cases: cases.count, links: max(12, c),
             reference: { i in
                 let cs = cases[i]
                 let a = attentions[cs.layer]
@@ -7721,7 +7799,7 @@ extension NemotronDraftTune {
                 return NemotronTargetQKV.verifyTuneLaunch(
                     g, weights: copies[j % c], packed: packs[0], kCache: t.0, vCache: t.1, position: timedPosition,
                     dep: previous ?? packs[0])?[0]
-            }, elapsed: elapsed, timed: 400)
+            }, elapsed: elapsed, timed: 120)
         report("inputs by \(String(format: "%.2f", inputsReady)) s, " + message)
     }
 }
@@ -8031,10 +8109,18 @@ enum NemotronJoin32 {
                                     out += [r.0, r.1]
                                 }
                             }
+                            if let r = J.runFinalOnly(rows(x, 1), rows(y, 1), shared: rows(s, 1), norm: norm,
+                                                      sharedFirst: false) {
+                                out.append(r)
+                            }
                             for first in [false, true] {
                                 if let r = J.applySum(rows(x, 1), p6, shared: rows(s, 1), norm: norm,
                                                       sharedFirst: first) {
                                     out += [r.0, r.1]
+                                }
+                                if let r = J.runFinalOnly(rows(x, 1), p6, shared: rows(s, 1), norm: norm,
+                                                          sharedFirst: first) {
+                                    out.append(r)
                                 }
                             }
                             return out
@@ -8260,10 +8346,18 @@ enum NemotronJoinEps {
                                     out += [r.0, r.1]
                                 }
                             }
+                            if let r = J.runFinalOnly(rows(x, 1), rows(y, 1), shared: rows(s, 1), norm: norm,
+                                                      sharedFirst: false) {
+                                out.append(r)
+                            }
                             for first in [false, true] {
                                 if let r = J.applySum(rows(x, 1), p6, shared: rows(s, 1), norm: norm,
                                                       sharedFirst: first) {
                                     out += [r.0, r.1]
+                                }
+                                if let r = J.runFinalOnly(rows(x, 1), p6, shared: rows(s, 1), norm: norm,
+                                                          sharedFirst: first) {
+                                    out.append(r)
                                 }
                             }
                             return out
@@ -8294,5 +8388,111 @@ enum NemotronJoinEps {
         let values = patterns.sorted().map { "\(Float(bitPattern: UInt32($0)))" }.joined(separator: ", ")
         report("on (\(launched) of \(registered) join kernels with eps \(values) as template bits: \(cases) outputs over"
             + " \(norms.count) norms x 2 row sets bitwise equal to the record launches)")
+    }
+}
+
+extension NemotronHResidualRMSNorm {
+    private static func finalOnlySource(products: Bool) -> String? {
+        var s = oneBarrierSource(products ? withProductsReduce(sumSource()) : sumSource())
+        let stores = ["residual[offset + i] = sum;", "residual[offset + i] = static_cast<T>(thread_x[i]);"]
+        guard stores.reduce(0, { $0 + s.components(separatedBy: $1).count - 1 }) == 1 else { return nil }
+        for store in stores { s = s.replacingOccurrences(of: store, with: "") }
+        guard !s.contains("residual[") else { return nil }
+        return s
+    }
+    private static let finalDenseOnlyKernel = finalOnlySource(products: false).map {
+        nmjKernel(name: name("nemotron_draft_final_sum_only"),
+            inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+            outputNames: ["normalized"], source: $0)
+    }
+    private static let finalProductsOnlyKernel = finalOnlySource(products: true).map {
+        nmjKernel(name: name("nemotron_draft_final_products_only"),
+            inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
+            outputNames: ["normalized"], source: $0)
+    }
+    private static let finalProductsSharedFirstOnlyKernel = finalOnlySource(products: true).map {
+        nmjKernel(name: name("nemotron_draft_final_products_sf_only"),
+            inputNames: ["lhs", "shared", "rhs", "weight", "axis_size", "eps"],
+            outputNames: ["normalized"], source: $0)
+    }
+    static let draftFinalOnlyRequested =
+        ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_FINAL_ONLY"] != "0"
+    nonisolated(unsafe) private static var draftFinalOnlyQualified = false
+
+    static func runFinalOnly(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray,
+                             norm: RMSNorm, sharedFirst: Bool) -> MLXArray? {
+        let products = rhs.shape == [6 * 2688] && rhs.dtype == .float32
+        guard Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              lhs.shape == [1, 1, 2688], lhs.dtype == .bfloat16,
+              shared.shape == lhs.shape, shared.dtype == .bfloat16,
+              products || (rhs.shape == lhs.shape && rhs.dtype == .bfloat16),
+              type(of: norm) == RMSNorm.self, norm.weight.shape == [2688], norm.weight.dtype == .bfloat16,
+              let kernel = products ? (sharedFirst ? finalProductsSharedFirstOnlyKernel : finalProductsOnlyKernel)
+                                    : finalDenseOnlyKernel else { return nil }
+        let (axis, eps) = scalars(norm.eps)
+        let inputs: [MLXArray] = products && sharedFirst
+            ? [lhs, shared, rhs, norm.weight, axis, eps] : [lhs, rhs, shared, norm.weight, axis, eps]
+        return nmj32(kernel, 1)(inputs, template: [("T", DType.bfloat16)],
+            grid: (672, 1, 1), threadGroup: (672, 1, 1),
+            outputShapes: [lhs.shape], outputDTypes: [.bfloat16])[0]
+    }
+
+    static func admitDraftFinalOnly(_ qualified: Bool) { draftFinalOnlyQualified = qualified }
+
+    static func finalSumNormalized(_ lhs: MLXArray, _ rhs: MLXArray, shared: MLXArray,
+                                   norm: RMSNorm, sharedFirst: Bool = false) -> MLXArray? {
+        if draftFinalOnlyQualified, !NemotronMoELeader.selfTest,
+           let output = runFinalOnly(lhs, rhs, shared: shared, norm: norm, sharedFirst: sharedFirst) {
+            return output
+        }
+        return applySum(lhs, rhs, shared: shared, norm: norm, sharedFirst: sharedFirst)?.1
+    }
+
+    static func qualifyDraftFinalOnly(_ head: Module) {
+        admitDraftFinalOnly(false)
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron draft final only: \(text)\n".utf8))
+        }
+        guard draftFinalOnlyRequested, !NemotronMoELeader.selfTest,
+              let block = head.modules().compactMap({ $0 as? NemotronH35MTPExpertBlock }).first else {
+            return report("off (setting or no eligible final norm)")
+        }
+        var cases = 0
+        do {
+            let equal = try withError { () -> Bool in
+                var comparisons: [MLXArray] = []
+                for i in 0 ..< 12 {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xfda0 + i)), into: 3)
+                    var lhs = (MLXRandom.normal([1, 1, 2688], key: keys[0]) * Float(1 + i % 3)).asType(.bfloat16)
+                    var shared = MLXRandom.normal([1, 1, 2688], scale: 0.1, key: keys[1]).asType(.bfloat16)
+                    var products = MLXRandom.normal([6 * 2688], scale: 0.05, key: keys[2])
+                    if i == 6 { lhs = MLXArray.zeros(lhs.shape, dtype: .bfloat16); products = MLXArray.zeros(products.shape) }
+                    if i == 7 { shared = MLXArray([Float](repeating: -0.0, count: 2688)).asType(.bfloat16).reshaped(1, 1, 2688) }
+                    if i == 8 {
+                        let padded = concatenated([MLXArray.zeros([1], dtype: .bfloat16), lhs.reshaped(2688)], axis: 0)
+                        lhs = padded[1 ..< 2689].reshaped(1, 1, 2688)
+                    }
+                    if i >= 9 {
+                        var special = [Float](repeating: 0, count: 6 * 2688)
+                        special[223 * i] = i == 9 ? Float.infinity : (i == 10 ? -Float.infinity : Float.nan)
+                        products = MLXArray(special)
+                    }
+                    let dense = NemotronZSkip.reduceProducts(products, rows: 1)
+                    for (rhs, first) in [(dense, false), (products, false), (products, true)] {
+                        guard let old = applySum(lhs, rhs, shared: shared, norm: block.finalNorm, sharedFirst: first),
+                              let new = runFinalOnly(lhs, rhs, shared: shared, norm: block.finalNorm, sharedFirst: first)
+                        else { return false }
+                        comparisons.append((old.1.view(dtype: .uint16) .== new.view(dtype: .uint16)).all())
+                        cases += 1
+                    }
+                }
+                eval(comparisons)
+                return !comparisons.isEmpty && comparisons.allSatisfy { $0.item(Bool.self) }
+            }
+            admitDraftFinalOnly(equal)
+            report(equal ? "on (\(cases) normalized outputs bitwise equal; dead residual omitted)" : "off (differs)")
+        } catch {
+            report("off (\(error))")
+        }
     }
 }

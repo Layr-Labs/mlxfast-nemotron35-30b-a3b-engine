@@ -877,6 +877,15 @@ final class NemotronH35MTPAttentionBlock: Module {
             front[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV))
     }
 
+    func pagedForwardParts(
+        hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands,
+        cache: any CBv2AttendingLayerCache
+    ) -> (residual: MLXArray, attention: MLXArray)? {
+        guard let front = draftFrontCache(hidden: hidden, operands: operands, owner: self) else { return nil }
+        return (front[0], mixer.cbv2Forward(
+            front[1], cache: cache, targetQKV: NemotronMTPDraftTail.fusedQKV))
+    }
+
     /// The part of `pagedForwardParts` that reads no cache: the fused
     /// residual, its norm and that norm's Q/K/V, as [residual, norm, q, k, v].
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
@@ -1157,6 +1166,21 @@ final class NemotronH35MTPAttentionBlock: Module {
         hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
     ) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
+        let batch = x.dim(0), length = x.dim(1)
+        let keys = mixer.wk(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        let values = mixer.wv(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        return cache.appendTrusted(keys: keys, values: values)
+    }
+
+    func appendTrustedKV(
+        hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, cache: PagedLayerCache
+    ) -> [MLXArray]? {
+        guard let joined = NemotronMTPFrontNorms.apply(
+            operands: operands, hidden: hidden, enorm: embeddingNorm, hnorm: hiddenNorm)
+        else { return nil }
+        let x = norm(nemotronR1Linear(joined, projection))
         let batch = x.dim(0), length = x.dim(1)
         let keys = mixer.wk(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
             .transposed(0, 2, 1, 3)
@@ -1451,9 +1475,9 @@ final class NemotronH35MTPExpertBlock: Module {
                    draftDep: sx, activation: { fc1 = $0 }),
                routed.shape == [6 * 2688], let fc1,
                let shared = sharedExperts.draftDown(sx, dep: fc1),
-               let joined = NemotronHResidualRMSNorm.applySum(
+               let joined = NemotronHResidualRMSNorm.finalSumNormalized(
                    x, routed, shared: shared, norm: finalNorm, sharedFirst: true) {
-                return joined.1
+                return joined
             }
         }
         // The shared rows are a dependency of the routed slot products (NEMOTRON_MTP_DRAFT_SD_EARLY=0: not).
@@ -1463,8 +1487,8 @@ final class NemotronH35MTPExpertBlock: Module {
                 h, indices, scores, mixer.switchMLP, products: true, after: early)
         else { return finalNorm(x + mixer(h)) }
         let shared = early ?? sharedExperts(h)
-        if let joined = NemotronHResidualRMSNorm.applySum(x, routed, shared: shared, norm: finalNorm) {
-            return joined.1
+        if let joined = NemotronHResidualRMSNorm.finalSumNormalized(x, routed, shared: shared, norm: finalNorm) {
+            return joined
         }
         return finalNorm(x + (routed + shared))
     }
@@ -1575,6 +1599,15 @@ final class NemotronH35MTPModule: Module {
         return (layers[1] as! NemotronH35MTPExpertBlock)(
             residual: parts.residual, attention: parts.attention)
     }
+    func pagedForward(
+        hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands,
+        cache: any CBv2AttendingLayerCache
+    ) -> MLXArray? {
+        guard let parts = (layers[0] as! NemotronH35MTPAttentionBlock).pagedForwardParts(
+            hidden: hidden, operands: operands, cache: cache) else { return nil }
+        return (layers[1] as! NemotronH35MTPExpertBlock)(
+            residual: parts.residual, attention: parts.attention)
+    }
     func pagedDraftInputs(hidden: MLXArray, embedding: MLXArray) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).pagedDraftInputs(
             hidden: hidden, embedding: embedding)
@@ -1655,6 +1688,12 @@ final class NemotronH35MTPModule: Module {
     ) -> [MLXArray] {
         (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
             hidden: hidden, embedding: embedding, cache: cache)
+    }
+    func appendTrustedKV(
+        hidden: MLXArray, operands: NemotronHEmbeddingRows.Operands, cache: PagedLayerCache
+    ) -> [MLXArray]? {
+        (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
+            hidden: hidden, operands: operands, cache: cache)
     }
     /// Keep the promoted full-width attention/KV arithmetic and its overlap.
     func pagedAttentionRows(
