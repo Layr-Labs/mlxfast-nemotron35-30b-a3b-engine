@@ -585,6 +585,26 @@ public enum CBv2MTPTopTwoKeys {
     nonisolated(unsafe) static var verified = false
 }
 
+/// CBV2_MTP_TOP2_COLUMNS_ENTRY=0 keeps the key finalize's column form reading the two draft ids at the packet store.
+/// Otherwise its twin (`cbv2PacketColumnsEntrySource`) reads `w1[0]` and `w2[0]` into registers as its first
+/// statements and the store takes them from there; used only after `cbv2TopTwoColumnsEntryQualify` found the twin
+/// bitwise equal to the column form.
+public enum CBv2MTPTopTwoColumnsEntry {
+    public static let enabled = ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_COLUMNS_ENTRY"] != "0"
+    nonisolated(unsafe) static var verified = false
+}
+
+/// The column form's text (`cbv2PacketColumnsSource`) with the two draft ids read first: `const int cbe_w1 = w1[0];`
+/// and `const int cbe_w2 = w2[0];` ahead of the record's first statement, and the packet store's
+/// `row == 1 ? w1[0] : w2[0]` reading `cbe_w1` / `cbe_w2` (the same values); every other statement is the column
+/// form's. nil when the store is not found exactly once.
+private func cbv2PacketColumnsEntrySource(_ s: String) -> String? {
+    let read = "row == 1 ? w1[0] : w2[0]"
+    guard s.components(separatedBy: read).count == 2 else { return nil }
+    return "        const int cbe_w1 = w1[0];\n        const int cbe_w2 = w2[0];\n"
+        + s.replacingOccurrences(of: read, with: "row == 1 ? cbe_w1 : cbe_w2")
+}
+
 private let cbv2TopTwoKeysHeader = cbv2TopTwoHeader + """
 
     inline ulong darkbloom_qwen35_mtp_top2_key(bfloat16_t x, uint id) {
@@ -727,6 +747,17 @@ private let cbv2TopTwoKeysFinalizeKernels: (window: MLXFast.MLXFastKernel, colum
             source: cbv2PacketColumnsSource($0), header: cbv2TopTwoKeysHeader, ensureRowContiguous: true))
     }
 
+/// The key finalize's column form with the draft ids read first (`CBv2MTPTopTwoColumnsEntry`); nil if a text moved.
+private let cbv2TopTwoKeysColumnsEntryKernel: MLXFast.MLXFastKernel? =
+    cbv2TopTwoKeysFinalizeSource(cbv2TopTwoFinalizePacketShuffleSource)
+        .flatMap { cbv2PacketColumnsEntrySource(cbv2PacketColumnsSource($0)) }.map {
+            MLXFast.metalKernel(
+                name: "darkbloom_qwen35_mtp_top2_finalize_packet_keys_cols_e",
+                inputNames: ["partial_keys", "w1", "w2"],
+                outputNames: ["top_ids", "top_values", "packet"],
+                source: $0, header: cbv2TopTwoKeysHeader, ensureRowContiguous: true)
+        }
+
 /// The packet finalize of either form on the partials, reading the draft ids from `draftColumns` ([1] int32
 /// each, window columns 1 and 2) or from `window`.
 private func cbv2TopTwoPacketFinalize(
@@ -765,7 +796,7 @@ package func cbv2TopTwoRowsPacket(
 /// int32 each; batch 1, width 3) when given, else from `window`.
 private func cbv2TopTwoRowsPacket(
     _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, shuffle: Bool?, offset32: Bool? = nil,
-    keys: Bool? = nil
+    keys: Bool? = nil, columnsEntry: Bool? = nil
 ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
     guard CBv2MTPTopTwoPacket.enabled,
         logits.ndim == 3, logits.dim(0) == 1, logits.dim(2) >= 2,
@@ -784,7 +815,8 @@ private func cbv2TopTwoRowsPacket(
             outputShapes: [[rows, 32, 2]],
             outputDTypes: [.uint64])[0]
         let columns = window.shape == [1, 3] ? draftColumns : nil
-        let outputs = (columns == nil ? finalize.window : finalize.columns)(
+        let entry = (columnsEntry ?? CBv2MTPTopTwoColumnsEntry.verified) ? cbv2TopTwoKeysColumnsEntryKernel : nil
+        let outputs = (columns == nil ? finalize.window : entry ?? finalize.columns)(
             columns.map { [partial, $0[0], $0[1]] } ?? [partial, window],
             grid: (rows * 32, 1, 1),
             threadGroup: (32, 1, 1),
@@ -1130,6 +1162,73 @@ package func cbv2TopTwoKeysQualify(logitsDType: DType, vocabulary: Int) {
     report(CBv2MTPTopTwoKeys.verified
         ? "on (\(cases) cases bitwise equal to the record partial and finalize)"
         : "off (differs from the record partial and finalize after \(cases) cases)")
+}
+
+/// Load time, after `cbv2TopTwoKeysQualify` admitted the key finalize: the column form with the draft ids read first
+/// against the column form, at width 3 over the full vocabulary and a short one, bit for bit in the ids, the values
+/// (as bits) and the packet. Logits: Gaussian, exact ties, NaNs, infinities, signed zeros, constant rows and random
+/// BF16 bit patterns; draft columns of seeded ids, the int32 extremes, zero and negative values. Engages only if every
+/// case matches (`CBv2MTPTopTwoColumnsEntry`).
+package func cbv2TopTwoColumnsEntryQualify(logitsDType: DType, vocabulary: Int) {
+    CBv2MTPTopTwoColumnsEntry.verified = false
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 mtp top2 columns entry: \(message)\n".utf8))
+    }
+    guard CBv2MTPTopTwoColumnsEntry.enabled else { return report("off (setting)") }
+    guard CBv2MTPTopTwoKeys.verified, logitsDType == .bfloat16, cbv2TopTwoKeysColumnsEntryKernel != nil else {
+        return report("off (key finalize off or its text moved)")
+    }
+    var cases = 0
+    do {
+        let matches = try withError { () -> Bool in
+            var ok = MLXArray(true)
+            let extremes: [(Int32, Int32)] = [(Int32.max, Int32.min), (0, -1), (-7, 123_456), (Int32.min, Int32.max)]
+            for vocab in [vocabulary, 5003] {
+                for kind in 0 ..< 8 {
+                    let seed = UInt64(0x7a99_0000 + vocab * 16 + kind)
+                    var logits = MLXRandom.normal([1, 3, vocab], key: MLXRandom.key(seed)) * 3
+                    switch kind {
+                    case 1: logits = round(logits)
+                    case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)), MLXArray(Float.nan), logits)
+                    case 3:
+                        logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                            which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                    case 4: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(Float(-0.0)), round(logits))
+                    case 5: logits = MLXArray.zeros([1, 3, vocab]) + MLXArray(Float(0.5))
+                    default: break
+                    }
+                    var typed = logits.asType(.bfloat16)
+                    if kind == 6 {
+                        typed = MLXRandom.randInt(0 ..< 65536, [1, 3, vocab], key: MLXRandom.key(seed + 1))
+                            .asType(.uint16).view(dtype: .bfloat16)
+                    }
+                    var ids = MLXRandom.randInt(0 ..< Int32(vocab), [1, 3], key: MLXRandom.key(seed + 2))
+                        .asType(.int32)
+                    if kind == 7 {
+                        let e = extremes[vocab % extremes.count]
+                        ids = MLXArray([Int32(1), e.0, e.1]).reshaped(1, 3)
+                    }
+                    let columns = [ids[0..., 1].reshaped(1), ids[0..., 2].reshaped(1)]
+                    guard let a = cbv2TopTwoRowsPacket(
+                            typed, window: ids, draftColumns: columns, shuffle: nil, keys: true, columnsEntry: false),
+                          let b = cbv2TopTwoRowsPacket(
+                            typed, window: ids, draftColumns: columns, shuffle: nil, keys: true, columnsEntry: true)
+                    else { return false }
+                    ok = ok .&& (a.ids .== b.ids).all()
+                        .&& (a.values.view(dtype: .uint32) .== b.values.view(dtype: .uint32)).all()
+                        .&& (a.packet .== b.packet).all()
+                    cases += 1
+                }
+            }
+            return ok.item(Bool.self)
+        }
+        CBv2MTPTopTwoColumnsEntry.verified = matches && cases > 0
+    } catch {
+        return report("off (\(error))")
+    }
+    report(CBv2MTPTopTwoColumnsEntry.verified
+        ? "on (\(cases) cases bitwise equal to the column form: ids, values and packet)"
+        : "off (differs from the column form)")
 }
 
 /// Load-time JIT of the packet finalize (its pipeline depends only on the
