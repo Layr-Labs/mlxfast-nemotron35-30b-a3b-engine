@@ -7574,13 +7574,13 @@ extension NemotronMoELeader {
 /// Multiplier on the seed tunes' timed cycles (`NemotronTuneAdoption.cycles(seed: true)`, the seed retiles' fixed
 /// counts). NEMOTRON_TUNE_TIMING_SCALE=1 restores the earlier counts.
 let nemotronTuneTimingScale: Double = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_TIMING_SCALE"] ?? "")
-    .map { min(max($0, 0.5), 8) } ?? 2.0
+    .map { min(max($0, 0.5), 8) } ?? 6.0
 /// Multiplier on the seed tunes' soft load caps (seed QMM and seed scan-window tunes). The caps only bound the
 /// untimed load: each variant's first launch JITs its pipeline, so a cap sized on a warm cache can stop a tune before
 /// its later kinds, variants or timing phase start on a fresh ranked load. NEMOTRON_TUNE_BUDGET_SCALE=1 restores the
 /// earlier caps.
 let nemotronTuneBudgetScale: Double = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_BUDGET_SCALE"] ?? "")
-    .map { min(max($0, 0.25), 20) } ?? 3.0
+    .map { min(max($0, 0.25), 20) } ?? 9.0
 /// NEMOTRON_WINDOW_TUNE_RULE=two-tier: the decode-round tunes (FC1, QMV, verify and draft FC2, the draft families and
 /// draft SDPA, verify SDPA, SSM anchor) take the seed rule as well (the two-tier shared bar, both scales). Otherwise
 /// they keep the single-tier rule, unscaled cycles and unscaled load caps.
