@@ -3310,10 +3310,24 @@ METAL_FUNC void nemotron_seed_dense_impl(
 /// NEMOTRON_SEED_DENSE_RETILE_X2=0 leaves `moreVariants` out; NEMOTRON_SEED_DENSE_RING=0 leaves `ringVariants`
 /// out;
 /// NEMOTRON_SEED_DENSE_RETILE_FORCE=<variant> adopts that variant wherever it
-/// qualifies.
+/// qualifies; NEMOTRON_SEED_PIN fixes a row per kind (`pins`).
 enum NemotronSeedDenseRetile {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE"] != "0"
     static let forced = ProcessInfo.processInfo.environment["NEMOTRON_SEED_DENSE_RETILE_FORCE"]
+    /// NEMOTRON_SEED_PIN: a fixed row per kind for this tune, as "kind:name" pairs separated by commas. A pinned row
+    /// is adopted for its kind only where it passed this tune's bit-for-bit qualification; elsewhere the tune's own
+    /// rule decides. NEMOTRON_SEED_DENSE_RETILE_FORCE takes precedence. Default: in_proj on the 64 x 64 x 128
+    /// prefetch row. NEMOTRON_SEED_PIN= (empty) leaves every kind to the rule.
+    static let pins = pinTable("NEMOTRON_SEED_PIN", default: "in_proj:64x64x128w22pf")
+    /// "kind:name,kind:name" from the environment variable `key` (or `default` when it is unset).
+    static func pinTable(_ key: String, default spec: String) -> [String: String] {
+        var out: [String: String] = [:]
+        for item in (ProcessInfo.processInfo.environment[key] ?? spec).split(separator: ",") {
+            let pair = item.split(separator: ":", maxSplits: 1)
+            if pair.count == 2 { out[String(pair[0])] = String(pair[1]) }
+        }
+        return out
+    }
 
     struct Variant: Sendable, Equatable {
         let name: String
@@ -3690,7 +3704,11 @@ enum NemotronSeedDenseRetile {
                 if let v { return launch(v, source: .dict, x: xs[0], linear: all[layer], relu2: relu2, dep: dep) }
                 return NemotronPrefillDenseDict.launch(xs[0], all[layer], relu2: relu2, dep: dep)
             } : nil)
-            if let pick = o.choice { choice[kind] = pick }
+            if forced == nil, let p = pins[kind], let f = o.alive.first(where: { $0.name == p }) {
+                choice[kind] = f
+            } else if let pick = o.choice {
+                choice[kind] = pick
+            }
             note(kind, o)
         }
         let downs = target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj }
@@ -3786,6 +3804,10 @@ extension NemotronHMLP {
 enum NemotronSeedQMMTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_TUNE"] != "0"
     static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_FORCE"] ?? "")
+    /// NEMOTRON_SEED_QMM_PIN: a fixed row per kind for this tune (same "kind:name" form and names as
+    /// `NemotronSeedDenseRetile.pins`), adopted only where it qualified; NEMOTRON_SEED_QMM_FORCE takes precedence.
+    /// Default: up_proj on the incumbent geometry's lean row. NEMOTRON_SEED_QMM_PIN= (empty) leaves every kind to the rule.
+    static let pins = NemotronSeedDenseRetile.pinTable("NEMOTRON_SEED_QMM_PIN", default: "up_proj:64x64x64w22ln")
     /// Launches per timing sample: the kind's first layers in model order.
     static let chainLength = 12
 
@@ -4069,6 +4091,9 @@ enum NemotronSeedQMMTune {
             } else {
                 why = f == 0 ? "forced stock" : "forced \(f) not qualified, kept"
             }
+        } else if let p = pins[kind.name], let v = alive.first(where: { $0.name == p }) {
+            picked = v
+            why = "pinned"
         } else if !medians.isEmpty, let best = verdict?.adopted {
             picked = candidates[best]
             why = "adopted"
