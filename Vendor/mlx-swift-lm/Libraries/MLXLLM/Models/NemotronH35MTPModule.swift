@@ -3093,3 +3093,143 @@ extension NemotronMTPDraftSDPA {
             : "off (differs after \(checked) cases)")
     }
 }
+
+// Stateless compiled attention epilogue only. Request KV/cache updates and SDPA
+// remain in the original caller; no request, offset, row or cache is captured.
+final class NemotronMTPAttentionProjectionJoinCache {
+    static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_ATTN_EPILOGUE_GRAPH"] != "0"
+    private struct Entry {
+        let identity: [ObjectIdentifier]
+        let function: @Sendable ([MLXArray]) -> [MLXArray]
+    }
+    private let lock = NSLock()
+    private var entry: Entry?
+    private var qualified: [ObjectIdentifier]?
+
+    private func identity(_ wo: Linear, _ norm: RMSNorm) -> [ObjectIdentifier] {
+        [ObjectIdentifier(wo), ObjectIdentifier(norm), ObjectIdentifier(norm.weight)]
+    }
+    private func supports(_ wo: Linear, _ norm: RMSNorm) -> Bool {
+        guard Self.enabled, !NemotronMoELeader.selfTest,
+              Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
+              NemotronMTPAttentionDirect.enabled, NemotronMultiRowQMV.enabled,
+              NemotronMultiRowQMV.narrowEnabled, NemotronMTPExecution.batchedM1,
+              NemotronHResidualRMSNorm.plumbingAvailable,
+              type(of: wo) == QuantizedLinear.self, let q = wo as? QuantizedLinear,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64,
+              q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
+              q.scales.dtype == .bfloat16, q.biases?.dtype == .bfloat16,
+              type(of: norm) == RMSNorm.self,
+              norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
+        else { return false }
+        return true
+    }
+    func isReady(wo: Linear, norm: RMSNorm) -> Bool {
+        supports(wo, norm) && lock.withLock { qualified == identity(wo, norm) }
+    }
+    private static func eager(_ packed: MLXArray, residual: MLXArray,
+                              q: QuantizedLinear, norm: RMSNorm) -> [MLXArray] {
+        var output = NemotronHeadPreparedActivation.projectPrepared(packed, q).reshaped(1, 3, 2688)
+        if let bias = q.bias { output = output + bias }
+        guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
+            residual, output, shared: nil, norm: norm) else {
+            preconditionFailure("Qualified attention epilogue join became ineligible")
+        }
+        return [joined.0, joined.1, joined.2]
+    }
+    private func outputs(_ packed: MLXArray, residual: MLXArray,
+                         q: QuantizedLinear, norm: RMSNorm) -> [MLXArray] {
+        let ids = identity(q, norm)
+        var retired: Entry?
+        let current = lock.withLock { () -> Entry in
+            if let entry, entry.identity == ids { return entry }
+            let state = q.innerState() + [norm.weight]
+            let function: @Sendable ([MLXArray]) -> [MLXArray] = compile(inputs: [state]) { arrays in
+                Self.eager(arrays[0], residual: arrays[1], q: q, norm: norm)
+            }
+            let replacement = Entry(identity: ids, function: function)
+            retired = entry
+            entry = replacement
+            return replacement
+        }
+        return withExtendedLifetime(retired) { current.function([packed, residual]) }
+    }
+    func run(_ packed: MLXArray, residual: MLXArray,
+             wo: Linear, norm: RMSNorm) -> (MLXArray, MLXArray, MLXArray)? {
+        guard isReady(wo: wo, norm: norm), let q = wo as? QuantizedLinear,
+              packed.shape == [3, 8, 544], packed.dtype == .float32,
+              packed.strides == [4352, 544, 1],
+              residual.shape == [1, 3, 2688], residual.dtype == .bfloat16,
+              residual.strides == [8064, 2688, 1] else { return nil }
+        let values = outputs(packed, residual: residual, q: q, norm: norm)
+        precondition(values.count == 3)
+        return (values[0], values[1], values[2])
+    }
+    // Load only: real o_proj and the actual following layer's norm; all
+    // compiled shapes/strides are warmed here, before any request is served.
+    func qualify(wo: Linear, norm: RMSNorm, layerIndex: Int) {
+        lock.withLock { qualified = nil }
+        guard supports(wo, norm), let q = wo as? QuantizedLinear else { return }
+        var cases = 0
+        func same(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
+            guard a.count == 3, b.count == 3,
+                  a[0].shape == [1, 3, 2688], a[1].shape == [1, 3, 2688],
+                  a[2].shape == [3, 11, 288],
+                  a[0].dtype == .bfloat16, a[1].dtype == .bfloat16, a[2].dtype == .float32,
+                  b[0].shape == a[0].shape, b[1].shape == a[1].shape, b[2].shape == a[2].shape,
+                  b[0].dtype == a[0].dtype, b[1].dtype == a[1].dtype, b[2].dtype == a[2].dtype
+            else { return false }
+            let ap = a[2].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+            let bp = b[2].reshaped([3, 11, 9, 32]).view(dtype: .uint32)
+            let live = (ap[0..., 0..<10, 0..., 0...] .== bp[0..., 0..<10, 0..., 0...]).all()
+                .&& (ap[0..., 10, 0..., 0..<16] .== bp[0..., 10, 0..., 0..<16]).all()
+            return ((a[0].view(dtype: .uint16) .== b[0].view(dtype: .uint16)).all()
+                .&& (a[1].view(dtype: .uint16) .== b[1].view(dtype: .uint16)).all()
+                .&& live).item(Bool.self)
+        }
+        do {
+            let passed = try withError { () -> Bool in
+                for seed in 0..<8 {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0xa770 + 16 * layerIndex + seed)), into: 2)
+                    var data = MLXRandom.normal([3, 4096], key: keys[0]) * Float(seed < 4 ? 1 : 4)
+                    var lhs = MLXRandom.normal([1, 3, 2688], key: keys[1]) * Float(seed < 4 ? 1 : 4)
+                    if seed == 1 { data = MLXArray.zeros([3, 4096]); lhs = MLXArray.zeros([1, 3, 2688]) }
+                    if seed == 2 { data = data * 0.000001; lhs = lhs * 0.000001 }
+                    if seed == 3 { data = data * 1000; lhs = lhs * 1000 }
+                    if seed >= 4 {
+                        let special: [UInt16] = [0x8000, 0x7f80, 0x7fc0, 0x0001]
+                        let value = MLXArray([special[seed - 4]]).view(dtype: .bfloat16).asType(.float32)
+                        data = which(MLXArray(Array(0..<4096)).reshaped(1, 4096) .== 7,
+                                     value, data)
+                    }
+                    let x = data.asType(.bfloat16)
+                    let rows = (0..<3).map { x[$0 ..< ($0 + 1)].reshaped(1, 32, 1, 128) }
+                    let packed = NemotronHeadPreparedActivation.packRows(rows, k: 4096)
+                    let residual = lhs.asType(.bfloat16)
+                    guard packed.strides == [4352, 544, 1], residual.strides == [8064, 2688, 1],
+                          let direct = NemotronMultiRowQMVRowInputs.apply(rows, q, prepared: packed)
+                    else { return false }
+                    var projected = direct.reshaped(1, 3, 2688)
+                    if let bias = q.bias { projected = projected + bias }
+                    guard let joined = NemotronHResidualRMSNorm.applyPreparedRows(
+                        residual, projected, shared: nil, norm: norm) else { return false }
+                    let expected = [joined.0, joined.1, joined.2]
+                    let first = outputs(packed, residual: residual, q: q, norm: norm)
+                    if !same(first, expected) { return false }
+                    // Reuse the same function with fresh array values, then
+                    // return to the first values; no request data is retained.
+                    let packed2 = NemotronHeadPreparedActivation.packRows(rows.map { $0 * MLXArray(0.5).asType(.bfloat16) }, k: 4096)
+                    let expected2 = Self.eager(packed2, residual: residual, q: q, norm: norm)
+                    if !same(outputs(packed2, residual: residual, q: q, norm: norm), expected2)
+                        || !same(outputs(packed, residual: residual, q: q, norm: norm), expected) { return false }
+                    cases += 3
+                }
+                return true
+            }
+            if passed { lock.withLock { qualified = identity(wo, norm) } }
+            FileHandle.standardError.write(Data("nemotron attention epilogue graph: layer \(layerIndex) \(passed ? "on" : "off") (\(cases) checks)\n".utf8))
+        } catch {
+            FileHandle.standardError.write(Data("nemotron attention epilogue graph: layer \(layerIndex) off (\(error))\n".utf8))
+        }
+    }
+}
