@@ -210,13 +210,13 @@ enum NemotronHResidualRMSNorm {
             const float nrm_inv_mean = metal::precise::rsqrt(acc / axis_size + eps);
             """).replacingOccurrences(of: "local_inv_mean[0]", with: "nrm_inv_mean")
     }
-    private static func name(_ base: String) -> String { oneBarrier ? base + "_1b" : base }
+    static func name(_ base: String) -> String { oneBarrier ? base + "_1b" : base }
 
-    private static let kernel = MLXFast.metalKernel(
+    private static let kernel = nmjKernel(
         name: name("nemotron_h_residual_rms_bf16"),
         inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
-        source: oneBarrierSource(source), ensureRowContiguous: true)
+        source: oneBarrierSource(source))
 
     static let preparedMoEEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_MTP_RMS_PREPARED_MOE"] != "0"
@@ -291,11 +291,11 @@ enum NemotronHResidualRMSNorm {
     }
     /// NEMOTRON_MTP_JOIN_SHUFFLE=0 keeps the threadgroup copy and barrier ahead of the prepared epilogue.
     static let joinShuffle = ProcessInfo.processInfo.environment["NEMOTRON_MTP_JOIN_SHUFFLE"] != "0"
-    private static let preparedKernel = MLXFast.metalKernel(
+    private static let preparedKernel = nmjKernel(
         name: name(joinShuffle ? "nemotron_h_residual_rms_prepared_moe_bf16_sh" : "nemotron_h_residual_rms_prepared_moe_bf16"),
         inputNames: ["lhs", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
-        source: oneBarrierSource(preparedSource()), ensureRowContiguous: true)
+        source: oneBarrierSource(preparedSource()))
 
     static func applyPrepared(_ lhs: MLXArray, _ rhs: MLXArray, norm: RMSNorm)
         -> (MLXArray, MLXArray, MLXArray)?
@@ -309,7 +309,7 @@ enum NemotronHResidualRMSNorm {
             type(of: norm) == RMSNorm.self,
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
-        let outputs = preparedKernel([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
+        let outputs = nmj32(preparedKernel)([lhs, rhs, norm.weight, UInt32(2688), norm.eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
@@ -349,11 +349,11 @@ enum NemotronHResidualRMSNorm {
         return s.replacingOccurrences(of: add, with: "T sum = lhs[offset + i];")
             .replacingOccurrences(of: store, with: "")
     }
-    private static let sumPreparedKernel = MLXFast.metalKernel(
+    private static let sumPreparedKernel = nmjKernel(
         name: name(joinShuffle ? "nemotron_h_residual_sum_rms_prepared_bf16_sh" : "nemotron_h_residual_sum_rms_prepared_bf16"),
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
-        source: oneBarrierSource(sumPreparedSource()), ensureRowContiguous: true)
+        source: oneBarrierSource(sumPreparedSource()))
 
     /// The MoE join reading the routed half as the six weighted slot products
     /// of its row ([18 * 2688] FP32, slot-major): the zero-skip top-six reduce
@@ -363,7 +363,7 @@ enum NemotronHResidualRMSNorm {
         withProductsReduce(sumPreparedSource())
     }
 
-    private static func withProductsReduce(_ s: String) -> String {
+    static func withProductsReduce(_ s: String) -> String {
         let add = "T part = rhs[offset + i] + shared[offset + i];"
         precondition(s.components(separatedBy: add).count == 2)
         return s.replacingOccurrences(of: add, with: """
@@ -375,28 +375,28 @@ enum NemotronHResidualRMSNorm {
                             T part = static_cast<T>(total) + shared[offset + i];
             """)
     }
-    private static let sumProductsPreparedKernel = MLXFast.metalKernel(
+    private static let sumProductsPreparedKernel = nmjKernel(
         name: name(joinShuffle ? "nemotron_h_residual_products_rms_prepared_bf16_sh" : "nemotron_h_residual_products_rms_prepared_bf16"),
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized", "prepared"],
-        source: oneBarrierSource(sumProductsPreparedSource()), ensureRowContiguous: true)
-    private static let normPreparedKernel = MLXFast.metalKernel(
+        source: oneBarrierSource(sumProductsPreparedSource()))
+    private static let normPreparedKernel = nmjKernel(
         name: name(joinShuffle ? "nemotron_h_rms_prepared_bf16_sh" : "nemotron_h_rms_prepared_bf16"),
         inputNames: ["lhs", "weight", "axis_size", "eps"],
         outputNames: ["normalized", "prepared"],
-        source: oneBarrierSource(normPreparedSource()), ensureRowContiguous: true)
+        source: oneBarrierSource(normPreparedSource()))
 
     /// Input-independent scalar kernel arguments, built once instead of per
     /// call (same values and the same scalar kernel instantiation).
     private static let scalarLock = NSLock()
     nonisolated(unsafe) private static var axisScalar: MLXArray?
     nonisolated(unsafe) private static var epsScalars: [UInt32: MLXArray] = [:]
-    private static func scalars(_ eps: Float) -> (MLXArray, MLXArray) {
+    static func scalars(_ eps: Float) -> (MLXArray, MLXArray) {
         scalarLock.lock(); defer { scalarLock.unlock() }
         let axis = axisScalar ?? MLXArray(UInt32(2688))
         axisScalar = axis
         if let value = epsScalars[eps.bitPattern] { return (axis, value) }
-        let value = MLXArray(eps)
+        let value = nmjEps(eps)
         epsScalars[eps.bitPattern] = value
         return (axis, value)
     }
@@ -432,12 +432,12 @@ enum NemotronHResidualRMSNorm {
         let shapes = [lhs.shape, lhs.shape, [3, 11, 9 * 32]]
         let outputs: [MLXArray]
         if let shared {
-            outputs = sumPreparedKernel([lhs, rhs, shared, norm.weight, axis, eps],
+            outputs = nmj32(sumPreparedKernel)([lhs, rhs, shared, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
                 grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
         } else {
-            outputs = preparedKernel([lhs, rhs, norm.weight, axis, eps],
+            outputs = nmj32(preparedKernel)([lhs, rhs, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
                 grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: shapes, outputDTypes: [.bfloat16, .bfloat16, .float32])
@@ -502,7 +502,7 @@ enum NemotronHResidualRMSNorm {
             return (summed, normalized, NemotronHeadPreparedActivation.pack(normalized.reshaped(3, 2688)))
         }
         let (axis, eps) = scalars(norm.eps)
-        let outputs = sumProductsPreparedKernel([lhs, products, shared, norm.weight, axis, eps],
+        let outputs = nmj32(sumProductsPreparedKernel)([lhs, products, shared, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape, [3, 11, 9 * 32]],
@@ -529,7 +529,7 @@ enum NemotronHResidualRMSNorm {
               norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
         let (axis, eps) = scalars(norm.eps)
-        let outputs = normPreparedKernel([x, norm.weight, axis, eps],
+        let outputs = nmj32(normPreparedKernel)([x, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
             grid: (672, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [x.shape, [1, 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
@@ -541,7 +541,7 @@ enum NemotronHResidualRMSNorm {
     static func normPreparedRows(_ x: MLXArray, norm: RMSNorm) -> (MLXArray, MLXArray)? {
         guard plumbingRows(x, norm: norm) else { return nil }
         let (axis, eps) = scalars(norm.eps)
-        let outputs = normPreparedKernel([x, norm.weight, axis, eps],
+        let outputs = nmj32(normPreparedKernel)([x, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * 3, 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [x.shape, [3, 11, 9 * 32]], outputDTypes: [.bfloat16, .float32])
@@ -617,7 +617,7 @@ enum NemotronHResidualRMSNorm {
             type(of: norm) == RMSNorm.self,
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
-        let result = kernel([lhs, rhs, norm.weight, UInt32(lhs.dim(2)), norm.eps],
+        let result = nmj32(kernel, lhs.dim(1))([lhs, rhs, norm.weight, UInt32(lhs.dim(2)), norm.eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
@@ -625,30 +625,30 @@ enum NemotronHResidualRMSNorm {
     }
 
 
-    private static func sumSource() -> String {
+    static func sumSource() -> String {
         let add = "T sum = lhs[offset + i] + rhs[offset + i];"
         precondition(source.components(separatedBy: add).count == 2)
         return source.replacingOccurrences(of: add, with: "T part = rhs[offset + i] + shared[offset + i];\n"
             + "                T sum = lhs[offset + i] + part;")
     }
-    private static let sumKernel = MLXFast.metalKernel(
+    private static let sumKernel = nmjKernel(
         name: name("nemotron_h_residual_sum_rms_bf16"),
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
-        source: oneBarrierSource(sumSource()), ensureRowContiguous: true)
+        source: oneBarrierSource(sumSource()))
     /// The draft tail's join over its six routed slot products ([6 * 2688]
     /// FP32): the top-six reduce of `sumProductsPreparedSource`, one row.
-    private static let sumProductsKernel = MLXFast.metalKernel(
+    private static let sumProductsKernel = nmjKernel(
         name: name("nemotron_h_residual_products_rms_bf16"),
         inputNames: ["lhs", "rhs", "shared", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
-        source: oneBarrierSource(withProductsReduce(sumSource())), ensureRowContiguous: true)
+        source: oneBarrierSource(withProductsReduce(sumSource())))
     /// `sumProductsKernel` with `shared` bound before `rhs` (same source text; the body names its arguments).
-    private static let sumProductsSharedFirstKernel = MLXFast.metalKernel(
+    private static let sumProductsSharedFirstKernel = nmjKernel(
         name: name("nemotron_h_residual_products_rms_sf_bf16"),
         inputNames: ["lhs", "shared", "rhs", "weight", "axis_size", "eps"],
         outputNames: ["residual", "normalized"],
-        source: oneBarrierSource(withProductsReduce(sumSource())), ensureRowContiguous: true)
+        source: oneBarrierSource(withProductsReduce(sumSource())))
 
     /// Load time: the one-row products join against the separate top-six
     /// reduce plus `applySum`, bit for bit, on seeded rows and the head's norms.
@@ -694,7 +694,7 @@ enum NemotronHResidualRMSNorm {
             norm.weight.shape == [2688], norm.weight.dtype == .bfloat16
         else { return nil }
         let (axis, eps) = scalars(norm.eps)
-        let result = sumKernel([lhs, rhs, shared, norm.weight, axis, eps],
+        let result = nmj32(sumKernel, lhs.dim(1))([lhs, rhs, shared, norm.weight, axis, eps],
             template: [("T", DType.bfloat16)],
             grid: (672 * lhs.dim(1), 1, 1), threadGroup: (672, 1, 1),
             outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
@@ -722,11 +722,11 @@ enum NemotronHResidualRMSNorm {
         }
         let (axis, eps) = scalars(norm.eps)
         let result = sharedFirst
-            ? sumProductsSharedFirstKernel([lhs, shared, products, norm.weight, axis, eps],
+            ? nmj32(sumProductsSharedFirstKernel)([lhs, shared, products, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
                 grid: (672, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
-            : sumProductsKernel([lhs, products, shared, norm.weight, axis, eps],
+            : nmj32(sumProductsKernel)([lhs, products, shared, norm.weight, axis, eps],
                 template: [("T", DType.bfloat16)],
                 grid: (672, 1, 1), threadGroup: (672, 1, 1),
                 outputShapes: [lhs.shape, lhs.shape], outputDTypes: [.bfloat16, .bfloat16])
@@ -5660,6 +5660,7 @@ class NemotronHAttention: Module, NemotronHMixer {
     @ModuleInfo(key: "k_proj") var wk: Linear
     @ModuleInfo(key: "v_proj") var wv: Linear
     @ModuleInfo(key: "o_proj") var wo: Linear
+    let mtpProjectionJoinCache = NemotronMTPAttentionProjectionJoinCache()
 
     // NOTE: NemotronH attention does NOT use RoPE (unlike most transformer models)
     // The Python implementation at mlx_lm/models/nemotron_h.py lines 247-274 shows
@@ -5725,7 +5726,7 @@ class NemotronHAttention: Module, NemotronHMixer {
                 : outputs
         }
         return (
-            captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
+            captureMTP ? nemotronMTPLinearRows(x, wq) : NemotronSeedQMMTune.attention(x, wq, kind: "q_proj") ?? wq(x),
             captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
             captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x))
     }
@@ -5738,7 +5739,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         captureMTP: Bool = false,
         targetQKV: Bool = false,
         prepared: MLXArray? = nil,
-        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil
+        projections precomputed: (MLXArray, MLXArray, MLXArray)? = nil,
+        projectRows: (([MLXArray], Linear) -> MLXArray)? = nil
     ) -> MLXArray {
         let batch = x.dim(0)
         let length = x.dim(1)
@@ -5783,7 +5785,7 @@ class NemotronHAttention: Module, NemotronHMixer {
             let rows = layerCache.updateAndAttendSerialQueryRowsWritten(
                 queries: queries, written: qkv.0, scale: scale, sinks: nil,
                 attendRows: NemotronMTPVerifySDPA.rows)
-            return NemotronMTPAttentionDirect.project(rows, wo)
+            return projectRows?(rows, wo) ?? NemotronMTPAttentionDirect.project(rows, wo)
         }
         let (q, k, v) = precomputed ?? cbv2Projections(
             x, captureMTP: captureMTP, targetQKV: targetQKV, prepared: prepared)
@@ -5806,7 +5808,7 @@ class NemotronHAttention: Module, NemotronHMixer {
            let rows = layerCache.updateAndAttendSerialQueryRows(
                queries: queries, keys: keys, values: values, scale: scale, sinks: nil,
                attendRows: NemotronMTPVerifySDPA.rows) {
-            return NemotronMTPAttentionDirect.project(rows, wo)
+            return projectRows?(rows, wo) ?? NemotronMTPAttentionDirect.project(rows, wo)
         }
         let output = cache.updateAndAttend(
             queries: queries,
@@ -5815,7 +5817,8 @@ class NemotronHAttention: Module, NemotronHMixer {
             scale: scale,
             sinks: nil)
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        return captureMTP ? nemotronMTPLinearRows(merged, wo) : nemotronR1Linear(merged, wo)
+        return captureMTP ? nemotronMTPLinearRows(merged, wo)
+            : NemotronSeedQMMTune.attention(merged, wo, kind: "o_proj") ?? nemotronR1Linear(merged, wo)
     }
 
     // Protocol conformance
@@ -6164,10 +6167,10 @@ class NemotronHSwitchMLP: Module {
     /// MoE block's `y + addend` in the combine launch; `added` says whether it
     /// was applied.
     func fusedSortedCombine(_ x: MLXArray, _ indices: MLXArray, _ scores: MLXArray, addend: MLXArray?,
-                            join: (residual: MLXArray, norm: RMSNorm)? = nil)
+                            join: (residual: MLXArray, norm: RMSNorm)? = nil, shared: NemotronHMLP? = nil)
         -> (out: MLXArray, added: Bool, normalized: MLXArray?)? {
         let k = indices.dim(-1)
-        guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
+        guard indices.size > 64 || NemotronSeedTailMoE.shortRuns, (1...8).contains(k), scores.dtype == .float32,
               scores.shape == indices.shape,
               x.dtype == .bfloat16 || x.dtype == .float16, x.dim(-1) == inputDims,
               inputDims % 4 == 0
@@ -6203,7 +6206,7 @@ class NemotronHSwitchMLP: Module {
             }
             return lin(input, idx, sortedIndices: true)
         }
-        var y: MLXArray
+        var y: MLXArray, fc1Out: MLXArray? = nil
         if let tiles = runTiles, let rowsK = orderK, let q = fc1 as? QuantizedSwitchLinear,
             let activated = NemotronPrefillDirectFC1.apply(
                 x.reshaped(tokens, 1, inputDims), q, rows: rowsK, tiles: tiles) {
@@ -6215,6 +6218,7 @@ class NemotronHSwitchMLP: Module {
             y = activated
         } else {
             y = gather(fc1, xs)
+            fc1Out = y
             // Stock relu2 promotes against an int scalar; fuse only when that
             // keeps the activation dtype (graph metadata, never evaluated).
             if MLX.maximum(y, MLXArray(0)).dtype == y.dtype {
@@ -6226,6 +6230,8 @@ class NemotronHSwitchMLP: Module {
                 y = relu2(y)
             }
         }
+        // Seed: `shared`'s down projection waits on the FC1 launch (`NemotronSeedSharedOverlap`).
+        let addend = shared.map { $0.seedShared(x, after: fc1Out ?? y) } ?? addend
         if let tiles = runTiles, let q = fc2 as? QuantizedSwitchLinear,
            let fromCopy = NemotronPrefillFC2Copy.apply(y, q, tiles: tiles) {
             y = fromCopy
@@ -8221,7 +8227,7 @@ func nemotronRunGather(
           ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
     else { return nil }
     let n = x.dim(0), k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
-    guard n == tiles.rows, n >= 16, n / experts >= 4,
+    guard n == tiles.rows, nemotronRunsAdmitted(n, experts: experts),
           tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
           ops.weight.dim(2) * 8 == k, k % 64 == 0,
           ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
@@ -8504,7 +8510,7 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
         else { return nil }
         let ops = lin.nemotronGatherOperands(for: x.dtype)
         let n = x.dim(0), k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
-        guard n == tiles.rows, n >= 16, n / experts >= 4,
+        guard n == tiles.rows, nemotronRunsAdmitted(n, experts: experts),
               tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
               ops.weight.dim(2) * 8 == k, k % 64 == 0, nOut % 128 == 0,
               copy.codes.shape == [experts, nOut / 128, k, 32], copy.codes.dtype == .uint16,
@@ -8582,7 +8588,7 @@ enum NemotronPrefillDenseDict {
     /// The admitted kinds: "in_proj", "out_proj" (Mamba mixers), "up_proj" (shared experts, with ReLU2).
     nonisolated(unsafe) static var kinds: Set<String> = []
 
-    private static let header: String? = {
+    static let header: String? = {
         var h = nemotronRunGatherHeader
         let edits: [(String, String)] = [
             ("// Nemotron: affine_gather_qmm_rhs_nax (transpose = true) with tiles aligned\n",
@@ -8624,15 +8630,19 @@ enum NemotronPrefillDenseDict {
         return NemotronSeedDenseRetile.dense(x, linear, kind: kind, relu2: relu2) ?? launch(x, linear, relu2: relu2)
     }
 
-    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool) -> MLXArray? {
+    /// `dep` (load-time timing chains only, `NemotronSeedDenseRetile`): the pair table is read from a view of `dep`'s
+    /// leading bytes, so the launch waits for `dep`'s producer.
+    static func launch(_ x: MLXArray, _ linear: Linear, relu2: Bool, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = linear as? QuantizedLinear,
               type(of: linear) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
               !relu2 || MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
               q.weight.dtype == .uint32, q.weight.ndim == 2,
-              let d = NemotronSBDict.dict(q), d.index.shape == q.scales.shape, d.index.dtype == .uint16,
-              d.table.dtype == .float32
+              let d0 = NemotronSBDict.dict(q), d0.index.shape == q.scales.shape, d0.index.dtype == .uint16,
+              d0.table.dtype == .float32,
+              let table = dep.map({ NemotronSeedQMMTune.operandView($0, like: d0.table) }) ?? d0.table
         else { return nil }
+        let d = (index: d0.index, table: table)
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, q.scales.shape == [nOut, k / 64] else { return nil }
         // Row tiles of 64 over the request's tokens, at least three descriptors
@@ -8760,12 +8770,16 @@ enum NemotronPrefillSharedDownCopy {
         return NemotronSeedDenseRetile.sharedDown(x, down) ?? launch(x, down)
     }
 
-    static func launch(_ x: MLXArray, _ down: Linear) -> MLXArray? {
+    /// `dep` (load-time timing chains only, `NemotronSeedDenseRetile`): the BF16 biases are read from a view of `dep`'s
+    /// leading bytes, so the launch waits for `dep`'s producer.
+    static func launch(_ x: MLXArray, _ down: Linear, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let kernel, let q = down as? QuantizedLinear,
               type(of: down) == QuantizedLinear.self, q.mode == .affine, q.bits == 4, q.groupSize == 64,
               q.bias == nil, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
-              let copy = NemotronSharedDownZSkip.copyArrays(for: down)
+              let copy0 = NemotronSharedDownZSkip.copyArrays(for: down),
+              let chainedBiases = dep.map({ NemotronSeedQMMTune.operandView($0, like: copy0.biases) }) ?? copy0.biases
         else { return nil }
+        let copy = (codes: copy0.codes, scales: copy0.scales, biases: chainedBiases)
         let rows = x.dim(1), k = x.dim(2), nOut = q.weight.dim(0)
         guard q.weight.dim(1) * 8 == k, k % 64 == 0, nOut % 128 == 0,
               copy.codes.shape == [1, nOut / 128, k, 32], copy.codes.dtype == .uint16,
@@ -9050,7 +9064,7 @@ const device T* xn = x;
 
     /// `header` with the pair-dictionary loader: the scales and biases operands
     /// become the fc1 bank's `NemotronSBDict` index and FP32 pair table.
-    private static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
+    static let dictHeader: String? = NemotronPrefillDirectFC1.header.flatMap { source -> String? in
         var h = source
         func swap(_ old: String, _ new: String) -> Bool {
             guard h.components(separatedBy: old).count == 2 else { return false }
@@ -9147,7 +9161,7 @@ const device T* xn = x;
               ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
         else { return nil }
         let n = tiles.rows, k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
-        guard n >= 16, n / experts >= 4,
+        guard nemotronRunsAdmitted(n, experts: experts),
               tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
               ops.weight.dim(2) * 8 == k, k % 64 == 0,
               ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
@@ -9289,12 +9303,13 @@ enum NemotronPrefillSharedUpGather {
 
     static func apply(_ x: MLXArray, _ up: Linear) -> MLXArray? {
         guard verified, NemotronHPrefillX5.active else { return nil }
-        return launch(x, up)
+        return NemotronSeedDenseRetile.sharedUp(x, up) ?? launch(x, up)
     }
 
-    private static func launch(_ x: MLXArray, _ up: Linear) -> MLXArray? {
+    static func launch(_ x: MLXArray, _ up: Linear, dep: MLXArray? = nil) -> MLXArray? {
         guard NemotronHPrefillX5.runGather, let q = up as? QuantizedLinear, type(of: up) == QuantizedLinear.self,
-              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases = q.biases,
+              q.mode == .affine, q.bits == 4, q.groupSize == 64, q.bias == nil, let biases0 = q.biases,
+              let biases = dep.map({ NemotronSeedQMMTune.operandView($0, like: biases0) }) ?? biases0,
               x.ndim == 3, x.dim(0) == 1, x.dim(1) > 8, x.dtype == .bfloat16,
               MLX.maximum(x, MLXArray(0)).dtype == x.dtype,
               q.weight.dtype == .uint32, q.weight.ndim == 2, q.scales.dtype == x.dtype, biases.dtype == x.dtype
@@ -9396,16 +9411,18 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     /// applies the block's residual add and that norm
     /// (`NemotronPrefillMoEJoin`): `out` is then the residual and
     /// `normalized` the norm's output.
-    func cbv2Forward(_ x: MLXArray, join: (residual: MLXArray, norm: RMSNorm)?)
+    func cbv2Forward(_ x: MLXArray, join: (residual: MLXArray, norm: RMSNorm)?, routes: (MLXArray, MLXArray)? = nil)
         -> (out: MLXArray, normalized: MLXArray?)
     {
-        let (inds, scores) = gate(x)
+        let (inds, scores) = routes ?? gate(x)
+        // Seed: the shared expert is built after the routed FC1 (`NemotronSeedSharedOverlap`).
+        let overlap = NemotronSeedSharedOverlap.mlp(sharedExperts)
         // Request prefill: the shared-expert add rides the combine launch.
-        let shared: MLXArray? = NemotronPrefillCombineAdd.verified && NemotronHPrefillX5.active
+        let shared: MLXArray? = overlap == nil && NemotronPrefillCombineAdd.verified && NemotronHPrefillX5.active
             ? sharedExperts.map { $0(x) } : nil
         var y: MLXArray
         var added = false
-        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared, join: join) {
+        if let fused = switchMLP.fusedSortedCombine(x, inds, scores, addend: shared, join: join, shared: overlap) {
             if let normalized = fused.normalized { return (fused.out, normalized) }
             y = fused.out
             added = fused.added
@@ -9573,9 +9590,28 @@ private class NemotronHBlock: Module {
             guard let attentionCache else {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
             }
-            output = (mixer as! NemotronHAttention).cbv2Forward(
+            let attention = mixer as! NemotronHAttention
+            var projectionJoin: (MLXArray, MLXArray, MLXArray)?
+            output = attention.cbv2Forward(
                 hidden, cache: attentionCache, captureMTP: true, targetQKV: true,
-                prepared: prepared)
+                prepared: prepared, projectRows: { rows, wo in
+                    if attention.mtpProjectionJoinCache.isReady(wo: wo, norm: nextNorm),
+                       rows.count == 3,
+                       rows.allSatisfy({ $0.shape == [1, 32, 1, 128] && $0.dtype == .bfloat16 }),
+                       let packed = NemotronMTPVerifySDPA.takePrepared(rows) {
+                        if let joined = attention.mtpProjectionJoinCache.run(
+                            packed, residual: x, wo: wo, norm: nextNorm) {
+                            projectionJoin = joined
+                            return joined.0
+                        }
+                        // The payload was consumed, so the incumbent may
+                        // re-prepare the same rows. SDPA preparation was
+                        // admitted bitwise against that original path.
+                        return NemotronMTPAttentionDirect.project(rows, wo)
+                    }
+                    return NemotronMTPAttentionDirect.project(rows, wo)
+                })
+            if let projectionJoin { return projectionJoin }
         case .mlp:
             precondition(
                 attentionCache == nil,
@@ -9605,6 +9641,18 @@ private class NemotronHBlock: Module {
         if let shared { output = output + shared }
         let residual = x + output
         return (residual, nemotronMTPNormRows(residual) { nextNorm($0) }, nil)
+    }
+}
+
+enum NemotronMTPAttentionProjectionGraphAdmission {
+    static func qualify(_ target: Module) {
+        guard let backbone = target.modules().compactMap({ $0 as? NemotronHBackbone }).first else { return }
+        let layers = backbone.layers
+        for i in layers.indices {
+            guard let attention = layers[i].mixer as? NemotronHAttention else { continue }
+            let nextNorm = i + 1 < layers.count ? layers[i + 1].norm : backbone.normF
+            attention.mtpProjectionJoinCache.qualify(wo: attention.wo, norm: nextNorm, layerIndex: i)
+        }
     }
 }
 
@@ -9747,6 +9795,8 @@ private class NemotronHBackbone: Module {
                 && next % earlyEvalInterval == 0
             let nextNorm = next < layers.count && !suppressedNorm
                 && (!captureMTP || NemotronMTPExecution.batchedNorm) ? layers[next].norm : nil
+            if next == layers.count, !captureMTP, let tail = NemotronSeedTailMoE.forward(
+                layer.mixer, x: hidden, normed: preparedNorm, norm: layer.norm, normF: normF) { return tail }
             let result = layer.cbv2Forward(
                 hidden,
                 modelLayerIndex: modelLayerIndex,
@@ -9929,6 +9979,11 @@ public class NemotronHModel:
 
     public var loraLayers: [Module] {
         backbone.layers
+    }
+
+    /// The blocks' mixers and norms, and norm_f (load-time seed checks).
+    var seedBlocks: (mixers: [Module], norms: [RMSNorm], normF: RMSNorm) {
+        (backbone.layers.map { $0.mixer }, backbone.layers.map { $0.norm }, backbone.normF)
     }
 
     public var cbv2LayerKinds: [CBv2LayerKind] {

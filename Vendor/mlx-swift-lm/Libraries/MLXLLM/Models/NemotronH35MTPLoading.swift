@@ -92,7 +92,10 @@ extension NemotronH35MTPAssistant {
         NemotronFC2Tune.tune(target)
         target.prepareVerifyEntry()
         NemotronHResidualRMSNorm.checkProductsJoin(target)
+        NemotronJoin32.qualify(target, head: assistant.module)
+        NemotronJoinEps.qualify(target, head: assistant.module)
         NemotronZSkip.prepareDraft(assistant.module)
+        NemotronZSkip.qualifyScoreEntry()
         NemotronFC2Tune.tuneDraft(assistant.module)
         NemotronMoELeader.warm(target)
         NemotronMTPRouterRows.warm(target)
@@ -101,15 +104,22 @@ extension NemotronH35MTPAssistant {
         NemotronU2.qualify(target: target, head: assistant.module)
         NemotronMambaInProjConvDt.qualifyEpilogue32(target)
         NemotronMambaInProjConvDt.qualifyRegs(target)
+        NemotronQMVLean.qualify(target)
+        NemotronMambaInProjConvDt.qualifyTSL(target)
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
+        NemotronDraftTune.tuneVerifyQKV(target)
         NemotronMTPSSMAnchor.tune(target)
+        NemotronSSMTail32.qualify(target)
+        NemotronSSMTailTC.qualify(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
+        NemotronHResidualRMSNorm.qualifyDraftFinalOnly(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoOffset32Qualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoPacketColumnsQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoKeysQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
+        cbv2TopTwoColumnsEntryQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
         cbv2TopTwoRowsPacketWarm(logitsDType: .bfloat16)
         NemotronMultiRowQMV.warmNarrow()
         NemotronMultiRowQMV.verifyAttentionOutputAdding(
@@ -127,6 +137,7 @@ extension NemotronH35MTPAssistant {
         NemotronMTPAttentionDirect.warm(target)
         NemotronMTPVerifySDPA.qualify(target)
         NemotronMTPVerifySDPA.tune(target)
+        NemotronMTPAttentionProjectionGraphAdmission.qualify(target)
         NemotronPrefillConvDt.qualify(target)
         NemotronFreshStateUpdate.qualify()
         NemotronPrefillCountingSort.qualify(target)
@@ -164,6 +175,9 @@ extension NemotronH35MTPAssistant {
         NemotronSeedDenseRetile.tune(target)
         NemotronSeedQMMTune.tune(target)
         NemotronSeedSSMTune.tune(target)
+        // After the seed tunes: the last block on its tail rows, then its routed experts on the last row.
+        NemotronSeedTailMoE.qualify(target)
+        NemotronSeedTailMoE.qualifyOne(target)
         // The general pass replaces one synthetic post-verify warm-up with
         // its real captured rows, then warms only the remaining widths.
         // Keep last: it ends with Memory.clearCache().
@@ -282,6 +296,9 @@ extension NemotronH35MTPAssistant {
             CBv2MTPCommittedTargetObservation(tokens: prompt, hidden: prefill.lastHidden),
             requestState: draftState)
         var carry = prefill.lastHidden[0..., (promptLength - 1)..<promptLength, 0...]
+        let primeWarm = draftStep(tokens: seed, hidden: carry, shortlist: nil, requestState: draftState)
+        eval([primeWarm.tokens, primeWarm.hidden] + evaluationTargets(for: draftState))
+        discardRound(requestState: draftState)
 
         // Plain one-token target step (non-captured decode shape).
         let stepEvaluation = try recurrent.bind()
@@ -526,7 +543,8 @@ final class NemotronDecodeResidency: @unchecked Sendable {
                 dense = [("up_proj", up)]
             }
             for (kind, linear) in dense
-            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind) {
+            where NemotronPrefillDenseDict.kinds.contains(kind) || NemotronSeedQMMTune.adopted(kind)
+                || (kind == "up_proj" && NemotronSeedDenseRetile.choice["up_gather"] != nil) {
                 guard let q = linear as? QuantizedLinear, let d = NemotronSBDict.dict(q), let b = q.biases else { continue }
                 denseDicts[n, default: []] += [d.index, d.table]
                 denseMetadata.formUnion([ObjectIdentifier(q.scales), ObjectIdentifier(b)])
@@ -811,6 +829,8 @@ final class NemotronCPUWarm: @unchecked Sendable {
 }
 
 // Measurement entry of the carried 3f932e3c tree.
+
+// Measurement entry 1 of this tree.
 
 // Measurement entry 1 of this tree.
 
