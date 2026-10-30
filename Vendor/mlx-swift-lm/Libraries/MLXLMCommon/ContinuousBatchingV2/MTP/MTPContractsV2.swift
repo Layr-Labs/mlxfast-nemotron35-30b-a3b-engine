@@ -411,6 +411,16 @@ extension CBv2MTPRequestStatefulDrafter {
     ) throws {}
 }
 
+/// Optional capability: issue the history preparation of a request's first
+/// draft at the end of the step that produced its first carry (a completed
+/// prompt or a seed decode), behind that step's submitted target work,
+/// instead of inside the first round's draft step. Evaluation order only:
+/// the drafter leaves the same assistant state as the deferred preparation,
+/// and falls back to it when the history changes before the first draft.
+public protocol CBv2MTPSeedHistoryPriming: CBv2MTPRequestStatefulDrafter {
+    func primeHistoryAfterSeed(requestState: any CBv2MTPRequestState)
+}
+
 // MARK: - Config
 
 /// How the target scores one MTP draft chain.

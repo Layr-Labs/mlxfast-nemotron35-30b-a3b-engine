@@ -226,8 +226,10 @@ enum NemotronMTPSSMAnchor {
     /// in the text, `arrival8` -> `arrival4`); its threads 0 ... 127 run the same tail text on the same stored
     /// outputs. `tune` checks the 4-d launches against the 8-d launches and adopts them only when
     /// `NemotronTuneAdoption.decide` admits them (at least 3% faster by median and faster in at least 75% of the
-    /// cycles). NEMOTRON_SSM_TUNE=0 keeps 8 d's; NEMOTRON_SSM_FORCE=1 adopts 4 d's when they qualified, 0 keeps 8.
-    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] != "0"
+    /// cycles). The tune is off by default (8 d's kept); NEMOTRON_SSM_TUNE=1 runs it; NEMOTRON_SSM_FORCE=1 adopts 4 d's
+    /// when they qualified, 0 keeps 8.
+    /// Off by default (the anchor SSM launch keeps its incumbent threadgroup size); NEMOTRON_SSM_TUNE=1 runs the tune.
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] == "1"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "")
     /// Soft cap on the tune's load time: the timing does not start past it.
     static let tuneBudgetSeconds = 1.2 * nemotronWindowTuneBudgetScale
@@ -678,11 +680,11 @@ enum NemotronMTPSSMAnchor {
                         return
                     }
                     compared = chain
-                    // A round: both geometries' chains built first, then evaluated back to back in `order`.
+                    // A round: each geometry's chain built, then evaluated and timed, one at a time in `order` (the
+                    // build stays outside the timed span).
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { run($0 == 1) }
-                        return chains.map { outs -> Double? in
-                            guard let outs else { return nil }
+                        order.map { idx -> Double? in
+                            guard let outs = run(idx == 1) else { return nil }
                             let begin = DispatchTime.now().uptimeNanoseconds
                             eval(outs)
                             Stream.gpu.synchronize()
