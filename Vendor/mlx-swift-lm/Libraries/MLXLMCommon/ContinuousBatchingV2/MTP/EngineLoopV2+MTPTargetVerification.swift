@@ -19,12 +19,12 @@ public enum CBv2MTPVerifyWindowColumns {
 
     /// `sources`: the drafter's own token arrays the draft columns were reshaped from (columns 1...k, in
     /// order), or empty.
-    static func publish(window: MLXArray, columns: [MLXArray], sources: [MLXArray] = []) {
+    public static func publish(window: MLXArray, columns: [MLXArray], sources: [MLXArray] = []) {
         guard enabled else { return }
         lock.withLock { published = (window, columns, sources) }
     }
 
-    static func clear() {
+    public static func clear() {
         lock.withLock { published = nil }
     }
 
@@ -37,6 +37,47 @@ public enum CBv2MTPVerifyWindowColumns {
     /// while `window` is the verify window being built; nil when they were not published.
     public static func sources(of window: MLXArray) -> [MLXArray]? {
         lock.withLock { published.flatMap { $0.window === window && !$0.sources.isEmpty ? $0.sources : nil } }
+    }
+}
+
+/// Depth gate hand-off (`NemotronDepthGate` in the model). When the target's forward of one verify window
+/// gates its last row (that row's MoE layers reuse the previous row's experts, so its outputs are not the
+/// target's), it publishes here a copy of the window whose last draft id is -1 on a gated round (the gate is a
+/// device value). Every acceptance reader then sees that id: the packet the target finalize writes from the
+/// masked window (`maskedWindow(for:)` marks it used) or, otherwise, the concatenated packet the engine builds
+/// from `drafts(for:)`. -1 is never a target id, so a gated round accepts at most k - 1 drafts and never emits
+/// the gated row's output. One pending entry per verify build; the engine takes it right after the target.
+public enum CBv2MTPVerifyDraftMask {
+    public final class Entry {
+        public let window: MLXArray
+        public let maskedWindow: MLXArray
+        public var packetMasked = false
+        init(window: MLXArray, maskedWindow: MLXArray) {
+            self.window = window
+            self.maskedWindow = maskedWindow
+        }
+    }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var pending: Entry?
+
+    public static func publish(window: MLXArray, maskedWindow: MLXArray) {
+        lock.withLock { pending = Entry(window: window, maskedWindow: maskedWindow) }
+    }
+
+    /// The masked window for the packet finalize reading `window`, when `window` is the gated one.
+    public static func maskedWindow(for window: MLXArray) -> MLXArray? {
+        lock.withLock {
+            guard let entry = pending, entry.window === window else { return nil }
+            entry.packetMasked = true
+            return entry.maskedWindow
+        }
+    }
+
+    static func take() -> Entry? {
+        lock.withLock {
+            defer { pending = nil }
+            return pending
+        }
     }
 }
 

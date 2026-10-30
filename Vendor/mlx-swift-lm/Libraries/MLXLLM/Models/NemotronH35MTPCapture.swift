@@ -466,9 +466,12 @@ enum NemotronMTPSSMAnchor {
                     if keep == 3 {
                         record11 = (a.2, nil)
                     } else {
-                        let grown = extend(record11.tape, w, keep)
-                        record11 = grown.steps <= NemotronMTPPendingSSM.strictSteps
-                            ? (record11.anchor, grown) : (replay(grown, record11.anchor), nil)
+                        let grown: Tape = extend(record11.tape, w, keep)
+                        if grown.steps <= NemotronMTPPendingSSM.strictSteps {
+                            record11 = (record11.anchor, grown)
+                        } else {
+                            record11 = (replay(grown, record11.anchor), nil)
+                        }
                     }
                     skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, extend(skip.tape, w, keep))
                     same = same && (skip.tape?.steps ?? 0) <= top
@@ -834,8 +837,8 @@ final class NemotronH35MTPCompactGraphCache {
     func supportsJoined(_ hidden: MLXArray, owner: NemotronHMamba2Mixer) -> Bool {
         Self.enabled && NemotronMTPExecution.batchedM1 && NemotronMTPExecution.batchedNorm
             && Device.defaultDevice().deviceType == .gpu && StreamOrDevice.default == .gpu
-            && hidden.shape == [1, 3, 2688] && hidden.dtype == .bfloat16
-            && Self.nativeIdentity(owner) != nil
+            && NemotronD3.rows(hidden.size / 2688) && hidden.shape == [1, hidden.size / 2688, 2688]
+            && hidden.dtype == .bfloat16 && Self.nativeIdentity(owner) != nil
     }
 
     func callAsFunction(
@@ -1262,7 +1265,7 @@ extension NemotronHMamba2Mixer {
         // and out_proj's prepared activation in one launch (see
         // NemotronHCompactSSMGated); the same normed rows, prepared activation
         // and final state as the two launches below.
-        if length == 3, NemotronMTPExecution.batchedNorm,
+        if NemotronD3.rows(length), NemotronMTPExecution.batchedNorm,
            let q = outProj as? QuantizedLinear, q.mode == .affine,
            q.bits == 4, q.groupSize == 64, q.bias == nil,
            q.weight.shape == [2688, 512], q.weight.dtype == .uint32,
@@ -1406,6 +1409,8 @@ extension NemotronH35Model: CBv2RecurrentCaptureMTPForwardable {
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         precondition(positionIds == nil)
+        NemotronDepthGate.begin(tokens: tokens)
+        defer { NemotronDepthGate.end() }
         if let fused = cbv2HiddenCapturedFused(
             tokens, caches: caches, recurrentState: recurrentState) {
             let output = lmHead.map { nemotronMTPHeadRows(fused.hidden, $0, prepared: fused.prepared) }
@@ -1436,18 +1441,22 @@ extension NemotronH35Model {
         // fused launch's pipeline, here at load (zero operands leave the
         // counters at zero).
         NemotronHCompactSSMGated.prepareCounter()
-        if let fused = mixer.norm.compactSSMPreparedRows(
-            convolution: MLXArray.zeros([1, 3, mixer.convDim], dtype: .bfloat16),
-            ALog: mixer.aLog, D: mixer.D,
-            dt: MLXArray.zeros([1, 3, heads], dtype: .float32),
-            state: MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32),
-            projected: MLXArray.zeros(
-                [1, 3, mixer.intermediateSize + mixer.convDim + heads], dtype: .bfloat16),
-            heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
-            eval(fused.0, fused.1, fused.2)
+        // Depth 3 (`NemotronD3.fused4`): the L = 4 window's launch too.
+        for L in NemotronD3.fused4 ? [3, 4] : [3] {
+            if let fused = mixer.norm.compactSSMPreparedRows(
+                convolution: MLXArray.zeros([1, L, mixer.convDim], dtype: .bfloat16),
+                ALog: mixer.aLog, D: mixer.D,
+                dt: MLXArray.zeros([1, L, heads], dtype: .float32),
+                state: MLXArray.zeros([1, heads, dim, stateDim], dtype: .float32),
+                projected: MLXArray.zeros(
+                    [1, L, mixer.intermediateSize + mixer.convDim + heads], dtype: .bfloat16),
+                heads: heads, headDim: dim, groups: groups, stateDim: stateDim) {
+                eval(fused.0, fused.1, fused.2)
+            }
         }
         NemotronHCompactSSMGated.qualifyShuffle(mixer)
         NemotronHCompactSSMGated.qualifyRowsTail(mixer)
+        NemotronHCompactSSMGated.qualifyTails4(mixer)
         // NEMOTRON_MTP_SSM_PENDING_FOLD: compiles and checks every folded launch.
         NemotronMTPPendingSSM.qualify(mixer)
         for width in 2...8 {
@@ -1493,5 +1502,70 @@ extension NemotronH35Model {
             MLXArray.zeros([1, 1, mixer.convDim], dtype: activationDType))
         roots += [packed.convolution, packed.padded]
         if !roots.isEmpty { eval(roots) }
+    }
+}
+
+// MARK: - Depth 3: the L = 4 window's SSM tails
+
+extension NemotronHCompactSSMGated {
+    /// Set at load by `qualifyTails4`: the L = 4 window's fused launch takes the shuffle tail / the one-barrier
+    /// tail (L = 3 keeps `shuffleQualified` / `rowsTailQualified`).
+    nonisolated(unsafe) static var shuffle4 = false
+    nonisolated(unsafe) static var rowsTail4 = false
+
+    /// Load time, after `qualifyRowsTail` (`NemotronD3.fused4` only): at L = 4, the shuffle tail against the record
+    /// launch and the one-barrier tail against the shuffle tail, on synthetic operands with `mixer`'s parameters
+    /// (three seeds; an L = 4 window carries no pending steps). Each is adopted only if the normalized rows, the
+    /// prepared activation and the final state are bitwise equal in every case, and only where its L = 3 twin is.
+    static func qualifyTails4(_ mixer: NemotronHMamba2Mixer) {
+        shuffle4 = false
+        rowsTail4 = false
+        guard NemotronD3.fused4, shuffleQualified else { return }
+        let (heads, dim, groups, stateDim) = (mixer.numHeads, mixer.headDim, mixer.numGroups, mixer.ssmStateSize)
+        func bits(_ x: MLXArray) -> MLXArray {
+            x.dtype == .bfloat16 ? x.view(dtype: .uint16) : x.view(dtype: .uint32)
+        }
+        var shuffleSame = MLXArray(true)
+        var rowsSame = MLXArray(rowsTailQualified)
+        do {
+            try withError {
+                for seed in 0 ..< 3 {
+                    let keys = MLXRandom.split(key: MLXRandom.key(UInt64(0x55C1 + seed)), into: 4)
+                    let scale = Float(1 + 3 * seed)
+                    let conv = (MLXRandom.normal([1, 4, mixer.convDim], key: keys[0]) * scale).asType(.bfloat16)
+                    let dt = MLXRandom.uniform(Float(0.001) ..< 0.2, [1, 4, heads], key: keys[1])
+                    let state = MLXRandom.normal([1, heads, dim, stateDim], key: keys[2]) * 0.1
+                    let projected = (MLXRandom.normal(
+                        [1, 4, mixer.intermediateSize + mixer.convDim + heads], key: keys[3]) * scale)
+                        .asType(.bfloat16)
+                    func run(_ shuffle: Bool, _ rows: Bool) -> (MLXArray, MLXArray, MLXArray)? {
+                        mixer.norm.compactSSMPreparedRows(
+                            convolution: conv, ALog: mixer.aLog, D: mixer.D, dt: dt, state: state,
+                            projected: projected, heads: heads, headDim: dim, groups: groups,
+                            stateDim: stateDim, shuffle: shuffle, rowsTail: rows)
+                    }
+                    guard let a = run(false, false), let b = run(true, false) else {
+                        shuffleSame = MLXArray(false); return
+                    }
+                    for (x, y) in [(a.0, b.0), (a.1, b.1), (a.2, b.2)] {
+                        shuffleSame = logicalAnd(shuffleSame, (bits(x) .== bits(y)).all())
+                    }
+                    if rowsTailQualified, let c = run(true, true) {
+                        for (x, y) in [(b.0, c.0), (b.1, c.1), (b.2, c.2)] {
+                            rowsSame = logicalAnd(rowsSame, (bits(x) .== bits(y)).all())
+                        }
+                    } else {
+                        rowsSame = MLXArray(false)
+                    }
+                    eval(shuffleSame, rowsSame)
+                }
+            }
+        } catch {
+            shuffleSame = MLXArray(false)
+        }
+        shuffle4 = shuffleSame.item(Bool.self)
+        rowsTail4 = shuffle4 && rowsSame.item(Bool.self)
+        FileHandle.standardError.write(Data(
+            "nemotron ssm tails L=4: shuffle \(shuffle4 ? "on" : "off"), one barrier \(rowsTail4 ? "on" : "off")\n".utf8))
     }
 }

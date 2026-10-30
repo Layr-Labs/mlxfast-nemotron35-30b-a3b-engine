@@ -412,7 +412,7 @@ enum NemotronMTPFrontNorms {
     /// builds the embedding rows and takes `applyPrepared`).
     static func applyPrepared(operands o: NemotronHEmbeddingRows.Operands, hidden: MLXArray, enorm: RMSNorm,
                               hnorm: RMSNorm) -> (MLXArray, MLXArray)? {
-        guard NemotronMTPDraftJoins.enabled, o.count == 3,
+        guard NemotronMTPDraftJoins.enabled, o.count == 3 || (o.count == 4 && NemotronD3Port.front4),
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               serves(o, hidden: hidden, enorm: enorm, hnorm: hnorm)
         else { return nil }
@@ -692,7 +692,8 @@ enum NemotronMTPFrontNorms {
     static func applyPrepared(embedding: MLXArray, hidden: MLXArray, enorm: RMSNorm, hnorm: RMSNorm)
         -> (MLXArray, MLXArray)?
     {
-        guard NemotronMTPDraftJoins.enabled, embedding.ndim == 3, embedding.dim(1) == 3,
+        guard NemotronMTPDraftJoins.enabled, embedding.ndim == 3,
+              embedding.dim(1) == 3 || (embedding.dim(1) == 4 && NemotronD3Port.front4),
               NemotronMultiRowQMV.enabled, NemotronMultiRowQMV.narrowEnabled,
               let reference = eligible(embedding: embedding, hidden: hidden, enorm: enorm, hnorm: hnorm)
         else { return nil }
@@ -1764,7 +1765,8 @@ extension NemotronH35Model: CBv2MTPPolicyTopTwoProviding {
     public func cbv2MTPTopTwoPacket(_ logits: MLXArray, window: MLXArray)
         -> (ids: MLXArray, values: MLXArray, packet: MLXArray)?
     {
-        cbv2TopTwoRowsPacket(logits, window: window)
+        // A depth-gated window's packet carries its masked draft ids (`CBv2MTPVerifyDraftMask`).
+        cbv2TopTwoRowsPacket(logits, window: CBv2MTPVerifyDraftMask.maskedWindow(for: window) ?? window)
     }
 }
 
@@ -2717,6 +2719,8 @@ extension NemotronMTPDraftSDPA {
 extension NemotronMTPDraftSDPA {
     static let walkEnabled = ProcessInfo.processInfo.environment["NEMOTRON_MTP_DRAFT_WALK_FOLD"] == "1"
     nonisolated(unsafe) private(set) static var walkVerified = false
+    /// Depth 3: `qualifyWalk`'s cases at width 4 (the walk serves width-4 rows only with it).
+    nonisolated(unsafe) private(set) static var walkVerified4 = false
 
     private static func walkSource(own: Bool) -> String? {
         guard var s = pagedSource(own: own) else { return nil }
@@ -2790,7 +2794,8 @@ extension NemotronMTPDraftSDPA {
     /// query rows [1, 32, W, 128] BF16 with W > count, and `read` a served paged range of at least W keys.
     static func walkServes(queryRows: MLXArray, packet: MLXArray, count: Int, drafts: Int, targets: Int,
                            read: CBv2PagedDirectRead) -> Bool {
-        walkEnabled && walkVerified && pagedVerified && servesPaged(read)
+        walkEnabled && (queryRows.ndim == 4 && queryRows.dim(2) == 4 && NemotronD3Port.front4 ? walkVerified4 : walkVerified)
+            && pagedVerified && servesPaged(read)
             && queryRows.ndim == 4 && queryRows.dim(0) == 1 && queryRows.dim(1) == 32 && queryRows.dim(3) == 128
             && queryRows.dtype == .bfloat16 && count >= 0 && count < queryRows.dim(2) && read.count >= queryRows.dim(2)
             && packet.ndim == 1 && packet.dtype == .int32 && drafts >= 0 && targets >= 0
@@ -2879,6 +2884,13 @@ extension NemotronMTPDraftSDPA {
     /// every output is bitwise equal; an MLX error keeps the row pick. Also compiles every pipeline.
     static func qualifyWalk(_ block: NemotronH35MTPAttentionBlock, norm: RMSNorm) {
         walkVerified = false
+        walkVerified4 = false
+        qualifyWalk(block, norm: norm, width: 3)
+        // Depth 3: the same cases on width-4 post-verify rows (accept counts 0...3); width 3 keeps its flag alone.
+        if NemotronD3Port.front4, walkVerified { qualifyWalk(block, norm: norm, width: 4) }
+    }
+
+    private static func qualifyWalk(_ block: NemotronH35MTPAttentionBlock, norm: RMSNorm, width: Int) {
         func report(_ message: String) {
             FileHandle.standardError.write(Data("nemotron mtp draft walk fold: \(message)\n".utf8))
         }
@@ -2887,14 +2899,14 @@ extension NemotronMTPDraftSDPA {
         guard walkKernel != nil, walkOwnKernel != nil, NemotronHResidualRMSNorm.walkKernelAvailable
         else { return report("off (the launch text moved)") }
         let scale = block.mixer.scale
-        let counts = [3, 17, 33, 97, 129, 488, 600, 1000, 1021]
-        let width = 3
+        let counts = [width, 17, 33, 97, 129, 488, 600, 1000, 1021]
+        let salt: UInt64 = width == 3 ? 0 : 0x100
         var checked = 0
         func bits(_ a: MLXArray) -> MLXArray { a.view(dtype: a.itemSize == 2 ? .uint16 : .uint32) }
         do {
             let matched = try withError { () -> Bool in
                 for (i, count) in counts.enumerated() {
-                    let keys7 = MLXRandom.split(key: MLXRandom.key(UInt64(0xd5db_0000 + i)), into: 9)
+                    let keys7 = MLXRandom.split(key: MLXRandom.key(UInt64(0xd5db_0000 + i) + salt), into: 9)
                     let firstSlot = (i * 5 + 3) % 16
                     let pageCount = (firstSlot + count + 15) / 16
                     let segmentPages = pageCount + 7
@@ -2923,17 +2935,12 @@ extension NemotronMTPDraftSDPA {
                                 .reshaped(1, 1, 2, 128).transposed(0, 2, 1, 3))
                     let attention = (MLXRandom.normal([1, 1, 2688], key: keys7[2]) * 0.5).asType(.bfloat16)
                     let firstSpeculated = count - width
-                    for size in [6, 11] {
-                        for accepted in 0 ... 2 {
-                            // drafts at 0..<2, targets at 2..<5; the rest is filler.
-                            var host = [Int32](repeating: 7, count: size)
-                            host[0] = 11; host[1] = 12
-                            host[2] = accepted >= 1 ? 11 : 21
-                            host[3] = accepted >= 2 ? 12 : 22
-                            host[4] = 13
-                            let packet = MLXArray(host)
-                            let walk = CBv2MTPDeviceAcceptWalk.Operands(
-                                packet: packet, count: 2, drafts: 0, targets: 2)
+                    for size in width == 3 ? [6, 11] : [8, 15] {
+                        for accepted in 0 ..< width {
+                            // drafts at 0..<k, targets at k..<2k+1 (k = width - 1); the rest is filler.
+                            let walk = NemotronMTPDraftRowPick.packet(width: width, size: size, accepted: accepted)
+                            let packet = walk.packet
+                            let k = walk.count
                             // The composition the walk launches replace.
                             let row = MLXArray([Int32(accepted)])
                             let picked = NemotronMTPDraftRowPick.pick(
@@ -2956,13 +2963,13 @@ extension NemotronMTPDraftSDPA {
                                       queries: ownQueries, read: read, own: own, scale: scale, mask: secondMask),
                                   let joined = NemotronHResidualRMSNorm.apply(rowFused, attention, norm: norm),
                                   let walkedFirst = launchPagedWalk(
-                                      queries: queries, packet: packet, count: 2, drafts: 0, targets: 2,
+                                      queries: queries, packet: packet, count: k, drafts: 0, targets: k,
                                       firstSpeculated: firstSpeculated, read: read, own: nil, scale: scale),
                                   let walkedSecond = launchPagedWalk(
-                                      queries: ownQueries, packet: packet, count: 2, drafts: 0, targets: 2,
+                                      queries: ownQueries, packet: packet, count: k, drafts: 0, targets: k,
                                       firstSpeculated: firstSpeculated, read: read, own: own, scale: scale),
                                   let walkedJoin = NemotronHResidualRMSNorm.applyWalk(
-                                      fused, attention, packet: packet, count: 2, drafts: 0, targets: 2, norm: norm)
+                                      fused, attention, packet: packet, count: k, drafts: 0, targets: k, norm: norm)
                             else { return false }
                             var same = MLXArray(true)
                             for (a, b) in [(walkedFirst, first), (walkedSecond, second), (walkedJoin.0, joined.0),
@@ -2977,9 +2984,13 @@ extension NemotronMTPDraftSDPA {
                 }
                 return true
             }
-            walkVerified = matched
+            if width == 3 { walkVerified = matched } else { walkVerified4 = matched }
         } catch {
             return report("off (\(error))")
+        }
+        if width == 4 {
+            return report(walkVerified4 ? "width 4 on (\(checked) cases, accept counts 0...3, packets of 8 and 15)"
+                                        : "width 4 off (differs after \(checked) cases)")
         }
         report(walkVerified
             ? "on (\(checked) cases: both draft attentions and the join bitwise equal to the row pick + paged launches + join, accept counts 0...2, packets of 6 and 11)"

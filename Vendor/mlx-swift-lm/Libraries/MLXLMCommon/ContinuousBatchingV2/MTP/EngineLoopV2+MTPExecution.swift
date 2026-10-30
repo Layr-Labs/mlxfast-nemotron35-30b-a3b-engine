@@ -661,9 +661,17 @@ extension EngineLoopV2 {
         }
         let targetColumns = [seedColumn] + draftSteps.map { $0.reshaped([batch, 1]) }
 
+        _ = CBv2MTPVerifyDraftMask.take()
         let target = try mtpBuildTargetVerification(
             columns: targetColumns, rows: verifyRows, driver: mtp,
             draftSources: draftSources.count == k ? draftSources : [])
+        // A gated last row (`CBv2MTPVerifyDraftMask`): every packet carries the masked draft ids.
+        let draftMask = CBv2MTPVerifyDraftMask.take()
+        if let draftMask {
+            precondition(batch == 1 && draftMask.maskedWindow.shape == [1, k + 1],
+                "CBv2 MTP: depth gate mask does not match the verify window")
+        }
+        let packetDraftIDs = draftMask.map { $0.maskedWindow[0..., 1...] } ?? draftIDs
         cacheInnerState.append(contentsOf: target.cacheInnerState)
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
@@ -671,7 +679,7 @@ extension EngineLoopV2 {
                 "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
         }
         func concatenatedPacket() -> MLXArray {
-            var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
+            var packetParts = [packetDraftIDs.reshaped([-1]), target.scores.reshaped([-1])]
             if let shortlist = target.shortlist {
                 packetParts.append(shortlist.massScaled.reshaped([-1]))
             }
@@ -686,7 +694,8 @@ extension EngineLoopV2 {
         let acceptancePacket: MLXArray
         var retainedDraftIDs = draftIDs
         if let folded = target.packet, target.shortlist == nil, CBv2MTPPolicyPacket.enabled,
-            target.policyTopTwo != nil, folded.size == batch * k + batch * (k + 1) * 3
+            target.policyTopTwo != nil, folded.size == batch * k + batch * (k + 1) * 3,
+            draftMask?.packetMasked ?? true
         {
             if CBv2MTPTopTwoPacket.selfTest {
                 let reference = concatenatedPacket()

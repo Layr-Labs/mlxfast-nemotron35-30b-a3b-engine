@@ -84,6 +84,8 @@ extension NemotronH35MTPAssistant {
         NemotronSBDict.prepare(target)
         NemotronMoELeader.qualifyFC1Unroll(target)
         NemotronFC1Tune.tune(target)
+        NemotronD3Quad.qualify(target)
+        NemotronD3Quad.timeAgainstTriple(target)
         NemotronSharedUpPacking.prepareUnpacked(target)
         NemotronFC2SharedColaunch.prepare(target)
         NemotronSBDict.prepareDraft(assistant.module)
@@ -217,6 +219,13 @@ extension NemotronH35MTPAssistant {
             if prefillLength > 0 { try warmUpPrefill(length: prefillLength) }
             try runWarmUp(depth: depth, promptLength: promptLength,
                           postVerifyWarmupWidth: &postVerifyWarmupWidth)
+            // Also warm the depth-3 (four-row verify) shapes, so a depth-3 declaration does not pay the
+            // four-row kernel JIT and graph traces in its first timed rounds. Throwaway state as above.
+            if environment["DARKBLOOM_NEMOTRON35_MTP_WARMUP_DEPTH"] == nil, depth < 3,
+               (maximumDraftTokens ?? 7) >= 3, environment["NEMOTRON_D3_WARMUP"] != "0" {
+                var depth3Width: Int?
+                try runWarmUp(depth: 3, promptLength: promptLength, postVerifyWarmupWidth: &depth3Width)
+            }
         } catch {
             FileHandle.standardError.write(Data("nemotron mtp warm-up skipped: \(error)\n".utf8))
         }
@@ -333,9 +342,11 @@ extension NemotronH35MTPAssistant {
             var tokens = seed, hidden = carry
             var drafts: [MLXArray] = []
             var draftRows: [MLXArray] = []
+            var draftSources: [MLXArray] = []
             for _ in 0..<k {
                 let result = draftStep(tokens: tokens, hidden: hidden, shortlist: nil,
                                        requestState: draftState)
+                draftSources.append(result.tokens)
                 let next = result.tokens.reshaped([1])
                 asyncEval([next, result.hidden] + evaluationTargets(for: draftState))
                 draftRows.append(concatenated([next], axis: 0))
@@ -351,8 +362,17 @@ extension NemotronH35MTPAssistant {
             }
             let window = concatenated([seed] + drafts, axis: 1)
             let evaluation = try recurrent.bind()
+            // Four-row windows: publish the drafts' own arrays as the engine does, so the depth gate's launch
+            // and its gated MoE graphs (`NemotronDepthGate`) are built here, not in a timed round.
+            if k == 3, NemotronDepthGate.enabled {
+                CBv2MTPVerifyWindowColumns.publish(window: window, columns: [seed] + drafts, sources: draftSources)
+            }
             let verify = target.cbv2ForwardWithHiddenCaptured(
                 window, caches: caches, recurrentState: [evaluation], positionIds: nil)
+            if k == 3, NemotronDepthGate.enabled {
+                CBv2MTPVerifyWindowColumns.clear()
+                _ = CBv2MTPVerifyDraftMask.maskedWindow(for: window).map { eval($0) }
+            }
             for cache in layerCaches {
                 cache.mtpSerializesRectangularAttention = false
                 cache.mtpBatchesRectangularAttention = false
