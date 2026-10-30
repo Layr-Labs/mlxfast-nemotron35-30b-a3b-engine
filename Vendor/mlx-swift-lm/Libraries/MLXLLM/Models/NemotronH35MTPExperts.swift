@@ -623,6 +623,48 @@ private func nmlFC1LeanSource(_ source: String) -> String? {
     return s
 }
 
+/// The draft leader's one-row routed FC1 (`nemotronMoELeaderSource` after the tail-8, dictionary and unroll
+/// transforms; plain or pair-dictionary form) with its code words and its (scale, bias) or pair-index words read
+/// through the arrays' base pointers plus 32-bit element offsets, as `nmlFC1LeanSource` does for the triple FC1:
+/// `nlw` is `ws`'s byte offset from `w` (`expert * N * K / 2 + out_row * K / 2 + simd_lid * 4`, below 2^32 for the
+/// 128 x 1856 x 1344-byte bank), advanced by `block_size / 2` per block, and `nlw >> 5` is the record's `sc - scales`
+/// (a row holds K / 2 = 32 x K / 64 bytes, a lane's `simd_lid * 4` bytes are its `simd_lid / 8` groups, and each block
+/// adds 32 x `block_size / 64`). The activation pointers keep the record's form. Every load reads the record's address
+/// and every statement, product, term order, affine close, closing simd_sum and store is the record's. nil unless
+/// every replaced statement occurs as expected.
+func nmlLeaderLeanSource(_ source: String) -> String? {
+    var s = source
+    let dict = s.contains("  const device uint16_t* sc = scales + (ulong)expert")
+    let (stream, second) = dict ? ("uint16_t", "scales") : ("T", "biases")
+    let ws = "  const device uint8_t* ws = (const device uint8_t*)w +\n"
+        + "      (ulong)expert * (N * in_vec_size_w) + out_row * in_vec_size_w +\n      simd_lid * 4;\n"
+    let sb = "  const device \(stream)* sc = scales + (ulong)expert * (N * in_vec_size_g) +\n"
+        + "      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+        + "  const device \(stream)* bs = \(second) + (ulong)expert * (N * in_vec_size_g) +\n"
+        + "      out_row * in_vec_size_g + simd_lid / scale_step_per_thread;\n"
+    guard s.components(separatedBy: ws).count == 2, s.components(separatedBy: sb).count == 2 else { return nil }
+    s = s.replacingOccurrences(of: ws, with:
+        "  static_assert(in_vec_size_w == 32 * in_vec_size_g && block_size / 2 == 32 * (block_size / 64),\n"
+            + "                \"a lane's group word offset is its code byte offset / 32\");\n"
+            + "  const device uint8_t* ws = (const device uint8_t*)w;\n"
+            + "  uint nlw = expert * uint(N * in_vec_size_w) + uint(out_row * in_vec_size_w) + simd_lid * 4;\n")
+    s = s.replacingOccurrences(of: sb, with: "  const device \(stream)* sc = scales;\n  const device \(stream)* bs = \(second);\n")
+    for (old, new) in [
+        ("(ws + r * in_vec_size_w)", "(ws + (nlw + uint(r * in_vec_size_w)))"),
+        ("sc + r * in_vec_size_g;", "sc + ((nlw >> 5) + uint(r * in_vec_size_g));"),
+        ("bs + r * in_vec_size_g;", "bs + ((nlw >> 5) + uint(r * in_vec_size_g));"),
+        ("      ws += block_size / 2;\n", "      nlw += block_size / 2;\n"),
+        ("      sc += block_size / 64;\n", ""),
+        ("      bs += block_size / 64;\n", ""),
+    ] {
+        guard s.components(separatedBy: old).count > 1 else { return nil }
+        s = s.replacingOccurrences(of: old, with: new)
+    }
+    guard !s.contains("(ulong)expert"), !s.contains("ws +="), !s.contains("sc +="), !s.contains("bs +="),
+          !s.contains("(ws + r"), !s.contains("sc + r *"), !s.contains("bs + r *") else { return nil }
+    return s
+}
+
 /// The (scale, bias) dictionary form of a leader-family or prepared QMV body
 /// (`NemotronSBDict`). `scales` carries one uint16 pair index per group and
 /// `biases` the tensor's pair table as FP32 (scale, bias), each entry the exact
@@ -5812,16 +5854,16 @@ extension NemotronU2 {
 // (activations with infinities, NaNs, -0, tiny and large values on routes with
 // experts in three, two and one rows and with all eighteen distinct, experts 0
 // and 127) against the production launch on every bank, and dropped on a miss.
-// NEMOTRON_FC1_TUNE=0 keeps the incumbent; the tune adopts row 21 (`r2n4xln`) by default; NEMOTRON_FC1_FORCE=<n> adopts
+// NEMOTRON_FC1_TUNE=0 keeps the incumbent; the tune adopts row 20 (`r2n2xln`) by default; NEMOTRON_FC1_FORCE=<n> adopts
 // variant n (1-based, `variants`) when it qualified, 0 keeps the incumbent.
 // NEMOTRON_FC1_LEAN_ROWS=0 leaves the lean rows out (the 18 record-text rows).
 enum NemotronFC1Tune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE"] != "0"
     /// An adopted variant's median is at most this fraction of the incumbent's.
     static let medianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_FC1_TUNE_BAR"] ?? "") ?? 0.995
-    /// Defaults to 21 (`r2n4xln`, adopted wherever it qualified); NEMOTRON_FC1_FORCE=<n> picks another row, 0 the
+    /// Defaults to 20 (`r2n2xln`, adopted wherever it qualified); NEMOTRON_FC1_FORCE=<n> picks another row, 0 the
     /// incumbent, an empty value lets the tune's rule decide.
-    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "21")
+    static let forced = Int(ProcessInfo.processInfo.environment["NEMOTRON_FC1_FORCE"] ?? "20")
     /// Wall time of the timed rounds (graph building included), sized from the warm-up round.
     static let timedMilliseconds = 600.0
 
@@ -7536,12 +7578,14 @@ enum NemotronFC2Tune {
 extension NemotronMoELeader {
     /// `NemotronDraftTune`'s one-row routed FC1 launch of geometry `g` (fc1): the production pipeline of the draft
     /// leader (tail-8 when `tail8`, pair dictionary, `g.unroll` on both main K loops) with the SIMD groups per
-    /// threadgroup from the template in `out_row` and, with `g.slotX`, the slot on grid x; unread `dep` input last.
+    /// threadgroup from the template in `out_row`, with `g.slotX` the slot on grid x and with `g.lean` the text through
+    /// `nmlLeaderLeanSource` last; unread `dep` input last.
     /// nil when it cannot run.
     static func draftTuneLaunch(_ g: NemotronDraftTune.Geometry, _ x: MLXArray, _ inds: MLXArray, bank: Bank,
                                 dict: NemotronSBDict.Dict, relu2: Bool, tail8: Bool, dep: MLXArray) -> MLXArray? {
         let n = bank.n
         let key = "nemotron_draft_tune_fc1_\(tail8 ? "t8" : "tr")_u\(g.unroll)" + (g.slotX ? "_x" : "")
+            + (g.lean ? "_ln" : "")
         guard inds.size == 6, x.size == bank.k, n % g.rps == 0, (n / g.rps) % g.nsg == 0, g.rps <= 32, g.nsg <= 32,
               let kernel = NemotronDraftTune.cached(key, {
                   var swaps = [("  const int out_row = tid.y * (2 * results_per_simdgroup) + simd_gid * results_per_simdgroup;\n",
@@ -7551,6 +7595,7 @@ extension NemotronMoELeader {
                   if tail8 { s = s.flatMap(nmlTail8Source) }
                   return s.flatMap(nemotronSBDictSource)
                       .flatMap { nemotronUnrollSource($0, loop: NemotronU2.leaderLoop, count: 2, unroll: g.unroll) }
+                      .flatMap { g.lean ? nmlLeaderLeanSource($0) : $0 }
                       .map {
                           MLXFast.metalKernel(
                               name: key, inputNames: ["w", "scales", "biases", "x", "inds", "dep"],

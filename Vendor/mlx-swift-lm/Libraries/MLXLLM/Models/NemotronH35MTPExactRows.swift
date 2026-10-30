@@ -6854,17 +6854,19 @@ enum NemotronScreenPicks {
 // The chains read cold data as the round does: fc1 cycles 16 routes through the bank, the other families cycle copies
 // of their weights (an integer add of zero, about 96 MB per pass). Load cap 3 s.
 // NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; by default the draft-chain families take fixed rows (the FORCE
-// default below: fc1 `r4n2u4`, screen `r8n1u1`, qkv and down `r4n2u2`, ehp `r2n2u2` in the incumbent's store form,
-// eh `r2n2u1`; up and wo keep their incumbents), each adopted only where it passed its bit-for-bit check, and only
-// the draft SDPA is decided by the rule; NEMOTRON_DRAFT_FORCE=<n> adopts
+// default below: fc1 `r4n2u4` in the lean leader text (`r4n2u4ln`), screen `r8n1u1`, the lean body on qkv (`r4n2u2ln`), ehp (`r2n2u2` in the
+// incumbent's store form, `r2n2u2vsln`), up and wo (the incumbent's geometry, `r4n2u1ln`), down (`r4n2u2ln`) and eh
+// (`r2n2u1ln`); the verify Q/K/V launch `r2n2u2vs`; the draft SDPA `r1n32u4k2`), each adopted only where it
+// passed its bit-for-bit check; NEMOTRON_DRAFT_FORCE=<n> adopts
 // variant n (1-based, `variants`) of
 // every family that qualified it, <family>:<n>[,<family>:<n>] of the named families; 0 keeps the incumbent.
 enum NemotronDraftTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_TUNE"] != "0"
     static let forced: (all: Int?, families: [Family: Int]) = {
-        // Default: fixed rows of the draft-chain families (`variants` order); the draft SDPA decides by the rule.
+        // Default: fixed rows of the draft-chain families and the verify Q/K/V launch (`variants` order); the draft
+        // SDPA decides by the rule.
         let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FORCE"]
-            ?? "fc1:9,screen:3,qkv:6,up:0,wo:0,down:6,ehp:6,eh:1"
+            ?? "fc1:10,screen:3,qkv:9,up:7,wo:7,down:9,ehp:9,eh:8,vqkv:16,sdpa:4"
         if let n = Int(value) { return (n, [:]) }
         var out: [Family: Int] = [:]
         for item in value.split(whereSeparator: { $0 == "," || $0 == "+" }) {
@@ -6905,9 +6907,13 @@ enum NemotronDraftTune {
         /// ehp: the vector-store closing loop (`nemotronQMVVectorStoreSource`); the incumbent's
         /// (`NemotronHeadPreparedActivation.projectVSVerified`).
         var vs = false
+        /// wo, up, down, eh, qkv: the multi-row body, ehp: the prepared body, through `nemotronQMVLeanSource`; fc1:
+        /// the leader text through `nmlLeaderLeanSource` (base pointers plus 32-bit lane offsets for the code and
+        /// pair-index or scale and bias words).
+        var lean = false
         var description: String {
             "r\(rps)n\(nsg)" + (slotX ? "x" : "") + "u\(unroll)" + (load != 0 ? "l\(load)" : "")
-                + (keys != 0 ? "k\(keys)" : "") + (packed ? "p" : "") + (vs ? "vs" : "")
+                + (keys != 0 ? "k\(keys)" : "") + (packed ? "p" : "") + (vs ? "vs" : "") + (lean ? "ln" : "")
         }
     }
 
@@ -6940,21 +6946,31 @@ enum NemotronDraftTune {
     /// unroll and store form; a variant equal to the incumbent is skipped.
     static func variants(_ f: Family, _ inc: Geometry) -> [(name: String, g: Geometry)] {
         func v(_ rps: Int, _ nsg: Int, unroll: Int? = nil, slotX: Bool = false, load: Int = 0, keys: Int = 0,
-               packed: Bool = false) -> (name: String, g: Geometry) {
+               packed: Bool = false, lean: Bool = false) -> (name: String, g: Geometry) {
             let g = Geometry(rps: rps, nsg: nsg, unroll: unroll ?? inc.unroll, slotX: slotX, load: load, keys: keys,
-                             packed: packed, vs: inc.vs)
+                             packed: packed, vs: inc.vs, lean: lean)
             return (g.description, g)
         }
         switch f {
         case .fc1:
+            // Rows 10 and 11: the lean leader text (`nmlLeaderLeanSource`) on row 9 and on the incumbent's geometry.
             return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 1), v(8, 2), v(4, 2, slotX: true),
-                    v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4)]
+                    v(4, 2, unroll: inc.unroll == 1 ? 2 : 1), v(4, 2, unroll: 4),
+                    v(4, 2, unroll: 4, lean: true), v(4, 2, lean: true)]
         case .screen:
             return [v(4, 2), v(16, 2), v(8, 1), v(8, 4), v(16, 1), v(32, 1), v(4, 4), v(16, 4)]
-        case .wo, .up, .down, .eh, .qkv:
-            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2)]
+        case .qkv:
+            // Rows 7 ... 10: the lean body (`qmvBody(lean:)`) on the incumbent's geometry and on rows 1, 6 and 3.
+            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2),
+                    v(4, 2, lean: true), v(2, 2, lean: true), v(4, 2, unroll: 2, lean: true), v(4, 1, lean: true)]
+        case .wo, .up, .down, .eh:
+            // Rows 7 ... 10: the lean body (`qmvBody(lean:)`) on the incumbent's geometry and on rows 1, 6 and 3.
+            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2),
+                    v(4, 2, lean: true), v(2, 2, lean: true), v(4, 2, unroll: 2, lean: true), v(4, 1, lean: true)]
         case .ehp:
-            return [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2)]
+            // Rows 8 and 9: the lean prepared body (`nemotronQMVLeanSource`) on the incumbent's geometry and on row 6.
+            return [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2),
+                    v(2, 2, lean: true), v(2, 2, unroll: 2, lean: true)]
         case .sdpa:
             return [v(1, 32, unroll: 8, keys: 2, packed: true), v(1, 32, unroll: 8, keys: 2),
                     v(1, 32, unroll: 8, keys: 1), v(1, 32, unroll: 4, keys: 2), v(1, 32, unroll: 4, keys: 1)]
@@ -6979,12 +6995,14 @@ enum NemotronDraftTune {
     }
 
     /// The R = 1 dictionary multi-row body (the pipeline of `kernelHalfDict`: decode form, pair dictionary, vector
-    /// store) with the SIMD groups per threadgroup from the template and `unroll` on its main K loop.
-    static func qmvBody(unroll: Int) -> String? {
-        nemotronCountedSwaps(nemotronMultiRowQMVSource, nemotronPreparedNSGSwaps)
+    /// store) with the SIMD groups per threadgroup from the template and `unroll` on its main K loop; `lean`: then
+    /// through `nemotronQMVLeanSource` (every load reads the same address, every statement is kept).
+    static func qmvBody(unroll: Int, lean: Bool = false) -> String? {
+        let body = nemotronCountedSwaps(nemotronMultiRowQMVSource, nemotronPreparedNSGSwaps)
             .flatMap { nemotronCountedSwaps($0, nemotronMultiRowHalfSwaps) }
             .flatMap(nemotronSBDictSource)
             .flatMap { nemotronUnrollSource($0, loop: NemotronU2.qmvLoop, count: 1, unroll: unroll) }
+        return lean ? nemotronQMVLeanSource(body) : body
     }
 
     /// One R = 1 dictionary multi-row launch of geometry `g` (x: one row of K); nil when it cannot run.
@@ -6993,10 +7011,10 @@ enum NemotronDraftTune {
         let k = x.dim(-1), n = w.dim(0)
         let form = NemotronMultiRowQMVKernel.r1HalfDecodeForm
         guard form != 0, x.size == k, n % g.rps == 0, (n / g.rps) % g.nsg == 0, g.rps <= 32, g.nsg <= 32,
-              let kernel = cached("nemotron_draft_tune_qmv_u\(g.unroll)", {
-                  qmvBody(unroll: g.unroll).map {
+              let kernel = cached("nemotron_draft_tune_qmv_u\(g.unroll)\(g.lean ? "ln" : "")", {
+                  qmvBody(unroll: g.unroll, lean: g.lean).map {
                       MLXFast.metalKernel(
-                          name: "nemotron_draft_tune_qmv_u\(g.unroll)",
+                          name: "nemotron_draft_tune_qmv_u\(g.unroll)\(g.lean ? "ln" : "")",
                           inputNames: ["w", "scales", "biases", "x", "K", "N", "dep"], outputNames: ["y"],
                           source: $0, header: nemotronMultiRowQMVHeader + nemotronHalfDecodeHeader)
                   }
@@ -7639,7 +7657,8 @@ extension NemotronDraftTune {
     /// tiny and large rows), rows written at two offsets. V0's twin and the survivors are timed round robin as chains
     /// in which each launch binds the previous launch's q rows as `dep`, cycling cold copies of every layer's
     /// weights (~96 MB per pass), and the fastest is adopted only through the shared rule. Own load cap (3 s).
-    /// One stderr line; off by default (the record launch), NEMOTRON_VQKV_TUNE=1 runs the tune; NEMOTRON_DRAFT_FORCE=vqkv:<n> forces variant n.
+    /// One stderr line; on by default with row 16 (`r2n2u2vs`) forced through NEMOTRON_DRAFT_FORCE (vqkv:<n> forces
+    /// variant n, vqkv:0 keeps the record launch); NEMOTRON_VQKV_TUNE=0 keeps the record launch.
     static func tuneVerifyQKV(_ target: Module) {
         adopted[.vqkv] = nil
         let t0 = DispatchTime.now().uptimeNanoseconds
@@ -7648,7 +7667,7 @@ extension NemotronDraftTune {
             FileHandle.standardError.write(Data(
                 "nemotron verify qkv tune: \(message) (\(String(format: "%.2f", elapsed())) s)\n".utf8))
         }
-        guard enabled, ProcessInfo.processInfo.environment["NEMOTRON_VQKV_TUNE"] == "1" else {
+        guard enabled, ProcessInfo.processInfo.environment["NEMOTRON_VQKV_TUNE"] != "0" else {
             return report("off (setting)")
         }
         guard !NemotronMoELeader.selfTest, Device.defaultDevice().deviceType == .gpu, StreamOrDevice.default == .gpu,
@@ -7740,12 +7759,12 @@ extension NemotronTargetQKV {
     /// `dep` input last. nil when it cannot run.
     static func tuneLaunch(_ g: NemotronDraftTune.Geometry, weights: [MLXArray], indices: [MLXArray],
                            tables: [MLXArray], x: MLXArray, dep: MLXArray) -> [MLXArray]? {
-        let key = "nemotron_draft_tune_qkv_u\(g.unroll)"
+        let key = "nemotron_draft_tune_qkv_u\(g.unroll)" + (g.lean ? "ln" : "")
         guard weights.count == 3, indices.count == 3, tables.count == 3, x.ndim == 3, x.dim(1) == 1,
               r1HalfDecodeForm != 0, 256 % (g.rps * g.nsg) == 0, g.rps <= 32, g.nsg <= 32,
               let kernel = NemotronDraftTune.cached(key, {
                   guard let prefix = nemotronCountedSwaps(dictTilePrefix, [("(2 * RPS)", "(NSG * RPS)", 2)]),
-                        let body = NemotronDraftTune.qmvBody(unroll: g.unroll) else { return nil }
+                        let body = NemotronDraftTune.qmvBody(unroll: g.unroll, lean: g.lean) else { return nil }
                   return MLXFast.metalKernel(
                       name: key,
                       inputNames: ["qw", "qs", "qb", "kw", "ks", "kb", "vw", "vs", "vb", "x", "K", "dep"],
@@ -7819,7 +7838,7 @@ extension NemotronHeadPreparedActivation {
     static func draftTuneLaunch(_ g: NemotronDraftTune.Geometry, packed: MLXArray, w: MLXArray, scales: MLXArray,
                                 biases: MLXArray, dep: MLXArray) -> MLXArray? {
         let k = w.dim(1) * 8, n = w.dim(0)
-        let key = "nemotron_draft_tune_prep_l\(g.load)_u\(g.unroll)" + (g.vs ? "_vs" : "")
+        let key = "nemotron_draft_tune_prep_l\(g.load)_u\(g.unroll)" + (g.vs ? "_vs" : "") + (g.lean ? "_ln" : "")
         let loads: [Int: [(String, String, Int)]] = [
             1: nemotronPreparedW32Swaps, 2: nemotronPreparedHoistSwaps, 3: nemotronPreparedPrefetchSwaps]
         guard packed.dim(0) == 3, g.load == 0 || loads[g.load] != nil, n % g.rps == 0, (n / g.rps) % g.nsg == 0,
@@ -7828,6 +7847,7 @@ extension NemotronHeadPreparedActivation {
                   (g.vs ? nemotronQMVVectorStoreSource(nemotronHeadPreparedQMVSource) : nemotronHeadPreparedQMVSource)
                       .flatMap { nemotronCountedSwaps($0, (loads[g.load] ?? []) + nemotronPreparedNSGSwaps) }
                       .flatMap { nemotronUnrollSource($0, loop: NemotronU2.qmvLoop, count: 1, unroll: g.unroll) }
+                      .flatMap { g.lean ? nemotronQMVLeanSource($0) : $0 }
                       .map {
                           MLXFast.metalKernel(
                               name: key, inputNames: ["w", "scales", "biases", "prepared", "K", "N", "dep"],
