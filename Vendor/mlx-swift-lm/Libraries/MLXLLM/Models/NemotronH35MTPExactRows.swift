@@ -3837,12 +3837,14 @@ enum NemotronMTPVerifySDPA {
         }
     }
 
-    /// NEMOTRON_SDPA_TUNE=0 keeps the launch selected above (one threadgroup per query head once `qualifyFast`
+    /// The tune is off by default (NEMOTRON_SDPA_TUNE=1 runs it): it keeps the launch selected above (one threadgroup
+    /// per query head once `qualifyFast`
     /// passed). Otherwise `tune` times that launch and the per-row prepared launch it was checked against
     /// (`mergedPrepared`: 32 x 3 threadgroups, the aggregation selected above) and adopts the per-row launch only
     /// when `NemotronTuneAdoption.decide` admits it (at least 3% faster by median and faster in at least 75% of the
     /// cycles). NEMOTRON_SDPA_FORCE=1 adopts the per-row launch, 0 keeps the per-head launch.
-    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] != "0"
+    /// Off by default (the verify SDPA keeps its incumbent form); NEMOTRON_SDPA_TUNE=1 runs the tune.
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SDPA_TUNE"] == "1"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SDPA_FORCE"] ?? "")
     nonisolated(unsafe) private static var perRowAdopted = false
 
@@ -3920,11 +3922,11 @@ enum NemotronMTPVerifySDPA {
                 }
                 same = ok.item(Bool.self)
                 guard same else { failure = "per-row launch differs"; return }
-                // A round: both launches' chains built first, then evaluated back to back in `order`.
+                // A round: each launch's chain built, then evaluated and timed, one at a time in `order` (the build
+                // stays outside the timed span).
                 func round(_ order: [Int]) -> [Double?] {
-                    let chains = order.map { run($0 == 1) }
-                    return chains.map { outs -> Double? in
-                        guard let outs else { return nil }
+                    order.map { idx -> Double? in
+                        guard let outs = run(idx == 1) else { return nil }
                         let begin = DispatchTime.now().uptimeNanoseconds
                         eval(outs)
                         Stream.gpu.synchronize()
@@ -6851,12 +6853,16 @@ enum NemotronScreenPicks {
 // 75% of the cycles, paired within each cycle).
 // The chains read cold data as the round does: fc1 cycles 16 routes through the bank, the other families cycle copies
 // of their weights (an integer add of zero, about 96 MB per pass). Load cap 3 s.
-// NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; NEMOTRON_DRAFT_FORCE=<n> adopts variant n (1-based, `variants`) of
+// NEMOTRON_DRAFT_TUNE=0 keeps every incumbent; by default the draft-chain families keep theirs (the FORCE default
+// below) and only the draft SDPA is decided by the rule; NEMOTRON_DRAFT_FORCE=<n> adopts
+// variant n (1-based, `variants`) of
 // every family that qualified it, <family>:<n>[,<family>:<n>] of the named families; 0 keeps the incumbent.
 enum NemotronDraftTune {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_TUNE"] != "0"
     static let forced: (all: Int?, families: [Family: Int]) = {
-        let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FORCE"] ?? ""
+        // Default: every draft-chain family keeps its incumbent; the draft SDPA decides by the tune's rule.
+        let value = ProcessInfo.processInfo.environment["NEMOTRON_DRAFT_FORCE"]
+            ?? "fc1:0,screen:0,qkv:0,up:0,wo:0,down:0,ehp:0,eh:0"
         if let n = Int(value) { return (n, [:]) }
         var out: [Family: Int] = [:]
         for item in value.split(whereSeparator: { $0 == "," || $0 == "+" }) {
@@ -7103,10 +7109,11 @@ enum NemotronDraftTune {
                         }
                         return previous
                     }
+                    // A round: each candidate's chain built, then evaluated and timed, one at a time in `order`
+                    // (the build stays outside the timed span).
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
