@@ -1109,13 +1109,16 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // matters for quantized projections whose selected graph may depend
         // on row count. It also bounds temporary fused/K/V tensors.
         if primePromptHistory && !s.started && !s.pendingTokens.isEmpty {
-            let ids = concatenated(s.pendingTokens, axis: 1)
-            let rows = concatenated(s.pendingHidden, axis: 1)
+            let ids = s.pendingTokens.count == 1 ? s.pendingTokens[0] : concatenated(s.pendingTokens, axis: 1)
+            let rows = s.pendingHidden.count == 1 ? s.pendingHidden[0] : concatenated(s.pendingHidden, axis: 1)
             for start in stride(from: 0, to: ids.dim(1), by: 512) {
                 let end = min(start + 512, ids.dim(1))
-                let primed = module.appendTrustedKV(
-                    hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+                let sliceIds = start == 0 && end == ids.dim(1) ? ids : ids[0..., start..<end]
+                let sliceRows = start == 0 && end == rows.dim(1) ? rows : rows[0..., start..<end, 0...]
+                let primed = target.mtpEmbeddingOperands(sliceIds).flatMap {
+                    module.appendTrustedKV(hidden: sliceRows, operands: $0, cache: s.cache)
+                } ?? module.appendTrustedKV(
+                    hidden: sliceRows, embedding: target.mtpEmbedding(sliceIds), cache: s.cache)
                 asyncEval(primed)
                 s.roots = primed
             }
@@ -1124,13 +1127,17 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
                 for i in 0..<ids.dim(1) {
                     let hiddenRow = rows[0..., i..<(i + 1), 0...]
-                    let embedding = target.mtpEmbedding(ids[0..., i..<(i + 1)])
+                    let tokenSlice = ids[0..., i..<(i + 1)]
                     if kvOnlyHistory {
-                        s.roots += module.appendTrustedKV(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache)
+                        s.roots += target.mtpEmbeddingOperands(tokenSlice).flatMap {
+                            module.appendTrustedKV(hidden: hiddenRow, operands: $0, cache: s.cache)
+                        } ?? module.appendTrustedKV(
+                            hidden: hiddenRow, embedding: target.mtpEmbedding(tokenSlice), cache: s.cache)
                     } else {
-                        s.roots.append(module.pagedForward(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache))
+                        s.roots.append(target.mtpEmbeddingOperands(tokenSlice).flatMap {
+                            module.pagedForward(hidden: hiddenRow, operands: $0, cache: s.cache)
+                        } ?? module.pagedForward(
+                            hidden: hiddenRow, embedding: target.mtpEmbedding(tokenSlice), cache: s.cache))
                     }
                 }
             }
@@ -1146,7 +1153,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         }
         // Before the request's first verify (`NemotronMTPFirstRoundDraft`).
         NemotronMTPFirstRoundDraft.firstRound = !s.started
-        let out = module.pagedForward(
+        let out = target.mtpEmbeddingOperands(tokens).flatMap {
+            module.pagedForward(hidden: hidden, operands: $0, cache: s.cache)
+        } ?? module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
         NemotronMTPFirstRoundDraft.firstRound = false
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
@@ -1312,9 +1321,12 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             if let secondInputs, secondInputs.from === first.hidden {
                 out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
             } else {
-                out = module.pagedForward(
+                let tokenIds = first.tokens.reshaped([1, 1])
+                out = target.mtpEmbeddingOperands(tokenIds).flatMap {
+                    module.pagedForward(hidden: first.hidden, operands: $0, cache: s.cache)
+                } ?? module.pagedForward(
                     hidden: first.hidden,
-                    embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+                    embedding: target.mtpEmbedding(tokenIds), cache: s.cache)
             }
             ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: false))
         }

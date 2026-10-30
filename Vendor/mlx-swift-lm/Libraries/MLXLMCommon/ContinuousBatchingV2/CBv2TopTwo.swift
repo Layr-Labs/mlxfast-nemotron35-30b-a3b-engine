@@ -585,6 +585,36 @@ public enum CBv2MTPTopTwoKeys {
     nonisolated(unsafe) static var verified = false
 }
 
+/// CBV2_MTP_TOP2_COLUMNS_ENTRY=0 keeps the key finalize's column form reading the two draft ids at the packet store.
+/// Otherwise its twin (`cbv2PacketColumnsEntrySource`) reads `w1[0]` and `w2[0]` into registers as its first
+/// statements and the store takes them from there; used only after `cbv2TopTwoColumnsEntryQualify` found the twin
+/// bitwise equal to the column form.
+public enum CBv2MTPTopTwoColumnsEntry {
+    public static let enabled = ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_COLUMNS_ENTRY"] != "0"
+    nonisolated(unsafe) static var verified = false
+}
+
+/// CBV2_MTP_TOP2_KEYS_VEC4=0 keeps the strided scalar loads in `cbv2TopTwoKeysPartialKernel`.
+/// Otherwise its coalesced 4-element twin (`cbv2TopTwoKeysVec4PartialKernel`) reads 4 contiguous BF16 logits per
+/// thread step (one 64-bit `uint2` load when the row base is 8-byte aligned) and keys them with the same total-order
+/// `darkbloom_qwen35_mtp_top2_key`; used only after `cbv2TopTwoKeysVec4Qualify` found ids, values and packet bitwise
+/// equal across all test cases.
+public enum CBv2MTPTopTwoKeysVec4 {
+    public static let enabled = ProcessInfo.processInfo.environment["CBV2_MTP_TOP2_KEYS_VEC4"] != "0"
+    nonisolated(unsafe) static var verified = false
+}
+
+/// The column form's text (`cbv2PacketColumnsSource`) with the two draft ids read first: `const int cbe_w1 = w1[0];`
+/// and `const int cbe_w2 = w2[0];` ahead of the record's first statement, and the packet store's
+/// `row == 1 ? w1[0] : w2[0]` reading `cbe_w1` / `cbe_w2` (the same values); every other statement is the column
+/// form's. nil when the store is not found exactly once.
+private func cbv2PacketColumnsEntrySource(_ s: String) -> String? {
+    let read = "row == 1 ? w1[0] : w2[0]"
+    guard s.components(separatedBy: read).count == 2 else { return nil }
+    return "        const int cbe_w1 = w1[0];\n        const int cbe_w2 = w2[0];\n"
+        + s.replacingOccurrences(of: read, with: "row == 1 ? cbe_w1 : cbe_w2")
+}
+
 private let cbv2TopTwoKeysHeader = cbv2TopTwoHeader + """
 
     inline ulong darkbloom_qwen35_mtp_top2_key(bfloat16_t x, uint id) {
@@ -615,6 +645,24 @@ private let cbv2TopTwoKeysHeader = cbv2TopTwoHeader + """
         state.second_id = ~uint(second >> 16);
         state.count = 2;
         return state;
+    }
+
+    template <typename Ptr>
+    inline void darkbloom_qwen35_mtp_top2_load4(
+        Ptr p, thread bfloat16_t &x0, thread bfloat16_t &x1, thread bfloat16_t &x2, thread bfloat16_t &x3
+    ) {
+        x0 = p[0]; x1 = p[1]; x2 = p[2]; x3 = p[3];
+    }
+
+    inline void darkbloom_qwen35_mtp_top2_load4(
+        const device bfloat16_t* p,
+        thread bfloat16_t &x0, thread bfloat16_t &x1, thread bfloat16_t &x2, thread bfloat16_t &x3
+    ) {
+        const uint2 raw = *reinterpret_cast<const device uint2*>(p);
+        x0 = as_type<bfloat16_t>(ushort(raw.x));
+        x1 = as_type<bfloat16_t>(ushort(raw.x >> 16));
+        x2 = as_type<bfloat16_t>(ushort(raw.y));
+        x3 = as_type<bfloat16_t>(ushort(raw.y >> 16));
     }
 """
 
@@ -677,6 +725,76 @@ private let cbv2TopTwoKeysPartialKernel = MLXFast.metalKernel(
     header: cbv2TopTwoKeysHeader,
     ensureRowContiguous: true)
 
+private let cbv2TopTwoKeysVec4PartialSource = """
+        uint lane = thread_position_in_threadgroup.x;
+        uint group_index = threadgroup_position_in_grid.x;
+        uint row = group_index / 32;
+        uint group = group_index % 32;
+        uint vocab = uint(logits_shape[2]);
+        const auto t2_row = logits + row * vocab;
+        ulong first = 0;
+        ulong second = 0;
+        const uint vec_vocab = vocab & ~3u;
+        const bool aligned8 = (reinterpret_cast<ulong>(t2_row) & 7ul) == 0ul;
+        uint index = (group * 256 + lane) * 4;
+        if (aligned8) {
+            for (; index < vec_vocab; index += 32 * 256 * 4) {
+                bfloat16_t x0, x1, x2, x3;
+                darkbloom_qwen35_mtp_top2_load4(t2_row + index, x0, x1, x2, x3);
+                darkbloom_qwen35_mtp_top2_key_push(first, second, darkbloom_qwen35_mtp_top2_key(x0, index));
+                darkbloom_qwen35_mtp_top2_key_push(first, second, darkbloom_qwen35_mtp_top2_key(x1, index + 1));
+                darkbloom_qwen35_mtp_top2_key_push(first, second, darkbloom_qwen35_mtp_top2_key(x2, index + 2));
+                darkbloom_qwen35_mtp_top2_key_push(first, second, darkbloom_qwen35_mtp_top2_key(x3, index + 3));
+            }
+        } else {
+            for (; index < vec_vocab; index += 32 * 256 * 4) {
+                darkbloom_qwen35_mtp_top2_key_push(
+                    first, second, darkbloom_qwen35_mtp_top2_key(t2_row[index], index));
+                darkbloom_qwen35_mtp_top2_key_push(
+                    first, second, darkbloom_qwen35_mtp_top2_key(t2_row[index + 1], index + 1));
+                darkbloom_qwen35_mtp_top2_key_push(
+                    first, second, darkbloom_qwen35_mtp_top2_key(t2_row[index + 2], index + 2));
+                darkbloom_qwen35_mtp_top2_key_push(
+                    first, second, darkbloom_qwen35_mtp_top2_key(t2_row[index + 3], index + 3));
+            }
+        }
+        if (group == 0 && lane < (vocab & 3u)) {
+            const uint rem = vec_vocab + lane;
+            darkbloom_qwen35_mtp_top2_key_push(
+                first, second, darkbloom_qwen35_mtp_top2_key(t2_row[rem], rem));
+        }
+
+        const uint simd_lane = thread_index_in_simdgroup;
+        const uint simd_group = simdgroup_index_in_threadgroup;
+        const ulong simd_first = darkbloom_qwen35_mtp_top2_key_max(first);
+        const ulong simd_second = darkbloom_qwen35_mtp_top2_key_max(first == simd_first ? second : first);
+
+        threadgroup ulong scratch[16];
+        if (simd_lane == 0) {
+            scratch[2 * simd_group] = simd_first;
+            scratch[2 * simd_group + 1] = simd_second;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_group == 0) {
+            const ulong key = simd_lane < 16 ? scratch[simd_lane] : 0ul;
+            const ulong group_first = darkbloom_qwen35_mtp_top2_key_max(key);
+            const ulong group_second = darkbloom_qwen35_mtp_top2_key_max(key == group_first ? 0ul : key);
+            if (simd_lane == 0) {
+                partial_keys[(row * 32 + group) * 2] = group_first;
+                partial_keys[(row * 32 + group) * 2 + 1] = group_second;
+            }
+        }
+    """
+
+private let cbv2TopTwoKeysVec4PartialKernel = MLXFast.metalKernel(
+    name: "darkbloom_qwen35_mtp_top2_partial_keys_vec4",
+    inputNames: ["logits"],
+    outputNames: ["partial_keys"],
+    source: cbv2TopTwoKeysVec4PartialSource,
+    header: cbv2TopTwoKeysHeader,
+    ensureRowContiguous: true)
+
 /// The shuffle-form packet finalize with its loads and shuffle merges swapped for the key merge of the row's 32
 /// threadgroup pairs (one counted swap; nil if the text moved). The stores are the record's text.
 private func cbv2TopTwoKeysFinalizeSource(_ s: String) -> String? {
@@ -727,6 +845,17 @@ private let cbv2TopTwoKeysFinalizeKernels: (window: MLXFast.MLXFastKernel, colum
             source: cbv2PacketColumnsSource($0), header: cbv2TopTwoKeysHeader, ensureRowContiguous: true))
     }
 
+/// The key finalize's column form with the draft ids read first (`CBv2MTPTopTwoColumnsEntry`); nil if a text moved.
+private let cbv2TopTwoKeysColumnsEntryKernel: MLXFast.MLXFastKernel? =
+    cbv2TopTwoKeysFinalizeSource(cbv2TopTwoFinalizePacketShuffleSource)
+        .flatMap { cbv2PacketColumnsEntrySource(cbv2PacketColumnsSource($0)) }.map {
+            MLXFast.metalKernel(
+                name: "darkbloom_qwen35_mtp_top2_finalize_packet_keys_cols_e",
+                inputNames: ["partial_keys", "w1", "w2"],
+                outputNames: ["top_ids", "top_values", "packet"],
+                source: $0, header: cbv2TopTwoKeysHeader, ensureRowContiguous: true)
+        }
+
 /// The packet finalize of either form on the partials, reading the draft ids from `draftColumns` ([1] int32
 /// each, window columns 1 and 2) or from `window`.
 private func cbv2TopTwoPacketFinalize(
@@ -765,7 +894,7 @@ package func cbv2TopTwoRowsPacket(
 /// int32 each; batch 1, width 3) when given, else from `window`.
 private func cbv2TopTwoRowsPacket(
     _ logits: MLXArray, window: MLXArray, draftColumns: [MLXArray]?, shuffle: Bool?, offset32: Bool? = nil,
-    keys: Bool? = nil
+    keys: Bool? = nil, columnsEntry: Bool? = nil, keysVec4: Bool? = nil
 ) -> (ids: MLXArray, values: MLXArray, packet: MLXArray)? {
     guard CBv2MTPTopTwoPacket.enabled,
         logits.ndim == 3, logits.dim(0) == 1, logits.dim(2) >= 2,
@@ -777,14 +906,17 @@ private func cbv2TopTwoRowsPacket(
     if keys ?? CBv2MTPTopTwoKeys.verified, logits.dtype == .bfloat16, rows * logits.dim(2) <= Int(UInt32.max),
         let finalize = cbv2TopTwoKeysFinalizeKernels
     {
-        let partial = cbv2TopTwoKeysPartialKernel(
+        let partialKernel = (keysVec4 ?? CBv2MTPTopTwoKeysVec4.verified)
+            ? cbv2TopTwoKeysVec4PartialKernel : cbv2TopTwoKeysPartialKernel
+        let partial = partialKernel(
             [logits],
             grid: (rows * 32 * 256, 1, 1),
             threadGroup: (256, 1, 1),
             outputShapes: [[rows, 32, 2]],
             outputDTypes: [.uint64])[0]
         let columns = window.shape == [1, 3] ? draftColumns : nil
-        let outputs = (columns == nil ? finalize.window : finalize.columns)(
+        let entry = (columnsEntry ?? CBv2MTPTopTwoColumnsEntry.verified) ? cbv2TopTwoKeysColumnsEntryKernel : nil
+        let outputs = (columns == nil ? finalize.window : entry ?? finalize.columns)(
             columns.map { [partial, $0[0], $0[1]] } ?? [partial, window],
             grid: (rows * 32, 1, 1),
             threadGroup: (32, 1, 1),
@@ -1130,6 +1262,190 @@ package func cbv2TopTwoKeysQualify(logitsDType: DType, vocabulary: Int) {
     report(CBv2MTPTopTwoKeys.verified
         ? "on (\(cases) cases bitwise equal to the record partial and finalize)"
         : "off (differs from the record partial and finalize after \(cases) cases)")
+}
+
+/// Load time, after `cbv2TopTwoKeysQualify` admitted the key finalize: the column form with the draft ids read first
+/// against the column form, at width 3 over the full vocabulary and a short one, bit for bit in the ids, the values
+/// (as bits) and the packet. Logits: Gaussian, exact ties, NaNs, infinities, signed zeros, constant rows and random
+/// BF16 bit patterns; draft columns of seeded ids, the int32 extremes, zero and negative values. Engages only if every
+/// case matches (`CBv2MTPTopTwoColumnsEntry`).
+package func cbv2TopTwoColumnsEntryQualify(logitsDType: DType, vocabulary: Int) {
+    defer { cbv2TopTwoKeysVec4Qualify(logitsDType: logitsDType, vocabulary: vocabulary) }
+    CBv2MTPTopTwoColumnsEntry.verified = false
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 mtp top2 columns entry: \(message)\n".utf8))
+    }
+    guard CBv2MTPTopTwoColumnsEntry.enabled else { return report("off (setting)") }
+    guard CBv2MTPTopTwoKeys.verified, logitsDType == .bfloat16, cbv2TopTwoKeysColumnsEntryKernel != nil else {
+        return report("off (key finalize off or its text moved)")
+    }
+    var cases = 0
+    do {
+        let matches = try withError { () -> Bool in
+            var ok = MLXArray(true)
+            let extremes: [(Int32, Int32)] = [(Int32.max, Int32.min), (0, -1), (-7, 123_456), (Int32.min, Int32.max)]
+            for vocab in [vocabulary, 5003] {
+                for kind in 0 ..< 8 {
+                    let seed = UInt64(0x7a99_0000 + vocab * 16 + kind)
+                    var logits = MLXRandom.normal([1, 3, vocab], key: MLXRandom.key(seed)) * 3
+                    switch kind {
+                    case 1: logits = round(logits)
+                    case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)), MLXArray(Float.nan), logits)
+                    case 3:
+                        logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                            which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                    case 4: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(Float(-0.0)), round(logits))
+                    case 5: logits = MLXArray.zeros([1, 3, vocab]) + MLXArray(Float(0.5))
+                    default: break
+                    }
+                    var typed = logits.asType(.bfloat16)
+                    if kind == 6 {
+                        typed = MLXRandom.randInt(0 ..< 65536, [1, 3, vocab], key: MLXRandom.key(seed + 1))
+                            .asType(.uint16).view(dtype: .bfloat16)
+                    }
+                    var ids = MLXRandom.randInt(0 ..< Int32(vocab), [1, 3], key: MLXRandom.key(seed + 2))
+                        .asType(.int32)
+                    if kind == 7 {
+                        let e = extremes[vocab % extremes.count]
+                        ids = MLXArray([Int32(1), e.0, e.1]).reshaped(1, 3)
+                    }
+                    let columns = [ids[0..., 1].reshaped(1), ids[0..., 2].reshaped(1)]
+                    guard let a = cbv2TopTwoRowsPacket(
+                            typed, window: ids, draftColumns: columns, shuffle: nil, keys: true, columnsEntry: false),
+                          let b = cbv2TopTwoRowsPacket(
+                            typed, window: ids, draftColumns: columns, shuffle: nil, keys: true, columnsEntry: true)
+                    else { return false }
+                    ok = ok .&& (a.ids .== b.ids).all()
+                        .&& (a.values.view(dtype: .uint32) .== b.values.view(dtype: .uint32)).all()
+                        .&& (a.packet .== b.packet).all()
+                    cases += 1
+                }
+            }
+            return ok.item(Bool.self)
+        }
+        CBv2MTPTopTwoColumnsEntry.verified = matches && cases > 0
+    } catch {
+        return report("off (\(error))")
+    }
+    report(CBv2MTPTopTwoColumnsEntry.verified
+        ? "on (\(cases) cases bitwise equal to the column form: ids, values and packet)"
+        : "off (differs from the column form)")
+}
+
+/// Load time, after `cbv2TopTwoColumnsEntryQualify`: the coalesced 4-element key partial (`CBv2MTPTopTwoKeysVec4`)
+/// against the strided scalar key partial, bit for bit in the ids, the values (as bits) and the packet, across the
+/// full vocabulary, short and non-multiple-of-4 vocabularies (2, 3, 64, 5003, 8193, vocabulary + 8195), R = 1 ... 4,
+/// all 12 special bit/value kinds, and the misaligned (`flat[5...]`), wide-window and transposed views.
+package func cbv2TopTwoKeysVec4Qualify(logitsDType: DType, vocabulary: Int) {
+    CBv2MTPTopTwoKeysVec4.verified = false
+    func report(_ message: String) {
+        FileHandle.standardError.write(Data("cbv2 mtp top2 keys vec4: \(message)\n".utf8))
+    }
+    guard CBv2MTPTopTwoPacket.enabled else { return report("off (packet finalize off)") }
+    guard CBv2MTPTopTwoKeysVec4.enabled else { return report("off (setting)") }
+    guard CBv2MTPTopTwoKeys.verified, logitsDType == .bfloat16, cbv2TopTwoKeysFinalizeKernels != nil else {
+        return report("off (keys off)")
+    }
+    var cases = 0
+    do {
+        let matches = try withError { () -> Bool in
+            func same(_ logits: MLXArray, _ window: MLXArray, columns: Bool) -> MLXArray? {
+                let draftColumns = columns ? [window[0..., 1].reshaped(1), window[0..., 2].reshaped(1)] : nil
+                guard let a = cbv2TopTwoRowsPacket(
+                        logits, window: window, draftColumns: draftColumns, shuffle: nil, keys: true, keysVec4: false),
+                      let b = cbv2TopTwoRowsPacket(
+                        logits, window: window, draftColumns: draftColumns, shuffle: nil, keys: true, keysVec4: true)
+                else { return nil }
+                cases += 1
+                return (a.ids .== b.ids).all()
+                    .&& (a.values.view(dtype: .uint32) .== b.values.view(dtype: .uint32)).all()
+                    .&& (a.packet .== b.packet).all()
+            }
+            func bits(_ range: Range<Int32>, _ shape: [Int], _ seed: UInt64) -> MLXArray {
+                MLXRandom.randInt(range, shape, key: MLXRandom.key(seed)).asType(.uint16)
+            }
+            func patterns(_ pool: [UInt16], _ shape: [Int], _ seed: UInt64) -> MLXArray {
+                let pick = MLXRandom.randInt(0 ..< Int32(pool.count), shape, key: MLXRandom.key(seed))
+                return take(MLXArray(pool), pick).view(dtype: .bfloat16)
+            }
+            for vocab in [vocabulary, 2, 3, 64, 5003, 8193, vocabulary + 8195] {
+                var ok = MLXArray(true)
+                for rows in 1 ... 4 {
+                    for kind in 0 ..< 12 {
+                        let seed = UInt64(0x7a9a_0000 + vocab * 64 + rows * 16 + kind)
+                        let shape = [1, rows, vocab]
+                        var logits = MLXRandom.normal(shape, key: MLXRandom.key(seed)) * 3
+                        switch kind {
+                        case 1: logits = round(logits)
+                        case 2: logits = which(abs(logits) .> MLXArray(Float(5.5)), MLXArray(Float.nan), logits)
+                        case 3:
+                            logits = which(logits .> MLXArray(Float(6)), MLXArray(Float.infinity),
+                                which(logits .< MLXArray(Float(-6)), MLXArray(-Float.infinity), logits))
+                        case 4: logits = which(abs(logits) .< MLXArray(Float(1)), MLXArray(Float(-0.0)), round(logits))
+                        case 5: logits = MLXArray.zeros(shape) + MLXArray(Float(0.5))
+                        case 10:
+                            let draw = MLXRandom.uniform(Float(0) ..< Float(1), shape, key: MLXRandom.key(seed + 1))
+                            logits = which(draw .< MLXArray(Float(0.002)), logits, MLXArray(-Float.infinity))
+                        case 11:
+                            let edge = MLXArray.zeros([1, rows, 1]) + MLXArray(Float(9))
+                            logits = vocab == 2 ? concatenated([edge, edge], axis: 2)
+                                : concatenated([edge, logits[0..., 0..., 1 ..< (vocab - 1)], edge], axis: 2)
+                        default: break
+                        }
+                        var typed = logits.asType(.bfloat16)
+                        switch kind {
+                        case 6: typed = bits(0 ..< 65536, shape, seed + 2).view(dtype: .bfloat16)
+                        case 7:
+                            typed = patterns([0x0000, 0x8000, 0x0001, 0x8001, 0x7fc0, 0xffc0, 0x7f81, 0xffff,
+                                0x7f80, 0xff80, 0x3f80, 0xbf80], shape, seed + 3)
+                        case 8:
+                            typed = which(bits(0 ..< 2, shape, seed + 4) .== MLXArray(UInt16(0)),
+                                bits(0x7f81 ..< 0x8000, shape, seed + 5), bits(0xff81 ..< 0x10000, shape, seed + 6))
+                                .view(dtype: .bfloat16)
+                        case 9:
+                            typed = patterns([0x0000, 0x8000, 0x0001, 0x8001, 0x0002, 0x8002, 0x0040, 0x8040,
+                                0x007f, 0x807f, 0x0080, 0x8080], shape, seed + 7)
+                        default: break
+                        }
+                        let window = MLXRandom.randInt(
+                            0 ..< Int32(vocab), [1, rows], key: MLXRandom.key(UInt64(0x7a9b_0000 + cases)))
+                            .asType(.int32)
+                        let w = rows >= 2 ? window : concatenated([window, window], axis: 1)
+                        let l = rows >= 2 ? typed : concatenated([typed, typed], axis: 1)
+                        guard let s = same(l, w, columns: false) else { return false }
+                        ok = ok .&& s
+                        if rows == 3 {
+                            guard let c = same(l, w, columns: true) else { return false }
+                            ok = ok .&& c
+                        }
+                    }
+                }
+                if !ok.item(Bool.self) { return false }
+            }
+            let window = MLXRandom.randInt(0 ..< Int32(5003), [1, 3], key: MLXRandom.key(0x7a9c_0000))
+                .asType(.int32)
+            let flat = (MLXRandom.normal([3 * vocabulary + 5], key: MLXRandom.key(0x7a9c_0001)) * 3)
+                .asType(.bfloat16)
+            let wide = (MLXRandom.normal([1, 3, vocabulary + 64], key: MLXRandom.key(0x7a9c_0002)) * 3)
+                .asType(.bfloat16)
+            let tall = (MLXRandom.normal([1, 5003, 3], key: MLXRandom.key(0x7a9c_0003)) * 3).asType(.bfloat16)
+            var ok = MLXArray(true)
+            for logits in [flat[5...].reshaped(1, 3, vocabulary), wide[0..., 0..., 32 ..< (32 + vocabulary)],
+                           tall.transposed(0, 2, 1)] {
+                for columns in [false, true] {
+                    guard let s = same(logits, window, columns: columns) else { return false }
+                    ok = ok .&& s
+                }
+            }
+            return ok.item(Bool.self)
+        }
+        CBv2MTPTopTwoKeysVec4.verified = matches && cases > 0
+    } catch {
+        return report("off (\(error))")
+    }
+    report(CBv2MTPTopTwoKeysVec4.verified
+        ? "on (\(cases) cases bitwise equal to the strided key partial: ids, values and packet)"
+        : "off (differs from the strided key partial after \(cases) cases)")
 }
 
 /// Load-time JIT of the packet finalize (its pipeline depends only on the
