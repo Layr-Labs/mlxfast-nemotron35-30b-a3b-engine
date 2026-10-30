@@ -2092,7 +2092,7 @@ extension NemotronHRMSNormGated {
 enum NemotronHPrefillX5 {
     static let enabled = ProcessInfo.processInfo.environment["NEMOTRON_PREFILL_X5"] != "0"
     /// The run gather clones the NAX kernel; without NAX stock runs another one.
-    static let runGather = enabled && GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    static let runGather = enabled && nemotronNAXOrForced
     /// The state update `product + exp(cumsum)[-1] * previous` is one kernel.
     /// `NEMOTRON_PREFILL_SSM_STATE_UPDATE=0` restores the stock pair.
     static let ssmStateUpdate = enabled
