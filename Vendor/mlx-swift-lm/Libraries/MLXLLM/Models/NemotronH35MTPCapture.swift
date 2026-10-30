@@ -226,9 +226,10 @@ enum NemotronMTPSSMAnchor {
     /// in the text, `arrival8` -> `arrival4`); its threads 0 ... 127 run the same tail text on the same stored
     /// outputs. `tune` checks the 4-d launches against the 8-d launches and adopts them only when
     /// `NemotronTuneAdoption.decide` admits them (at least 3% faster by median and faster in at least 75% of the
-    /// cycles). NEMOTRON_SSM_TUNE=0 keeps 8 d's; NEMOTRON_SSM_FORCE=1 adopts 4 d's when they qualified, 0 keeps 8.
+    /// cycles). NEMOTRON_SSM_TUNE=0 keeps 8 d's; NEMOTRON_SSM_FORCE defaults to 1 (4 d's adopted when they
+    /// qualified); 0 keeps 8, an empty value lets the tune's rule decide.
     static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] != "0"
-    static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "")
+    static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "1")
     /// Soft cap on the tune's load time: the timing does not start past it.
     static let tuneBudgetSeconds = 1.2 * nemotronWindowTuneBudgetScale
     nonisolated(unsafe) static var tg4Adopted = false
