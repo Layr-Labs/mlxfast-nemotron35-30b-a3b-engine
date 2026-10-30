@@ -61,6 +61,8 @@ private final class NemotronMTPDraftHead {
         /// The B1 select without the ticket (`NemotronHeadScreen.noTicketEnabled`),
         /// set once its pick, kept rows and chunk bests matched the fused B1 select.
         var noTicket = false
+        /// Identical native screen policy, omitting outputs never consumed by greedy calls.
+        var bestOnly = false
     }
     private var screen: Screen?
     private var checkSteps = 0, checkMisses = 0, checkRescoreMismatches = 0
@@ -90,6 +92,16 @@ private final class NemotronMTPDraftHead {
         else { return argMax(logits(hidden)[0..., -1, 0...], axis: -1).asType(.int32) }
         // `NemotronDraftTune` (screen): the paired 2-bit partial pass at the geometry adopted at load.
         let tuned = screen.records2 != nil && screen.paired ? NemotronDraftTune.adopted[.screen] : nil
+        if screen.bestOnly, !NemotronHeadScreen.check, let records2 = screen.records2,
+           let result = NemotronHeadScreen.runBestOnly(hidden,
+            weight: screen.weight, scales: screen.scales, biases: screen.biases,
+            records2: records2, groups: screen.groups, groupCount: screen.groupCount,
+            chunk: screen.chunk, keep: screen.keep, upperGroups: upper ? screen.upperGroups : nil,
+            upperGroupCount: upper ? screen.upperGroupCount : 0, paired: screen.paired,
+            rowsPerSimdgroup: tuned?.rps ?? 8, simdgroups: tuned?.nsg ?? 2, tunedPartial: tuned != nil) {
+            NemotronScreenPicks.register(result.id, .init(values: result.bestValues, ids: result.bestIds))
+            return result.id
+        }
         let result = NemotronHeadScreen.run(
             hidden, weight: screen.weight, scales: screen.scales, biases: screen.biases,
             groups: screen.groups, groupCount: screen.groupCount, chunk: screen.chunk,
@@ -105,6 +117,76 @@ private final class NemotronMTPDraftHead {
             checkAgainstStock(hidden, result, screen)
         }
         return result.id
+    }
+
+    /// Official-worker only: identical original producer and native winner/pick semantics; no counter mutation.
+    private func qualifyBestOnly(_ plan: Screen, gamma: MLXArray) -> Bool {
+        func report(_ text: String) {
+            FileHandle.standardError.write(Data("nemotron draft bests only: \(text)\n".utf8))
+        }
+        guard NemotronHeadScreen.bestOnlyRequested, plan.noTicket, plan.b1,
+              let records2 = plan.records2, let prefix, let head = target.lmHead as? QuantizedLinear else {
+            report("off (setting or no admitted plan)")
+            return false
+        }
+        var cases = 0
+        do {
+            let equal = try withError { () -> Bool in
+                var state: UInt64 = 0x082E_FA98_EC4E_6C89
+                var checks: [MLXArray] = []
+                for round in 0 ..< 12 {
+                    let values = (0 ..< 2688).map { _ -> Float in
+                        state = state &* 6364136223846793005 &+ 1442695040888963407
+                        return (Float(state >> 40) / Float(1 << 24) - 0.5) * 3.4641016
+                    }
+                    var x = (MLXArray(values) * gamma.asType(.float32) * Float(1 + round % 3))
+                        .asType(.bfloat16).reshaped(1, 1, 2688)
+                    if round == 6 { x = MLXArray.zeros([1, 1, 2688], dtype: .bfloat16) }
+                    if round == 7 { x = MLXArray([Float](repeating: -0.0, count: 2688))
+                        .asType(.bfloat16).reshaped(1, 1, 2688) }
+                    if round == 8 {
+                        let padded = concatenated([MLXArray.zeros([1], dtype: .bfloat16), x.reshaped(2688)], axis: 0)
+                        x = padded[1 ..< 2689].reshaped(1, 1, 2688)
+                    }
+                    if round >= 9 {
+                        var special = values
+                        special[(round * 223) % 2688] = round == 9 ? Float.infinity
+                            : (round == 10 ? -Float.infinity : Float.nan)
+                        x = MLXArray(special).asType(.bfloat16).reshaped(1, 1, 2688)
+                    }
+                    for full in plan.upperGroups == nil ? [false] : [false, true] {
+                        let old = NemotronHeadScreen.run(x,
+                            weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            groups: plan.groups, groupCount: plan.groupCount, chunk: plan.chunk, keep: plan.keep,
+                            upperGroups: full ? plan.upperGroups : nil, upperGroupCount: full ? plan.upperGroupCount : 0,
+                            records2: records2, paired: plan.paired, b1: true, noTicket: true)
+                        guard let new = NemotronHeadScreen.runBestOnly(x,
+                            weight: plan.weight, scales: plan.scales, biases: plan.biases,
+                            records2: records2, groups: plan.groups, groupCount: plan.groupCount,
+                            chunk: plan.chunk, keep: plan.keep, upperGroups: full ? plan.upperGroups : nil,
+                            upperGroupCount: full ? plan.upperGroupCount : 0, paired: plan.paired),
+                              let bestValues = old.bestValues, let bestIds = old.bestIds else { return false }
+                        checks.append((old.scores.view(dtype: .uint32) .== new.scores.view(dtype: .uint32)).all()
+                            .&& (bestValues.view(dtype: .uint32) .== new.bestValues.view(dtype: .uint32)).all()
+                            .&& (bestIds .== new.bestIds).all() .&& (old.id .== new.id).all())
+                        if round < 9 {
+                            let logits = (full ? head(x) : prefix(x))[0, -1].asType(.float32)
+                            let expected = take(logits, bestIds, axis: 0)
+                            checks.append((expected.view(dtype: .uint32) .== new.bestValues.view(dtype: .uint32)).all())
+                        }
+                        cases += 1
+                    }
+                }
+                eval(checks)
+                return !checks.isEmpty && checks.allSatisfy { $0.item(Bool.self) }
+            }
+            report(equal ? "on (\(cases) partial/best/pick cases bitwise equal; candidate stores omitted)"
+                         : "off (source or output words differ)")
+            return equal
+        } catch {
+            report("off (\(error))")
+            return false
+        }
     }
 
     /// NEMOTRON_MTP_HEAD_SCREEN_CHECK=1 only: synchronous comparison with the
@@ -677,6 +759,7 @@ private final class NemotronMTPDraftHead {
         } else {
             partialOffset32Note = "off (no paired full-head 2-bit screen)"
         }
+        plan.bestOnly = qualifyBestOnly(plan, gamma: gamma)
         screen = plan
         // Requests switch between the full and the half-head screen; compile
         // the half-head variant (on the same packed and fused path) here as
@@ -1113,9 +1196,13 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             let rows = concatenated(s.pendingHidden, axis: 1)
             for start in stride(from: 0, to: ids.dim(1), by: 512) {
                 let end = min(start + 512, ids.dim(1))
-                let primed = module.appendTrustedKV(
-                    hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+                let sliceIds = ids[0..., start..<end]
+                let sliceRows = rows[0..., start..<end, 0...]
+                let primed = target.mtpEmbeddingOperands(sliceIds).flatMap {
+                    module.appendTrustedKV(hidden: sliceRows, operands: $0, cache: s.cache)
+                } ?? module.appendTrustedKV(
+                    hidden: sliceRows,
+                    embedding: target.mtpEmbedding(sliceIds), cache: s.cache)
                 asyncEval(primed)
                 s.roots = primed
             }
@@ -1124,13 +1211,17 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
                 for i in 0..<ids.dim(1) {
                     let hiddenRow = rows[0..., i..<(i + 1), 0...]
-                    let embedding = target.mtpEmbedding(ids[0..., i..<(i + 1)])
+                    let tokenRow = ids[0..., i..<(i + 1)]
                     if kvOnlyHistory {
-                        s.roots += module.appendTrustedKV(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache)
+                        s.roots += target.mtpEmbeddingOperands(tokenRow).flatMap {
+                            module.appendTrustedKV(hidden: hiddenRow, operands: $0, cache: s.cache)
+                        } ?? module.appendTrustedKV(
+                            hidden: hiddenRow, embedding: target.mtpEmbedding(tokenRow), cache: s.cache)
                     } else {
-                        s.roots.append(module.pagedForward(
-                            hidden: hiddenRow, embedding: embedding, cache: s.cache))
+                        s.roots.append(target.mtpEmbeddingOperands(tokenRow).flatMap {
+                            module.pagedForward(hidden: hiddenRow, operands: $0, cache: s.cache)
+                        } ?? module.pagedForward(
+                            hidden: hiddenRow, embedding: target.mtpEmbedding(tokenRow), cache: s.cache))
                     }
                 }
             }
@@ -1146,7 +1237,9 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         }
         // Before the request's first verify (`NemotronMTPFirstRoundDraft`).
         NemotronMTPFirstRoundDraft.firstRound = !s.started
-        let out = module.pagedForward(
+        let out = target.mtpEmbeddingOperands(tokens).flatMap {
+            module.pagedForward(hidden: hidden, operands: $0, cache: s.cache)
+        } ?? module.pagedForward(
             hidden: hidden, embedding: target.mtpEmbedding(tokens), cache: s.cache)
         NemotronMTPFirstRoundDraft.firstRound = false
         let ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: first))
@@ -1312,9 +1405,12 @@ extension NemotronH35MTPAssistant: CBv2MTPFirstDraftPrestaging {
             if let secondInputs, secondInputs.from === first.hidden {
                 out = module.pagedForward(inputs: secondInputs.inputs, cache: s.cache)
             } else {
-                out = module.pagedForward(
+                let firstTokens = first.tokens.reshaped([1, 1])
+                out = target.mtpEmbeddingOperands(firstTokens).flatMap {
+                    module.pagedForward(hidden: first.hidden, operands: $0, cache: s.cache)
+                } ?? module.pagedForward(
                     hidden: first.hidden,
-                    embedding: target.mtpEmbedding(first.tokens.reshaped([1, 1])), cache: s.cache)
+                    embedding: target.mtpEmbedding(firstTokens), cache: s.cache)
             }
             ids = draftHead.greedy(out, upper: s.screensUpper(firstDraft: false))
         }
