@@ -390,7 +390,8 @@ func nemotronSSMTail32Source(_ source: String) -> String? {
 
 /// NEMOTRON_MTP_SSM_TAIL32=0 keeps the record tail. Otherwise the verify's fused SSM launches in the one-barrier tail
 /// form (`compactSSMAnchorRows`: no pending steps, pending steps without a store and with the anchor store) at the
-/// geometry `NemotronMTPSSMAnchor.tune` kept (8 or 4 d's per thread group) run twins built from their text by
+/// geometry `qualify` checked (the one in use when it runs: 8 d's per thread group, since `NemotronMTPSSMAnchor.tune`
+/// runs after it; a 4-d adoption there leaves the twins out, `admits`) run twins built from their text by
 /// `nemotronSSMTail32Source` (kernel name + "_o32"), once `qualify` found every twin of that geometry bitwise equal to
 /// its record launch.
 enum NemotronSSMTail32 {
@@ -422,12 +423,13 @@ enum NemotronSSMTail32 {
     /// Whether a launch at this geometry takes its twin by default (`compactSSMAnchorRows`).
     static func admits(tg4: Bool) -> Bool { verified && tg4 == checkedTG4 }
 
-    /// Load time, after `NemotronMTPSSMAnchor.tune` and before any verify graph is traced: every twin of the kept
-    /// geometry against its record launch on every Mamba layer's real parameters (A_log, D, the gated norm's weight
-    /// and eps), with two operand sets per layer (seeded, and the same with infinities, NaNs, -0, tiny and large values
-    /// in the gate, the window's conv rows and the old state), each at every pending count 0 ... anchorAt + 2 (no
-    /// store; and from one pending step on also the anchor store): the normalized rows, the prepared activation and
-    /// the stored state bit for bit. Engages only if every case matches.
+    /// Load time, before `NemotronMTPSSMAnchor.tune` (which then times the 8-d launches with the twins admitted) and
+    /// before any verify graph is traced: every twin of the geometry in use against its record launch on every Mamba
+    /// layer's real parameters (A_log, D, the gated norm's weight and eps), with two operand sets per layer (seeded,
+    /// and the same with infinities, NaNs, -0, tiny and large values in the gate, the window's conv rows and the old
+    /// state), each at every pending count 0 ... anchorAt + 2 (no store; and from one pending step on also the anchor
+    /// store): the normalized rows, the prepared activation and the stored state bit for bit. Engages only if every
+    /// case matches.
     static func qualify(_ model: Module) {
         verified = false
         let tg4 = NemotronMTPSSMAnchor.tg4Adopted
@@ -540,8 +542,9 @@ func nemotronSSMTailTCSource(_ source: String) -> String? {
 
 /// NEMOTRON_MTP_SSM_TAIL_TC=0 keeps the tail `compactSSMAnchorRows` launches without it (the record tail, or its 32-bit
 /// twin once `NemotronSSMTail32` admitted it). Otherwise the verify's fused SSM launches in the one-barrier tail form
-/// (no pending steps, pending steps without a store and with the anchor store) at the geometry
-/// `NemotronMTPSSMAnchor.tune` kept (8 or 4 d's per thread group) run twins built by `nemotronSSMTailTCSource` from the
+/// (no pending steps, pending steps without a store and with the anchor store) at the geometry `qualify` checked (8 d's
+/// per thread group: `NemotronMTPSSMAnchor.tune` runs after it, and a 4-d adoption there leaves the twins out,
+/// `admits`) run twins built by `nemotronSSMTailTCSource` from the
 /// text of the launch they replace (the record text, or the 32-bit text of `nemotronSSMTail32Source`; kernel name +
 /// "_tc") with the gated norm's eps and the identity scale as the template integers NMEPS and NMID, once `qualify` found
 /// every twin of that geometry bitwise equal to the launch it replaces with those values.
@@ -590,8 +593,8 @@ enum NemotronSSMTailTC {
         verified && tg4 == checkedTG4 && checkedEps.contains(Int(eps.bitPattern))
     }
 
-    /// Load time, after `NemotronMTPSSMAnchor.tune` and `NemotronSSMTail32.qualify` and before any verify graph is
-    /// traced: every twin of the kept geometry against the launch it replaces (the one `NemotronSSMTail32` admits) on
+    /// Load time, after `NemotronSSMTail32.qualify`, before `NemotronMTPSSMAnchor.tune` and before any verify graph is
+    /// traced: every twin of the geometry in use against the launch it replaces (the one `NemotronSSMTail32` admits) on
     /// every Mamba layer's real parameters (A_log, D, the gated norm's weight
     /// and eps), with two operand sets per layer (seeded, and the same with infinities, NaNs, -0, tiny and large values
     /// in the gate, the window's conv rows and the old state), each at every pending count 0 ... anchorAt + 2 (no

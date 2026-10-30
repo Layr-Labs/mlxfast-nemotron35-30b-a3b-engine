@@ -6170,7 +6170,7 @@ class NemotronHSwitchMLP: Module {
                             join: (residual: MLXArray, norm: RMSNorm)? = nil, shared: NemotronHMLP? = nil)
         -> (out: MLXArray, added: Bool, normalized: MLXArray?)? {
         let k = indices.dim(-1)
-        guard indices.size > 64, (1...8).contains(k), scores.dtype == .float32,
+        guard indices.size > 64 || NemotronSeedTailMoE.shortRuns, (1...8).contains(k), scores.dtype == .float32,
               scores.shape == indices.shape,
               x.dtype == .bfloat16 || x.dtype == .float16, x.dim(-1) == inputDims,
               inputDims % 4 == 0
@@ -8212,7 +8212,7 @@ private final class NemotronHRunGatherKernel: Sendable {
 /// (N block, expert-run tile). Only where stock GatherQMM takes the
 /// sorted-rhs route (M == 1, B >= 16, B / E >= 4) and gather_qmm_rhs picks
 /// affine_gather_qmm_rhs_nax (NAX available, half-precision activations)
-/// using the same per-row K fragment order; nil = use the stock op. ReLU2 is BF16-only and retains
+/// using the same per-row K fragment order (`nemotronRunsAdmitted`); nil = use the stock op. ReLU2 is BF16-only and retains
 /// the native Maximum promotion rule before selecting the fused store.
 func nemotronRunGather(
     _ x: MLXArray, _ lin: QuantizedSwitchLinear, tiles: NemotronHRunTiles,
@@ -8227,7 +8227,7 @@ func nemotronRunGather(
           ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
     else { return nil }
     let n = x.dim(0), k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
-    guard n == tiles.rows, n >= 16, n / experts >= 4,
+    guard n == tiles.rows, nemotronRunsAdmitted(n, experts: experts),
           tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
           ops.weight.dim(2) * 8 == k, k % 64 == 0,
           ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
@@ -8510,7 +8510,7 @@ METAL_FUNC void nemotron_gather_qmm_runs_copy_impl(
         else { return nil }
         let ops = lin.nemotronGatherOperands(for: x.dtype)
         let n = x.dim(0), k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
-        guard n == tiles.rows, n >= 16, n / experts >= 4,
+        guard n == tiles.rows, nemotronRunsAdmitted(n, experts: experts),
               tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
               ops.weight.dim(2) * 8 == k, k % 64 == 0, nOut % 128 == 0,
               copy.codes.shape == [experts, nOut / 128, k, 32], copy.codes.dtype == .uint16,
@@ -9161,7 +9161,7 @@ const device T* xn = x;
               ops.weight.ndim == 3, ops.scales.dtype == x.dtype, biases.dtype == x.dtype
         else { return nil }
         let n = tiles.rows, k = x.dim(-1), experts = ops.weight.dim(0), nOut = ops.weight.dim(1)
-        guard n >= 16, n / experts >= 4,
+        guard nemotronRunsAdmitted(n, experts: experts),
               tiles.bm == nemotronGatherTileRows(rows: n, experts: experts),
               ops.weight.dim(2) * 8 == k, k % 64 == 0,
               ops.scales.shape == [experts, nOut, k / 64], biases.shape == ops.scales.shape
