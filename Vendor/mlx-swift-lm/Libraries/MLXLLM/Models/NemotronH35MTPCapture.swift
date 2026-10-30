@@ -226,8 +226,10 @@ enum NemotronMTPSSMAnchor {
     /// in the text, `arrival8` -> `arrival4`); its threads 0 ... 127 run the same tail text on the same stored
     /// outputs. `tune` checks the 4-d launches against the 8-d launches and adopts them only when
     /// `NemotronTuneAdoption.decide` admits them (at least 3% faster by median and faster in at least 75% of the
-    /// cycles). NEMOTRON_SSM_TUNE=0 keeps 8 d's; NEMOTRON_SSM_FORCE=1 adopts 4 d's when they qualified, 0 keeps 8.
-    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] != "0"
+    /// cycles). The tune is off by default (8 d's kept); NEMOTRON_SSM_TUNE=1 runs it; NEMOTRON_SSM_FORCE=1 adopts 4 d's
+    /// when they qualified, 0 keeps 8.
+    /// Off by default (the anchor SSM launch keeps its incumbent threadgroup size); NEMOTRON_SSM_TUNE=1 runs the tune.
+    static let tuneEnabled = ProcessInfo.processInfo.environment["NEMOTRON_SSM_TUNE"] == "1"
     static let tuneForced = Int(ProcessInfo.processInfo.environment["NEMOTRON_SSM_FORCE"] ?? "")
     /// Soft cap on the tune's load time: the timing does not start past it.
     static let tuneBudgetSeconds = 1.2 * nemotronWindowTuneBudgetScale
@@ -467,8 +469,11 @@ enum NemotronMTPSSMAnchor {
                         record11 = (a.2, nil)
                     } else {
                         let grown = extend(record11.tape, w, keep)
-                        record11 = grown.steps <= NemotronMTPPendingSSM.strictSteps
-                            ? (record11.anchor, grown) : (replay(grown, record11.anchor), nil)
+                        if grown.steps <= NemotronMTPPendingSSM.strictSteps {
+                            record11 = (record11.anchor, grown)
+                        } else {
+                            record11 = (replay(grown, record11.anchor), nil)
+                        }
                     }
                     skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, extend(skip.tape, w, keep))
                     same = same && (skip.tape?.steps ?? 0) <= top

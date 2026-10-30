@@ -4027,9 +4027,8 @@ enum NemotronSeedQMMTune {
                         return previous
                     }
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
@@ -4128,10 +4127,12 @@ enum NemotronSeedQMMTune {
         }
         if NemotronPrefillSharedDownCopy.verified {
             parts.append("shared_down off (copy launch verified)")
-        } else {
+        } else if ProcessInfo.processInfo.environment["NEMOTRON_SEED_QMM_SHARED_DOWN"] == "1" {
             kinds.append(Kind(name: "shared_down",
                               linears: target.modules().compactMap { ($0 as? NemotronHMoE)?.sharedExperts?.downProj },
                               source: .copy, relu2: false, zeros: true))
+        } else {
+            parts.append("shared_down off (preserve target down_proj mlock)")
         }
         let specials = MLXArray([Float(-0.0), 0, .infinity, -.infinity, .nan, Float(bitPattern: 0x0001_0000),
                                  Float(bitPattern: 0x8001_0000), 3e38])
