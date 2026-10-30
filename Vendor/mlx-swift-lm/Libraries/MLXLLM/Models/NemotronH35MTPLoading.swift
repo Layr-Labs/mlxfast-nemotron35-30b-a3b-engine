@@ -109,9 +109,9 @@ extension NemotronH35MTPAssistant {
         NemotronQMVTune.tune(target)
         assistant.tuneDraftKernels()
         NemotronDraftTune.tuneVerifyQKV(target)
-        NemotronMTPSSMAnchor.tune(target)
         NemotronSSMTail32.qualify(target)
         NemotronSSMTailTC.qualify(target)
+        NemotronMTPSSMAnchor.tune(target)
         NemotronRouterSharedUpColaunch.qualify(target)
         NemotronDraftColaunch.qualify(assistant.module)
         cbv2TopTwoShuffleQualify(logitsDType: .bfloat16, vocabulary: target.configuration.vocabSize)
@@ -829,4 +829,4 @@ final class NemotronCPUWarm: @unchecked Sendable {
 
 // Measurement entry 1 of this tree.
 
-// Measurement entry 1 of this tree.
+// Measurement entry 2 of this tree.

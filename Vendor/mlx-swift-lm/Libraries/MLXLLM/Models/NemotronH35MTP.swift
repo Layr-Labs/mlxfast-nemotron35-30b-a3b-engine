@@ -901,6 +901,11 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         var nextSecondDraft: (ids: MLXArray, out: MLXArray, keys: MLXArray, values: MLXArray,
                               from: MLXArray)?
         var deferredSecondRow: (keys: MLXArray, values: MLXArray)?
+        /// The prompt history `primeHistoryAfterSeed` primed ahead of the first
+        /// draft step and the head-cache offset it started at. Kept until the
+        /// first round finalizes; an observation before then restores the
+        /// unprimed state first (`unprimeSeedHistory`).
+        var seedPrimed: (tokens: [MLXArray], hidden: [MLXArray], offset: Int)?
         init(owner: ObjectIdentifier, normalBacklogLimit: Int) {
             self.owner = owner
             self.normalBacklogLimit = normalBacklogLimit
@@ -917,9 +922,10 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             return [snapshot.keys, snapshot.values]
         }
         var arrays: [MLXArray] {
-            let base: [MLXArray] = (paged?.cache.innerState() ?? [])
+            var base: [MLXArray] = (paged?.cache.innerState() ?? [])
                 + pendingTokens + pendingHidden + savedTokens + savedHidden
                 + [frontier, savedFrontier].compactMap { $0 } + roots
+            if let primed = seedPrimed { base += primed.tokens + primed.hidden }
             guard let row = deferredSecondRow else { return base }
             return base + [row.keys, row.values]
         }
@@ -1058,6 +1064,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         let n = observation.tokens.dim(1)
         precondition(observation.tokens.shape == [1, n] && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
         guard n > 0 else { return }
+        unprimeSeedHistory(s)
         // Keep every known (next token, previous target hidden) pair, including
         // the bridge between prefill chunks. The final frontier pairs with the
         // next observed token or the seed supplied to draftStep.
@@ -1109,16 +1116,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         // matters for quantized projections whose selected graph may depend
         // on row count. It also bounds temporary fused/K/V tensors.
         if primePromptHistory && !s.started && !s.pendingTokens.isEmpty {
-            let ids = concatenated(s.pendingTokens, axis: 1)
-            let rows = concatenated(s.pendingHidden, axis: 1)
-            for start in stride(from: 0, to: ids.dim(1), by: 512) {
-                let end = min(start + 512, ids.dim(1))
-                let primed = module.appendTrustedKV(
-                    hidden: rows[0..., start..<end, 0...],
-                    embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
-                asyncEval(primed)
-                s.roots = primed
-            }
+            primeHistory(s)
         } else {
             // Post-prefill accepted target rows retain one-token arithmetic.
             for (ids, rows) in zip(s.pendingTokens, s.pendingHidden) {
@@ -1156,6 +1154,21 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         return (ids, out)
     }
 
+    /// The fixed-width priming of the pending prompt history: 512-row
+    /// chunks of the concatenated rows, each appended and submitted.
+    private func primeHistory(_ s: State) {
+        let ids = concatenated(s.pendingTokens, axis: 1)
+        let rows = concatenated(s.pendingHidden, axis: 1)
+        for start in stride(from: 0, to: ids.dim(1), by: 512) {
+            let end = min(start + 512, ids.dim(1))
+            let primed = module.appendTrustedKV(
+                hidden: rows[0..., start..<end, 0...],
+                embedding: target.mtpEmbedding(ids[0..., start..<end]), cache: s.cache)
+            asyncEval(primed)
+            s.roots = primed
+        }
+    }
+
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { state(requestState).arrays }
     public func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
         committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {
@@ -1188,6 +1201,7 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
             }
         }
         s.committedInputCount += confirmedInputTokens
+        s.seedPrimed = nil
         s.canPrestageFirstDraft = s.started
         s.started = true
         s.paged!.row.commitSpeculativeWrite()
@@ -1225,8 +1239,38 @@ public final class NemotronH35MTPAssistant: Module, CBv2MTPRequestStatefulDrafte
         clearRound(s)
         s.nextFirstDraft = nil; s.nextSecondInputs = nil; s.nextSecondDraft = nil
         s.paged?.release(); s.paged = nil
-        s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil
+        s.pendingTokens = []; s.pendingHidden = []; s.frontier = nil; s.seedPrimed = nil
         s.committedInputCount = 0; s.released = true
+    }
+}
+
+extension NemotronH35MTPAssistant: CBv2MTPSeedHistoryPriming {
+    /// `draftStep`'s prompt-history priming for the request's first draft,
+    /// issued at the end of the step that produced its carry: the same
+    /// pending rows, chunks and appends (`primeHistory`), before the first
+    /// round opens. The frontier stays for that draft's seed row.
+    public func primeHistoryAfterSeed(requestState: any CBv2MTPRequestState) {
+        let s = state(requestState)
+        guard primePromptHistory, !s.started, s.stagedInputCount == 0, s.seedPrimed == nil,
+              s.paged != nil, !s.pendingTokens.isEmpty
+        else { return }
+        s.seedPrimed = (tokens: s.pendingTokens, hidden: s.pendingHidden, offset: s.cacheOffset)
+        primeHistory(s)
+        s.pendingTokens = []
+        s.pendingHidden = []
+    }
+
+    /// Undoes `primeHistoryAfterSeed` before the history grows: the head
+    /// cache back to the offset it started at and the primed rows pending
+    /// again ahead of anything queued since, so `draftStep` primes the whole
+    /// history in its fixed-width chunks.
+    fileprivate func unprimeSeedHistory(_ s: State) {
+        guard let primed = s.seedPrimed else { return }
+        s.seedPrimed = nil
+        s.paged!.row.rollback(s.cacheOffset - primed.offset)
+        s.pendingTokens = primed.tokens + s.pendingTokens
+        s.pendingHidden = primed.hidden + s.pendingHidden
+        s.roots = []
     }
 }
 

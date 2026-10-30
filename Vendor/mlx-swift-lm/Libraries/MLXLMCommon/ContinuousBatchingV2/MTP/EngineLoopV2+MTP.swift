@@ -64,6 +64,7 @@ extension EngineLoopV2 {
         CBv2MTPSubmitMerge.flush()
         asyncEval(graph.asyncEvalTargets)
         if let verify = graph.verify { mtpSpeculateAfterVerify(verify, driver: mtp) }
+        mtpPrimeHistoryAfterSeed(graph, driver: mtp)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
@@ -101,5 +102,22 @@ extension EngineLoopV2 {
         step.forwardShapes = shapes
         shapes?.attach()
         return step
+    }
+
+    /// The first draft's history priming for each row whose first carry this
+    /// step produces (a completed prompt's or a seed decode's), submitted on
+    /// its own behind the step's target work: the GPU runs it while the host
+    /// reads back the sampled token and builds the first round. Not with a
+    /// prefix checkpoint store, whose capture at this step's finalize reads
+    /// the unprimed history (`NEMOTRON_MTP_PRIME_IN_SEED`).
+    func mtpPrimeHistoryAfterSeed(_ graph: CBv2MTPGraphBuild, driver mtp: CBv2MTPRoundDriver) {
+        guard CBv2MTPPrimeInSeed.enabled, hybridPrefixCache == nil, completeCheckpointCapture == nil,
+            !graph.prefillCarries.isEmpty || !graph.seedRows.isEmpty,
+            let primer = mtp.drafter as? any CBv2MTPSeedHistoryPriming
+        else { return }
+        let ids = Set(graph.prefillCarries.map(\.id) + graph.seedRows.map(\.id))
+        for observation in graph.committedObservationRows where ids.contains(observation.id) {
+            primer.primeHistoryAfterSeed(requestState: observation.assistantState)
+        }
     }
 }
