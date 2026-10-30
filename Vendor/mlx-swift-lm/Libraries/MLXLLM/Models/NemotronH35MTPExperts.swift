@@ -5848,22 +5848,10 @@ enum NemotronFC1Tune {
     static let variants: [Variant] = [
         Variant(name: "r2n2", rps: 2, nsg: 2, slotX: false, w32: false, unroll: 0),
         Variant(name: "r2n4", rps: 2, nsg: 4, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r1n4", rps: 1, nsg: 4, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r4n1", rps: 4, nsg: 1, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r4n2", rps: 4, nsg: 2, slotX: false, w32: false, unroll: 0),
         Variant(name: "r2n1x", rps: 2, nsg: 1, slotX: true, w32: false, unroll: 0),
         Variant(name: "r2n4x", rps: 2, nsg: 4, slotX: true, w32: false, unroll: 0),
-        Variant(name: "r2n1w", rps: 2, nsg: 1, slotX: false, w32: true, unroll: 0),
-        Variant(name: "r2n8", rps: 2, nsg: 8, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r1n8", rps: 1, nsg: 8, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r4n4", rps: 4, nsg: 4, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r8n1", rps: 8, nsg: 1, slotX: false, w32: false, unroll: 0),
-        Variant(name: "r8n2", rps: 8, nsg: 2, slotX: false, w32: false, unroll: 0),
         Variant(name: "r2n2x", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0),
-        Variant(name: "r4n1x", rps: 4, nsg: 1, slotX: true, w32: false, unroll: 0),
-        Variant(name: "r2n1u1", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 1),
         Variant(name: "r2n1u4", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 4),
-        Variant(name: "r4n2u1", rps: 4, nsg: 2, slotX: false, w32: false, unroll: 1),
     ] + (leanRows ? [
         Variant(name: "r2n1ln", rps: 2, nsg: 1, slotX: false, w32: false, unroll: 0, lean: true),
         Variant(name: "r2n2xln", rps: 2, nsg: 2, slotX: true, w32: false, unroll: 0, lean: true),
@@ -6237,11 +6225,10 @@ enum NemotronFC1Tune {
                         }
                         return prev
                     }
-                    // A round: every candidate's chain built first, then evaluated back to back in `order`.
+                    // A round: each candidate's chain built and evaluated back to back in `order`.
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
@@ -6407,9 +6394,8 @@ enum NemotronQMVTune {
             }
         }
         var relu2: Bool { self == .sharedUp }
-        /// The default median bar of the family's adoption: 0.995 (at least 0.5% faster) for in_proj, the head and
-        /// out_proj; the shared up keeps the shared bar (`NemotronTuneAdoption.medianBar`).
-        var medianBar: Double { self == .sharedUp ? NemotronTuneAdoption.medianBar : 0.995 }
+        /// The default median bar of the family's adoption: 0.995 (at least 0.5% faster).
+        var medianBar: Double { 0.995 }
         init?(k: Int, n: Int) {
             guard let f = Family.allCases.first(where: { $0.k == k && $0.n == n }) else { return nil }
             self = f
@@ -6497,59 +6483,36 @@ enum NemotronQMVTune {
             return [
                 Variant(name: "r2n4", rps: 2, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n1", rps: 2, nsg: 1, load: nil, u2: nil),
-                Variant(name: "r4n2", rps: 4, nsg: 2, load: nil, u2: nil),
                 Variant(name: "r2n2l1", rps: 2, nsg: 2, load: 1, u2: nil),
-                Variant(name: "r2n2u0", rps: 2, nsg: 2, load: nil, u2: false),
-                Variant(name: "r1n4", rps: 1, nsg: 4, load: nil, u2: nil),
-                Variant(name: "r2n8", rps: 2, nsg: 8, load: nil, u2: nil),
+                Variant(name: "r2n1l1", rps: 2, nsg: 1, load: 1, u2: nil),
+                Variant(name: "r2n4l1", rps: 2, nsg: 4, load: 1, u2: nil),
                 Variant(name: "r2n2l2", rps: 2, nsg: 2, load: 2, u2: nil),
-                // Index 9 on (more geometries x load forms; the rule's paired win test guards the wider pick).
                 Variant(name: "r2n4l2", rps: 2, nsg: 4, load: 2, u2: nil),
                 Variant(name: "r2n2l3", rps: 2, nsg: 2, load: 3, u2: nil),
-                Variant(name: "r1n2", rps: 1, nsg: 2, load: nil, u2: nil),
-                Variant(name: "r4n1", rps: 4, nsg: 1, load: nil, u2: nil),
-                Variant(name: "r1n8", rps: 1, nsg: 8, load: nil, u2: nil),
             ]
         case .head:
             return [
                 Variant(name: "r2n4", rps: 2, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n16", rps: 2, nsg: 16, load: nil, u2: nil),
-                Variant(name: "r4n4", rps: 4, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n8u0", rps: 2, nsg: 8, load: nil, u2: false),
-                Variant(name: "r1n16", rps: 1, nsg: 16, load: nil, u2: nil),
-                Variant(name: "r2n32", rps: 2, nsg: 32, load: nil, u2: nil),
-                Variant(name: "r2n8l3", rps: 2, nsg: 8, load: 3, u2: nil),
-                Variant(name: "r4n8", rps: 4, nsg: 8, load: nil, u2: nil),
-                Variant(name: "r1n8", rps: 1, nsg: 8, load: nil, u2: nil),
-                Variant(name: "r2n4l3", rps: 2, nsg: 4, load: 3, u2: nil),
-                Variant(name: "r2n16l3", rps: 2, nsg: 16, load: 3, u2: nil),
             ]
         case .outProj:
             return [
                 Variant(name: "r2n4", rps: 2, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n1", rps: 2, nsg: 1, load: nil, u2: nil),
-                Variant(name: "r4n2", rps: 4, nsg: 2, load: nil, u2: nil),
                 Variant(name: "r2n2l0", rps: 2, nsg: 2, load: 0, u2: nil),
+                Variant(name: "r2n2l1", rps: 2, nsg: 2, load: 1, u2: nil),
+                Variant(name: "r2n1l0", rps: 2, nsg: 1, load: 0, u2: nil),
                 Variant(name: "r2n2u1", rps: 2, nsg: 2, load: nil, u2: true),
-                Variant(name: "r1n4", rps: 1, nsg: 4, load: nil, u2: nil),
-                Variant(name: "r2n8", rps: 2, nsg: 8, load: nil, u2: nil),
-                Variant(name: "r2n2l3", rps: 2, nsg: 2, load: 3, u2: nil),
-                Variant(name: "r2n4l3", rps: 2, nsg: 4, load: 3, u2: nil),
-                Variant(name: "r1n2", rps: 1, nsg: 2, load: nil, u2: nil),
-                Variant(name: "r4n1", rps: 4, nsg: 1, load: nil, u2: nil),
-                Variant(name: "r2n1l3", rps: 2, nsg: 1, load: 3, u2: nil),
-                Variant(name: "r1n8", rps: 1, nsg: 8, load: nil, u2: nil),
             ]
         case .sharedUp:
             return [
                 Variant(name: "r2n4", rps: 2, nsg: 4, load: nil, u2: nil),
                 Variant(name: "r2n1", rps: 2, nsg: 1, load: nil, u2: nil),
-                Variant(name: "r4n2", rps: 4, nsg: 2, load: nil, u2: nil),
+                Variant(name: "r2n2l1", rps: 2, nsg: 2, load: 1, u2: nil),
+                Variant(name: "r2n1l1", rps: 2, nsg: 1, load: 1, u2: nil),
                 Variant(name: "r2n2l2", rps: 2, nsg: 2, load: 2, u2: nil),
                 Variant(name: "r2n2u1", rps: 2, nsg: 2, load: nil, u2: true),
-                Variant(name: "r1n4", rps: 1, nsg: 4, load: nil, u2: nil),
-                Variant(name: "r2n8", rps: 2, nsg: 8, load: nil, u2: nil),
-                Variant(name: "r2n2l1", rps: 2, nsg: 2, load: 1, u2: nil),
             ]
         }
     }
@@ -6928,11 +6891,10 @@ enum NemotronQMVTune {
                         }
                         return previous
                     }
-                    // A round: every candidate's chain built first, then evaluated back to back in `order`.
+                    // A round: each candidate's chain built and evaluated back to back in `order`.
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
@@ -7454,11 +7416,10 @@ enum NemotronFC2Tune {
                         }
                         return prev
                     }
-                    // A round: every candidate's chain built first, then evaluated back to back in `order`.
+                    // A round: each candidate's chain built and evaluated back to back in `order`.
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
@@ -7594,12 +7555,15 @@ enum NemotronTuneAdoption {
     static let minCycles = 16
     /// The decode-round tunes' shared bar: an adopted candidate's median is at most this fraction of the
     /// incumbent's (`seedMedianBar` under NEMOTRON_WINDOW_TUNE_RULE=two-tier).
-    static let medianBar = nemotronWindowTuneTwoTier ? seedMedianBar : 0.97
+    static let medianBar = nemotronWindowTuneTwoTier ? seedMedianBar : 0.985
     /// The seed rule's shared bar. NEMOTRON_TUNE_BAR sets it (0.97 makes it single-tier).
     static let seedMedianBar = Double(ProcessInfo.processInfo.environment["NEMOTRON_TUNE_BAR"] ?? "")
         .map { min(max($0, 0.5), 1.0) } ?? 0.99
     /// An adopted candidate beats the incumbent in at least this fraction of the cycles.
     static let winBar = 0.75
+    /// The single-tier (decode-round) rule's cycle win bar: of the candidates that pass `medianBar`, the fastest
+    /// one that beats the incumbent in at least this fraction of the cycles.
+    static let decodeWinBar = 0.65
     /// Two-tier rule for the tunes on the seed rule's shared bar: a candidate whose median is at least 3% below the
     /// incumbent's (`strongBar`) needs `winBar`; one between 1% and 3% below (`seedMedianBar` .. `strongBar`) needs
     /// `narrowWinBar` of the paired cycles. Tunes that pass their own bar keep `winBar` throughout.
@@ -7663,20 +7627,12 @@ enum NemotronTuneAdoption {
         let twoTier = seed || nemotronWindowTuneTwoTier
         let bar = ownBar ?? (twoTier ? seedMedianBar : medianBar)
         var adopted: Int? = nil
-        guard twoTier else {
-            // Single tier: the lowest median, adopted only when it passes both bars.
-            if let b = best, cycles > 0, samples.allSatisfy({ $0.count == cycles }), medians[b] <= bar * medians[0],
-               Double(wins[b]) >= winBar * Double(cycles) {
-                adopted = b
-            }
-            return Verdict(medians: medians, wins: wins, cycles: cycles, best: best, adopted: adopted)
-        }
         // The seed rule's shared bar is two-tier (`strongBar`, `narrowWinBar`); a tune's own bar keeps `winBar`
         // throughout.
-        let tiered = bar == seedMedianBar && bar > strongBar
+        let tiered = twoTier && bar == seedMedianBar && bar > strongBar
         func passes(_ i: Int) -> Bool {
             guard medians[i] <= bar * medians[0] else { return false }
-            let needed = tiered && medians[i] > strongBar * medians[0] ? narrowWinBar : winBar
+            let needed = tiered && medians[i] > strongBar * medians[0] ? narrowWinBar : (twoTier ? winBar : decodeWinBar)
             return Double(wins[i]) >= needed * Double(cycles)
         }
         // Of the candidates that pass both bars, the lowest median.

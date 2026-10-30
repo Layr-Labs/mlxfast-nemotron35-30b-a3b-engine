@@ -467,8 +467,11 @@ enum NemotronMTPSSMAnchor {
                         record11 = (a.2, nil)
                     } else {
                         let grown = extend(record11.tape, w, keep)
-                        record11 = grown.steps <= NemotronMTPPendingSSM.strictSteps
-                            ? (record11.anchor, grown) : (replay(grown, record11.anchor), nil)
+                        if grown.steps <= NemotronMTPPendingSSM.strictSteps {
+                            record11 = (record11.anchor, grown)
+                        } else {
+                            record11 = (replay(grown, record11.anchor), nil)
+                        }
                     }
                     skip = writes ? (b.2!, extend(nil, w, keep)) : (skip.anchor, extend(skip.tape, w, keep))
                     same = same && (skip.tape?.steps ?? 0) <= top
@@ -678,11 +681,10 @@ enum NemotronMTPSSMAnchor {
                         return
                     }
                     compared = chain
-                    // A round: both geometries' chains built first, then evaluated back to back in `order`.
+                    // A round: each geometry's chain built and evaluated back to back in `order`.
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { run($0 == 1) }
-                        return chains.map { outs -> Double? in
-                            guard let outs else { return nil }
+                        order.map { idx -> Double? in
+                            guard let outs = run(idx == 1) else { return nil }
                             let begin = DispatchTime.now().uptimeNanoseconds
                             eval(outs)
                             Stream.gpu.synchronize()

@@ -6944,18 +6944,14 @@ enum NemotronDraftTune {
         case .screen:
             return [v(4, 2), v(16, 2), v(8, 1), v(8, 4), v(16, 1), v(32, 1), v(4, 4), v(16, 4)]
         case .wo, .up, .down, .eh, .qkv:
-            return [v(2, 2), v(2, 4), v(4, 1), v(4, 4), v(8, 2), v(4, 2, unroll: 2)]
+            return [v(2, 2), v(4, 1), v(4, 2, unroll: 2)]
         case .ehp:
             return [v(2, 4), v(2, 1), v(4, 2), v(1, 4), v(2, 8), v(2, 2, unroll: 2), v(2, 2, load: 2)]
         case .sdpa:
             return [v(1, 32, unroll: 8, keys: 2, packed: true), v(1, 32, unroll: 8, keys: 2),
                     v(1, 32, unroll: 8, keys: 1), v(1, 32, unroll: 4, keys: 2), v(1, 32, unroll: 4, keys: 1)]
         case .vqkv:
-            // Outputs per SIMD group x SIMD groups per tile (256 % (rps * nsg) == 0), then the prepared QMV's
-            // main-loop load forms (1 W32, 2 W32 + hoist, 3 + next-block prefetch) and the unroll pragma.
-            return [v(1, 2), v(1, 4), v(2, 1), v(2, 4), v(2, 8), v(4, 1), v(4, 2), v(4, 4), v(8, 1),
-                    v(2, 2, load: 1), v(2, 2, load: 2), v(2, 2, load: 3), v(2, 4, load: 2), v(4, 2, load: 2),
-                    v(1, 4, load: 2), v(2, 2, unroll: 2)]
+            return [v(2, 2, load: 1), v(2, 2, unroll: 2), v(2, 2, unroll: 2, load: 1), v(2, 2, unroll: 2, load: 2)]
         }
     }
 
@@ -7104,9 +7100,8 @@ enum NemotronDraftTune {
                         return previous
                     }
                     func round(_ order: [Int]) -> [Double?] {
-                        let chains = order.map { build($0) }
-                        return chains.map { last -> Double? in
-                            guard let last else { return nil }
+                        order.map { idx -> Double? in
+                            guard let last = build(idx) else { return nil }
                             let start = DispatchTime.now().uptimeNanoseconds
                             eval(last)
                             Stream.gpu.synchronize()
